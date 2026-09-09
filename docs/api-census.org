@@ -1,0 +1,67 @@
+#+title: DOrg Public API Caller Census
+
+This census records the DOrg =0.1.0= public surface that external consumers may
+depend on.  It replaces the older 2026-07-09 pre-internalization snapshot as
+the current documentation view.  Historical caller findings remain useful
+background only where noted;
+the supported boundary is the public facade documented in [[file:api.org][api.org]],
+[[file:query.org][query.org]], [[file:mutate.org][mutate.org]], [[file:cli.org][cli.org]],
+and [[file:backend-extension.org][backend-extension.org]].
+
+The guard for this file is ~make test SELECT='^dorg-test-project-'~.  It
+requires row-level coverage for the risky symbols below so docs cannot drop a
+known cross-repository coupling by accident.
+
+* Current Boundary
+
+| Family | Public entry points | Notes |
+|--------+---------------------+-------|
+| Mutation command API | ~dorg-api-read~, ~dorg-api-normalize~, ~dorg-api-make-mutation-intent~, ~dorg-api-execute~ | One public write door; callers pass DSL forms or first-class intents and receive typed command envelopes. |
+| Query API | ~dorg-ql-select~, ~dorg-command-run-query~, ~dorg-session-open~, ~dorg-session-query~, ~dorg-session-refresh~, ~dorg-session-close~ | Atomic and composable v2 query forms share the same facade and backend adapters. |
+| Materialized views | ~dorg-materialize~, ~dorg-refresh-materialized-view~, ~dorg-materialized-view-scope~, ~dorg-render~, ~dorg-render-island~ | Dolt-backed buffers and ~/dorg:~ views are read-only projections. |
+| Registry and backend descriptors | ~dorg-bind-dolt~, ~dorg-unregister~, ~dorg-current-registration~, ~dorg-registered-backend~, ~dorg-registered-dolt-dir~, ~dorg-backend-plain-org~, ~dorg-backend-dolt~ | Binding and descriptor inspection are public; direct mutation still goes through the typed door. |
+| Dolt storage/admin | ~dorg-sql~, ~dorg-sql-batch~, ~dorg-sql-quote~, ~dorg-head-commit~, ~dorg-commit~, ~dorg-dolt-start~, ~dorg-dolt-stop~, ~dorg-dolt-stop-all~, ~dorg-dolt-list~, ~dorg-dolt-compact~ | SQL helpers remain risky and schema-coupled.  They are kept for existing extension/downstream needs, not as a general application write API. |
+| Import and transactions | ~dorg-import-document~, ~dorg-transaction-commit~ | Explicit administrative import/recovery and exact-base transactions; not a replacement for typed mutation. |
+| Extension plane | ~dorg-register-extension~, ~dorg-unregister-extension~, ~dorg-get-extension~, ~dorg-registered-extensions~, ~dorg-ext-rebuild-index~, documented extension context/accessor functions | Extension authors register schema/migrations and derived-index projectors; caller-payload mutation inputs are retired. |
+| Domain/model readers | ~dorg-model-load-tree~, ~dorg-model-load-headings~, documented ~dorg-heading-*~ and ~dorg-item-*~ accessors | Public where current docs expose them, but consumers should prefer query/render facades for new cross-repo integration. |
+
+* Risky Symbol Rows
+
+| Symbol | Kind / category | Current disposition | Rationale |
+|--------+-----------------+---------------------+-----------|
+| ~dorg-sql~ | Low-level SQL execution | ~keep-public-risky~ | Existing extension/downstream code may still need schema-coupled reads.  New application writes must use ~dorg-api-execute~. |
+| ~dorg-sql-batch~ | Low-level SQL batch | ~keep-public-risky~ | Kept for controlled transactional/storage use.  It is below the public mutation door and is not the recommended consumer write API. |
+| ~dorg-sql-quote~ | SQL literal quoting helper | ~keep-public-risky~ | Kept as the dependency-free quoting helper for the exposed SQL surface and extension SQL generation. |
+| ~dorg-materialize~ | Public buffer materialized-view lifecycle | ~keep-public~ | Single public operation that publishes a whole/window Dolt-backed view into a buffer. |
+| ~dorg-materialized-view-scope~ | Materialized-view classifier | ~keep-public~ | Stable observation seam returning nil, ~whole~, or ~partial~ without exposing private projection state. |
+| ~dorg-render~ | Whole-root render to string | ~keep-public~ | Public read/render primitive used by docs and downstream read-only/admin workflows. |
+| ~dorg-render-island~ | Partial subtree render to string | ~keep-public~ | Public island render primitive for bounded read-only materialization. |
+| ~dorg-model-load-headings~ | DB model loader for selected ids | ~keep-public-low-level~ | Still documented and used by lower-level read workflows; prefer render/query facades for new external code. |
+| ~dorg-model-load-tree~ | DB model loader for whole root | ~keep-public-low-level~ | Still documented and useful below render/materialize; avoid new downstream coupling to raw model shape when a facade fits. |
+| ~dorg-head-commit~ | Dolt HEAD probe | ~keep-public~ | Freshness, exact-base checks, and diagnostics need a stable commit-token probe. |
+| ~dorg-register-extension~ | Extension registration | ~keep-public~ | The supported extension schema/projector registration point. |
+| ~dorg-ext-rebuild-index~ | Exact-revision derived-index audit/repair | ~keep-public~ | The controlled administrative path for auditing or repairing one declared extension scope through its existing projector. |
+| ~dorg-ext-read-context-root-id~ | Extension read context accessor | ~keep-public~ | Generated accessor on the documented extension read context used by read-plane callbacks. |
+| ~dorg-registered-backend~ | Registry backend lookup | ~keep-public~ | Public descriptor lookup for callers that need backend routing without private registry state. |
+| ~dorg-registered-dolt-dir~ | Registry Dolt-dir lookup | ~keep-public~ | Kept for existing public docs and simple Dolt-bound buffer inspection. |
+| ~dorg-bind-dolt~ | File/backend binding | ~keep-public~ | Primary public binding operation for connecting an Org file/buffer to a Dolt store. |
+
+* Demoted Or Retired Surface
+
+The public API does not include private helpers named with module-local
+double-hyphen prefixes.  In particular, docs must not revive the demoted
+model-render helpers, git internals, backend capability accessors, retired
+extension cache wrappers, or private Dolt-server lifecycle helpers guarded by
+~tests/dorg-project-tests.el~.
+
+Legacy raw mutation functions such as ~dorg-plan-ops~ and ~dorg-apply-ops~ are
+removed.  The replacement is the typed mutation DSL and command API documented
+in [[file:mutate.org][mutate.org]] and [[file:api.org][api.org]].
+
+* Downstream Rule
+
+Downstream consumers adopting a pinned ~lib/dorg~ copy must treat
+~dorg-api-execute~, ~dorg-ql-select~, ~dorg-command-run-query~,
+materialization, and documented extension callbacks as the integration door.
+Raw SQL remains a narrow storage/extension compatibility surface; it is not an
+application-level write contract.

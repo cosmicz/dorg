@@ -1,0 +1,197 @@
+#+begin_example sh
+! tracker-cli c zcm
+  ⎿  TODO state changed to DESIGN
+     Claimed: active bead saved to .tracker/.current.claude-max
+       `tracker-cli advance` and `tracker-cli close` use tracked bead automatically:
+     coordinator-zcm  DESIGN  [B]  feat: agent instance beads should use tracker named beads
+     Assignee:    claude-max
+     Created:     [2026-03-26 Thu 13:05]
+     Blocked by:  none
+     Blocking:    none
+     Related:     none
+
+     Currently creating a new bead per instance, should be reused
+
+     ,#+begin_example org
+
+     ---
+     Context:  Buffer: beads.org<3>
+     Path: /private/cosmic/dev/Coordinator/.tracker/beads.org
+     Selected text (lines 3251-3263):
+     ```
+     ,* agent: hook-test
+     ,* agent: hook-test
+
+     ```
+     Cursor position: line 3263
+     ---
+
+     ,#+end_example
+
+     --- Status Log ---
+     - State "DESIGN" from "TODO"  [2026-03-26 Thu 13:15] by claude-max
+
+     𝛏mbd╌◉ coordinator-zcm  DESIGN  [B]  feat: agent instance beads should use tracker named beads
+       → Think before coding. Understand the problem, explore the codebase, design your approach.
+
+     1. Read the bead description and any linked context (~tracker-cli show ID~)
+     2. Clarify the ask: is the description clear, correct, and concise?
+        If not, rewrite it: ~tracker-cli update ID -d "improved description"~
+     3. Identify affected files and existing patterns
+     4. Consider edge cases, failure modes, and simpler alternatives
+     5. Write your approach in the Design section:
+        ~tracker-cli update ID --section Design --content - <<EOF ... EOF~
+     6. Draft what "done" looks like in Acceptance Criteria:
+        ~tracker-cli update ID --section "Acceptance Criteria" --content - <<EOF ... EOF~
+
+     Exit criteria: Description clear, design section filled, acceptance criteria drafted.
+
+❯ c
+
+∴ Thinking…
+
+  The user claimed coordinator-zcm and sent 'c' to continue. Let me understand the problem: currently coordinator creates a new tracker bead every time an agent instance is created/started, but it should reuse beads by name. The context
+   shows duplicate "agent: hook-test" beads in the tracker beads.org file.
+
+  Let me look at how instance beads are currently created in coordinator-tracker.el.
+
+⏺ Read(coordinator-tracker.el)
+  ⎿  Read 151 lines
+
+⏺ Now let me check if tracker has a "named bead" or "find by name" feature:
+
+⏺ Bash(tracker-cli --help 2>&1 | head -30; echo "---"; tracker-cli create --help 2>&1 | head -30)
+  ⎿  Usage: tracker-cli [OPTIONS] COMMAND
+
+     Lightweight issue tracking for projects.
+
+     Project:
+       --tracker-dir VALUE     Override beads directory path
+       --tracker-file VALUE    Override beads file path
+
+     Options:
+       -q, --quiet    Suppress status footer
+
+     Output:
+       --json    Output as JSON
+
+     Commands:
+       create    Create a new bead
+       show      Show full bead details
+       import    Import an org heading from a file as a bead
+       move      Move a bead to another tracker project
+
+     Lifecycle:
+       update     Update bead fields
+       advance    Advance bead to next workflow step
+       close      Close a bead with resolution
+       claim      Claim a bead for active work
+       delete     Permanently delete beads
+       archive    Archive beads to archive file
+
+       Sections (update, advance, close):
+         --design VALUE                 Set Design section
+     ---
+     Usage: tracker-cli create [OPTIONS] <title>
+
+     Create a new bead
+
+     Arguments:
+       <title>    Bead title
+
+     Options:
+       -p, --priority VALUE       Priority (choices: A, B, C, D, E)
+       -a, --assignee VALUE       Assignee name
+       -d, --description VALUE    Description text
+       --parent VALUE             Parent bead ID
+       --discovered-from VALUE    Source bead ID
+       --blocked-by VALUE ...     Blocked-by bead IDs
+       --related VALUE ...        Related bead IDs
+       --duplicate-of VALUE       Duplicate-of bead ID
+       --static                   Mark bead as static (no workflow)
+       -n, --name VALUE           Assign a name (alias) to the bead
+
+     Global Options:
+       --tracker-dir VALUE     Override beads directory path
+       --tracker-file VALUE    Override beads file path
+       -q, --quiet            Suppress status footer
+       --json                 Output as JSON
+
+⏺ There's --name VALUE on tracker-cli create. Let me check if there's a way to look up by name:
+
+⏺ Bash(tracker-cli show --help 2>&1; echo "==="; tracker-cli search --help 2>&1)
+  ⎿  Usage: tracker-cli show [<ids>...]
+
+     Show full bead details
+
+     Arguments:
+       <ids>    Bead IDs (defaults to active bead)
+
+     Global Options:
+       --tracker-dir VALUE     Override beads directory path
+       --tracker-file VALUE    Override beads file path
+       -q, --quiet            Suppress status footer
+       --json                 Output as JSON
+     ===
+     Usage: tracker-cli query search <pattern>
+
+     Search beads by text pattern
+
+     Arguments:
+       <pattern>    Search pattern (regex)
+
+     Global Options:
+       -s, --status VALUE ...    Filter by status (choices: TODO, DESIGN, SPEC, PLAN,
+                                 REVIEW, IMPL, REFINE, ACCEPT, RESOLVE, WAIT, DONE,
+                                 CNCL, DONE)
+       --all                     Include done/cancelled beads
+       -p, --priority VALUE      Filter by priority (choices: A, B, C, D, E)
+       -a, --assignee VALUE      Filter by assignee
+       --blocked                 Show only blocked beads
+       --static                  Show only static beads
+       --tracker-dir VALUE        Override beads directory path
+       --tracker-file VALUE       Override beads file path
+       -q, --quiet               Suppress status footer
+       --json                    Output as JSON
+
+     Pattern is an Emacs regex.  OR: tracker-cli search "foo\\|bar"
+
+⏺ Bash(tracker-cli create --help 2>&1 | grep -A2 "name"; echo "==="; tracker-cli show @test 2>&1; echo "==="; tracker-cli create "test named" --name agent-test --static --quiet 2>&1; echo "==="; tracker-cli show @agent-test 2>&1; echo "==="; tracker-cli
+      show @agent-test --json 2>&1)
+  ⎿  Error: Exit code 1
+       -a, --assignee VALUE       Assignee name
+       -d, --description VALUE    Description text
+       --parent VALUE             Parent bead ID
+     --
+       -n, --name VALUE           Assign a name (alias) to the bead
+
+     Global Options:
+     ===
+     Error: Bead not found: @test
+     ===
+     TODO state changed to
+     Created coordinator-4lg (agent-test)  -  [-]  test named
+     ===
+     Error: Bead not found: @agent-test
+     ===
+     {"error":"Bead not found: @agent-test"}
+
+       -a, --assignee VALUE       Assignee name
+       -d, --description VALUE    Description text
+       --parent VALUE             Parent bead ID
+     --
+       -n, --name VALUE           Assign a name (alias) to the bead
+
+     Global Options:
+     ===
+     Error: Bead not found: @test
+     ===
+     TODO state changed to
+     Created coordinator-4lg (agent-test)  -  [-]  test named
+     ===
+     Error: Bead not found: @agent-test
+     ===
+     {"error":"Bead not found: @agent-test"}
+
+✻ Sautéed for 49s
+#+end_example

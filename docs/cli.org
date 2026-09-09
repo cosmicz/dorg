@@ -1,0 +1,538 @@
+#+title: DOrg Command-line Interface
+
+#+begin_quote
+*DOrg 0.1.0 command-line interface.*  This document describes the first public
+CLI surface.  Keep independent backups of important data.
+#+end_quote
+
+This document is the detailed reference for =bin/dorg=, the
+non-interactive CLI that exposes dorg's query, mutate, and
+explicit administrative import, plus Dolt-server-management helpers to
+downstream tools without an Emacs UI.
+
+DOrg *editing DSL*: *CLI* · [[file:query.org][query language]] · [[file:mutate.org][mutation API]].
+
+The CLI app source lives at the repo root in =dorg-app.el= (app symbol
+~dorg-cli~, presented to users as ~dorg~ via the wrapper).  Earlier
+prototypes included a separate =bin/dorg-ql= binary backed by
+=cli/dorg-ql.el=; the surface was consolidated under the single =bin/dorg=
+(see /Compatibility/ below).
+
+For the public command API this CLI is one transport of, see
+[[file:api.org][docs/api.org]]; for the mutate DSL and typed patch IR v2 see
+[[file:mutate.org][docs/mutate.org]]; for the ~dorg-ql~ query surface — the atomic predicates
+and the composable v2 DSL — see [[file:query.org][docs/query.org]].
+
+* Overview
+
+#+begin_quote
+*DOrg 0.1.0 CLI surface.*  This page documents the =bin/dorg= surface:
+the =query= and =mutate= verbs, explicit administrative =import=, and =dolt=
+server management.  The =mutate=
+verb (typed patch IR, mandatory =--dry-run= / =--apply= mode) *replaces*
+the legacy =set= command and =POST /set=, which are *removed* from the CLI
+and the serve surface (the interactive Emacs ~dorg-set-property~ helper is
+retained).  The per-predicate read subcommands =id= / =property= / =tag= /
+=title= are *retained* as convenience aliases over =query '(<predicate>)'=
+(see [[file:api.org][docs/api.org]], /Convenience aliases/).  The =mutate= command, the
+=/mutate= route, and the =set= / =POST /set= removal are implemented in the
+development tree.
+#+end_quote
+
+=bin/dorg= is a non-interactive [[https://github.com/cosmicz/clime][Clime]] app with four command
+families, so downstream tools can drive dorg-backed org
+trees without an Emacs UI.  It uses only stable public facades — never
+private helpers or a direct SQL path:
+
+- *query* — UI-free command-boundary reads through the
+  ~dorg-command-run-query~ facade, which wraps the canonical
+  ~dorg-ql-select~ read engine and maps typed query failures to the shared
+  command envelope;
+- *mutate* — writes through the public command API (~dorg-api-execute~):
+  a public DSL form normalized to typed patch IR v2 and executed under the
+  =--dry-run= / =--apply= mode contract (see [[file:mutate.org][docs/mutate.org]]);
+- *import* — explicit administrative whole-document bootstrap/recovery
+  through ~dorg-import-document~; this is not an authoring or repair-default
+  path and is unavailable over HTTP;
+- *dolt* — DOrg-managed Dolt sql-server management through the
+  user-facing surface (~dorg-dolt-list~,
+  ~dorg-dolt-start~, ~dorg-dolt-stop~, ~dorg-dolt-stop-all~).
+
+The interactive Emacs helper ~dorg-set-property~ is a one-property convenience
+over the same typed mutation boundary.  The CLI exposes the general
+noninteractive write path through =mutate=; a file-backed apply requests
+persistence inside that sole API execution, with no later save/sync step.
+
+* Local invocation history
+
+DOrg appends one local JSONL record for each CLI invocation and each
+authenticated HTTP dispatch.  This ledger is diagnostic only: it is never sent
+over the network and is never consulted for authorization, dispatch, or state
+mutation.
+
+The default location is
+=$XDG_STATE_HOME/dorg/clime-invocations.jsonl= when =XDG_STATE_HOME= is set and
+nonempty, otherwise =~/.local/state/dorg/clime-invocations.jsonl=.  Set
+=DORG_CLI_HISTORY_FILE=/path/to/file.jsonl= to override it.  Set
+=DORG_CLI_HISTORY_FILE== (an explicitly empty value) to disable history for CLI
+processes.  Lisp callers may customize ~dorg-cli-history-file~ to =default=,
+an explicit file name, or nil (disabled); =default= resolves the XDG/HOME path
+when each event is written rather than when the app is loaded.
+
+Each object has exactly these fields: =timestamp=, =app=, =surface=, =phase=,
+=path=, =exit_code=, =duration=, =output_format=, and =error_type=.  =path= is
+only a resolved command path; it is null for unknown HTTP routes so raw URL
+segments cannot enter the ledger.  Pre-dispatch authentication rejection is
+not a Clime invocation and is not logged.
+
+The closed schema excludes raw argv, resolved parameters, context and auth or
+request metadata, headers, URL query/body, environment, source content,
+handler output, return values, and error messages.  Append, directory, or
+bounded lock-retry failures may produce a diagnostic, but cannot change the
+command output or exit code and cannot repeat the handler.
+
+Readers should bound the append-only file before aggregating it.  For example:
+
+#+begin_src sh
+history_file="${DORG_CLI_HISTORY_FILE:-${XDG_STATE_HOME:-$HOME/.local/state}/dorg/clime-invocations.jsonl}"
+
+# Frequency by resolved command over the latest 10,000 records.
+tail -n 10000 "$history_file" |
+  jq -s 'group_by(.path) | map({path: .[0].path, count: length})'
+
+# Recent failures and their metadata-only signal types.
+tail -n 10000 "$history_file" |
+  jq -c 'select(.exit_code != 0) | {timestamp,path,phase,error_type,duration}'
+#+end_src
+
+* Query commands
+
+#+begin_src sh
+# Read — one dorg-ql form (atomic predicate or composable v2 pipeline):
+dorg query '(property "CATEGORY" "red")' -f tasks.org
+dorg query '(id 100)'                    -f tasks.org
+dorg query '(tag "work")'                -f tasks.org
+dorg query '(pipe (where (deadline (this-week))) (traverse children))' -f tasks.org
+#+end_src
+
+=query= reads exactly one Lisp form: either an atomic predicate (=id=,
+=property=, =tag=, =title=, …) or a composable v2 pipeline (=pipe=,
+=where=, =traverse=, =and=/=or=/=not=, =field=, =timestamp=).  The CLI
+dispatches on the file's buffer backend, where composable forms are fully
+supported (the in-memory model-list adapter is not a CLI source).  Every
+timestamp predicate -- =scheduled=, =deadline=,
+=closed=, =property-ts=, =logbook=, and =active-ts= -- resolves natively
+against the plain-org and Dolt buffer backends as well as the model
+adapter.  See [[file:query.org][docs/query.org]] for the full grammar.
+
+=query= and =mutate= share one exact-form reader.  It disables Lisp reader
+evaluation (=#.= forms are never executed), accepts exactly one complete form
+followed only by whitespace, and passes reader-valid atoms/=nil= onward to the
+verb's domain validator.  Supplied empty input, malformed syntax (including a
+comment-only argument), and any trailing form/data/comment are
+=invalid-form= with =error.details.detail= equal to =empty-input=,
+=malformed-syntax=, or =trailing-input=.  Every refusal exits nonzero and
+emits one error envelope; mutation input is fully read before any source is
+opened or write is planned.
+
+The per-predicate convenience subcommands (~dorg id~, ~dorg property~,
+~dorg tag~, ~dorg title~) are retained as thin aliases over
+~dorg query '(<predicate>)'~, which takes the same selector predicate.
+Prefer =query= for anything beyond a single atomic predicate; the aliases
+exist only for the common one-predicate reads.
+
+* Mutate command
+
+#+begin_src sh
+# Dry-run first (never writes), then apply — exactly one mode is required:
+dorg mutate '(on (id 100) (set (property "STATUS") "DONE"))' --dry-run -f tasks.org
+dorg mutate '(on (id 100) (set (property "STATUS") "DONE"))' --apply   -f tasks.org
+
+# Document-level keyword sequence (order-preserving whole-sequence replace):
+dorg mutate '(on document (replace (keywords "SEQ_TODO") "TODO" "NEXT" "DONE"))' --apply -f tasks.org
+
+# Query-scoped apply — confirm the exact id set a prior dry-run resolved:
+dorg mutate '(on (where (property "STATUS" "OPEN")) (set (property "STATUS") "DONE"))' --dry-run -f tasks.org
+dorg mutate '(on (where (property "STATUS" "OPEN")) (set (property "STATUS") "DONE"))' \
+    --apply --expect-targets 101,102 -f tasks.org
+#+end_src
+
+=mutate= takes exactly one public DSL form (~(on TARGET ACTION...)~,
+~(insert (heading ...) (under ...))~, or ~(batch FORM...)~; see [[file:mutate.org][docs/mutate.org]]) and
+requires *exactly one* of:
+
+- =--dry-run= — normalize and plan only; never writes.  Returns the
+  normalized intent, typed patch IR, resolved target
+  ids, affected ids where known, the current source token, and any
+  validation errors.
+- =--apply= — run the same normalization path, then execute under the
+  safety gates.
+
+Supplying neither or both flags is a usage error (=mode-error=); there is
+*no default apply*.  Additional options:
+
+- =--base TOKEN= — optimistic-concurrency base (plain-org
+  ~:base-revision~ / Dolt ~:base-commit~); a mismatch is =stale=.
+- =--expect-targets ID,ID= — *required* for a query-scoped
+  (~(where …)~) ~--apply~: the exact id set a prior ~--dry-run~ resolved.
+  Apply re-expands the query and refuses (=target-set-changed=) if the set
+  differs; omitting it is =expected-targets-required=.  Single-target
+  forms (~(id N)~, ~(key V)~, =document=) take no expected set.
+- =--allow-broad= — required to apply over more than
+  ~dorg-api-broad-write-threshold~ (default 100) targets, else
+  =broad-write-refused=.
+
+=mutate= inherits =-f/--file= and =--dolt-dir= / =--root-id= for source
+selection (see /Source selection/).
+
+* Import command
+
+#+begin_src sh
+# First ingest of an unbound complete Org source:
+dorg import -f source.org \
+  --dolt-dir /repo/project.dolt \
+  --target-file /repo/canonical.org \
+  --mode bootstrap
+
+# Recovery replacement from a distinct source, guarded by exact HEAD:
+dorg import -f recovery.org \
+  --dolt-dir /repo/project.dolt \
+  --target-file /repo/canonical.org \
+  --mode replace \
+  --base exact-current-head
+#+end_src
+
+=import= is an opt-in administrative command, not a third write DSL and not a
+replacement for typed mutation.  All four request components are explicit:
+=--file/-f= is the complete source, =--dolt-dir= is the repository,
+=--target-file= is the canonical file/root identity, and =--mode= is
+=bootstrap= or =replace=.  Replace additionally requires =--base= and a source
+different from the canonical target.
+
+Bootstrap accepts only an unbound target or an exact never-imported synthetic
+root.  Replace preserves the existing root and file identity and rebuilds only
+that root.  Both reject partial/projection sources, duplicate or cross-root
+IDs, ambiguous targets, concurrent HEAD movement, and dirty working sets.
+Core and registered import-participant SQL commit together, and the JSON
+response contains the normalized identities, root/base/commit, affected IDs,
+extension summaries, and invalidation scope.
+
+Import is deliberately unavailable through ~dorg serve~.  Full semantics and
+the Elisp API are in [[file:import.org][docs/import.org]].
+
+* Dolt server commands
+
+#+begin_src sh
+# List DOrg-managed Dolt sql-servers (read-only; never starts one):
+dorg dolt list
+dorg dolt status            # alias for `dolt list'
+dorg dolt list --json
+
+# Ensure / stop a server for an explicit Dolt dir (no prompt in batch):
+dorg dolt start /repo/dolt
+dorg dolt ensure /repo/dolt # alias for `dolt start'
+dorg dolt stop  /repo/dolt
+
+# Or derive the Dolt dir from a bound org file:
+dorg dolt start -f tasks.org
+
+# Reclaim unreachable chunks while preserving reachable history / undo:
+dorg dolt compact /repo/dolt
+dorg dolt compact --shallow -f tasks.org
+
+# Repair one moved source binding at an exact Dolt revision (metadata only):
+dorg dolt rebind /repo/dolt /new/path/tasks.org --root-id 42 --base HASH
+dorg dolt rebind /repo/dolt /new/path/tasks.org --root-id 42 --base HASH --json
+
+# Stop every server this process owns:
+dorg dolt stop-all
+#+end_src
+
+The dolt family preserves the ownership and safety
+semantics exactly:
+
+- =list= / =status= is a pure reader.  It merges this process's owned
+  servers, foreign ports it has attached to, and same-host DOrg ownership
+  claims, classifying each =live/dead/stale/unreachable/incompatible= and
+  =owned/attached/foreign=.  External =dolt sql-server= processes without a
+  DOrg claim are excluded.  Listing never starts a server.
+- =start= / =ensure= is an *explicit user action*: it reuses an owned
+  server, attaches to a live DOrg server owned by another
+  process on the host, reaps a dead/stale claim, or starts a new server —
+  never starting a second server behind a live owner's back.
+- =stop= is *owner-safe*: it stops a server this process owns (releasing
+  the token-checked claim), detaches an attach-only client (leaving the
+  owner's claim intact), and *refuses* to stop a live or unreachable
+  server owned by another DOrg process (reporting the owner pid/port).
+- =compact= runs history-preserving Dolt garbage collection for the resolved
+  store.  It can reclaim unreachable chunks and reports before/after/reclaimed
+  byte counts; it does not delete reachable commit history, so DOrg history /
+  undo remains readable.  =--shallow= requests Dolt's faster newgen-only GC
+  pass.
+- =rebind= validates the schema, exact HEAD, root shape, normalized local
+  locator, and collisions, then changes exactly one =dorg_files= locator in one
+  gated commit.  It never searches for, creates, reads, or writes the Org file,
+  never changes root identity or the in-process registry, and returns the old
+  and new relative locators plus base/commit and changed/no-op status.
+- =stop-all= is scoped to servers this process owns; foreign servers are
+  never touched.
+
+Dolt server commands never require =--file=.  A target Dolt dir is
+resolved, without prompting, in this order: a positional argument, then
+=--dolt-dir=, then the Dolt repo registered for =--file=.  When none
+resolves, the command exits nonzero with a usage error rather than reading
+the minibuffer — a batch path never blocks on a prompt.
+
+** External Dolt SQL
+
+An external shell command such as =dolt sql -q "show tables"= is outside
+DOrg's command boundary.  It may still use Dolt's own native server
+discovery, but the observed raw-command stall does not prove that native
+server discovery is universally bypassed.  What it does bypass is DOrg's
+target selection, managed-server health recovery, and bounded guarantees
+around its internal one-shot recovery seam.
+
+Use DOrg's public =query= / =mutate= commands for ordinary reads and writes.
+There is no ~dorg sql~ command in the current CLI.  The ~dorg dolt~ lifecycle
+group starts, stops, lists, compacts, and rebinds managed stores; it does not
+provide an allowlisted SQL inspection verb.  Use external =dolt sql= only as a
+native Dolt operator action outside DOrg's target selection and health recovery
+guarantees.
+
+* Doctor (DB consistency)
+
+#+begin_src sh
+# Report consistency findings for a Dolt-backed dorg DB (exit 1 if any):
+dorg doctor -f tasks.org
+dorg doctor --dolt-dir /repo/.dorg/dolt
+dorg doctor --dolt-dir /repo/.dorg/dolt --json
+
+# Apply fixable findings in one transaction, then re-check:
+dorg doctor -f tasks.org --fix
+#+end_src
+
+=doctor= runs the ~dorg-doctor~ consistency checks (orphan roots, root
+invariants, dangling parents / items / detail rows / drawer children, and
+unreachable headings) against the Dolt database and prints an org-mode report.
+It is Dolt-only; the Dolt dir is resolved without prompting in the same order
+as the Dolt commands (positional =DIR=, then =--dolt-dir=, then the Dolt repo
+registered for =--file=).  Under =--json=, clean runs put
+=command=, =dolt-dir=, =clean=, =applied=, and structured =findings= under
+=data=.  Inconsistent runs exit nonzero and put the same structured findings
+under =error.details.findings=, with each finding carrying =check=,
+=severity=, =message=, and =fixable=.
+
+The exit code is =0= when the database is clean and =1= when findings remain,
+so scripts and CI can gate on it.  =--fix= applies the fixable findings (those
+carrying a repair statement) in a single transaction and re-checks, so the exit
+code reflects the post-fix state.  Under =--json= a clean run is a
+={"clean": true, ...}= object; an inconsistent run is the standard
+={"error": ...}= envelope (the full per-finding report is the text surface).
+Interactively, =M-x dorg-doctor= — bound to =C-c C-x d= in ~dorg-mode~ — shows
+the report and offers to apply fixes.
+
+* Source selection
+
+For query/mutate commands the input file is selected via =--file/-f FILE=,
+or the =DORG_FILE= environment variable (the app declares
+~:env-prefix "DORG"~ and the option declares ~:env "FILE"~, which Clime
+combines into =DORG_FILE=); an explicit =--file= overrides the env var.
+The backend is chosen by the existing ~dorg--classify-registration~ order: a plain
+=.org= file resolves to plain-org, a file carrying =#+DORG_DOLT_DIR:=
+auto-binds Dolt, and =--dolt-dir DIR= forces a Dolt binding on a file
+lacking the keyword.  For =mutate=, =--dolt-dir DIR --root-id ID= selects
+an explicit Dolt root directly and does not require =--file=; =--root-id=
+without =--dolt-dir= is a usage error.
+
+Import does not use backend inference.  It requires =--file=,
+=--dolt-dir=, and =--target-file= independently so source, repository, and
+canonical target cannot collapse into an implicit buffer/binding decision.
+=--root-id= is rejected for import; the target file identity owns root
+resolution.
+
+* Output
+
+Text (default) prints one tab-separated line per result row
+(~query~: ="<heading-id>\t<title>"=; ~dolt list~:
+="<role>\t<status>\t<port>\t<dolt-dir>"=).  =--json= emits the shared
+command envelope for every command:
+
+#+begin_src json
+{"ok":true,"data":{"command":"query","results":[{"heading-id":100,"title":"Inbox","properties":{"CATEGORY":"red"}}],"count":1},"error":null}
+{"ok":false,"data":null,"error":{"reason":"mode-error","message":"mode-error","details":{...}}}
+#+end_src
+
+Command-specific fields live under =data=.  =query= uses =data.results= /
+=data.count=.  =mutate --json= puts the canonical command response (see
+[[file:api.org][docs/api.org]], /Response envelope/) under =data= with =command=,
+=mode=, =intent=, =patches=, =targets=, =affected=, base token fields,
+and new token; these fields are not duplicated at the top level.  =import
+--json= puts its receipt under
+=data= with =mode=, =source=, =target=, =dolt-dir=, =root-id=,
+=base-commit=, =commit=, =created= / =changed= / =deleted=, =extensions=,
+and =invalidation=.  Dolt commands put their semantic fields
+under =data= using kebab-case keys such as =dolt-dir=.  Errors are clean
+nonzero exits without an Emacs backtrace and use =error.reason=,
+=error.message=, and optional =error.details=.  Query grammar/arity/value and
+cardinality failures use =invalid-query=; known source/backend capability
+refusals use =unsupported=.  Applied Dolt writes commit through the typed
+transaction path; plain-org file writes use the source-preserving executor and
+explicit save policy.
+
+* Build & vendoring
+
+=bin/dorg= is committed with its executable bit and uses only relative
+=-L= load paths (=$D/..=, =$D/../lib/clime=), so a fresh checkout can run
+the committed wrapper immediately.  Because =dorg-app.el= lives at the
+repo root, =make compile= and =make lint= put =lib/clime= on the load path
+so the root =*.el= glob builds honestly; core dorg still gains *no* Clime
+dependency — ~dorg-app~ is not a member of =dorg.el= / ~dorg--modules~, and
+a dedicated test asserts ~(require 'dorg)~ loads with no Clime on the path.
+=make bin/dorg= regenerates the wrapper from =dorg-app.el= when it is
+missing or older than the app source.  The target uses
+=CLIME_MAKE=/path/to/clime-make= when provided, otherwise it auto-detects
+=clime-make= from =PATH= or common local checkouts such as =../clime=.
+=lib/clime/= holds the
+CLI-required Clime modules plus
+the *optional* =clime-serve= module and its vendored =web-server=
+dependency (a plain source snapshot pinned to the upstream commit — not a
+submodule/gitlink, no =.elc=), alongside =LICENSE= and a =VERSION= marker.
+=clime-serve= and =web-server= are loaded *lazily*: only ~dorg serve start~
+requires them, so the base CLI and ~(require 'dorg)~ still gain *no* HTTP
+dependency — a dedicated test asserts neither =clime-serve= nor
+=web-server= is provided until a serve command runs.  The HTTP surface is
+documented under [[*Serve (HTTP)]].
+
+* Serve (HTTP)
+
+~dorg serve~ exposes the same query/mutate command surface over HTTP, via
+the optional =clime-serve= module (loaded lazily; see [[*Build & vendoring]]).
+The server binds loopback (=127.0.0.1=) by default, speaks *JSON only*, and
+requires an auth token on every request.  Result bodies are byte-identical
+to ~dorg … --json~ — the same handlers and JSON finalizer run — so the
+[[*Output][shared envelope contract]] carries over unchanged.
+
+** Lifecycle
+
+~dorg serve start~ runs the server and *blocks* until stopped:
+
+: dorg serve start [--file F] [--port N] [--bind ADDR] [--token T]
+
+- =--port= TCP port (default =8080=); =--bind= bind address (default
+  =127.0.0.1=); =--file= sets the process-wide default org source
+  (=DORG_FILE=); =--token= sets the auth token.
+- Start is *idempotent*: a second start against a live port refuses
+  cleanly (it neither rebinds nor blocks).
+- Binding a non-loopback =--bind= still starts but prints a
+  =bound beyond loopback; store is network-exposed= warning; the token is
+  always required (there is no no-token mode).
+
+~dorg serve status [--port N]~ reports whether a server is running on the
+port (pid, host, start time) without ever revealing the token.
+~dorg serve stop [--port N]~ does not perform cross-process shutdown in
+Current behavior: a serve daemon owns its own process, so a separate invocation neither
+proves ownership nor confirms exit.  When a server is running it fails
+closed with a clear message (it never signals a PID or deletes the claim);
+stop the daemon through its owning ~dorg serve~ process.  When nothing is
+running it is a clean no-op.  (Authenticated self-shutdown is a deferred
+explicit runtime/dolt-server decision.)
+
+Runtime coordination uses two =0600= files per port — =serve-PORT.state=
+and =serve-PORT.token= — under a =0700= runtime directory
+(=$TMPDIR/dorg/serve= by default, relocatable via =DORG_SERVE_RUNTIME_DIR=,
+e.g. to =$XDG_RUNTIME_DIR=).  The state file omits the token.
+
+** Routes
+
+Routes mirror the CLI command tree one-to-one.  All structured responses use
+the shared envelope; the =Result= column names the =data= payload.
+
+| Method | Path                        | Result      |
+|--------+-----------------------------+-------------|
+| GET    | =/query?sexp=<form>=        | =data.results= / =data.count= |
+| GET    | =/dolt/list=                | =data.servers= / =data.count= |
+| POST   | =/mutate?mode=<dry-run\|apply>= | canonical mutate payload |
+| POST   | =/dolt/start?dir=<DIR>=     | =data.dolt-dir=, =data.port=, =data.started= |
+| POST   | =/dolt/stop?dir=<DIR>=      | =data.dolt-dir=, =data.stopped= |
+| POST   | =/dolt/stop-all=            | =data.stopped= |
+
+The =sexp= query parameter is a URL-encoded dorg-ql form — an atomic
+predicate or a composable v2 pipeline — the same argument ~dorg query~
+takes.  =POST /mutate= carries the public DSL form in the request body and
+the required =mode= (=dry-run= / =apply=) as a query/body parameter, with
+=base=, =expect-targets=, and =allow-broad= as further parameters (see
+[[file:mutate.org][docs/mutate.org]], /Command envelope/).  The same query and mutate handlers
+back the CLI and HTTP, so forms run over HTTP against plain-org and Dolt
+buffers too.  Usage/input errors — including =mode-error=,
+=expected-targets-required=, =target-set-changed=, and
+=broad-write-refused= — return the shared error envelope with HTTP status
+=400=.  Route misses return the same error shape with HTTP =404=.  HTTP is *JSON-only*: there is no =.txt= route — tab-separated
+text remains a CLI-only mode (=bin/dorg= without =--json=).  The =serve=
+lifecycle itself (=start=/=status=/=stop=) is *CLI-only* and is
+deliberately not reachable over HTTP (a =/serve/*= request is refused).
+Administrative =import= is also CLI-only; a =/import= request is refused.
+
+** Auth
+
+Every request must present the token.  Because the vendored web-server
+rejects a standard =Authorization: Bearer= header, the token rides *either*
+a =token= query parameter *or* an =X-Dorg-Token= request header:
+
+- =GET /query?sexp=<form>&token=<TOKEN>=
+- =X-Dorg-Token: <TOKEN>=
+
+The token is resolved with the precedence =--token= > =DORG_SERVE_TOKEN=
+env > a freshly generated high-entropy token, which is written to the
+=0600= token file (its path is printed once on start).  Comparison is
+constant-time.  A missing or wrong token returns HTTP =401= with the shared
+=application/json= error envelope.
+
+** Example
+
+#+begin_src sh
+# Start a loopback server on the default port (blocks); note the token path.
+dorg serve start -f tasks.org &
+TOKEN=$(cat "$TMPDIR/dorg/serve/serve-8080.token")
+
+# Query (token as a query parameter):
+curl "http://127.0.0.1:8080/query?sexp=%28tag%20%22work%22%29&token=$TOKEN"
+
+# Query (token as a header):
+curl -H "X-Dorg-Token: $TOKEN" \
+     "http://127.0.0.1:8080/query?sexp=%28property%20%22CATEGORY%22%20%22red%22%29"
+
+# Mutate (POST /mutate; mode is required, returns a JSON object):
+curl -X POST -H "X-Dorg-Token: $TOKEN" \
+     --data '(on (id 100) (set (property "STATUS") "DONE"))' \
+     "http://127.0.0.1:8080/mutate?mode=apply"
+
+dorg serve stop
+#+end_src
+
+** Downstream value
+
+A downstream tool can drive DOrg by shelling out to =bin/dorg= (one
+subprocess per call).  The HTTP surface offers a warm, long-lived endpoint
+— lower per-call latency and a shared warm session — that such a tool could
+POST to instead of spawning.  A serve daemon may also hold a warm ~dorg-session~
+per source so repeated queries skip cold backend bring-up.  Both are
+deferred perf value (not yet consumed), not a current dependency.
+
+* Compatibility
+
+The CLI is a single =bin/dorg= binary.  The legacy =bin/dorg-ql= shim —
+and its =DORG_QL_FILE= environment variable, a deprecated alias for
+=DORG_FILE= — were removed during pre-release development.
+
+DOrg 0.1.0 does not expose the pre-release write surface (=set= / =POST /set=);
+use the canonical =mutate= verb (see the Overview note):
+
+- ~dorg set KEY VALUE --id ID~ and =POST /set= → =dorg mutate '(on (id ID)
+  (set (property "KEY") "VALUE"))' --apply= and =POST /mutate?mode=apply=.
+
+The per-predicate read commands ~dorg id~ / ~dorg property~ / ~dorg tag~ /
+~dorg title~ are *retained* as convenience aliases for =dorg query
+'(<predicate>)'= with the same selector predicate.  The selector
+*predicates* ~(id N)~, ~(property K V)~, ~(tag T)~, ~(title T)~ are
+likewise the base case of the query/=where= selector language
+([[file:query.org][docs/query.org]]).

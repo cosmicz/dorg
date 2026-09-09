@@ -1,0 +1,36 @@
+#+TITLE: Body Elements
+
+* Body surface
+Paragraph one keeps prose.
+
+Paragraph two keeps order.
+
+- first list item
+- second list item with [ ] checkbox text
+  - nested item
+
+| Name | Value |
+|------+-------|
+| one  |     1 |
+| two  |     2 |
+
+#+NAME: release-src
+#+CAPTION: Source payload
+#+begin_src emacs-lisp
+(message "hello")
+#+end_src
+
+#+begin_example
+* not a real heading
+#+TITLE: not a real keyword
+,#+begin_src text
+#+end_example
+
+#+begin_quote
+Quoted line one.
+Quoted line two.
+#+end_quote
+
+: Fixed width line
+
+See [[id:abc123][an id link]] and =verbatim= text.

@@ -1,0 +1,153 @@
+#+title: DOrg Administrative Import
+
+#+begin_quote
+*DOrg 0.1.0 administrative surface.*  This operation is not an authoring
+workflow.  Use it only with recoverable data.
+#+end_quote
+
+Whole-file three-way synchronization has been removed.
+~dorg-import-document~ is the sole sanctioned whole-document ingest boundary
+that remains: an explicit, fail-closed operation for initial bootstrap or
+operator-directed recovery.  Normal save, mode enable, refresh, and
+typed mutation do not call it.
+
+* Public call
+
+Every identity and mode is explicit:
+
+#+begin_src emacs-lisp
+(dorg-import-document
+ "/tmp/source.org"
+ :dolt-dir "/tmp/project.dolt"
+ :target-file "/tmp/canonical.org"
+ :mode 'bootstrap)
+
+(dorg-import-document
+ "/tmp/recovery.org"
+ :dolt-dir "/tmp/project.dolt"
+ :target-file "/tmp/canonical.org"
+ :mode 'replace
+ :base "exact-current-head")
+#+end_src
+
+=SOURCE= is a readable file path or a live file-visiting buffer containing the
+complete declared document.  There is no =current-buffer= fallback.
+~:dolt-dir~, ~:target-file~, and ~:mode~ are required.  The function returns a
+plist containing:
+
+#+begin_src emacs-lisp
+(:ok t
+ :mode bootstrap
+ :source "/tmp/source.org"
+ :target "/tmp/canonical.org"
+ :dolt-dir "/tmp/project.dolt/"
+ :root-id 123
+ :base-commit "old"
+ :commit "new"
+ :created (123 124)
+ :changed nil
+ :deleted nil
+ :extensions ((example :statements 2))
+ :invalidation (:roots (123)
+                :extensions (example)
+                :ext-dirty ((example :tables ("example_ix")))
+                :scope whole))
+#+end_src
+
+The source bytes are never updated.  Missing =DORG_ID= values are allocated
+only in the isolated parse model.  Publishing a canonical Org projection is a
+separate ~dorg-materialize~ call pinned to the returned ~:commit~.
+
+* Modes
+
+** =bootstrap=
+
+Bootstrap accepts an unbound target or the exact empty synthetic root left by
+legacy binding.  It refuses populated targets and targets carrying the durable
+=document-import:<root-id>= marker.  The marker distinguishes a deliberately
+imported empty document from a never-imported blank binding, so retrying
+bootstrap cannot silently overwrite it.
+
+Source and target may name the same file only when the target is unbound.  This
+is the first-time ~dorg-setup~ case.
+
+** =replace=
+
+Replace is recovery, not routine update.  It requires:
+
+- an existing target/root;
+- a recovery source distinct from the canonical target file; and
+- ~:base~ equal to the exact current Dolt HEAD.
+
+It deletes and rebuilds only the declared root's descendants while preserving
+the root id and =dorg_files= identity.  A stale base fails before document SQL.
+
+Both modes use the repository-owned store-relative locator boundary.  Target
+resolution validates the persisted locator and requires exactly one valid
+level-0 root.  Bootstrap remains the explicit way to add a second file/root to
+a nonempty store; ordinary binding refuses that same miss as =path-mismatch=.
+
+* Rejection boundary
+
+Import rejects incomplete or ambiguous inputs before document mutation:
+
+- narrowed and indirect buffers;
+- live materialized views and files carrying =DORG_HASH= or =DORG_WINDOW=;
+- unreadable or identity-less sources;
+- case-alias targets that resolve to more than one root;
+- duplicate heading IDs and IDs owned by another root;
+- populated/previously imported bootstrap targets;
+- missing or stale replace bases; and
+- an uncommitted Dolt working set.
+
+Repository initialization and schema ensure are administrative prerequisites
+and may create or migrate the repository before document planning.  After that,
+the document operation plans against one HEAD, constructs the same immutable
+~dorg-ext-index-context~ used by ordinary mutation, runs registered ~:project~
+index projectors against that canonical candidate, acquires the same store
+lease/=GET_LOCK= gate as typed Dolt mutation, compares HEAD again inside the
+gate, and executes core plus derived extension SQL in one transaction.  Root
+identity, file identity, exact ID set, parent closure, the durable import
+marker, and derived-row postimages are validated before commit.  The same core
+postconditions are then read =AS OF= the exact hash returned by =DOLT_COMMIT=;
+DOrg does not infer that identity from a later =HEAD= read.
+
+There is no import-only extension participant, no import payload channel, and
+no public ~:extension-inputs~ option.  Extension rows are derived only through
+the registered ~:project~ callback over DOrg's canonical parsed/imported core
+state.  Bootstrap treats the candidate document as a full create.  Replace is a
+full snapshot recovery: it reloads the existing root at the exact base, compares
+it to the candidate, and reprojects every surviving heading plus creates and
+deletes so stale derived rows are corrected from canonical core.
+
+A validation/projector/SQL failure before =DOLT_COMMIT= rolls back the document
+transaction.  A transport failure during commit is instead reported as
+indeterminate because the commit may have landed.  If =DOLT_COMMIT= returned a
+hash before finalization failed, that hash is included in the error.  Inspect
+the reported commit or current =HEAD= before retrying.  Likewise, an
+exact-revision observation failure after a returned commit reports that durable
+commit explicitly; it cannot truthfully claim the earlier state was restored.
+
+* CLI and setup
+
+The CLI exposes import as an administrative, CLI-only command:
+
+#+begin_src sh
+dorg import -f source.org \
+  --dolt-dir /tmp/project.dolt \
+  --target-file /tmp/canonical.org \
+  --mode bootstrap
+
+dorg import -f recovery.org \
+  --dolt-dir /tmp/project.dolt \
+  --target-file /tmp/canonical.org \
+  --mode replace \
+  --base exact-current-head
+#+end_src
+
+It is deliberately refused over the HTTP serve surface.
+
+~dorg-setup~ uses the same public boundary in this order: bootstrap the current
+plain Org file, bind the successfully imported root, materialize the exact
+receipt revision, save that projection, then enable read-only projection
+policy.  Mode enable installs no reconciliation or write-back hook.

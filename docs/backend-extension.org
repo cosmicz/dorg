@@ -1,0 +1,316 @@
+#+title: DOrg Backend & Extension Contracts
+
+#+begin_quote
+*DOrg 0.1.0 contracts.*  This document describes the first public backend and
+extension surface.
+#+end_quote
+
+This document is the detailed reference for two related contracts:
+
+- the *storage backend* descriptor model
+  (=dorg-backend.el=, =dorg-registry.el=), and
+- the *extension schema migration* and derived-index projector contracts
+  (=dorg-ext.el=).
+
+For the function-level API tables of these modules, see
+[[file:api.org][docs/api.org]].  For the relational schema the backends
+read and write, see [[file:schema.org][docs/schema.org]].
+
+* Storage backends
+
+A file is bound to a storage backend through the registry
+(=dorg-registry.el=); plain-org is the default and =dorg-bind-dolt=
+binds a file to a Dolt repo.  Each backend is described by a
+=dorg-backend= descriptor (=dorg-backend.el=) carrying a type and an options
+plist.  Dispatch is by backend kind: =dorg-backend-plain-org-p= for the
+plain file backend and =dorg-backend-dolt-p= plus =dorg-backend-dolt-dir= /
+=dorg-backend-root-id= for Dolt-backed storage.
+
+* Extension schema migration contract
+
+Extensions register a current =:version= and, optionally, a
+=:migrations= alist keyed by from-version.  Each step migrates exactly
+=N -> N+1= and is either SQL (a string or list of strings) or a function
+of one argument (the dolt-dir) that returns SQL:
+
+#+begin_src emacs-lisp
+(dorg-register-extension 'myapp
+  :schema myapp-dorg-schema-ddl           ; string or list of SQL strings
+  :version 2
+  :migrations '((1 . myapp-dorg--migration-1-to-2)))
+#+end_src
+
+The extension version is recorded in =dorg_meta= as
+=ext:<name>:version=.  Extension ensure runs after core schema
+migrations during =dorg-init= and during the normal Dolt bind/open
+lifecycle (=dorg-bind-dolt= → =dorg-repo-ensure-schema=), so a repo
+created before an extension was enabled acquires it on next open, and
+downstream backends fail fast on stale extension schemas.  For each
+registered extension dorg:
+
+- installs the fresh =:schema= and records the version when none is
+  recorded;
+- does nothing when the recorded version equals the registered version;
+- runs the migration chain one step at a time when the recorded version
+  is lower, committing a deterministic step per version;
+- signals a future-version error when the recorded version is higher.
+
+Dorg owns the =dorg_meta= version bump — extensions must not commit or
+update it themselves; the bump rides in the same committed transaction as
+the migration SQL, so a failed step does not advance the version.  Each
+install/migration step is atomic: it runs inside a single
+transaction/=DOLT_COMMIT= boundary, and because Dolt follows MySQL
+implicit-commit-on-DDL semantics (an =ALTER=/=CREATE= that runs before a
+later statement fails would otherwise linger in the working set), a failed
+step also resets the working set back to HEAD.  The repo is therefore left
+exactly at the last successfully committed step — no partial schema, no
+half-applied data, and a clean retry on the next ensure.  Because that
+reset discards the *entire* working set, each install/migration step first
+requires a clean working set: if the repo has uncommitted Dolt changes,
+ensure signals an actionable error before touching any schema or data
+rather than risk the reset erasing unrelated pending work.  (A pure no-op
+ensure, where every extension is already current, touches nothing and so
+imposes no such requirement.)  Dorg never infers
+schema diffs and never downgrades.  A *missing* migration step is an
+actionable error, not silent drift: the extension (or the operator) must
+supply the step.  Manual SQL is an escape hatch only — after it, the
+operator must set =ext:<name>:version= accurately, and dorg will trust
+that metadata on the next ensure.
+
+* Index projectors
+
+Extensions that maintain derived tables register a pure =:project= callback.
+DOrg calls it with one immutable =dorg-ext-index-context= after core
+simulation/import planning and before persistence.  The callback returns typed
+row deltas, never SQL; DOrg validates them against the extension's
+=:read-tables= manifest, generates the SQL, and commits derived effects in the
+same Dolt transaction as the core mutation or administrative import.
+
+For identity-owner-indexed projections, the context exposes affected owner
+partitions through =dorg-ext-index-context-owner-partitions=.  DOrg alone builds
+those partitions from the mutation source identity policy and the exact
+S0/candidate simulation.  A projector reads the provided =dorg-heading= models
+directly; it must not run implicit SQL/query reads, render and reparse Org text,
+accept a caller-supplied owner closure, construct or persist partition state, or
+invent a second scope authority.  This keeps projection a pure function of the
+DOrg-owned context.
+
+#+begin_src emacs-lisp
+(defun myapp--partition-for-entry (ctx entry)
+  (let ((heading-id (dorg-ext-index-entry-id entry)))
+    (cl-find-if
+     (lambda (partition)
+       (member heading-id
+               (dorg-ext-owner-partition-affected-ids partition)))
+     (dorg-ext-index-context-owner-partitions ctx))))
+
+(defun myapp--heading-prop (heading key)
+  (cdr (assoc key (dorg-model-heading-property-snapshot heading))))
+
+(defun myapp-project-owner-index (ctx)
+  (let (effects)
+    (dolist (entry (append (dorg-ext-index-context-created ctx)
+                           (dorg-ext-index-context-changed ctx)
+                           (dorg-ext-index-context-moved ctx)
+                           (dorg-ext-index-context-deleted ctx)))
+      (let* ((heading-id (dorg-ext-index-entry-id entry))
+             (partition (myapp--partition-for-entry ctx entry))
+             (post (and partition
+                        (dorg-ext-owner-partition-candidate-postimage
+                         partition)))
+             (heading (and post (gethash heading-id post))))
+        (push `(:table "myapp_bead_index"
+                       :delete ((heading_id . ,heading-id)))
+              effects)
+        (when (and partition heading)
+          (push `(:table "myapp_bead_index"
+                         :insert
+                         ((heading_id . ,heading-id)
+                          (bead_id . ,(dorg-ext-owner-partition-owner-value
+                                       partition))
+                          (parent_bead_id
+                           . ,(dorg-ext-owner-partition-parent-owner-value
+                               partition))
+                          (title . ,(dorg-heading-title heading))
+                          (status . ,(myapp--heading-prop heading "STATUS"))))
+                effects))))
+    (nreverse effects)))
+
+(dorg-register-extension
+ 'myapp
+ :schema '("CREATE TABLE myapp_bead_index (heading_id BIGINT PRIMARY KEY, bead_id TEXT, parent_bead_id TEXT, title TEXT, status TEXT)")
+ :version 1
+ :capabilities '(dolt)
+ :read-tables '((:name "myapp_bead_index" :key-column "heading_id"))
+ :project #'myapp-project-owner-index)
+#+end_src
+
+The example derives =parent_bead_id= from the nearest ancestor identity owner
+and derives row cells from the direct model objects in the owner-local candidate
+image.  Deletes emit a typed delete for the affected heading id; creates,
+changes, and moves reinsert the candidate row when the affected heading still
+exists in the owner-local candidate image.  It does not parse rendered text or
+read the database.
+
+The owner partition is deliberately narrower than a general extension scope.
+It contains the owner heading, nearest ancestor owner identity when present,
+affected before/after paths, and the complete dense ordered owner-local
+descendant image excluding nested identity-owned partitions.  Same-root and
+cross-root moves expose source and destination owner partitions.  Deletes keep
+base tombstones; creates use candidate ownership.  Owner partitions do not widen
+root/config keyword authority, and they do not give extensions a graph/global
+read mechanism.
+
+For ordinary mutation, construction is batched and bounded by affected owners,
+ancestor paths, and owner-local content; it uses explicit id hydration and never
+a full-root fallback for owner partitions.  The context candidate identity
+covers projector-visible owner partition fields, and a stale-CAS replan rebuilds
+partitions from the replacement base/candidate before projection.  Broken
+ancestry, cycles, ambiguous ownership, stale or mismatched materialization, and
+partition load failure fail closed before projector effects persist.
+
+Administrative =dorg-import-document= / =dorg import= uses the same =:project=
+contract instead of a separate import participant.  Import has complete
+before/after document images, so owner partitions are built by a pure walk over
+those images using the target binding's identity policy.  Bootstrap projects the
+candidate as a full create.  Replace is full snapshot recovery: every surviving
+heading, create, and delete is reprojected from canonical core, which corrects
+stale derived rows without accepting caller payloads.
+
+* Exact-revision derived-index rebuild
+
+=dorg-ext-rebuild-index= is the Dolt-only administrative repair boundary for
+one registered index projector and one root at an exact committed revision.  It
+accepts an extension name, root id, =:dolt-dir=, =:revision=, and =:mode=
+(=audit= or =repair=); it accepts no extension SQL, rows, or callback beyond
+the existing =:validate= / =:project= contract.
+
+Rebuild passes that projector an honest full-snapshot context: an empty base
+image, the complete requested root as candidate postimage AS OF =:revision=,
+and every candidate heading classified =created=.  This is an administrative
+exception to ordinary mutation's bounded context, not a second projector
+protocol.  A projector that depends on entry kind, before image, or patches is
+therefore non-derivable; rebuild audit reports the resulting drift.
+
+Every rebuilt =:read-tables= descriptor must declare an identifier-safe,
+unqualified =:scope-column=.  DOrg owns =DELETE ... WHERE scope-column =
+root-id= for the clear and adds that same predicate to projector deletes.  It
+requires projector inserts to carry the requested root scope.  This narrowing
+is deliberately rebuild-specific: it prevents a raw projector delete from
+altering another root while ordinary mutation effects retain their existing
+semantics.  Every generated clear and narrowed effect passes the same
+core-table/ownership validator as projector effects before a transaction opens.
+Audit is read-only.  Repair is permitted only at current HEAD and
+uses the existing exact-base transaction gate; a historical revision can be
+audited but cannot be published beside newer core state.  Before a repair scope
+clear, DOrg also refuses if the observed scope contains an extra or different
+row that this projector does not reproduce exactly: replacing that row would
+erase state DOrg cannot prove derivable.  Missing expected rows remain safe to
+add.  A zero-drift repair creates no commit.
+
+Rebuild uses the same projector and therefore the same configuration resolver
+as the mutation path; it does not acquire import-only configuration authority.
+If a downstream importer honors inherited policy but its mutation/rebuild
+resolver reads only a local keyword or default, an ordinary mutation can omit
+an inherited-derived row and a subsequent local rebuild can agree with that
+omission.  A clean audit then proves only parity under that local resolver; it
+does not prove that inherited policy was honored or restore the omitted row.
+Conversely, if the inherited row is still present, destructive repair refuses
+before its scope clear.  Fixing that resolver split belongs to the downstream
+domain, not to this generic DOrg rebuild boundary.
+
+Drift compares canonical *full rows* as bounded multisets.  The manifest
+=:key-column= remains read-plane metadata, never a uniqueness contract for
+repair: rows sharing a value there must not collapse and hide an unexplained
+row.  Consequently repair refuses before its scope clear whenever any current
+row occurrence is unmatched by the projector's expected multiset; duplicate
+complete rows are counted rather than overwritten.
+
+* Read-plane snapshot coherence contract
+
+Every public DOrg read result and every materialized Org buffer is a
+projection of *exactly one* Dolt commit — its *snapshot token* is the Dolt
+=HASHOF('HEAD')= hash the projection was computed at.  Two projections carry
+the same token iff they name the same committed snapshot.
+
+- A *materialized Org buffer* carries its token as the =#+DORG_HASH:= keyword
+  the renderer injects (=dorg-render=): the visible file is versioned.
+- A *warm read result* carries its token explicitly through
+  =dorg-ext-read-snapshot=, which returns =(:rows ROWS :head TOKEN :root RID)=.
+  The bare =dorg-ext-hydrate= (rows only) is unchanged for callers that do
+  not need the token.
+
+At a stable HEAD the two are semantically equivalent and carry the *same*
+token, so the visible projection and the warm read name one commit.
+
+** The token is BOUND to the rows, not merely adjacent
+
+=dorg-ext-read-snapshot= captures the committed token *once* (one
+=dorg-head-commit= probe — the same value used for the cache key, the
+=dorg-ext-read-context= =head=, the revision-bound execution scope, and the
+returned =:head=) and *DOrg itself* binds the plan to it: every plan
+statement executes inside a Dolt *revision database* at the captured token
+(=dorg-sql--at-revision=), so each unqualified table reference — repeated
+and nested-subquery uses included — reads at that commit.  Snapshot safety
+is a structural property of DOrg's executor, *not* of participant SQL
+discipline.  A =:hydrate= participant expresses ordinary relational intent:
+
+#+begin_src emacs-lisp
+(defun myapp-dorg-hydrate (ctx)
+  (list :sql (list (format "SELECT id, title FROM myapp_proj WHERE root_id = %d"
+                           (dorg-ext-read-context-root-id ctx)))))
+#+end_src
+
+Because a revision database is deterministic history, the rows are
+*selected at* the token: a concurrent HEAD advance between the token capture
+and the read, or between two statements of one plan, cannot tear the result.
+A downstream consumer therefore compares read tokens across arms
+deterministically instead of inferring coherence from HEAD-probe timing.
+The result is outcome-equivalent to per-reference committed-hash
+=AS OF '<hash>'= reads (the mechanism the SQL layer's own generated
+statements use, =dorg-sql-gen--as-of-suffix=), so a client read token and a
+storage token are equal by construction for the same store and commit.
+
+Migration notes for existing adapters:
+
+- Plans are *ordinary SQL with no =AS OF= at all*.  The revision-bound
+  scope is the sole snapshot authority, so any =AS OF= inside a plan —
+  even one naming the captured token — is rejected: drop the
+  =dorg-ext-read-as-of-suffix= call from hydrate plans.  (The helper
+  itself survives for the separate pattern of a consumer explicitly
+  coordinating one snapshot across multiple ordinary =dorg-sql= calls,
+  outside any hydrate plan.)
+- Plan statements use *unqualified* table names, and DOrg *enforces* the
+  scope fail-closed: before the first statement of a revision-bound plan
+  executes, every statement is checked (declarative patterns over a
+  literal/comment mask — validation only, not a SQL parser) and the plan
+  is rejected with a typed error if any statement could resolve outside
+  the scope — an explicitly database-qualified reference (=mydb.tbl=,
+  backticked or comment-obscured alike), a revision/branch-qualified
+  identifier (=`mydb/main`.tbl=), a second statement smuggled behind =;=,
+  or any =AS OF=.  The check is conservative: don't name aliases after
+  the database.
+- History-shaped projections (diffs, changelogs) do not need =AS OF=:
+  Dolt's =dolt_history_*= / =dolt_diff_*= system tables read *inside* the
+  pinned scope are bounded by the captured commit's ancestry and remain
+  deterministic at the token.
+- Revision-bound scopes are *read-only*: a stray write inside a snapshot
+  plan fails loudly rather than mutating live data.
+- Under the managed connection each pinned statement runs on the
+  *exclusive session lease*: same-store SQL issued re-entrantly from a
+  callback while a pinned statement is in flight is refused with a typed
+  error rather than multiplexed onto the pinned session.
+
+** Freshness and failure
+
+The token doubles as the read's freshness discriminator: hydrate folds it into
+the private warm-cache identity, so an out-of-process HEAD advance yields a
+different key and misses the warm cache (a PULL re-hydrate at the new HEAD).
+A warm cache *hit* re-serves the *stored* rows and their *stored* token —
+never a re-probed live HEAD — so a cached read stays internally coherent.
+
+=dorg-ext-read-snapshot= fails *closed*: for a Dolt source whose HEAD is not
+a committed hash token (unreadable, or a blank read-back) it signals
+=dorg-ext-read-error= *before any plan SQL executes* rather than returning
+rows tagged with a non-committed token; for a plain (non-Dolt) source
+=:head= is nil — an explicitly unversioned result, never a bogus token.

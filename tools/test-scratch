@@ -1,0 +1,491 @@
+#!/bin/sh
+# Kill-resilient test scratch runner and audited stale-root sweeper.
+#
+# This is deliberately not a generic tmp cleaner.  It creates and recognizes
+# only versioned dorg-test-run-* / tracker-test-run-* parents.  Every deletion
+# is an exact quoted path after marker, identity, owner-death, and age checks.
+
+set -u
+
+scratch_marker_name=.test-scratch-owner
+scratch_format=tracker-test-scratch-v1
+
+scratch_usage()
+{
+    printf '%s\n' \
+        'usage: test-scratch run {dorg|tracker} -- COMMAND [ARG...]' \
+        '       test-scratch sweep [--root ABSOLUTE_DIR] [--min-age-seconds N] [--apply]' >&2
+    exit 64
+}
+
+scratch_refuse()
+{
+    printf 'REFUSE reason=%s target=%s\n' "$1" "$2" >&2
+    return 1
+}
+
+scratch_canonical_dir()
+{
+    (CDPATH='' cd -P "$1" 2>/dev/null && pwd -P)
+}
+
+scratch_bounded_decimal()
+{
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#1}" -le "$2" ]
+}
+
+scratch_validate_root()
+{
+    scratch_input=$1
+    case "$scratch_input" in
+        /*) ;;
+        *) scratch_refuse relative-root "$scratch_input"; return 1 ;;
+    esac
+    case "$scratch_input" in
+        *'
+'*) scratch_refuse newline-root "$scratch_input"; return 1 ;;
+    esac
+    if [ -L "$scratch_input" ]; then
+        scratch_refuse symlink-root "$scratch_input"
+        return 1
+    fi
+    if [ ! -d "$scratch_input" ]; then
+        scratch_refuse missing-root "$scratch_input"
+        return 1
+    fi
+    scratch_validated_root=$(scratch_canonical_dir "$scratch_input") || {
+        scratch_refuse unresolvable-root "$scratch_input"
+        return 1
+    }
+    if [ "$scratch_validated_root" = / ]; then
+        scratch_refuse filesystem-root "$scratch_input"
+        return 1
+    fi
+    if [ -n "${HOME:-}" ] && [ -d "$HOME" ]; then
+        scratch_home=$(scratch_canonical_dir "$HOME") || scratch_home=
+        if [ -n "$scratch_home" ] && [ "$scratch_validated_root" = "$scratch_home" ]; then
+            scratch_refuse home-root "$scratch_input"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+scratch_identity()
+{
+    scratch_identity_path=$1
+    if scratch_stat=$(stat -f '%d %i' "$scratch_identity_path" 2>/dev/null); then
+        printf '%s\n' "$scratch_stat"
+    elif scratch_stat=$(stat -c '%d %i' "$scratch_identity_path" 2>/dev/null); then
+        printf '%s\n' "$scratch_stat"
+    else
+        return 1
+    fi
+}
+
+scratch_marker_invalid()
+{
+    scratch_marker_valid=false
+    return 1
+}
+
+scratch_parse_marker()
+{
+    scratch_marker=$1
+    scratch_marker_valid=true
+    scratch_m_format=
+    scratch_m_namespace=
+    scratch_m_root=
+    scratch_m_owner_pid=
+    scratch_m_owner_uid=
+    scratch_m_created_at=
+    scratch_m_root_dev=
+    scratch_m_root_ino=
+    scratch_seen_format=false
+    scratch_seen_namespace=false
+    scratch_seen_root=false
+    scratch_seen_owner_pid=false
+    scratch_seen_owner_uid=false
+    scratch_seen_created_at=false
+    scratch_seen_root_dev=false
+    scratch_seen_root_ino=false
+
+    while IFS= read -r scratch_line || [ -n "$scratch_line" ]; do
+        case "$scratch_line" in
+            format=*)
+                [ "$scratch_seen_format" = false ] || scratch_marker_invalid
+                scratch_seen_format=true
+                scratch_m_format=${scratch_line#format=}
+                ;;
+            namespace=*)
+                [ "$scratch_seen_namespace" = false ] || scratch_marker_invalid
+                scratch_seen_namespace=true
+                scratch_m_namespace=${scratch_line#namespace=}
+                ;;
+            root=*)
+                [ "$scratch_seen_root" = false ] || scratch_marker_invalid
+                scratch_seen_root=true
+                scratch_m_root=${scratch_line#root=}
+                ;;
+            owner_pid=*)
+                [ "$scratch_seen_owner_pid" = false ] || scratch_marker_invalid
+                scratch_seen_owner_pid=true
+                scratch_m_owner_pid=${scratch_line#owner_pid=}
+                ;;
+            owner_uid=*)
+                [ "$scratch_seen_owner_uid" = false ] || scratch_marker_invalid
+                scratch_seen_owner_uid=true
+                scratch_m_owner_uid=${scratch_line#owner_uid=}
+                ;;
+            created_at=*)
+                [ "$scratch_seen_created_at" = false ] || scratch_marker_invalid
+                scratch_seen_created_at=true
+                scratch_m_created_at=${scratch_line#created_at=}
+                ;;
+            root_dev=*)
+                [ "$scratch_seen_root_dev" = false ] || scratch_marker_invalid
+                scratch_seen_root_dev=true
+                scratch_m_root_dev=${scratch_line#root_dev=}
+                ;;
+            root_ino=*)
+                [ "$scratch_seen_root_ino" = false ] || scratch_marker_invalid
+                scratch_seen_root_ino=true
+                scratch_m_root_ino=${scratch_line#root_ino=}
+                ;;
+            *) scratch_marker_invalid ;;
+        esac
+    done < "$scratch_marker"
+
+    for scratch_required_seen in \
+        "$scratch_seen_format" "$scratch_seen_namespace" "$scratch_seen_root" \
+        "$scratch_seen_owner_pid" "$scratch_seen_owner_uid" \
+        "$scratch_seen_created_at" "$scratch_seen_root_dev" "$scratch_seen_root_ino"
+    do
+        [ "$scratch_required_seen" = true ] || scratch_marker_invalid
+    done
+    scratch_bounded_decimal "$scratch_m_owner_pid" 10 || scratch_marker_invalid
+    scratch_bounded_decimal "$scratch_m_owner_uid" 10 || scratch_marker_invalid
+    # Keep subtraction within signed 64-bit shell arithmetic.  Eighteen
+    # decimal digits cover any useful epoch while refusing overflow payloads.
+    scratch_bounded_decimal "$scratch_m_created_at" 18 || scratch_marker_invalid
+    case "$scratch_m_root_dev" in ''|*[!0-9]*) scratch_marker_invalid ;; esac
+    case "$scratch_m_root_ino" in ''|*[!0-9]*) scratch_marker_invalid ;; esac
+    [ "$scratch_m_owner_pid" -gt 0 ] 2>/dev/null || scratch_marker_invalid
+    [ "$scratch_marker_valid" = true ]
+}
+
+# Set scratch_candidate_reason for one candidate.  "eligible" is the only
+# result that authorizes removal.  Every ambiguity is a KEEP reason.
+scratch_classify_candidate()
+{
+    scratch_candidate=$1
+    scratch_scan_root=$2
+    scratch_min_age=$3
+    scratch_now=$4
+    scratch_candidate_reason=invalid-candidate
+
+    if [ -L "$scratch_candidate" ]; then
+        scratch_candidate_reason=symlink-candidate
+        return
+    fi
+    if [ ! -d "$scratch_candidate" ]; then
+        scratch_candidate_reason=not-directory
+        return
+    fi
+    scratch_candidate_canon=$(scratch_canonical_dir "$scratch_candidate") || {
+        scratch_candidate_reason=unresolvable-candidate
+        return
+    }
+    if [ "$(dirname "$scratch_candidate_canon")" != "$scratch_scan_root" ]; then
+        scratch_candidate_reason=outside-scan-root
+        return
+    fi
+
+    scratch_basename=$(basename "$scratch_candidate_canon")
+    case "$scratch_basename" in
+        dorg-test-run-*)
+            scratch_expected_namespace=dorg
+            scratch_suffix=${scratch_basename#dorg-test-run-}
+            ;;
+        tracker-test-run-*)
+            scratch_expected_namespace=tracker
+            scratch_suffix=${scratch_basename#tracker-test-run-}
+            ;;
+        *) scratch_candidate_reason=prefix-mismatch; return ;;
+    esac
+    case "$scratch_suffix" in
+        ''|*[!A-Za-z0-9._-]*) scratch_candidate_reason=invalid-basename; return ;;
+    esac
+
+    scratch_marker=$scratch_candidate_canon/$scratch_marker_name
+    if [ -L "$scratch_marker" ]; then
+        scratch_candidate_reason=symlink-marker
+        return
+    fi
+    if [ ! -f "$scratch_marker" ]; then
+        scratch_candidate_reason=missing-marker
+        return
+    fi
+    if ! scratch_parse_marker "$scratch_marker"; then
+        scratch_candidate_reason=invalid-marker
+        return
+    fi
+    if [ "$scratch_m_format" != "$scratch_format" ]; then
+        scratch_candidate_reason=unknown-format
+        return
+    fi
+    if [ "$scratch_m_namespace" != "$scratch_expected_namespace" ]; then
+        scratch_candidate_reason=namespace-mismatch
+        return
+    fi
+    if [ "$scratch_m_root" != "$scratch_candidate_canon" ]; then
+        scratch_candidate_reason=root-mismatch
+        return
+    fi
+    scratch_current_uid=$(id -u) || {
+        scratch_candidate_reason=unknown-current-uid
+        return
+    }
+    if [ "$scratch_m_owner_uid" != "$scratch_current_uid" ]; then
+        scratch_candidate_reason=owner-uid-mismatch
+        return
+    fi
+    scratch_current_identity=$(scratch_identity "$scratch_candidate_canon") || {
+        scratch_candidate_reason=unknown-identity
+        return
+    }
+    # shellcheck disable=SC2086 # stat emits exactly two decimal fields.
+    set -- $scratch_current_identity
+    if [ "$#" -ne 2 ] || [ "$scratch_m_root_dev" != "$1" ] || \
+       [ "$scratch_m_root_ino" != "$2" ]; then
+        scratch_candidate_reason=identity-mismatch
+        return
+    fi
+    scratch_age=$((scratch_now - scratch_m_created_at)) 2>/dev/null || {
+        scratch_candidate_reason=invalid-age
+        return
+    }
+    if [ "$scratch_age" -lt "$scratch_min_age" ]; then
+        scratch_candidate_reason=too-young
+        return
+    fi
+
+    # Authentic markers carry this user's uid.  For a same-uid process,
+    # kill -0 succeeds for every live/zombie pid; failure is ESRCH.  PID reuse
+    # therefore preserves a root (safe false negative), never deletes it.
+    if kill -0 "$scratch_m_owner_pid" 2>/dev/null; then
+        scratch_candidate_reason=owner-live
+        return
+    fi
+    scratch_candidate_reason=eligible
+}
+
+scratch_remove_exact()
+{
+    scratch_remove_candidate=$1
+    scratch_remove_root=$2
+    scratch_remove_min_age=$3
+    scratch_remove_now=$(date +%s) || return 1
+    # Re-run every proof immediately before unlinking the exact quoted path.
+    scratch_classify_candidate "$scratch_remove_candidate" "$scratch_remove_root" \
+        "$scratch_remove_min_age" "$scratch_remove_now"
+    [ "$scratch_candidate_reason" = eligible ] || return 2
+    rm -rf -- "$scratch_remove_candidate" || return 1
+    [ ! -e "$scratch_remove_candidate" ] && [ ! -L "$scratch_remove_candidate" ]
+}
+
+scratch_run()
+{
+    [ "$#" -ge 3 ] || scratch_usage
+    scratch_namespace=$1
+    shift
+    case "$scratch_namespace" in dorg|tracker) ;; *) scratch_usage ;; esac
+    [ "$1" = -- ] || scratch_usage
+    shift
+    [ "$#" -gt 0 ] || scratch_usage
+
+    scratch_requested_base=${TMPDIR:-/tmp}
+    scratch_validate_root "$scratch_requested_base" || exit 65
+    scratch_creation_base=$scratch_requested_base
+    while [ "$scratch_creation_base" != "${scratch_creation_base%/}" ]; do
+        scratch_creation_base=${scratch_creation_base%/}
+    done
+    scratch_created_root=$(mktemp -d \
+        "$scratch_creation_base/${scratch_namespace}-test-run-$$-XXXXXXXX") || {
+        scratch_refuse create-failed "$scratch_creation_base"
+        exit 73
+    }
+    scratch_run_root=$(scratch_canonical_dir "$scratch_created_root") || {
+        rm -rf -- "$scratch_created_root"
+        scratch_refuse canonicalize-created-root-failed "$scratch_created_root"
+        exit 73
+    }
+    scratch_gate=$scratch_run_root/.test-scratch-start
+    if ! mkfifo "$scratch_gate"; then
+        rm -rf -- "$scratch_run_root"
+        scratch_refuse gate-create-failed "$scratch_run_root"
+        exit 73
+    fi
+
+    (
+        if IFS= read -r _scratch_gate_message < "$scratch_gate"; then
+            # shellcheck disable=SC2030 # This export intentionally belongs to the child.
+            # Preserve the caller's non-symlink path spelling for software
+            # whose visited-file identity distinguishes /var from /private/var.
+            # The marker and every deletion check still use scratch_run_root,
+            # the canonical identity path.
+            TMPDIR=$scratch_created_root/
+            export TMPDIR
+            exec "$@"
+        fi
+        exit 125
+    ) &
+    scratch_owner_pid=$!
+    scratch_owner_uid=$(id -u) || scratch_owner_uid=
+    scratch_created_at=$(date +%s) || scratch_created_at=
+    scratch_run_identity=$(scratch_identity "$scratch_run_root") || scratch_run_identity=
+    # shellcheck disable=SC2086 # stat emits exactly two decimal fields.
+    set -- $scratch_run_identity
+    scratch_root_dev=${1:-}
+    scratch_root_ino=${2:-}
+    scratch_marker=$scratch_run_root/$scratch_marker_name
+    scratch_marker_temp=$scratch_run_root/.test-scratch-owner.tmp.$$
+    umask 077
+
+    if [ -z "$scratch_owner_uid" ] || [ -z "$scratch_created_at" ] || \
+       [ -z "$scratch_root_dev" ] || [ -z "$scratch_root_ino" ] || \
+       ! {
+           printf 'format=%s\n' "$scratch_format"
+           printf 'namespace=%s\n' "$scratch_namespace"
+           printf 'root=%s\n' "$scratch_run_root"
+           printf 'owner_pid=%s\n' "$scratch_owner_pid"
+           printf 'owner_uid=%s\n' "$scratch_owner_uid"
+           printf 'created_at=%s\n' "$scratch_created_at"
+           printf 'root_dev=%s\n' "$scratch_root_dev"
+           printf 'root_ino=%s\n' "$scratch_root_ino"
+       } > "$scratch_marker_temp" || ! mv -f "$scratch_marker_temp" "$scratch_marker"
+    then
+        kill "$scratch_owner_pid" 2>/dev/null || true
+        wait "$scratch_owner_pid" 2>/dev/null || true
+        rm -rf -- "$scratch_run_root"
+        scratch_refuse marker-publish-failed "$scratch_run_root"
+        exit 73
+    fi
+
+    printf 'RUN namespace=%s root=%s owner_pid=%s\n' \
+        "$scratch_namespace" "$scratch_run_root" "$scratch_owner_pid"
+    if ! printf 'start\n' > "$scratch_gate"; then
+        kill "$scratch_owner_pid" 2>/dev/null || true
+        wait "$scratch_owner_pid" 2>/dev/null || true
+        printf 'PRESERVE namespace=%s reason=gate-release-failed path=%s\n' \
+            "$scratch_namespace" "$scratch_run_root"
+        exit 73
+    fi
+    rm -f -- "$scratch_gate"
+    wait "$scratch_owner_pid"
+    scratch_status=$?
+
+    if [ "$scratch_status" -ne 0 ]; then
+        printf 'PRESERVE namespace=%s reason=command-exit-%s path=%s\n' \
+            "$scratch_namespace" "$scratch_status" "$scratch_run_root"
+        return "$scratch_status"
+    fi
+
+    scratch_run_parent=$(dirname "$scratch_run_root")
+    if scratch_remove_exact "$scratch_run_root" "$scratch_run_parent" 0; then
+        printf 'CLEANED namespace=%s path=%s\n' "$scratch_namespace" "$scratch_run_root"
+        return 0
+    fi
+    scratch_cleanup_status=$?
+    scratch_now=$(date +%s) || scratch_now=0
+    scratch_classify_candidate "$scratch_run_root" "$scratch_run_parent" 0 "$scratch_now"
+    printf 'PRESERVE namespace=%s reason=cleanup-%s-%s path=%s\n' \
+        "$scratch_namespace" "$scratch_cleanup_status" "$scratch_candidate_reason" \
+        "$scratch_run_root" >&2
+    return 74
+}
+
+scratch_sweep()
+{
+    # shellcheck disable=SC2031 # TMPDIR changes only in the run child subshell.
+    scratch_sweep_root=${TMPDIR:-/tmp}
+    scratch_min_age=86400
+    scratch_mode=dry-run
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --root)
+                [ "$#" -ge 2 ] || scratch_usage
+                scratch_sweep_root=$2
+                shift 2
+                ;;
+            --min-age-seconds)
+                [ "$#" -ge 2 ] || scratch_usage
+                scratch_min_age=$2
+                shift 2
+                ;;
+            --apply)
+                scratch_mode=apply
+                shift
+                ;;
+            *) scratch_usage ;;
+        esac
+    done
+    scratch_bounded_decimal "$scratch_min_age" 18 || scratch_usage
+    scratch_validate_root "$scratch_sweep_root" || exit 65
+    scratch_sweep_root=$scratch_validated_root
+    scratch_now=$(date +%s) || exit 74
+    scratch_seen=0
+    scratch_eligible=0
+    scratch_removed=0
+    scratch_kept=0
+    scratch_failed=0
+
+    # Globs enumerate candidates only.  They are never passed to rm; removal
+    # receives one revalidated, quoted candidate path at a time.
+    for scratch_candidate in \
+        "$scratch_sweep_root"/dorg-test-run-* \
+        "$scratch_sweep_root"/tracker-test-run-*
+    do
+        if [ ! -e "$scratch_candidate" ] && [ ! -L "$scratch_candidate" ]; then
+            continue
+        fi
+        scratch_seen=$((scratch_seen + 1))
+        scratch_classify_candidate "$scratch_candidate" "$scratch_sweep_root" \
+            "$scratch_min_age" "$scratch_now"
+        if [ "$scratch_candidate_reason" != eligible ]; then
+            scratch_kept=$((scratch_kept + 1))
+            printf 'KEEP reason=%s path=%s\n' "$scratch_candidate_reason" "$scratch_candidate"
+            continue
+        fi
+        scratch_eligible=$((scratch_eligible + 1))
+        if [ "$scratch_mode" = dry-run ]; then
+            printf 'WOULD_REMOVE reason=eligible path=%s\n' "$scratch_candidate"
+        elif scratch_remove_exact "$scratch_candidate" "$scratch_sweep_root" \
+            "$scratch_min_age"
+        then
+            scratch_removed=$((scratch_removed + 1))
+            printf 'REMOVED reason=eligible path=%s\n' "$scratch_candidate"
+        else
+            scratch_failed=$((scratch_failed + 1))
+            scratch_now=$(date +%s) || scratch_now=0
+            scratch_classify_candidate "$scratch_candidate" "$scratch_sweep_root" \
+                "$scratch_min_age" "$scratch_now"
+            printf 'KEEP reason=revalidation-%s path=%s\n' \
+                "$scratch_candidate_reason" "$scratch_candidate"
+        fi
+    done
+    printf 'SUMMARY mode=%s root=%s seen=%s eligible=%s removed=%s kept=%s failed=%s\n' \
+        "$scratch_mode" "$scratch_sweep_root" "$scratch_seen" "$scratch_eligible" \
+        "$scratch_removed" "$scratch_kept" "$scratch_failed"
+    [ "$scratch_failed" -eq 0 ]
+}
+
+[ "$#" -gt 0 ] || scratch_usage
+scratch_command=$1
+shift
+case "$scratch_command" in
+    run) scratch_run "$@" ;;
+    sweep) scratch_sweep "$@" ;;
+    *) scratch_usage ;;
+esac

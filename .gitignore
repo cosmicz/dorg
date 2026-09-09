@@ -1,0 +1,50 @@
+# -*- mode: gitignore; -*-
+
+.DS_Store
+.idea
+*.log
+tmp/
+
+# Emacs backup files
+*.org~
+
+# Emacs auto-save (#file#) and lock (.#file) files
+\#*#
+.#*
+
+# Dolt local database
+.dolt/
+
+# Byte-compiled Elisp
+*.elc
+*-autoloads.el
+
+# Flycheck
+/flycheck_*
+
+# Project metadata
+.claude
+
+# Package cache
+.packages
+
+# Development tracking (local-only)
+drafts/
+
+# Conflict fixture: generated artifacts (rebuilt by generate.el on demand)
+tools/conflict-fixture/db/
+tools/conflict-fixture/conflicts.org
+tools/conflict-fixture/remote.org
+
+# Tools: Issue tracking and agents
+.beads/
+.em[b]ead/
+.dorg/
+.me[l]d/
+
+# tracker state
+.claude/settings.local.json
+
+# local data
+data/
+.codex/

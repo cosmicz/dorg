@@ -1,0 +1,27 @@
+#+TITLE: Properties And Logbook
+#+CATEGORY: release
+#+CATEGORY: duplicate-category
+
+* TODO Ordered properties
+:PROPERTIES:
+:ZED: last-ish
+:ALPHA: first-ish
+:MID: middle
+:END:
+:LOGBOOK:
+- State "TODO" from "" [2026-07-09 Thu 10:00]
+
+- Note taken with an interior blank line.
+:END:
+:NOTES:
+first note line
+
+last note line
+:END:
+Body after drawers.
+
+* DONE DORG managed id only
+:PROPERTIES:
+:DORG_ID: 424242
+:END:
+The managed id drawer may disappear semantically.

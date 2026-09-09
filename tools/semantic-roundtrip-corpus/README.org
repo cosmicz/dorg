@@ -1,0 +1,19 @@
+#+title: Semantic Round-Trip Corpus Runner
+
+This release helper runs the Downstream tracker-like semantic corpus through an isolated
+scratch Downstream tracker project and then checks the materialized file with the same
+semantic projection used by ~tests/dorg-roundtrip-corpus-tests.el~.
+
+It is intentionally semantic, not byte-faithful.  The runner fails on missing
+tooling or semantic drift and never touches the live swarm tracker.
+
+#+begin_src sh
+TRACKER_CLI=/path/to/tracker \
+TRACKER_STATE_DIR=.tracker \
+  tools/semantic-roundtrip-corpus/run.sh
+#+end_src
+
+~TRACKER_FILE~ and ~TRACKER_DOLT_DIR~ may override the conventional paths
+under ~TRACKER_STATE_DIR~.  Requiring the downstream executable and state
+directory explicitly keeps this public helper independent of one private
+consumer's command name and control-plane layout.

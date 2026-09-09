@@ -1,0 +1,338 @@
+#+title: DOrg
+#+subtitle: Dolt-backed storage for org-mode files
+#+author: Octavian Cosmin
+
+*DOrg* gives your Org files a database backend — and your agents a
+dataplane.  It maps org-mode structure into [[https://www.dolthub.com/][Dolt]] (a MySQL-compatible
+database with Git semantics), keeps an ordinary Org buffer as the
+reading surface, and routes every write through a typed, versioned,
+concurrency-safe API.
+
+DOrg 0.1.0 defines its first public interface ([[*Status][Status]]).
+
+* Overview
+
+Editing my project's ~11MB tasks.org concurrently with a couple of
+agents and =auto-revert-mode= was getting unbearable.
+
+For want of a *queryable*, *version-controlled*, *concurrent-safe*,
+*fast* backend for multiuser access to large org files, *DOrg* was
+built.[fn:perf]
+
+A saner person would have split his org files.  But *dorg* says you
+shouldn't have to!
+
+Every element of an org file — headings, text, keywords, drawers,
+planning lines, properties, tags — is stored relationally and can be
+reconstructed into a semantically identical org buffer.  Round-trip
+fidelity is the core contract: what goes in comes back out.
+
+What you get on top of that contract:
+
+- an Org buffer as a *read-only projection* you can navigate, search,
+  and query like any other Org file
+- *typed mutations* — from Emacs commands, the =bin/dorg= CLI, or the
+  programmatic API — each one a versioned Dolt commit
+- Git semantics on your data: branch, diff, merge, and history for the
+  whole file, courtesy of Dolt
+- concurrent access from several Emacs sessions, people, or scripted
+  agents without stepping on each other
+
+Dolt needs no separate database administration.  DOrg manages a =dolt
+sql-server= for you: =M-x dorg-dolt-start= (or =dorg dolt start=)
+brings up a durable detached daemon that outlives the starting process
+and stops only on an explicit =dorg dolt stop=.  Interactive
+=dorg-mode= buffers start one automatically on activation
+(=dorg-dolt-auto-server=).  Batch/one-shot SQL attaches to a running
+server, and otherwise errors by default rather than silently starting
+a daemon — set =dorg-dolt-server-autostart= if you want implicit
+startup (see [[file:docs/configuration.org::*SQL transport (Dolt backend)][docs/configuration.org]]).  The MySQL wire client
+(=mysql.el=) ships bundled; there is no external client to install.
+
+* Positioning
+
+DOrg aims at a specific corner of the Org ecosystem:
+
+- large Org workflow files that are painful to keep as plain text only
+- concurrent edits from multiple Emacs sessions, people, or scripted
+  agents
+- queryable, versioned storage with an Org buffer as the projection
+  and navigation surface
+
+It is *not* a replacement for ordinary Org usage on small or
+single-user files, and it is not a workflow application.  DOrg
+projects structured Org data from a Dolt store; task models, workflow
+rules, and project semantics live in whatever you build on top.
+
+The mental model:
+
+- Org stays the user-facing document format and read-only projection
+  surface
+- DOrg provides the structured, versioned backend underneath
+- DOrg commands and the mutation API own all writes to Dolt-backed
+  projections; plain-org files keep normal Emacs editing
+- higher-level query, workflow, or project semantics live above dorg,
+  not inside the storage core
+
+If plain Org files, =org-ql=, or an indexer such as =org-roam= already
+fit your problem, they are almost certainly simpler.  DOrg becomes
+interesting when the hard parts are concurrency, scale, or
+round-trippable structured storage.
+
+See also https://github.com/aspiers/madolt
+
+** Using DOrg as a backing store
+
+DOrg has no task semantics of its own; it is the storage layer.  An
+issue or task tracker can sit on top and use dorg as its backing store
+— the tracker owns the task model while dorg keeps the underlying Org
+file versioned and queryable.  Bring your own structure on the Org
+surface, or layer a workflow tool above the command API; either way
+dorg stays the versioned store underneath.
+
+* Requirements
+
+GNU Emacs 30.1 is the supported CI target.  Emacs 29 is unsupported and
+unverified, not explicitly blocked by the package metadata; see
+[[*Emacs 29 compatibility][Emacs 29 compatibility]].  Dependencies then split by backend:
+
+- *Plain-org backend* — *no external dependencies*.  The MySQL wire
+  client (=mysql.el=) is bundled at =lib/mysql= and auto-wired onto
+  =load-path=; no Dolt binary is needed.
+- *Dolt backend* — additionally requires *Dolt 1.86.4 or newer* on
+  =PATH= (install or upgrade from [[https://github.com/dolthub/dolt][DoltHub]]).  Older binaries are
+  rejected up front by the availability gate rather than failing later
+  in less actionable ways.
+
+One packaging nuance applies to everyone: =mysql.el= is a hard
+dependency loaded at =(require 'dorg)= time — the managed =dolt
+sql-server= is the only supported SQL transport — so distributions
+must ship =lib/= intact next to the dorg sources.  If the bundled copy
+is missing, =(require 'dorg)= fails with an actionable error rather
+than silently degrading.
+
+When =dolt init= or =dolt sql-server= startup fails, dorg raises an
+error embedding Dolt's own stdout/stderr alongside the directory,
+port, and exit status.  Auto-server failures surface the same text
+through a =dorg= warning — preserve that output when reporting a
+problem.
+
+* Quickstart
+
+Use a disposable Org file and Dolt directory for your first session, and keep
+independent backups of important data ([[*Status][Status]]).
+
+Add the repository to your =load-path= and require the package:
+
+#+begin_src emacs-lisp
+(add-to-list 'load-path "/path/to/dorg")
+(require 'dorg)
+#+end_src
+
+Create an Org file, say =tasks.org=:
+
+#+begin_src org
+,* TODO Evaluate DOrg :work:
+,* TODO Write the README :work:docs:
+,* DONE Buy milk :home:
+#+end_src
+
+Open it and run =M-x dorg-setup=.  It checks for a supported Dolt
+binary, prompts for a Dolt directory, and — when that directory has no
+repo yet — confirms before creating one:
+
+#+begin_example
+  Dolt directory: ~/tasks-db/
+  No Dolt repo in ~/tasks-db/ — initialize a new one there? (y or n) y
+  dorg: setup complete — tasks.org
+    Dolt dir: ~/tasks-db/
+    3 headings imported
+    Query with C-c C-x q (M-x dorg-query)
+#+end_example
+
+=dorg-setup= runs the administrative bootstrap, binds the imported
+root, materializes the committed revision (adding =#+DORG_DOLT_DIR:=,
+=#+DORG_HASH:=, and stable =:DORG_ID:= values to the projection), and
+enables =dorg-mode=.  The resulting Dolt-backed buffer is a *read-only
+projection* — writes go through DOrg commands or the mutation API, not
+through making the buffer writable.
+
+A file that already carries =#+DORG_DOLT_DIR:= auto-binds Dolt, and
+=global-dorg-mode= auto-enables =dorg-mode= on such buffers.
+
+For scripted bootstrap or operator-directed replacement from a
+recovery file, use =dorg-import-document= / =dorg import= explicitly.
+Import is revision-guarded administration, not ordinary authoring; see
+[[file:docs/import.org][docs/import.org]].
+
+* Querying and editing
+
+DOrg has one *editing DSL* — a read-and-write command language over
+your DOrg-backed org — reachable from three surfaces: interactive
+commands in =dorg-mode=, the =bin/dorg= command line, and the
+=dorg-ql= query language shared by both.
+
+** Interactive (Emacs)
+
+=dorg-mode= binds query, navigation, typed update, and exact refresh
+commands under =C-c C-x= (=dorg-query=, =dorg-goto-id=,
+=dorg-set-property=, =dorg-refresh-materialized-view=, =dorg-doctor=,
+…).  =dorg-query= reads a =dorg-ql= form — an atomic predicate such as
+=(tag "work")=, or a composable pipeline such as =(pipe (where
+(deadline (this-week))) (traverse children))= — and lists matching
+headings in a results buffer; =C-c C-x g= jumps to one by id.
+
+A Dolt-backed buffer is read-only even when =dorg-mode= is off.
+=dorg-set-property= executes one typed mutation and refreshes the
+projection at the returned exact revision.  External Dolt changes are
+not polled in the background: =C-c C-x s=
+(=dorg-refresh-materialized-view=) captures current HEAD explicitly.
+Plain-org buffers keep normal Org editing.  Interactive command
+coverage is still growing — a capture-style node editor is planned —
+but the answer to a gap is a new typed command, not whole-file
+editing.
+
+** Command line (=bin/dorg=)
+
+From the shell, =bin/dorg= drives a DOrg-backed org tree without an
+Emacs UI — reads, typed mutation, explicit administrative import, and
+server management:
+
+#+begin_src sh
+# Read — one dorg-ql form (atomic alias or composable pipeline):
+dorg query '(pipe (where (tag "work")) (traverse children))' -f tasks.org
+
+# Read — convenience predicate subcommands:
+dorg id 100                   -f tasks.org
+dorg property CATEGORY red    -f tasks.org
+dorg tag work                 -f tasks.org
+dorg title "Inbox"            -f tasks.org
+
+# Write — mutate (exactly one of --dry-run / --apply):
+dorg mutate '(on (id 100) (set (property "STATUS") "done"))' --apply -f tasks.org
+
+# Administrative first ingest (not a save/edit path):
+dorg import -f source.org --dolt-dir ~/tasks-db \
+  --target-file ~/canonical/tasks.org --mode bootstrap
+
+# Server — list DOrg-managed Dolt sql-servers (read-only):
+dorg dolt list --json
+#+end_src
+
+=dorg-ql= is a composable query language: a backend-neutral normalized
+AST underlies both the atomic predicates (kept as aliases) and the
+composable reader forms (=pipe=, =where=, =traverse=, =and=/=or=/=not=,
+=field=, =timestamp=).  Composable forms run on model-list, plain-org,
+and Dolt sources.
+
+See [[file:docs/cli.org][docs/cli.org]] for the full CLI reference, [[file:docs/query.org][docs/query.org]] for
+=dorg-ql=, [[file:docs/mutate.org][docs/mutate.org]] for the programmatic mutation API, and
+[[file:docs/import.org][docs/import.org]] for the administrative ingest contract.
+
+* Performance
+
+On a 15 MB tracker-class workload, warm command requests that used to
+cost 33–40 seconds of wall clock now complete in about 2 seconds worst
+case.  Two things make the difference:
+
+- *A warm =sql-server= is the fast path.*  A running Dolt
+  =sql-server= (auto-started by =dorg-mode=, or via =dorg dolt=)
+  serves SQL over the MySQL wire protocol and is markedly faster than
+  one-shot =dolt sql= calls.
+- *Scoped reads.*  Ordinary commands read only what they need instead
+  of traversing the whole document.
+
+Cold first-use setup, initial import, and explicit whole-tree
+materialization still traverse and render the full document; making
+those fast is ongoing development work, and the numbers above do not
+cover them.
+
+* Troubleshooting / FAQ
+
+** Emacs 29 compatibility
+
+Emacs 29 is unsupported and excluded from CI.  On GNU Emacs 29.1 and
+29.4 in Linux CI, the DOrg test runner aborted when a filesystem-dependent
+test signalled =ert-skip=, instead of recording a skip and continuing.
+The runs passed 208 tests before stopping; the remaining tests were not
+completed.  This establishes a test-runner limitation, not that normal
+DOrg operations necessarily fail on Emacs 29.  Compatibility remains
+unverified; use the supported Emacs 30.1 target.
+
+** "Dolt binary not found" / "Dolt … is unsupported"
+
+dorg checks for a supported Dolt up front.  Install or upgrade to
+*Dolt 1.86.4+* from [[https://github.com/dolthub/dolt][DoltHub]] and make sure =dolt= is on Emacs's
+=exec-path= / =PATH=.  The error names the binary it found, the
+detected version, the required minimum, and the install URL.
+
+** A legacy whole-file sync name was invoked
+
+The old reconciliation entry points no longer exist.  Remove the call
+rather than aliasing it: Dolt-backed writes use typed mutation,
+plain-org files use ordinary Emacs save, and projection refresh is
+explicit.
+
+If a typed mutation reports a database problem, preserve the embedded
+Dolt stdout/stderr and verify the managed =sql-server= state.  Do not
+respond by making the projection writable.
+
+** Why is the first operation slow?
+
+Initial import and whole-root materialization traverse the full Org
+tree, and a cold start pays one-shot process startup.  Warm requests
+against a running =sql-server= are the fast path — see [[*Performance][Performance]].
+
+** A pre-release repository uses an older schema
+
+The first public release starts at schema 6 and ships no upgrade path for
+earlier development stores.  Opening one signals
+=dorg-schema-migration-required= before any schema write.  Recreate the store
+from its Org source with the current release.
+
+** Database consistency
+
+If a Dolt-backed database ever looks inconsistent — orphaned roots,
+dangling references, unreachable headings — run the consistency
+checker.  =dorg doctor= reports findings and exits non-zero while any
+remain (=--fix= applies the fixable ones in a single transaction and
+re-checks); interactively, =M-x dorg-doctor= (=C-c C-x d=) shows the
+report and offers to apply fixes:
+
+#+begin_src sh
+dorg doctor -f tasks.org          # report (exit 1 if inconsistent)
+dorg doctor -f tasks.org --fix    # repair fixable findings, then re-check
+#+end_src
+
+* Status
+
+DOrg =0.1.0= is the first public interface for the storage core, typed mutation
+API, query language, CLI, and server lifecycle.  Keep independent backups of
+important data and coordinate upgrades across every process sharing a store.
+
+* Documentation
+
+- [[file:docs/schema.org][docs/schema.org]] — relational schema, ERD, table catalogue, sort-key
+  storage contract
+- [[file:docs/api.org][docs/api.org]] — module dependency map and per-module public API
+- [[file:docs/query.org][docs/query.org]] — query language and selector semantics
+- [[file:docs/mutate.org][docs/mutate.org]] — mutation DSL, typed patch IR, plans, receipts,
+  and safety gates
+- [[file:docs/cli.org][docs/cli.org]] — command-line and serve HTTP surfaces
+- [[file:docs/import.org][docs/import.org]] — explicit administrative import/recovery
+- [[file:docs/backend-extension.org][docs/backend-extension.org]] — backend capability and extension
+  migration contracts
+- [[file:docs/configuration.org][docs/configuration.org]] — user options, hooks, and the read-only
+  projection/typed-write boundary (browse and set options via
+  =M-x customize-group RET dorg=)
+
+Contributor guidance — build/test/lint commands, coding conventions, and
+testing practices — lives in [[file:CONTRIBUTING.org][CONTRIBUTING.org]].  The
+[[file:docs/api.org::*Module dependency map][module dependency map]] documents
+the repository structure.
+
+* Footnotes
+
+[fn:perf] On performance: dorg keeps an Org buffer as the
+projection/query surface and a Dolt =sql-server= as a fast path — see
+[[*Performance][Performance]] for what is and isn't fast today.

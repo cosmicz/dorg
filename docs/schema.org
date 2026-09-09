@@ -1,0 +1,242 @@
+#+title: DOrg Schema
+
+#+begin_quote
+*DOrg 0.1.0 schema.*  This document describes the first public on-disk schema.
+Schema version 6 identifies that state; future schema changes require an
+explicitly supported migration.
+#+end_quote
+
+This document is the detailed reference for the relational schema that
+backs dorg.  It describes the design principles, the entity-relationship
+model, the table catalogue, and the binary sort-key storage contract.
+
+For the current command and mutation data flow that reads and writes this
+schema, see [[file:api.org][docs/api.org]] and
+[[file:mutate.org][docs/mutate.org]].  Whole-file reconciliation is not part of
+DOrg 0.1.0; Dolt-backed buffers are read-only projections.  For the schema
+DDL/migration API (=dorg-schema.el=), see [[file:api.org][docs/api.org]].
+
+* Design Principles
+
+- *Round-trip fidelity* -- a Dolt DB can reproduce the original org
+  buffer (with some normalization)
+- *Polymorphic item container* -- =heading_items= is the ordering
+  backbone.  All content under a heading (text, keywords, planning,
+  drawers) is a typed item with a binary sort key preserving exact
+  interleaving order.
+- *Synthetic root per file* -- each file has a level-0 heading whose
+  =id= doubles as its =root_id=, representing the file preamble and
+  serving as the self-referential anchor for subtree scoping.  A
+  tiny =dorg_files(root_id, relative_path)= index maps store-relative
+  source locators to roots.  The locator is not identity: moving the
+  containing store/source bundle preserves =root_id=.
+- *Stable heading identity* -- every heading carries a client-generated
+  64-bit snowflake id (see =dorg-id.el=), written into the buffer as
+  ~:DORG_ID:~ in the ~:PROPERTIES:~ drawer.  Re-parses and explicit recovery
+  ingest read the id back; typed selectors and mutations preserve that
+  identity across revisions.
+- *Binary sort keys* -- =headings= and =heading_items= use
+  =VARBINARY(64)= sort keys for O(1) insert-between (forward-looking
+  toward fractional indexing).
+- *Integer ordinals* -- small-N tables (=heading_tags=,
+  =drawer_lines=, =property_entries=) use =INT= ordinals for
+  simplicity.
+
+* Entity Relationship
+
+#+begin_src mermaid
+erDiagram
+    dorg_meta {
+        VARCHAR key PK
+        TEXT value
+    }
+
+    headings {
+        BIGINT id PK
+        BIGINT root_id FK
+        BIGINT parent_id FK
+        VARBINARY sort_key UK
+        INT level
+        VARCHAR todo_keyword
+        CHAR priority
+        BOOLEAN commented
+        TEXT title
+        INT post_blank
+        VARCHAR items_hash
+    }
+
+    dorg_files {
+        BIGINT root_id PK,FK
+        VARCHAR relative_path UK
+    }
+
+    heading_tags {
+        BIGINT heading_id PK,FK
+        INT ordinal PK
+        VARCHAR tag UK
+    }
+
+    heading_items {
+        BIGINT id PK
+        BIGINT heading_id FK
+        VARBINARY sort_key UK
+        VARCHAR kind
+        INT post_blank
+    }
+
+    text_items {
+        BIGINT item_id PK,FK
+        LONGTEXT text_raw
+    }
+
+    keyword_items {
+        BIGINT item_id PK,FK
+        VARCHAR keyword
+        TEXT value_raw
+    }
+
+    planning_items {
+        BIGINT item_id PK,FK
+        VARCHAR scheduled_raw
+        VARCHAR deadline_raw
+        VARCHAR closed_raw
+    }
+
+    drawer_items {
+        BIGINT item_id PK,FK
+        VARCHAR name
+    }
+
+    drawer_lines {
+        BIGINT id PK
+        BIGINT drawer_item_id FK
+        INT ordinal UK
+        TEXT line_raw
+    }
+
+    property_entries {
+        BIGINT id PK
+        BIGINT drawer_item_id FK
+        INT ordinal UK
+        VARCHAR prop_key
+        TEXT prop_value
+        TEXT raw_line
+    }
+
+    headings ||--o{ headings : "parent_id"
+    headings ||--|| dorg_files : "root_id"
+    headings ||--o{ heading_tags : "heading_id"
+    headings ||--o{ heading_items : "heading_id"
+    heading_items ||--o| text_items : "item_id"
+    heading_items ||--o| keyword_items : "item_id"
+    heading_items ||--o| planning_items : "item_id"
+    heading_items ||--o| drawer_items : "item_id"
+    drawer_items ||--o{ drawer_lines : "drawer_item_id"
+    drawer_items ||--o{ property_entries : "drawer_item_id"
+#+end_src
+
+* Table Descriptions
+
+| Table              | Purpose                                            |
+|--------------------+----------------------------------------------------|
+| =dorg_meta=        | Key-value metadata (schema version, etc.)          |
+| =headings=         | Heading tree; level 0 = synthetic file root        |
+| =dorg_files=       | Store-relative source locator → root_id index     |
+| =heading_tags=     | Ordered tags per heading                           |
+| =heading_items=    | Polymorphic container -- orders all content items   |
+| =text_items=       | Plain text blocks (body paragraphs, lists, etc.)   |
+| =keyword_items=    | File/heading keywords (=#+KEY: VALUE=)             |
+| =planning_items=   | SCHEDULED / DEADLINE / CLOSED timestamps           |
+| =drawer_items=     | Named drawers (~:NAME: ... :END:~)                 |
+| =drawer_lines=     | Raw lines within a drawer                          |
+| =property_entries= | Structured ~:KEY: VALUE~ pairs from PROPERTIES     |
+
+The =heading_properties= view joins =property_entries= through
+=drawer_items= and =heading_items= for convenient heading-to-property
+lookups.
+
+* Versioned Raw SQL Contract
+
+The raw SQL helper family documented in [[file:api.org][docs/api.org]] is a
+development extension escape hatch for callers that deliberately couple to
+this schema.  Its compatibility discriminator is the recorded schema version
+in =dorg_meta.schema_version= and ~dorg-schema-version~.  The current schema
+version is 6.
+
+Within a schema version, schema-coupled callers may depend on the documented
+tables, columns, views, primary keys, foreign keys, root scoping, ordering
+semantics, ordinal semantics, item kind/detail-table relationships, and frozen
+persistence formats named in this document.  Incompatible persistence changes
+must bump ~dorg-schema-version~ and include a migration entry.  This is a data
+migration rule, not a command-API stability promise.
+
+This contract is lower-level than the command API.  It does not promise
+=query= / =mutate= selector semantics, command-envelope result shapes,
+transport parity across CLI and HTTP, or mutate safety gates.  Raw SQL writers
+must preserve the invariants described here and use the quoting, batch, and
+commit helpers documented in [[file:api.org][docs/api.org]].
+
+* Item Kind Values
+
+The =heading_items.kind= column discriminates the polymorphic type:
+
+| Kind        | Detail table     |
+|-------------+------------------|
+| =text=      | =text_items=     |
+| =keyword=   | =keyword_items=  |
+| =planning=  | =planning_items= |
+| =drawer=    | =drawer_items=   |
+
+* Sort-key Storage Contract
+
+=headings= and =heading_items= order rows by a =VARBINARY(64)= binary
+sort key, allocated by fractional midpoint (=dorg-sortkey.el=).  The
+storage contract:
+
+- Existing keys read from the DB whose length is at most
+  ~dorg-sortkey-max-bytes~ (64 bytes, the column width) are valid,
+  including keys of exactly 64 bytes.
+- Newly allocated midpoint candidates whose length is
+  =>= dorg-sortkey-rebalance-threshold= (64 bytes) do not get written;
+  instead ~dorg-sortkey-midpoint-limited~ signals
+  ~dorg-sortkey-exhausted~ so the caller rebalances the sibling group.
+- As a backstop, SQL generation rejects any key longer than
+  ~dorg-sortkey-max-bytes~ before emission, so an overlong key can never
+  reach the =VARBINARY(64)= column and silently truncate.
+
+The schema stays at =VARBINARY(64)=; widening is not the fix.  See the
+=dorg-sortkey.el= API table in [[file:api.org][docs/api.org]] for the
+function-level reference.
+
+DOrg requires Dolt 1.86.4 or newer.  Dolt 1.86.0 through 1.86.3 panic
+while maintaining a binary secondary index through the foreign-key update
+path used by this schema; [[https://github.com/dolthub/dolt/pull/10906][Dolt PR 10906]] fixes that engine defect.
+
+* Schema-v6 portable file bindings
+
+Schema v6 hard-renames =dorg_files.path= to =relative_path=.  Each locator is
+normalized relative to the canonical Dolt repository directory; parent
+segments are legal, so the canonical Downstream tracker sibling layout stores
+=../beads.org=.  The schema version is the table-wide encoding discriminator:
+there is no per-row kind and no compatibility alias for the absolute column.
+
+Root resolution validates the complete locator representation, requires one
+level-0 self-rooted heading, and refuses ambiguity.  An implicit bind may create
+only the first root in an empty store.  A miss in a nonempty store is a typed
+=path-mismatch=; explicit =import --mode bootstrap= remains the operation that
+adds another document.  ~dorg-rebind-file~ / ~dorg dolt rebind~ changes one
+locator at an exact Dolt base without reading or writing the Org file.
+
+The first public release begins with this schema.  Earlier development stores
+have no supported upgrade path and are refused before any write; recreate them
+from their Org source.  The generic migration runner remains empty and ready
+for post-release schema changes.
+
+The portable file-binding surface uses =relative_path=,
+=uq_dorg_files_relative_path=, the ~(dolt-dir root-id abs-file)~ row-builder
+signature, the locator encode/decode boundary, ~dorg-binding-error~ reasons,
+and ~dorg-rebind-file~ / ~dorg dolt rebind~.
+
+An Downstream tracker pin bump must also replace its direct =dorg_files.path= query, bump
+its required core schema to 6, migrate fixtures/docs, and certify both schema
+generations plus rollback before any separately authorized live migration.

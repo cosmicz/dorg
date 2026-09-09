@@ -1,0 +1,398 @@
+#!/bin/sh
+":"; exec emacs --quick --script "$0" -- "$@"
+;;; public-release-gate --- Verify a disposable public candidate -*- lexical-binding: t; -*-
+
+;; Output contract: success writes only the requested receipt.  Failure writes
+;; exactly one JSON document and no other stdout/stderr text.
+
+(require 'cl-lib)
+(require 'json)
+(require 'subr-x)
+
+(defun dorg-public-release-gate--fail (reason &optional fields)
+  "Stop the gate with failure REASON and additional JSON FIELDS."
+  (throw 'dorg-public-release-gate--failure
+         (append `((failure_reason . ,reason)) fields)))
+
+(defun dorg-public-release-gate--parse-args (args)
+  "Parse command-line ARGS into an alist, failing on malformed input."
+  (when (equal (car args) "--")
+    (setq args (cdr args)))
+  (let (result)
+    (while args
+      (let ((key (pop args)))
+        (unless (and (string-prefix-p "--" key) args)
+          (dorg-public-release-gate--fail "invalid-arguments"))
+        (push (cons (intern (substring key 2)) (pop args)) result)))
+    (dolist (required '(repo manifest scrub-source accounting-baseline
+                             baseline trunk public receipt))
+      (unless (alist-get required result)
+        (dorg-public-release-gate--fail
+         "invalid-arguments" `((missing_argument . ,(symbol-name required))))))
+    result))
+
+(defun dorg-public-release-gate--command (repo &rest args)
+  "Run a Git inspection command with ARGS in REPO and return its output."
+  (with-temp-buffer
+    (let ((status (apply #'call-process
+                         "git" nil (list (current-buffer) t) nil
+                         "-C" repo args)))
+      (unless (equal status 0)
+        (dorg-public-release-gate--fail
+         "git-inspection"
+         `((command_status . ,status)
+           (command_output . ,(buffer-string)))))
+      (buffer-string))))
+
+(defun dorg-public-release-gate--command-status (repo &rest args)
+  "Run a quiet Git inspection command with ARGS in REPO and return its status."
+  (with-temp-buffer
+    (apply #'call-process
+           "git" nil (list (current-buffer) t) nil "-C" repo args)))
+
+(defun dorg-public-release-gate--sha (repo revision)
+  "Resolve REVISION to an exact commit in REPO."
+  (string-trim-right
+   (dorg-public-release-gate--command
+    repo "rev-parse" "--verify" (concat revision "^{commit}"))))
+
+(defun dorg-public-release-gate--manifest-lines (text)
+  "Validate and return active manifest lines from TEXT."
+  (let ((lines (cl-loop for line in (split-string text "\n")
+                        for trimmed = (string-trim line)
+                        unless (or (string-empty-p trimmed)
+                                   (string-prefix-p "#" trimmed))
+                        collect trimmed)))
+    (unless (and (equal lines (sort (copy-sequence lines) #'string<))
+                 (= (length lines) (length (delete-dups (copy-sequence lines))))
+                 (member "public-export-manifest.txt" lines))
+      (dorg-public-release-gate--fail "manifest-invalid"))
+    (dolist (line lines)
+      (when (or (file-name-absolute-p line)
+                (member line '("." ".." "./" "../"))
+                (string-match-p "\\(?:^\\|/\\)\\.\\.?\\(?:/\\|$\\)" line)
+                (string-match-p "[][?*{}]" line))
+        (dorg-public-release-gate--fail
+         "manifest-invalid" `((manifest_entry . ,line)))))
+    lines))
+
+(defun dorg-public-release-gate--excluded-p (path manifest)
+  "Return non-nil when MANIFEST excludes PATH."
+  (cl-some (lambda (entry)
+             (if (string-suffix-p "/" entry)
+                 (string-prefix-p entry path)
+               (equal entry path)))
+           manifest))
+
+(defun dorg-public-release-gate--tree-paths (repo treeish)
+  "Return every file path in TREEISH from REPO."
+  (split-string
+   (dorg-public-release-gate--command
+    repo "ls-tree" "-r" "-z" "--name-only" treeish)
+   "\0" t))
+
+(defun dorg-public-release-gate--production-paths (repo revision)
+  "Return root-level production Elisp paths at REVISION in REPO."
+  (cl-remove-if-not
+   (lambda (path)
+     (and (not (string-match-p "/" path))
+          (string-suffix-p ".el" path)))
+   (dorg-public-release-gate--tree-paths repo revision)))
+
+(defun dorg-public-release-gate--production-counts (repo revision)
+  "Return physical line and top-level definition counts at REVISION in REPO."
+  (let ((definition-re
+         (concat
+          "^(\\(?:cl-\\)?def"
+          "\\(?:un\\|macro\\|subst\\|var\\|const\\|custom\\|group"
+          "\\|face\\|struct\\|class\\|method\\|generic\\|alias\\|error\\)"
+          "\\_>\\|^(define-[[:alnum:]-]+\\_>"))
+        (lines 0)
+        (definitions 0))
+    (dolist (path (dorg-public-release-gate--production-paths repo revision))
+      (let ((text (dorg-public-release-gate--command
+                   repo "show" (format "%s:%s" revision path))))
+        (setq lines (+ lines (cl-count ?\n text)))
+        (dolist (line (split-string text "\n"))
+          (when (string-match-p definition-re line)
+            (setq definitions (1+ definitions))))))
+    `((lines . ,lines) (definitions . ,definitions))))
+
+(defun dorg-public-release-gate--production-delta (repo before after)
+  "Return added and deleted root Elisp lines from BEFORE to AFTER in REPO."
+  (let ((text (dorg-public-release-gate--command
+               repo "diff" "--numstat" before after "--"
+               ":(top,glob)*.el"))
+        (added 0)
+        (deleted 0))
+    (dolist (line (split-string text "\n" t))
+      (unless (string-match "\\`\\([0-9]+\\)\t\\([0-9]+\\)\t" line)
+        (dorg-public-release-gate--fail
+         "accounting-invalid" `((numstat_line . ,line))))
+      (setq added (+ added (string-to-number (match-string 1 line)))
+            deleted (+ deleted (string-to-number (match-string 2 line)))))
+    `((added . ,added) (deleted . ,deleted))))
+
+(defun dorg-public-release-gate--tree-records (repo treeish)
+  "Return TREEISH records as (PATH MODE TYPE OBJECT) lists."
+  (mapcar
+   (lambda (record)
+     (unless (string-match
+              "\\`\\([0-9]+\\) \\([^ ]+\\) \\([0-9a-f]+\\)\t\\(.*\\)\\'"
+              record)
+       (dorg-public-release-gate--fail "tree-inspection"))
+     (list (match-string 4 record)
+           (match-string 1 record)
+           (match-string 2 record)
+           (match-string 3 record)))
+   (split-string
+    (dorg-public-release-gate--command repo "ls-tree" "-r" "-z" treeish)
+    "\0" t)))
+
+(defun dorg-public-release-gate--content-records (records)
+  "Remove mode fields from tree RECORDS."
+  (mapcar (lambda (record)
+            (list (nth 0 record) (nth 2 record) (nth 3 record)))
+          records))
+
+(defun dorg-public-release-gate--known-token-table (repo trunk paths)
+  "Return known public DOrg symbols found in exported Elisp PATHS."
+  (let ((definition-re
+         "^[ \t]*(\\(?:[[:alnum:]-]*def[[:alnum:]-]*\\|define-[[:alnum:]-]+\\|provide\\)[ \t\n]+['(]*\\(dorg-[[:alnum:]-]+\\)")
+        (table (make-hash-table :test #'equal)))
+    (dolist (path paths)
+      (when (string-suffix-p ".el" path)
+        (dolist (line
+                 (split-string
+                  (dorg-public-release-gate--command
+                   repo "show" (format "%s:%s" trunk path))
+                  "\n"))
+          (let ((start 0))
+            (while (string-match definition-re line start)
+              (let ((prefix (match-string 1 line)))
+                (while (string-prefix-p "dorg-" prefix)
+                  (puthash prefix t table)
+                  (if (string-match "\\`\\(.+\\)-[^-]+\\'" prefix)
+                      (setq prefix (match-string 1 prefix))
+                    (setq prefix ""))))
+              (setq start (match-end 0)))))))
+    table))
+
+(defun dorg-public-release-gate--scrub-p (repo trunk paths)
+  "Return non-nil when every exported PATH at TRUNK passes the shared scrub."
+  (let ((known (dorg-public-release-gate--known-token-table repo trunk paths))
+        clean)
+    (setq clean t)
+    (dolist (path paths)
+      (dolist (line
+               (split-string
+                (dorg-public-release-gate--command
+                 repo "show" (format "%s:%s" trunk path))
+                "\n"))
+        (when (dorg-public-scrub-classify-string line known)
+          (setq clean nil))))
+    clean))
+
+(defun dorg-public-release-gate--write-receipt (path data)
+  "Atomically write JSON DATA to PATH without emitting a message."
+  (let ((temporary (make-temp-file "dorg-public-receipt-")))
+    (unwind-protect
+        (progn
+          (with-temp-buffer
+            (insert (json-serialize data) "\n")
+            (write-region (point-min) (point-max) temporary nil 'silent))
+          (rename-file temporary path t)
+          (setq temporary nil))
+      (when (and temporary (file-exists-p temporary))
+        (delete-file temporary)))))
+
+(defun dorg-public-release-gate--file-sha256 (path)
+  "Return the SHA-256 digest of the literal bytes at PATH."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally path)
+    (secure-hash 'sha256 (current-buffer))))
+
+(defun dorg-public-release-gate--protected-refs (repo)
+  "Return the canonical publication-relevant ref listing in REPO.
+Only exact private/public branch targets and public tag/remote namespaces are
+part of the release no-mutation witness.  Agent, tracker, and disposable local
+refs are coordination state rather than publication effects."
+  (mapconcat
+   #'identity
+   (cl-remove-if-not
+    (lambda (line)
+      (string-match-p
+       "\\(?: refs/heads/\\(?:trunk\\|main\\)\\'\\| refs/\\(?:tags\\|remotes\\)/\\)"
+       line))
+    (split-string
+     (string-trim-right
+      (dorg-public-release-gate--command
+       repo "for-each-ref" "--format=%(objectname) %(refname)"
+       "refs/heads" "refs/tags" "refs/remotes"))
+     "\n" t))
+   "\n"))
+
+(defun dorg-public-release-gate--run (args)
+  "Run the release proof described by parsed ARGS."
+  (let* ((repo (file-name-as-directory
+                (expand-file-name (alist-get 'repo args))))
+         (manifest-name (alist-get 'manifest args))
+         (scrub-source (expand-file-name (alist-get 'scrub-source args)))
+         (accounting-baseline
+          (dorg-public-release-gate--sha
+           repo (alist-get 'accounting-baseline args)))
+         (baseline-input (alist-get 'baseline args))
+         (trunk (dorg-public-release-gate--sha repo (alist-get 'trunk args)))
+         (public-input (alist-get 'public args))
+         (public (dorg-public-release-gate--sha repo public-input))
+         (receipt (expand-file-name (alist-get 'receipt args)))
+         (refs-before (dorg-public-release-gate--protected-refs repo))
+         (refs-before-digest (secure-hash 'sha256 refs-before))
+         (manifest-text
+          (dorg-public-release-gate--command
+           repo "show" (format "%s:%s" trunk manifest-name)))
+         (manifest (dorg-public-release-gate--manifest-lines manifest-text))
+         (trunk-paths (dorg-public-release-gate--tree-paths repo trunk))
+         (excluded (cl-remove-if-not
+                    (lambda (path)
+                      (dorg-public-release-gate--excluded-p path manifest))
+                    trunk-paths))
+         (exported (cl-set-difference trunk-paths excluded :test #'equal))
+         (accounting-before
+          (dorg-public-release-gate--production-counts repo accounting-baseline))
+         (accounting-after
+          (dorg-public-release-gate--production-counts repo trunk))
+         (accounting-delta
+          (dorg-public-release-gate--production-delta
+           repo accounting-baseline trunk))
+         expected-tree temporary-index public-count)
+    (unless (file-readable-p scrub-source)
+      (dorg-public-release-gate--fail "scrub-source-missing"))
+    (load scrub-source nil t)
+    (unless (fboundp 'dorg-public-scrub-classify-string)
+      (dorg-public-release-gate--fail "scrub-source-invalid"))
+    (unless (= (alist-get 'lines accounting-after)
+               (+ (alist-get 'lines accounting-before)
+                  (alist-get 'added accounting-delta)
+                  (- (alist-get 'deleted accounting-delta))))
+      (dorg-public-release-gate--fail
+       "accounting-inconsistent"
+       `((accounting_before . ,accounting-before)
+         (accounting_after . ,accounting-after)
+         (accounting_delta . ,accounting-delta))))
+
+    (if (equal baseline-input "EMPTY")
+        (progn
+          (setq public-count
+                (string-to-number
+                 (string-trim
+                  (dorg-public-release-gate--command
+                   repo "rev-list" "--count" public))))
+          (unless (and (= public-count 1)
+                       (= 1 (length
+                             (split-string
+                              (string-trim
+                               (dorg-public-release-gate--command
+                                repo "rev-list" "--parents" "-n" "1" public))))))
+            (dorg-public-release-gate--fail "commit-count")))
+      (let ((baseline (dorg-public-release-gate--sha repo baseline-input)))
+        (unless (equal 0 (dorg-public-release-gate--command-status
+                          repo "merge-base" "--is-ancestor" baseline public))
+          (dorg-public-release-gate--fail "commit-count"))
+        (setq public-count
+              (string-to-number
+               (string-trim
+                (dorg-public-release-gate--command
+                 repo "rev-list" "--count" (concat baseline ".." public)))))
+        (unless (= public-count 1)
+          (dorg-public-release-gate--fail "commit-count"))))
+
+    (setq temporary-index (make-temp-file "dorg-public-index-"))
+    (delete-file temporary-index)
+    (unwind-protect
+        (let ((process-environment
+               (cons (concat "GIT_INDEX_FILE=" temporary-index)
+                     process-environment)))
+          (dorg-public-release-gate--command repo "read-tree" trunk)
+          (dolist (path excluded)
+            (dorg-public-release-gate--command
+             repo "update-index" "--force-remove" "--" path))
+          (setq expected-tree
+                (string-trim
+                 (dorg-public-release-gate--command repo "write-tree"))))
+      (when (file-exists-p temporary-index)
+        (delete-file temporary-index)))
+
+    (let* ((public-tree
+            (string-trim
+             (dorg-public-release-gate--command
+              repo "rev-parse" (concat public "^{tree}"))))
+           (expected-records
+            (dorg-public-release-gate--tree-records repo expected-tree))
+           (public-records
+            (dorg-public-release-gate--tree-records repo public-tree)))
+      (unless (equal expected-records public-records)
+        (dorg-public-release-gate--fail
+         (if (equal (dorg-public-release-gate--content-records expected-records)
+                    (dorg-public-release-gate--content-records public-records))
+             "mode-drift"
+           "content-drift")))
+      (unless (dorg-public-release-gate--scrub-p repo trunk exported)
+        (dorg-public-release-gate--fail
+         "scrub-leak" '((scrub_passed . :false))))
+      (let* ((refs-after (dorg-public-release-gate--protected-refs repo))
+             (refs-after-digest (secure-hash 'sha256 refs-after)))
+        (unless (equal refs-before refs-after)
+          (dorg-public-release-gate--fail "protected-refs-changed"))
+        (dorg-public-release-gate--write-receipt
+         receipt
+         `((public_baseline_sha . ,baseline-input)
+           (trunk_candidate_sha . ,trunk)
+           (trunk_tree . ,(string-trim
+                           (dorg-public-release-gate--command
+                            repo "rev-parse" (concat trunk "^{tree}"))))
+           (public_candidate_sha . ,public)
+           (public_tree . ,public-tree)
+           (manifest_sha256 . ,(secure-hash 'sha256 manifest-text))
+           (scrub_rule_source_sha256
+            . ,(dorg-public-release-gate--file-sha256 scrub-source))
+           (excluded_path_count . ,(length excluded))
+           (public_commit_count . ,public-count)
+           (accounting_baseline_sha . ,accounting-baseline)
+           (production_lines_before
+            . ,(alist-get 'lines accounting-before))
+           (production_lines_after
+            . ,(alist-get 'lines accounting-after))
+           (production_lines_added
+            . ,(alist-get 'added accounting-delta))
+           (production_lines_deleted
+            . ,(alist-get 'deleted accounting-delta))
+           (production_definitions_before
+            . ,(alist-get 'definitions accounting-before))
+           (production_definitions_after
+            . ,(alist-get 'definitions accounting-after))
+           (scrub_passed . t)
+           (byte_mode_equal . t)
+           (protected_refs_unchanged . t)
+           (protected_refs_before_sha256 . ,refs-before-digest)
+           (protected_refs_after_sha256 . ,refs-after-digest)
+           (push_performed . :false)))))))
+
+(let ((inhibit-message t)
+      (message-log-max nil)
+      (debug-on-error nil)
+      failure)
+  (setq failure
+        (catch 'dorg-public-release-gate--failure
+          (condition-case err
+              (progn
+                (dorg-public-release-gate--run
+                 (dorg-public-release-gate--parse-args command-line-args-left))
+                nil)
+            (error
+             `((failure_reason . "internal-error")
+               (error_message . ,(error-message-string err)))))))
+  (when failure
+    (princ (concat (json-serialize failure) "\n"))
+    (kill-emacs 1)))

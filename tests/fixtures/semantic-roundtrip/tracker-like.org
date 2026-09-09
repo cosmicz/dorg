@@ -1,0 +1,35 @@
+#+TITLE: Downstream tracker Like Tracker
+#+TODO: TODO DESIGN PLAN SPEC REVIEW IMPL REFINE ACCEPT RESOLVE WAIT | DONE CNCL
+
+* TODO dorg-demo  [A]  sample release bead
+:PROPERTIES:
+:ID: dorg-demo
+:CUSTOM_ID: sample-release-bead
+:END:
+The bead body contains a realistic description with a [[tracked-regression][child link]].
+
+** Design
+The design section has prose, code-like tokens, and ordering.
+
+** Plan
+1. Create the fixture.
+2. Run the semantic gate.
+3. Record evidence.
+
+** Notes
+:LOGBOOK:
+- Note added [2026-07-09 Thu 20:00] by driver
+  First durable note.
+- Note added [2026-07-09 Thu 20:05] by reviewer
+  Review note with a blank separator.
+
+  Continued text.
+:END:
+
+* WAIT dorg-demo-child  [B]  linked child bead                    :blocked:
+SCHEDULED: <2026-07-11 Sat>
+:PROPERTIES:
+:ID: dorg-demo-child
+:PARENT: dorg-demo
+:END:
+Waiting for upstream review.

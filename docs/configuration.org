@@ -1,0 +1,206 @@
+#+title: DOrg Configuration
+
+#+begin_quote
+*DOrg 0.1.0 configuration surface.*  Whole-file save/enable synchronization is
+not installed.  Dolt-backed buffers are read-only projections and writes belong
+on the typed mutation/command API.
+#+end_quote
+
+This document lists the user-facing options and hooks that tune dorg's
+projection, server, and id-generation behaviour.  For their runtime roles, see
+the relevant module API tables in [[file:api.org][docs/api.org]].
+
+* Options and hooks
+
+| Variable                                   | Default                                    | Purpose                                                                                                  |
+|--------------------------------------------+--------------------------------------------+----------------------------------------------------------------------------------------------------------|
+| ~dorg-activation-claim-lock-timeout~       | =0.25=                                     | Short claim-lock bound used by passive ~dorg-mode~ activation                                            |
+| ~dorg-after-materialize-functions~         | =nil=                                      | Hook after materialize                                                                                   |
+| ~dorg-api-broad-write-threshold~           | =100=                                      | Mutate API target count that requires broad-write confirmation                                           |
+| ~dorg-dolt-auto-server~                    | =t=                                        | Engage a shared sql-server when ~dorg-mode~ opens a Dolt-backed buffer                                   |
+| ~dorg-dolt-compact-warn-threshold~         | =512 MiB=                                  | Store size above which compaction check warns (=nil= disables)                                           |
+| ~dorg-dolt-server-bound-org-globs~         | ~(\"*.org\" \"*/*.org\")~                  | Org globs probed by the ~dorg dolt~ misbound-root guard                                                  |
+| ~dorg-dolt-server-claim-lock-stale-after~  | =60.0=                                     | Seconds before an abandoned claim lock can be reaped                                                     |
+| ~dorg-dolt-server-autostart~               | =nil=                                      | Implicitly start a detached daemon for batch/one-shot SQL when none exists                               |
+| ~dorg-dolt-server-claim-lock-timeout~      | =10.0=                                     | Seconds to wait for claim-lock acquisition                                                               |
+| ~dorg-dolt-server-health-timeout~          | =2.0=                                      | Seconds bounding sql-server health-check SQL                                                             |
+| ~dorg-dolt-server-index-dir~               | =user-emacs-directory/dorg/server-stores/= | Non-authoritative managed-store discovery pointers; =DORG_DOLT_SERVER_INDEX_DIR= overrides it            |
+| ~dorg-dolt-server-probe-attempts~          | =3=                                        | Total served-database probes before returning an inconclusive verdict                                    |
+| ~dorg-dolt-server-startup-timeout~         | =30=                                       | Seconds to wait for =dolt sql-server= startup                                                            |
+| ~dorg-dolt-server-stop-term-grace~         | =5.0=                                      | Seconds to wait after SIGTERM before SIGKILL                                                             |
+| ~dorg-dolt-user-email~                     | =\"dorg@localhost\"=                       | Author email for Dolt commits                                                                            |
+| ~dorg-dolt-user-name~                      | =\"dorg\"=                                 | Author name for Dolt commits                                                                             |
+| ~dorg-id-shard~                            | random =[16,1023]=                         | Snowflake shard id [0,1023]; defaults to a random shard, =0-15= reserved for explicit assignment         |
+| ~dorg-mutate-gate-acquire-timeout~         | =30=                                       | Seconds to wait for the per-store mutation gate before returning =contended=                             |
+| ~dorg-mutate-gate-deadline~                | =60=                                       | Shared wall-clock bound for Dolt gate wait, moved-HEAD replan, and op-id-authorized post-rollback replan |
+| ~dorg-ql-week-start-day~                   | =1=                                        | Week start day for date-relative ~dorg-ql~ predicates                                                    |
+| ~dorg-schema-auto-migrate~                 | =t=                                        | Automatically apply supported schema migrations                                                          |
+| ~dorg-schema-diagnostics-show-source-path~ | =nil=                                      | Include source file paths in schema diagnostic output                                                    |
+| ~dorg-serve-runtime-dir~                   | =TMPDIR/dorg/serve=                        | Per-port state/token files for the optional ~dorg serve~ HTTP daemon                                     |
+| ~dorg-sql-cli-arg-max-threshold~           | =131072=                                   | Byte length at/above which CLI SQL streams over stdin (avoids ARG_MAX)                                   |
+| ~dorg-sql-cli-timeout~                     | =30.0=                                     | Seconds bounding one-shot CLI SQL in the internal seam                                                   |
+| ~dorg-sql-connect-timeout~                 | =2.0=                                      | Seconds bounding mysql.el connection setup                                                               |
+| ~dorg-sql-read-timeout~                    | =10.0=                                     | Seconds of mysql.el read inactivity tolerated during a query                                             |
+| ~dorg-dolt-max-retries~                    | =3=                                        | Retries for transient Dolt errors (serialization / sequencing rollbacks)                                 |
+| ~dorg-dolt-retry-base-ms~                  | =50=                                       | Base backoff delay (ms) between Dolt retries                                                             |
+
+Heading and item extraction always use Org =element= granularity.  This is a
+parser invariant rather than a user option: coarser AST shapes omit data that
+the DOrg model requires.
+
+* Default project store convention
+
+New project integrations use =<project>/.dorg/dorg/= as the canonical local
+DOrg store.  The outer =.dorg/= directory is the project-level DOrg namespace;
+the inner =dorg/= directory is the Dolt repository and therefore the database
+name exposed by that project's managed server.  Compute this path with
+~dorg-default-store-directory~ by passing an explicit absolute project root.
+The helper is pure: it neither creates nor discovers a store and does not bind
+a source.
+
+The database name is not independently configurable.  DOrg derives it from
+the physical store basename, keeping the repository path, server target,
+claims, revision-qualified SQL, and connection identity aligned.  Explicit
+legacy and custom stores remain valid unchanged: for example, an explicitly
+bound =<project>/.tracker/dolt/= store continues to serve database =dolt=.
+There is no fallback search, alias, automatic move, or silent re-import.
+
+For an Downstream tracker projection at =<project>/.tracker/beads.org=, the source binding
+to the canonical store is =../.dorg/dorg=, and the store-relative source
+locator is =../../.tracker/beads.org=.  A root-level
+=<project>/beads.org= source instead has locator =../../beads.org=.  Moving the
+whole project preserves both relative relationships.
+
+External Dolt repository synchronization is orthogonal to the local database
+name.  Each project may keep the same local ~dorg~ name while its remote URL
+or repository namespace supplies global multi-project identity.  This does
+not claim that multiple local stores can be attached directly to one shared
+SQL server under the same name; that future topology requires a separate,
+durable unique store identity.
+
+* Interactive Dolt projection safety
+
+Any Org buffer carrying a genuine preamble
+=#+DORG_DOLT_DIR:= (or legacy =#+DORG_DIR:=) binding is read-only.  The guard
+is installed on =org-mode-hook= and re-applied to already-open buffers by
+~dorg-reload~, so it does not depend on =global-dorg-mode= or the transient
+~dorg-mode~ bit.  DOrg-owned mutations bind =inhibit-read-only= through the
+central programmatic-change guard.  Plain-org buffers retain ordinary Emacs
+editing and saving.  Batch execution does not bypass a Dolt projection's
+identity-derived policy.
+
+* Managing sql-servers
+
+DOrg runs a =dolt sql-server= per Dolt repo to speed up queries from
+long-lived interactive sessions.  Servers DOrg starts publish a
+same-host /ownership claim/ under the store-relative =<store>/.dorg/=
+overlay so other DOrg processes attach to an existing server rather
+than starting a second one or contending on the Dolt write lock.
+
+Discoverable commands let you inspect and manage these without
+evaluating Lisp (see [[file:api.org][docs/api.org]] for return values):
+
+- =M-x dorg-dolt-list= — show owned servers, attached ports, and
+  same-host claims, each classified live / dead / stale / unreachable /
+  incompatible.  External non-DOrg =dolt sql-server= processes are not
+  shown.
+- =M-x dorg-dolt-start= — ensure a server for the current buffer's
+  registered Dolt repo (or a prompted directory).
+- =M-x dorg-dolt-stop= — owner-safe: stops a server this Emacs owns,
+  detaches an attach-only client, or refuses to stop one owned by
+  another DOrg process (reporting its pid/port).
+- =M-x dorg-dolt-stop-all= — stop every server this Emacs owns.
+
+Starting a server with these commands is an explicit action.  Ordinary
+SQL uses strict managed-server transport.
+
+~dorg-serve-runtime-dir~ is separate from the Dolt store-relative
+=<store>/.dorg/= overlay: it holds the per-port state and token files
+for the optional ~dorg serve~ HTTP daemon (not the =dolt sql-server=).
+Its contents are volatile and safe to delete when no serve daemon is
+running.
+
+* SQL transport (Dolt backend)
+
+For Dolt-backed repos, ~dorg-sql-transport~ is a special policy cell
+that selects how SQL reaches Dolt.  It is intentionally not a Customize
+option; sessions and workers may let-bind it while the global default
+stays strict =server=.  It applies to all post-init SQL (queries,
+schema, migration, model load, commit, rollback, and HEAD/root metadata
+reads); the =dolt version= and initial =dolt init= calls are exempt.
+
+The packaged default is strict =server= in both interactive Emacs and
+noninteractive batch processes (the =bin/dorg= CLI, =make test=).
+
+- =server= — strict server mode: every SQL
+  operation routes through a DOrg-managed server (reusing a server this
+  process owns, a previously attached port, or attaching to a live
+  same-host server that owns the repo) or errors; it never falls back to
+  CLI.  On a =server= path, =mysql.el= being unavailable is a
+  packaging/configuration error (install the bundled MySQL client
+  support), not a silent downgrade.
+One-shot CLI is not a public transport setting; it remains only as an
+internal test/recovery seam for standalone stores that no managed server
+owns.
+
+When no usable server is visible, whether that SQL call implicitly starts
+one is governed by ~dorg-dolt-server-autostart~ (default =nil=):
+
+- disabled (the default) — signals ~dorg-sql-transport-error~ naming the
+  two remedies, before starting a process or writing any claim/
+  =sql-server.info= metadata: run ~dorg dolt start PATH~ (=M-x
+  dorg-dolt-start=), or enable the option.
+- enabled — starts a durable detached daemon (the same daemon
+  ~dorg-dolt-start~ starts), matching earlier development behavior.
+
+This option governs only that no-usable-server case of the batch/one-shot
+=server= path.  Explicit ~dorg-dolt-start~/~dorg dolt start~, explicit
+~dorg-dolt-stop~/~dorg dolt stop~, warm ~dorg-session~ ownership
+(session-open strict-server attach via ~dorg-dolt-server--ensure-strict~),
+and the interactive ~dorg-dolt-auto-server~ buffer activation above
+(session-scoped ~dorg-dolt-server--ensure-strict~) always start or attach a
+server as before and are not governed by this option.
+
+A Dolt-backed ~dorg-session~ opened with no explicit ~:transport~ is
+unconditionally strict =server=; there is no session-default knob.  An
+explicit ~:transport~ still wins and is validated server-only
+(=auto=/=cli=/unknown fail closed).  Plain-org sessions keep the global
+~dorg-sql-transport~.
+
+For a *fresh* repository initialized with ~dorg-init~ under strict
+=server= transport, DOrg starts a managed bootstrap =dolt sql-server=
+immediately after bare =dolt init= and before applying schema.  The
+schema apply and initial commit then use the normal strict server
+transport; there is no separate bootstrap CLI transport override.
+
+** Portable file bindings and schema migration
+
+Dolt schema v6 stores each source locator relative to the canonical Dolt
+directory.  Moving a directory that contains both the store and its source
+therefore needs no rebind.  An ordinary bind may create only the initial root
+of an empty store; a miss in a nonempty store refuses instead of guessing or
+minting a blank root.  Use explicit ~dorg import --mode bootstrap~ to add a
+document, or ~dorg dolt rebind DIR FILE --root-id N --base HASH~ to repair one
+known moved binding without touching file bytes.
+
+The first public schema is version 6.  Earlier development stores have no
+supported migration path and are refused before any write; recreate them from
+their Org source.  Future migrations can be held behind
+~dorg-schema-auto-migrate~nil= so coordinated applications advance their DOrg
+pin and required-core guard before an operator-authorized migration.
+
+~dorg-sql-cli-arg-max-threshold~ (=131072=) bounds CLI argument size:
+short queries pass to =dolt= as a =-q= argument, but a large batch (for
+example, a bulk import) can exceed the operating system's =ARG_MAX=
+limit and fail with "Argument list too long".  Queries whose UTF-8 byte
+length reaches this threshold are streamed to =dolt= over stdin instead,
+where no argument-length limit applies.
+
+* Customizing
+
+Every option/hook in the table above is a defcustom in the single
+~dorg~ customize group.  Run =M-x customize-group RET dorg= to browse
+and set them with live docstrings and type checking, or =C-h v VAR RET=
+to inspect one variable.  ~dorg-sql-transport~ is deliberately outside
+Customize; inspect it with =C-h v= or let-bind it in code that needs an
+explicit policy.

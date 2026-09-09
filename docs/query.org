@@ -1,0 +1,496 @@
+#+title: DOrg Query API — the dorg-ql selector DSL
+
+#+begin_quote
+*DOrg 0.1.0 query surface.*  This document describes the first public query
+interface.
+#+end_quote
+
+This page is the user-facing reference for the *composable v2* ~dorg-ql~
+query language: its reader forms, the normalized AST they lower to, the
+timestamp/window vocabulary, traversal and result-order semantics, and
+the =bin/dorg= CLI surface.
+
+DOrg *editing DSL*: [[file:cli.org][CLI]] · *query language* · [[file:mutate.org][mutation API]].
+
+For the function-level API — ~dorg-ql-select~, the result-plist shape, source
+dispatch, and the relationship to ~dorg-command-run-query~, ~dorg-find~, and
+~dorg-query~ — see [[file:api.org::*Read entry hierarchy][docs/api.org, Read
+entry hierarchy]] and its module reference.  For the non-interactive CLI
+wrapper, see [[file:cli.org][docs/cli.org]].  For the write side —
+the source-generic primitive mutation API that a query's ~:heading-id~
+results can feed into explicit mutations — see [[file:mutate.org][docs/mutate.org]].
+
+#+begin_quote
+*DOrg 0.1.0 query surface.*  This page specifies the current query DSL:
+operator-headed comparisons (~(OP (field …) V)~), the ~(keyword …)~
+predicate, and the removal of the middle-operator forms and the
+~:at-or-above~ / ~:below~ operators.  The reader change and the keyword
+predicate is part of the DOrg 0.1.0 design; the normalized AST and
+backend lowering are unchanged.
+#+end_quote
+
+* Mental model
+
+The real contract is a *backend-neutral normalized AST*, not the surface
+syntax.  ~dorg-ql-normalize~ is the single parsing layer: it lowers both
+the compact atomic predicates and the operator-headed v2 reader forms
+into one AST that every adapter — model-list, plain-org, and Dolt —
+consumes; the model-list evaluator ~dorg-ql--model-eval~ is the semantic
+baseline the buffer adapters reproduce.  The surface syntax is a *reader*
+concern; switching an atom to its prefix form produces the identical AST
+node and the identical backend lowering.
+
+Two consequences follow:
+
+- *Lisp reader forms are the first public reader.*  They are natural for
+  Emacs Lisp callers and fit the existing ~dorg query '(...)'~ CLI
+  path.  A jq-style reader is a deferred second reader over the *same*
+  AST (see [[*jq-style syntax (deferred)][jq-style syntax (deferred)]]); it is not implemented.
+- *Normalization never widens to a broad scan.*  A malformed form signals
+  ~dorg-ql-error~; it does not silently degrade to "match everything".
+
+** Normalized AST shape
+
+A normalized query is always a pipeline whose first step is the source:
+
+#+begin_src emacs-lisp
+(:pipe (:source :all) STEP...)
+#+end_src
+
+Each subsequent =STEP= is one of, *in order*:
+
+#+begin_src emacs-lisp
+(:filter EXPR)        (:traverse REL...)        (:unique)
+#+end_src
+
+Steps stay ordered — filters and traversals may interleave — so the
+pipeline is a flat ordered list, preserving the outside-in mental model.
+A top-level predicate =P= is equivalent to ~(pipe (where P))~, i.e.
+~(:pipe (:source :all) (:filter EXPR))~ over all headings in the source.
+
+Filter =EXPR= nodes:
+
+#+begin_src emacs-lisp
+(:and EXPR...)  (:or EXPR...)  (:not EXPR)
+(:id OP INTEGER)
+(:cmp FIELD OP VALUE)
+(:property KEY OP VALUE)              ; VALUE nil for exists/missing
+(:keyword KEY OP VALUE)              ; VALUE nil for exists/missing; heading-scoped (root excluded)
+(:tag OP VALUE)                       ; VALUE nil for exists/missing
+(:timestamp SOURCE REL (START . END)) ; START/END are (YEAR MONTH DAY) or nil
+#+end_src
+
+You do not normally write AST nodes by hand; you write reader forms and
+~dorg-ql-normalize~ produces the AST.  The shape is documented here so the
+backend semantics below are unambiguous.
+
+* Reader forms
+
+** Atomic predicates
+
+The common-case predicates have a compact equality spelling — the base
+case of the selector language.  They are *query* predicates; of them only
+the ~(id N)~ atom is *also* a literal =mutate= target.  Every other
+predicate reaches the mutate surface only through =(on (where PREDICATE)
+…)= (see [[file:mutate.org][docs/mutate.org]]).  Each lowers to the same normalized AST as the
+prefix operator forms below:
+
+#+begin_example
+(id ID)                      exact DORG_ID match (integer or numeric string)
+(field FIELD VALUE)          scalar heading field equals VALUE (e.g. (field todo "DONE"))
+(property KEY VALUE)         exact, non-inherited PROPERTIES match
+(keyword KEY [VALUE])        host has #+KEY: [whose value equals VALUE]
+(title TITLE)                exact heading-title match
+(tag TAG)                    exact local-tag match (no inheritance)
+(scheduled FROM TO)          SCHEDULED planning timestamp in window
+(deadline FROM TO)           DEADLINE planning timestamp in window
+(closed FROM TO)             CLOSED planning timestamp in window
+(active-ts FROM TO)          ANY active body timestamp overlaps window
+(logbook FROM TO)            ANY LOGBOOK entry timestamp overlaps window
+(property-ts FROM TO [NAME]) ANY property-drawer timestamp overlaps window;
+                             with NAME, restricted to that property key
+#+end_example
+
+The timestamp aliases also accept a single convenience window form in
+place of their =FROM TO= bounds — e.g. ~(deadline (this-week))~ or
+~(closed (on "2026-07-01"))~ — exactly the window syntax the v2
+=timestamp= form accepts (see [[*Window inputs][Window inputs]]).
+
+** Composable v2 forms
+
+#+begin_example
+(pipe STEP...)               outside-in stream; STEP = (where P) | (traverse REL...) | (unique)
+(where PREDICATE)            keep headings matching PREDICATE
+(traverse RELATION...)       walk tree edges (union of RELATIONs)
+(unique)                     de-duplicate by heading id, preserving order
+(one QUERY)                  top-level WRAPPER: assert QUERY yields exactly one; else dorg-ql-error
+
+(and PREDICATE...)           all must match
+(or PREDICATE...)            any must match
+(not PREDICATE)              negation
+(key VALUE)                  identity predicate; matches the heading whose policy identity = VALUE
+
+(OP EXPR VALUE)              operator-headed compare; OP ∈ = != < <= > >= contains prefix suffix
+(exists EXPR)                EXPR present
+(missing EXPR)               EXPR absent
+                             EXPR := (property KEY) | (keyword KEY) | (tag)
+(timestamp SOURCE REL WINDOW) structured-timestamp window match
+#+end_example
+
+If the top-level query is a predicate (not a =pipe=), it is treated as
+~(pipe (where PREDICATE))~ over all headings in the registered
+root/source.  =where=, =traverse=, and =unique= are pipeline *steps*: at
+top level they must be wrapped in ~(pipe ...)~, and in predicate position
+(inside =where=/=and=/=or=/=not=) they signal ~dorg-ql-error~.
+
+~(key VALUE)~ is the *identity predicate* in the shared selector: it
+matches the single heading whose identity equals VALUE.  The key NAME is not in
+the form — it is resolved from the SOURCE's binding through the ONE identity
+resolver (~dorg-mutate--source-identity~; see [[file:mutate.org][docs/mutate.org]], /Identity policy/)
+and depends on the binding's identity POLICY:
+
+- ~(:property K)~ → lowers ~(key V)~ to ~(property K V)~ (a match on the
+  declared PROPERTIES key K);
+- ~dorg~ → lowers it to ~(id V)~ (=DORG_ID= is the owned identity, never a
+  property scan);
+- =none= → read-only: ~(key V)~ signals ~dorg-ql-error~ carrying
+  ~(:reason unsupported :detail identity-none)~.
+
+A model-list or unregistered/unbound source has no binding identity, so
+~(key V)~ is likewise a loud ~dorg-ql-error~ — never a silent empty or a
+fallback scan.  Under the mutate verb the identity contract is exactly-one:
+0 matches → =invalid-target=, >1 → =identity-violation= (see [[file:mutate.org][docs/mutate.org]]).
+
+~(one QUERY)~ is a top-level *cardinality wrapper*, not a pipeline step:
+it wraps any query (a predicate, an alias, or a ~(pipe ...)~) and asserts
+the result holds exactly one heading, signalling ~dorg-ql-error~ (a data
+cardinality fact) on 0 or >1.  It normalizes to the inner query's pipe
+with a terminal ~(:one)~ step, so every backend enforces it identically.
+Because the mutate target ~(where QUERY)~ evaluates =QUERY= as a top-level
+query, ~(on (where (one …)) …)~ reuses the same wrapper — an apply whose
+selector asserts cardinality ≤ 1 is exempt from the ~:expected-targets~
+ceremony (see [[file:mutate.org][docs/mutate.org]]).  Bare ~(one)~ inside ~(pipe …)~ is not
+public grammar.
+
+* Fields and operators
+
+** Operator-headed comparison
+
+A comparison is ~(OP EXPR VALUE)~ — the operator is the head, =EXPR= names
+what to compare, =VALUE= is the literal.  One uniform operator vocabulary
+applies to everything comparable; there are *no* field-specific
+operators.  =EXPR= is one of:
+
+#+begin_example
+(field FIELD)     a scalar heading field (table below)
+(property KEY)    the PROPERTIES-drawer value for KEY
+(keyword KEY)     the host's #+KEY: keyword value
+(tag)             the heading's local tags (set membership)
+#+end_example
+
+The operators: =​=​= =!=​= (all), =<= =<=​= =>= =>=​= (ordered EXPRs), and
+=contains= =prefix= =suffix= (string EXPRs).  ~(exists EXPR)~ and
+~(missing EXPR)~ test presence — e.g. ~(exists (property "DUE"))~,
+~(missing (tag))~.  Existence operators apply to =property= / =keyword= /
+=tag= EXPRs only: a heading =field= is always present, so
+~(exists (field …))~ / ~(missing (field …))~ signal ~dorg-ql-error~.  An
+unknown =FIELD=, or an ordered operator on an unordered EXPR, also signals
+~dorg-ql-error~.
+
+~(field FIELD)~ is the *one-argument* value form used inside an operator;
+~(field FIELD VALUE)~ is its *two-argument* equality atom, so =(field
+priority "A")= ≡ ~(~ (field priority) "A")= (just as =(property KEY
+VALUE)= ≡ ~(~ (property KEY) VALUE)=).
+
+*** Heading fields and their order
+
+| Field       | Comparison order | Value          |
+|-------------+------------------+----------------|
+| =id=        | numeric          | integer        |
+| =title=     | string           | string         |
+| =todo=      | string           | string         |
+| =priority=  | Org *rank*       | one-char string or character |
+| =commented= | (= != only)      | =t= or =nil=   |
+| =level=     | numeric          | integer        |
+| =parent-id= | numeric          | integer        |
+
+Comparison order is a property of the *field type*, not of a special
+operator.  =id= / =level= / =parent-id= compare numerically; =title= /
+=todo= lexically (and accept =contains= / =prefix= / =suffix=);
+timestamps use the dedicated ~(timestamp …)~ form.  =priority= compares by
+Org *rank* — =A= highest, then =B=, =C=, …, with no-priority lowest — so
+~(>~ (field priority) "B")= matches =A= and =B=, and a heading with no
+priority never matches an ordered comparison.  A priority value may be
+given as a one-character string (="A"=) or an Org priority character
+(=?A=); both normalize to the same rank.  ~(~ (field id) N)= is the
+prefix form of the ~(id N)~ atom.
+
+** property, keyword, and tag
+
+#+begin_example
+(property KEY VALUE)                    equality atom
+(= (property KEY) VALUE)                equality (prefix form of the atom)
+(exists (property KEY)) (missing (property KEY))
+(contains|prefix|suffix (property KEY) VALUE)
+
+(keyword KEY)                           host has #+KEY:
+(keyword KEY VALUE)                     equality atom
+(= (keyword KEY) VALUE)                 equality (prefix form)
+(exists (keyword KEY)) (missing (keyword KEY))
+(contains|prefix|suffix (keyword KEY) VALUE)
+
+(tag TAG)                               membership atom (has local tag TAG)
+(exists (tag))                          heading has at least one local tag
+(missing (tag))                         heading has no local tag
+(contains|prefix|suffix (tag) VALUE)    some local tag matches
+#+end_example
+
+Property, keyword, and tag matching is *local and non-inherited*, and each
+is evaluated against a single heading host.  Keyword matching does *not*
+reach the file-level document host; document keywords are edited by naming
+=document= explicitly in the mutate DSL (see [[file:mutate.org][docs/mutate.org]]).
+
+* Timestamps and windows
+
+~(timestamp SOURCE REL WINDOW)~ selects headings whose structured Org
+timestamps fall in a date window.
+
+** Sources
+
+| =SOURCE=         | Where the timestamp lives                          |
+|------------------+----------------------------------------------------|
+| =scheduled=      | SCHEDULED planning line                            |
+| =deadline=       | DEADLINE planning line                             |
+| =closed=         | CLOSED planning line                               |
+| =active-ts=      | any active timestamp in the body                   |
+| =logbook=        | any LOGBOOK entry timestamp                         |
+| ~(:property KEY)~ | timestamp value of property =KEY=                  |
+| ~(:property *)~  | any property-drawer timestamp                      |
+
+** Relations
+
+Only ~:overlaps~ is supported today: the timestamp's date span overlaps
+the window.  The design also names ~:within~, ~:starts-before~, and
+~:starts-after~; those are later slices and currently signal
+~dorg-ql-error~.
+
+** Window inputs
+
+A =WINDOW= is either a convenience form or a single bound value.  The
+atomic timestamp aliases accept the same vocabulary in place of their
+=FROM TO= bounds.
+
+Convenience forms:
+
+#+begin_example
+(between FROM TO)   inclusive [FROM, TO]
+(on X)              the single date X
+(before X)          open FROM, on-or-before X
+(after X)           on-or-after X, open TO
+(today)             the current date
+(this-week)         the week containing today
+#+end_example
+
+A bound (=FROM=, =TO=, or the argument of =on=/=before=/=after=) may be:
+
+- a bare ="YYYY-MM-DD"= string (zero-padded);
+- a raw Org timestamp string — active =<2026-07-01>=, inactive
+  =[2026-07-01]=, or a range =<2026-07-01>--<2026-07-03>= (the
+  active/inactive delimiters do not affect matching, and a range
+  contributes its start and end dates);
+- a ~dorg-timestamp~ struct; or
+- =nil=, an *open bound* (~(before X)~ opens =FROM=; ~(after X)~ opens
+  =TO=).
+
+*Relative windows.*  ~(today)~ and ~(this-week)~ resolve against a
+reference time.  =this-week= is the seven-day span containing today,
+starting on ~dorg-ql-week-start-day~ (an integer 0..6, 0 = Sunday;
+default =1=, Monday).  Bind ~dorg-ql-current-time~ to a fixed Emacs time
+value to make relative windows deterministic (used in tests).
+
+** Matching semantics
+
+Window matching is at *date granularity* — clock times are ignored.  A
+timestamp covers the span =[start-date .. (end-date|start-date)]=
+inclusive and matches when that span overlaps =[FROM, TO]=.  ~dorg-ql~
+does *not* perform calendar expansion: repeaters match by their *base*
+(literal start-date) occurrence only, with no future projection.
+Recurrence/agenda policy belongs downstream.
+
+* Pipelines, traversal, and result order
+
+** Traversal relations
+
+A ~(traverse REL...)~ step accepts these tree relations:
+
+| Relation      | Result                                      |
+|---------------+---------------------------------------------|
+| =self=        | keep the current stream                     |
+| =parent=      | the immediate parent (one edge)             |
+| =children=    | immediate children (one edge)               |
+| =ancestors=   | all transitive ancestors                    |
+| =descendants= | all transitive descendants                  |
+| =siblings=    | same-parent headings, excluding self        |
+
+A single =traverse= step takes the *union* of each listed relation — so
+~(traverse self descendants)~ is the whole subtree.  Chain separate hops
+with separate steps.  =ancestors= and =descendants= are guarded against
+parent-id cycles.
+
+** Result order and de-duplication
+
+Every traversal *de-duplicates by heading id* and orders results by their
+position in the input heading list (input/tree order), keeping the first
+occurrence.  ~(unique)~ is available as an explicit step and is also the
+implicit final pass for traversals that can produce duplicates.
+
+** Result shape and selection granularity
+
+Each result is a plist with exactly ~:heading-id~, ~:marker~, ~:title~,
+and ~:properties~ — the same stable shape ~dorg-find~ produces.
+Plain-org results carry *live markers*; model-list and Dolt results carry
+=nil= markers.  An empty match returns =nil=.
+
+*Selection is heading-granular — uniformly.*  The unit of selection is
+the heading: every predicate (~(keyword …)~ included) matches a real
+heading, and the result set is a list of heading result plists.  Mutation
+keeps exactly that selected heading set, then projects each hit to a target
+identity under the source policy: under ~(:property K)~, a K-bearing hit uses
+its extern key while a hit lacking K may use an existing numeric =DORG_ID=.
+Thus mutate ~:targets~ / ~:expected-targets~ may mix extern keys and integer
+ids without changing query membership.  Sub-heading entities — properties,
+keyword occurrences, planning, drawer items, body text, LOGBOOK entries — are
+*not* independently selectable; they are addressed only *relative to a host*
+(see [[file:mutate.org][docs/mutate.org]]).  There is no row/field/aggregate
+reporting projection in DOrg 0.1.0.
+
+The level-0 document host is *outside* the query domain: no predicate
+matches it and it never appears in query results or in a ~(where …)~
+target set.  Document-owned file-level keywords are edited by naming =document=
+explicitly in the mutate DSL (~(on document …)~), never via ~(where …)~.  This
+keeps one target algebra: query results select headings and mutate target sets
+name only those headings through their policy-projected identities.
+
+* Backend support and error semantics
+
+| Source                       | Atomic predicates | v2 composable forms       |
+|------------------------------+----------------+------------------------------|
+| plain-org buffer             | yes            | yes (plain-org executor)     |
+| Dolt buffer                  | yes            | yes (Dolt planner)           |
+| model-list (~dorg-heading~)  | yes            | yes (model evaluator)        |
+
+The model adapter answers every *atomic* timestamp predicate ungated.
+For plain-org and Dolt buffers, the six timestamp predicates
+(=scheduled=, =deadline=, =closed=, =property-ts=, =logbook=, =active-ts=)
+are all lowered natively.  A (backend, predicate) pair with no native
+lowering signals ~dorg-ql-error~ ("not supported on <backend> backend")
+rather than silently widening or emptying the result.
+
+Composable v2 forms run on model-list, plain-org, and Dolt sources.  A
+model-list source is an *ordered forest* of ~dorg-heading~ structs: input
+order is result order, and traversal resolves only headings present in the
+supplied list.  Filter-only model-list pipelines do not require ids to be
+non-nil or unique.  Pipelines containing =traverse= or =unique= require
+unique non-nil ids and signal ~dorg-ql-error~ if that identity contract is
+violated.  Across backends the three adapters reuse one timestamp parser
+and one window predicate, so they converge on identical matches and no
+buffer-backed path materializes the whole tree.
+
+Invalid arity, unknown fields/operators/predicates, malformed query objects,
+and invalid relations all signal ~dorg-ql-error~ with top-level reason
+=invalid-query=.  A known source/backend capability refusal (for example
+~(key V)~ on a model-list source, an unknown backend, or a Dolt negated
+timestamp whose complement cannot be bounded) uses =unsupported=.  These are
+the only two top-level query reasons; callers inspect them with
+~dorg-error-reason~ / ~dorg-error-data~ rather than parsing messages.  Bad
+forms are validated up front, before any registration lookup, so they fail
+the same way regardless of backing storage — and never fall back to a broad
+scan.
+
+* CLI
+
+=bin/dorg query SEXPR= reads exactly one Lisp form and runs it through
+the same ~dorg-ql-select~ path.  The app-owned reader is shared with
+=mutate=, binds =read-eval= to nil, and permits only trailing whitespace.
+Supplied empty, malformed/comment-only, and trailing input fail before source
+resolution as =invalid-form= with detail =empty-input=,
+=malformed-syntax=, or =trailing-input=.  See [[file:cli.org][docs/cli.org]] for source
+selection, output, and build details.
+
+#+begin_src sh
+# A composable pipeline (quote the whole sexp for the shell):
+dorg query '(pipe (where (deadline (this-week))) (traverse children))' -f tasks.org
+
+# Atomic predicate (equality shorthand):
+dorg query '(tag "work")' -f tasks.org
+
+# JSON output is a strict array for 0, 1, and N results:
+dorg query '(>= (field priority) "B")' -f tasks.org --json
+#+end_src
+
+Text output prints one ="<heading-id>\t<title>"= line per hit.  =--json=
+emits a strict JSON array (=[]=, =[obj]=, =[obj …]=) where each hit is
+={heading-id, title, properties}= — never a bare object or empty output
+for a result set.
+
+* Planning examples
+
+These compose filters and traversals for common planning queries.  They
+assume a plain-org or Dolt buffer source.
+
+*High-priority children of headings due this week:*
+
+#+begin_src emacs-lisp
+(dorg-ql-select
+ '(pipe
+   (where (deadline (this-week)))
+   (traverse children)
+   (where (>= (field priority) "B"))))
+#+end_src
+
+Select headings whose DEADLINE falls in the current week, step to their
+immediate children, then keep the children at priority B or higher.
+
+*Ancestors of every high-priority heading:*
+
+#+begin_src emacs-lisp
+(dorg-ql-select
+ '(pipe
+   (where (field priority "A"))
+   (traverse ancestors)
+   (unique)))
+#+end_src
+
+Roll up from each =[#A]= heading to its enclosing context.  =unique= is
+explicit here, though the traversal de-duplicates by default.
+
+*Property-backed due dates due this week (high priority):*
+
+#+begin_src emacs-lisp
+(dorg-ql-select
+ '(pipe
+   (where (and (timestamp (:property "DUE") :overlaps (this-week))
+               (>= (field priority) "B")))))
+#+end_src
+
+For trees that record due dates in a =DUE= property rather than a
+DEADLINE line, ~(timestamp (:property "DUE") :overlaps (this-week))~
+matches the property timestamp; ~(:property *)~ would match any
+property-drawer timestamp.
+
+As CLI invocations:
+
+#+begin_src sh
+dorg query '(pipe (where (deadline (this-week))) (traverse children) (where (>= (field priority) "B")))' -f tasks.org --json
+dorg query '(pipe (where (field priority "A")) (traverse ancestors) (unique))' -f tasks.org
+#+end_src
+
+* jq-style syntax (deferred)
+
+A jq-style, outside-in pipeline syntax is an attractive interactive/CLI
+reader, especially for tree traversal.  It is *deferred*: when it lands,
+it will be a second reader over the *same* normalized AST documented here,
+not a separate engine.  The pipeline AST is designed so an outside-in
+reader maps cleanly onto it.  Until then, the Lisp reader forms above are
+the only supported public syntax — do not treat any jq-style spelling as
+implemented.

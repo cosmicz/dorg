@@ -1,0 +1,22 @@
+#+title: Mixed Semantic Fixture
+#+author: dorg release gate
+#+startup: showall
+#+startup: logdone
+
+Preamble paragraph before the first heading.
+
+* TODO [#A] Project Alpha                                      :work:urgent:
+SCHEDULED: <2026-07-10 Fri> DEADLINE: <2026-07-12 Sun>
+:PROPERTIES:
+:Owner: Alice
+:Effort: 2h
+:END:
+Alpha body paragraph with a [[https://example.test][link]] and /markup/.
+
+** DONE Review notes                                           :review:
+CLOSED: [2026-07-09 Thu 15:30]
+- [X] Read the spec
+- [ ] Confirm the certificate
+
+* COMMENT Archive                                               :archive:
+Historical note that should remain a commented heading.

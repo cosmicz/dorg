@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main, trunk]
+  pull_request:
+    branches: [main, trunk]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        emacs-version: ['30.1']
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: purcell/setup-emacs@master
+        with:
+          version: ${{ matrix.emacs-version }}
+
+      # The suite needs a real Dolt.  Stock v1.86.1 panics in isNoopUpdate on
+      # the headings UPDATE (VARBINARY index + foreign key; upstream PR 10906,
+      # released in v1.86.4).  Pin that release asset and verify its digest
+      # (GitHub release-asset digest, confirmed by hashing the download on
+      # 2026-09-09).  The DOLT_MIN floor moves in a separate production change.
+      - name: Install Dolt 1.86.4
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -sSL -o dolt.tgz https://github.com/dolthub/dolt/releases/download/v1.86.4/dolt-linux-amd64.tar.gz
+          echo "88bdca99086bbac7f2414af2756c962d20a8d9b6463861dc2cf35111f13b6dea  dolt.tgz" | sha256sum -c -
+          tar xzf dolt.tgz
+          sudo install -m 0755 dolt-linux-amd64/bin/dolt /usr/local/bin/dolt
+          rm -rf dolt.tgz dolt-linux-amd64
+          dolt version
+          dolt config --global --add user.name "dorg-ci"
+          dolt config --global --add user.email "dorg-ci@example.invalid"
+
+      - name: Byte-compile
+        run: make compile
+
+      - name: Lint
+        run: make lint
+
+      - name: Test
+        run: make test

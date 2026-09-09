@@ -1,0 +1,89 @@
+#+title: DOrg Changelog
+
+* 0.1.0
+
+DOrg 0.1.0 establishes the DB-as-truth architecture: Dolt-backed
+files are read-only Org projections, and ongoing writes go through typed
+mutation APIs.  Plain-org files keep ordinary Emacs editing.
+
+** Storage and projection model
+
+- Dolt is the source of truth for a bound project.
+- Dolt-backed Org buffers are read-only projections.
+- Exact materialization refreshes the visible Org buffer from a committed
+  revision.
+- Explicit import remains available for bootstrap, recovery, and
+  operator-directed replacement; it is not an ordinary authoring path.
+- The read-only VFS, history browser, warm sessions, and consistency doctor sit
+  on top of the same committed-store model.
+
+** Query and command surfaces
+
+- =dorg-ql= is the shared query language for model, plain-org, and Dolt
+  sources.
+- The CLI, Elisp command layer, and API share the same query forms and
+  convenience predicates.
+- The doctor and Dolt server lifecycle surfaces are available from both CLI and
+  interactive entry points, with documented administrative asymmetries.
+- Interactive mutation currently exposes the narrow =dorg-set-property=
+  command.  The full typed mutation DSL is available through the API and CLI;
+  broader interactive editing remains future work.
+- History browsing/restoration is currently interactive-only.
+
+** Typed mutation and authoring boundary
+
+- The public mutation DSL lowers to typed patch IR and executes under explicit
+  dry-run/apply modes.
+- Extension index projectors can read affected identity-owner partitions built
+  by DOrg from the immutable index context, enabling bounded owner-indexed
+  derived rows without caller payloads, implicit queries, render/reparse, or
+  extension-built closure state.
+- Extension index rebuilds are deterministic from an exact committed revision
+  after projector definitions change.
+- Batch insertion preserves declared order when targeting heading-after
+  anchors across the API and command-line interface.
+- Subtree moves persist the updated heading level for every moved descendant,
+  including deeply nested descendants.
+- Dolt-backed whole-file edit, parse, diff, merge, and write-back
+  reconciliation has been removed.  There is no compatibility facade, save hook
+  fallback, or hidden writable projection path.
+- Plain-org execution preserves ordinary source editing where that backend owns
+  the file.
+- One narrow generic drawer-line insertion is supported:
+  =(insert (drawer-line NAME (occurrence 1)) (before-first) RAW-LINE)=.  It
+  prepends to the first exact-name generic drawer or creates that drawer at the
+  metadata/body boundary when absent.
+
+** Schema and compatibility notes
+
+- Dolt 1.86.4 is the required version floor.  Older Dolt versions are refused
+  when a Dolt-backed operation is attempted, including the 1.86.0 through
+  1.86.3 releases in the same 1.86 series.
+- The public schema starts at version 6 and stores file bindings as
+  Dolt-store-relative paths.  Earlier development stores have no automatic
+  upgrade path and are refused before any write.
+- Legacy raw mutation vocabulary has no compatibility aliases.  Downstreams
+  pinned to older DOrg revisions must migrate to =dorg-api-execute= before
+  deliberately advancing their DOrg pin across that break.
+- The transient Dolt retry customization surface now lives in =dorg-dolt.el=:
+  =dorg-dolt-with-retry=, =dorg-dolt-max-retries=, and
+  =dorg-dolt-retry-base-ms=.
+
+** Operational boundaries
+
+- GNU Emacs 30.1 is the supported CI target.  Emacs 29 is unsupported and
+  unverified; it is excluded from CI without adding a package-level refusal.
+- Startup does not eager-load optional adapters; the default load surface is
+  the core, and pre-release compatibility wrappers and aliases are not part of
+  the public surface.
+- DOrg manages Dolt =sql-server= lifecycle for interactive and explicit CLI
+  server commands.
+- Batch SQL paths attach to an existing server by default and fail closed when
+  no suitable server is available, unless explicit autostart configuration is
+  enabled.
+- Cold import and whole-tree materialization still traverse the document;
+  ordinary warm reads and scoped commands are the intended fast path.
+
+* Released versions
+
+None.

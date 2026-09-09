@@ -1,0 +1,10 @@
+#+title: mysql.el upstream provenance
+
+- Source :: https://github.com/LuciusChen/mysql.el
+- Version :: 0.2.4
+- Commit :: a59dd867884938b2c6d7ea528ffb2a8b093674f5
+- mysql.el SHA-256 :: 42d058c1d8d6463c160402ecba787b8597673e25248a117c9790380e80b14718
+- LICENSE SHA-256 :: 3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
+
+The vendored =mysql.el= is copied byte-for-byte from that commit.  DOrg carries
+no local patch; dependency-path naming remains separate work in =tracked-case=.

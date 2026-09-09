@@ -1,0 +1,41 @@
+Vendored Clime snapshot provenance
+==================================
+
+This directory is a plain source snapshot of selected Clime modules,
+not a git submodule.  Source: https://github.com/ (Clime, by Cosmin Octavian).
+
+Vendored at:
+  clime          commit 9622ad90cd552cc0bef6895e7da71ba617c8506a  (trunk)
+  lib/web-server commit 6357a1c2d1718778503f7ee0909585094117525b
+
+Selectively ported from later clean Clime history:
+  unified invocation event/hook
+    5b05b6daa7b7a39d95ba111d98bab48765800246
+    files: clime-core.el, clime-dsl.el, clime-run.el, clime-serve.el
+  serve not-found invocation event
+    bb332abc9a82270a2d70d4fc4f8477bd73c8ef58
+    files: clime-core.el, clime-serve.el
+  privacy-safe JSONL sink (byte-exact file)
+    338a74122412b5b9d27d3822854260ebd232d83f
+    file: clime-telemetry.el
+
+Clime's package version remains 0.7.1 at those source commits.  The telemetry
+sink is a post-0.7.1 trunk change in upstream's Unreleased section; no upstream
+release tag contains 338a741.  The DOrg snapshot VERSION below is therefore a
+separate vendor revision, not an upstream Clime release number.
+
+VERSION 0.8.2 includes:
+  - clime-serve.el            (optional module; loaded only on demand)
+  - clime-telemetry.el        (privacy-safe local JSONL sink)
+  - lib/web-server/           (network layer for clime-serve; runtime
+                               source + COPYING/README only — no nested
+                               .git, no gitlink, no .elc, no tests)
+
+DOrg retains deliberate local overlays while porting the upstream event seam:
+  - 0ada564 / b4e3515 structured serve error envelopes in clime-run.el and
+    clime-serve.el;
+  - dorg-app.el owns destination policy and the named hook, not an event model.
+
+clime-serve and web-server are NOT loaded by `(require 'clime)` or by the
+base `dorg' CLI; only an explicit serve entry point requires them.
+clime-telemetry is loaded by dorg-app.el but has no network dependency.

@@ -1,0 +1,423 @@
+#+title: dorg Development Guide
+
+This file is the durable architecture and development ledger for DOrg.  It is
+not a task tracker: current work and its evidence live in the project's issue
+tracker, not here.  Keep this file for source-backed design facts, module/test
+maps, contributor commands, and long-lived decisions that should survive
+outside an issue.
+
+* Emacs support scope
+
+GNU Emacs 30.1 is the supported CI target.  Emacs 29 is unsupported and
+unverified following the test-runner skip-handling failure documented in
+[[file:README.org::*Emacs 29 compatibility][Emacs 29 compatibility]].  Excluding a version from CI is not evidence of
+a runtime incompatibility.  The existing package metadata minimum is
+retained; it does not certify compatibility with every permitted version.
+
+* Architecture
+
+DOrg stores Org-shaped documents in either plain Org buffers or Dolt-backed
+relational storage.  A Dolt-backed Org buffer is a read-only projection: users
+read, navigate, query, and refresh it like Org, but writes enter through the
+typed command/mutation door.  This boundary is implemented by
+[[file:dorg-api.el][dorg-api.el]], [[file:dorg-command.el][dorg-command.el]],
+[[file:dorg-app.el][dorg-app.el]], [[file:dorg-mutate.el][dorg-mutate.el]],
+[[file:dorg-mode.el][dorg-mode.el]], and the storage modules listed in
+[[*Modules][Modules]].
+
+** Layer Diagram
+
+Layers are listed top-down; each layer calls downward only.
+
+- Public surfaces ::
+  - [[file:dorg-api.el][dorg-api.el]] — programmatic mutation/query command API
+  - [[file:dorg-command.el][dorg-command.el]] — interactive query and
+    one-property mutation commands
+  - [[file:dorg-app.el][dorg-app.el]] — =bin/dorg= CLI and serve HTTP command
+    tree
+- Query and command facades ::
+  - [[file:dorg-ql.el][dorg-ql.el]] — public select facade
+  - =dorg-ql-*.el= — AST, evaluator, and the model/plain/Dolt adapters
+  - [[file:dorg-session.el][dorg-session.el]] — warm read-only query sessions
+- One mutation door :: a public DSL form or intent lowers to typed patch IR;
+  [[file:dorg-mutate.el][dorg-mutate.el]] plans and simulates the candidate;
+  in-transaction validation gates the commit; the caller receives the commit
+  result and receipt; postimage audit and projection refresh follow.
+- Model and derived views ::
+  - [[file:dorg-model.el][dorg-model.el]] — headings, items, timestamps,
+    LOGBOOK data
+  - [[file:dorg-parse.el][dorg-parse.el]] — Org buffer to model
+  - [[file:dorg-render.el][dorg-render.el]] — model/Dolt to Org text
+  - [[file:dorg-projection.el][dorg-projection.el]] — materialized-view state
+    and regions
+- Storage adapters ::
+  - [[file:dorg-backend.el][dorg-backend.el]] — backend descriptors
+  - [[file:dorg-registry.el][dorg-registry.el]] — file/backend binding
+  - [[file:dorg-repo.el][dorg-repo.el]] — repository and schema lifecycle
+  - [[file:dorg-dolt.el][dorg-dolt.el]] — SQL, commit, transport entry points
+  - [[file:dorg-sql-gen.el][dorg-sql-gen.el]] — SQL text generation from model
+    operations
+  - [[file:dorg-ext.el][dorg-ext.el]] — extension schema and derived-index
+    participants
+- Runtime ::
+  - [[file:dorg-transport.el][dorg-transport.el]] — SQL transport policy
+  - [[file:dorg-dolt-server.el][dorg-dolt-server.el]] — sql-server registry,
+    claims, leases, scrub, discovery
+
+#+name: layer-diagram-mermaid
+#+begin_src mermaid
+flowchart TD
+  subgraph P[Public surfaces]
+    api[dorg-api.el<br>programmatic mutation/query command API]
+    cmd[dorg-command.el<br>interactive query and one-property mutation]
+    app[dorg-app.el<br>bin/dorg CLI and serve HTTP tree]
+  end
+  subgraph Q[Query and command facades]
+    ql[dorg-ql.el select facade]
+    qla[dorg-ql-*.el AST, evaluator, adapters]
+    ses[dorg-session.el warm read-only sessions]
+  end
+  subgraph D[One mutation door]
+    ir[public DSL / intent -> typed patch IR]
+    mut[dorg-mutate.el plan and simulation]
+    val[in-transaction validation]
+    rcpt[commit result, receipt, postimage audit]
+  end
+  subgraph M[Model and derived views]
+    model[dorg-model.el domain model]
+    parse[dorg-parse.el Org -> model]
+    render[dorg-render.el model/Dolt -> Org text]
+    proj[dorg-projection.el materialized-view state]
+  end
+  subgraph S[Storage adapters]
+    be[dorg-backend.el descriptors]
+    reg[dorg-registry.el binding]
+    repo[dorg-repo.el repo/schema lifecycle]
+    dolt[dorg-dolt.el SQL, commit, transport entry]
+    gen[dorg-sql-gen.el SQL generation]
+    ext[dorg-ext.el extension schema/index]
+  end
+  subgraph R[Runtime]
+    tr[dorg-transport.el transport policy]
+    srv[dorg-dolt-server.el sql-server lifecycle]
+  end
+  P --> Q --> D --> M --> S --> R
+#+end_src
+
+** Write Path
+
+1. A caller — ~dorg-api-execute~, ~dorg-set-property~, =dorg mutate=, or the
+   HTTP mutate route — submits a public DSL form or mutation intent.
+2. [[file:dorg-api.el][dorg-api.el]] reads and normalizes the request,
+   protects identity fields, and lowers it to typed patch IR.
+3. [[file:dorg-mutate.el][dorg-mutate.el]] resolves the source, validates the
+   typed patches, plans source-generic effects, and simulates the candidate
+   image.
+4. The store gate and transaction open: ~dorg-mutate-call-with-store-gate~,
+   the SQL session lease, and ~dorg-transaction-commit~ where administrative
+   import needs an exact base.
+5. Pre-commit validation runs HEAD/base checks, structural consistency,
+   extension index candidate validation, and postimage expectations.
+6. Commit and receipt: ~dorg-sql-batch~ / ~dorg-commit~, the mutation log and
+   postimage payloads, and the response envelope.
+7. Derived readers refresh: materialized projections at the exact token,
+   extension read-cache invalidation, and warm session freshness on the next
+   read.
+
+#+name: write-path-mermaid
+#+begin_src mermaid
+flowchart TD
+  caller[Caller<br>dorg-api-execute / dorg-set-property / dorg mutate / HTTP mutate]
+  dsl[Public DSL or mutation intent]
+  api[dorg-api.el<br>read and normalize, protect identity fields,<br>lower to typed patch IR]
+  eng[dorg-mutate.el<br>resolve source, validate typed patches,<br>plan effects, simulate candidate image]
+  gate[Store gate / transaction<br>store gate, SQL lease,<br>administrative exact-base commit where needed]
+  pre[Pre-commit validation<br>HEAD/base checks, structural consistency,<br>extension index candidates, postimage expectations]
+  commit[Commit and receipt<br>SQL batch and Dolt commit,<br>mutation log, postimage payloads, response envelope]
+  refresh[Derived readers refresh<br>projection refresh at exact token,<br>extension cache invalidation, session freshness]
+  caller --> dsl --> api --> eng --> gate --> pre --> commit --> refresh
+#+end_src
+
+Retired boundaries are not supported alternatives.  Whole-file
+edit/parse/diff/three-way reconciliation, save-hook write-back, dirty-buffer
+promotion, and reconciliation conflict production are removed.  The current
+write contract is the typed mutation path documented in
+[[file:docs/mutate.org][docs/mutate.org]].
+Parallel expectation checking has been replaced by candidate/postimage
+validation in the single write path.
+
+** Consumer Boundary
+
+A downstream application reaches typed mutation, query, materialization,
+import, and server lifecycle exclusively through the public surface.
+Supported calls:
+
+- ~dorg-api-execute~
+- ~dorg-command-run-query~
+- ~dorg-ql-select~
+- ~dorg-materialize~ / ~dorg-refresh-materialized-view~
+- ~dorg-register-extension~ and documented extension callbacks
+
+Forbidden above the door:
+
+- raw SQL as an application write API
+- byte-splicing Dolt-backed projections
+- save-hook whole-file reconciliation
+- private =dorg-*--= helpers as compatibility API
+
+#+name: consumer-boundary-mermaid
+#+begin_src mermaid
+flowchart TD
+  down[Downstream application]
+  pub[DOrg public surface]
+  door[typed mutation, query, materialization,<br>import, and server lifecycle]
+  down -->|"dorg-api-execute, dorg-command-run-query,<br>dorg-ql-select, dorg-materialize,<br>dorg-register-extension + documented callbacks"| pub --> door
+  down -. "forbidden: raw SQL writes,<br>byte-splicing projections,<br>save-hook reconciliation,<br>private dorg-*-- helpers" .-x door
+#+end_src
+
+A downstream consumer may pin a vendored =lib/dorg= copy during adoption.  The
+pin is a downstream release decision, not permission to couple new code to DOrg
+internals.  The stable cross-repository contract is the public facade
+documented in [[file:README.org][README.org]], [[file:docs/api.org][docs/api.org]],
+[[file:docs/query.org][docs/query.org]], [[file:docs/mutate.org][docs/mutate.org]],
+[[file:docs/cli.org][docs/cli.org]], and
+[[file:docs/backend-extension.org][docs/backend-extension.org]].
+
+** Server And Transport Topology
+
+- Interactive ~dorg-mode~ :: ~dorg-dolt-auto-server~ starts the
+  [[file:dorg-dolt-server.el][dorg-dolt-server.el]] detached managed daemon,
+  which publishes a claim file in the store; clients then speak strict
+  =mysql.el= transport through [[file:dorg-transport.el][dorg-transport.el]].
+- CLI / batch command :: attaches to a compatible visible managed server;
+  otherwise it fails by default with an explicit start remedy.  Optional
+  ~dorg-dolt-server-autostart~ starts the same detached daemon.
+- One-shot SQL fallback :: internal recovery seam only; it sits outside
+  DOrg's managed-server health and target-selection guarantees.
+- Test/runtime isolation :: DOrg-owned scratch roots live under the test
+  runtime with store-local claims and indexes; cleanup may remove only owned,
+  exact, canonicalized paths.
+
+#+name: server-topology-mermaid
+#+begin_src mermaid
+flowchart LR
+  subgraph starts[Start paths]
+    im[Interactive dorg-mode] --> auto[dorg-dolt-auto-server]
+    cli[CLI / batch command] --> attach[attach to compatible visible managed server]
+    attach -->|none visible| fail[fail with explicit start remedy]
+    attach -->|dorg-dolt-server-autostart| auto
+  end
+  auto --> daemon[dorg-dolt-server.el<br>detached managed daemon]
+  daemon --> claim[claim file in the store]
+  daemon --> mysql[mysql.el strict transport<br>via dorg-transport.el]
+  oneshot[One-shot SQL fallback] -. internal recovery seam only .- daemon
+#+end_src
+
+The authoritative lifecycle code is in
+[[file:dorg-dolt-server.el][dorg-dolt-server.el]].  Transport policy is split
+into [[file:dorg-transport.el][dorg-transport.el]] and the SQL/lease
+implementation in [[file:dorg-dolt.el][dorg-dolt.el]] so callers do not select
+an unmanaged path accidentally.
+
+* Public Surfaces
+
+- Programmatic writes: ~dorg-api-execute~ in [[file:dorg-api.el][dorg-api.el]].
+- Programmatic reads: ~dorg-ql-select~ in [[file:dorg-ql.el][dorg-ql.el]] and
+  ~dorg-command-run-query~ in [[file:dorg-command.el][dorg-command.el]].
+- Interactive commands: ~dorg-query~, ~dorg-goto-id~, ~dorg-set-property~,
+  ~dorg-materialize~, ~dorg-refresh-materialized-view~, ~dorg-doctor~, and
+  ~dorg-history~ through [[file:dorg-mode.el][dorg-mode.el]] /
+  [[file:dorg-command.el][dorg-command.el]].
+- CLI commands: =query=, =id=, =property=, =tag=, =title=, =mutate=, =import=,
+  =doctor=, =serve start|stop|status=, and
+  =dolt list|status|start|stop|stop-all|compact|rebind= through
+  [[file:dorg-app.el][dorg-app.el]].
+- Administrative import: ~dorg-import-document~ in
+  [[file:dorg-import.el][dorg-import.el]].
+- Extension registration and derived indexes: ~dorg-register-extension~ and
+  related documented accessors in [[file:dorg-ext.el][dorg-ext.el]] /
+  [[file:dorg-ext-read.el][dorg-ext-read.el]].
+
+* Modules
+
+#+begin_example
+Module                     Layer              Responsibility / key public entry points
+dorg.el                   public surface      package entry point; dorg-version, dorg-reload, dorg-assign-id
+dorg-api.el               public surface      mutation DSL/intent/IR command API; dorg-api-read, dorg-api-normalize, dorg-api-execute
+dorg-app.el               public surface      Clime CLI/serve app backing bin/dorg; query/mutate/import/doctor/serve/dolt verbs
+dorg-command.el           public surface      interactive query/update facade; dorg-command-run-query, dorg-query, dorg-goto-id, dorg-set-property
+dorg-mode.el              public surface      minor mode, materialization, projection policy, setup; dorg-mode, dorg-setup, dorg-materialize
+dorg-envelope.el          public surface      command ok/data/error envelopes; dorg-envelope-success-json, dorg-envelope-error-json
+dorg-error.el             public surface      shared error root and accessors; dorg-error-data, dorg-error-reason
+dorg-ql.el                query              public query facade; dorg-ql-select
+dorg-ql-ast.el            query              normalized v2 query AST and reader; dorg-ql-normalize
+dorg-ql-core.el           query              shared query validation, timestamp metadata, result shape
+dorg-ql-eval.el           query              backend-neutral boolean/pipeline/traversal evaluator
+dorg-ql-model.el          query              model-list query adapter
+dorg-ql-plain.el          query              plain-org buffer query adapter
+dorg-ql-dolt.el           query              Dolt SQL query adapter
+dorg-session.el           query              warm read-only query session; dorg-session-open/query/refresh/close
+dorg-find.el              query              lookup facade; dorg-find-heading-by-id, dorg-find-headings-by-property
+dorg-mutate.el            mutation door      source-generic mutation engine; dorg-mutate-call-with-store-gate and typed apply/plan internals
+dorg-mutate-grammar.el    mutation door      semantic mutation grammar; render/help/completion inventory
+dorg-sortkey.el           mutation door      fractional order keys; dorg-sortkey-midpoint, dorg-sortkey-rebalance-threshold
+dorg-id.el                mutation door      snowflake ids and DORG_ID readers; dorg-id-generate, dorg-id-at-point
+dorg-transaction.el       mutation door      exact-base administrative transaction; dorg-transaction-commit
+dorg-model.el             model              heading/item/timestamp/LOGBOOK domain model and render planning
+dorg-model-load.el        model              DB to model hydration; dorg-model-load-tree, dorg-model-load-headings
+dorg-parse.el             model              Org buffer to model parser; dorg-parse-buffer and region parsers
+dorg-render.el            model              Dolt/model to Org rendering; dorg-render, dorg-render-island, dorg-render-subtree-ids
+dorg-projection.el        model              materialized-view regions/state; dorg-materialized-view-scope and projection helpers
+dorg-keywords.el          model              root #+KEY reader; dorg-root-keywords, dorg-root-keyword-values
+dorg-timestamp.el         model              structured Org timestamp parser; dorg-timestamp-parse
+dorg-freshness.el         model              raw-byte content hash primitive; dorg-freshness-file-hash
+dorg-dolt.el              storage adapter    Dolt SQL/commit/lease implementation; dorg-sql, dorg-sql-batch, dorg-head-commit, dorg-commit
+dorg-sql-gen.el           storage adapter    SQL generation/lowering from domain operations
+dorg-sql-quote.el         storage adapter    dependency-free SQL literal quoting; dorg-sql-quote, dorg-sql-escape-string
+dorg-transport.el         storage adapter    SQL transport policy above Dolt/server lifecycle
+dorg-schema.el            storage adapter    schema DDL/migrations; dorg-schema-version, dorg-schema-ddl
+dorg-repo.el              storage adapter    repository, root binding, schema migration; dorg-init, dorg-repo-root-id, dorg-rebind-file
+dorg-history.el           storage adapter    DB-level undo/history; dorg-history, dorg-restore-to-commit
+dorg-import.el            storage adapter    explicit full-document bootstrap/recovery import; dorg-import-document
+dorg-doctor.el            storage adapter    DB consistency diagnostics/fixes; dorg-doctor
+dorg-git.el               storage adapter    explicit-directory git primitives
+dorg-git-sync.el          storage adapter    plain-org git sync-branch publication adapter
+dorg-registry.el          storage adapter    file/backend registry; dorg-bind-dolt, dorg-unregister, dorg-registered-backend
+dorg-backend.el           storage adapter    backend descriptors; dorg-backend-plain-org, dorg-backend-dolt
+dorg-sexp-file.el         storage adapter    atomic single-sexp file read/write
+dorg-dolt-server.el       runtime            managed sql-server lifecycle, claims, registry, scrub, attach/stop commands
+dorg-ext.el               extension plane    extension schema, placement, index projection; dorg-register-extension
+dorg-ext-rebuild.el       extension plane    exact-revision derived-index audit/repair; dorg-ext-rebuild-index
+dorg-ext-read.el          extension plane    grouped warm extension hydration and cache invalidation
+dorg-vfs.el               projection         read-only /dorg: file-name-handler; dorg-vfs-enable, dorg-vfs-disable
+#+end_example
+
+* Tests
+
+#+begin_example
+Test file                              Responsibility
+dorg-2ij34-postimage-tests.el         postimage receipt, parity, and audit payloads
+dorg-api-tests.el                      public mutation DSL, typed IR, command API, and safety gates
+dorg-backend-tests.el                  backend descriptors and capability behavior
+dorg-binding-isolation-tests.el        backend binding isolation and contamination guards
+dorg-cli-tests.el                      bin/dorg CLI, serve, invocation history, vendoring
+dorg-command-tests.el                  interactive query/navigation/update command layer
+dorg-doctor-tests.el                   DB consistency diagnostics and fix behavior
+dorg-dolt-server-tests.el              Dolt sql-server lifecycle, claims, cleanup, adoption
+dorg-dolt-tests.el                     Dolt CLI/repo/SQL primitives
+dorg-tracker-cli-dou7f-probe-tests.el downstream tracker command-composition probe coverage
+dorg-envelope-tests.el                 command-boundary envelopes and JSON serialization
+dorg-error-tests.el                    shared error root and accessor taxonomy
+dorg-ext-index-context-tests.el        extension index context and post-mutation images
+dorg-ext-index-projector-tests.el      derived-index projector validation and persistence
+dorg-ext-rebuild-tests.el              exact-revision derived-index rebuild, drift, and parity controls
+dorg-ext-read-tests.el                 extension read-plane hydration and cache invalidation
+dorg-ext-tests.el                      extension registry, schema, placement, participant contracts
+dorg-faithful-tests.el                 downstream-faithful plain-org apply/render behavior
+dorg-find-tests.el                     heading lookup facade
+dorg-freshness-tests.el                content-hash primitive
+dorg-git-sync-tests.el                 plain-org git sync-branch adapter
+dorg-git-tests.el                      explicit-directory git primitives
+dorg-grammar-tests.el                  DORG_ID and identity-drawer grammar constants
+dorg-history-tests.el                  DB-level history browse/restore
+dorg-id-tests.el                       id generation and DORG_ID readers
+dorg-import-tests.el                   administrative import, exact-base transaction, postconditions
+dorg-integration-tests.el              end-to-end integration behavior
+dorg-keywords-tests.el                 root keyword reader
+dorg-lease-tests.el                    endpoint ownership and session-affine leases
+dorg-materialize-lifecycle-tests.el    exact-revision/window materialization lifecycle
+dorg-mode-tests.el                     minor mode, setup, projection policy
+dorg-model-tests.el                    model load/render/accessor behavior
+dorg-mutate-grammar-tests.el           mutation grammar inventory, docs/help/completion drift
+dorg-mutate-linearize-tests.el         multi-writer linearization and exactly-once boundaries
+dorg-mutate-persist-tests.el           atomic plain-org persistence
+dorg-mutate-tests.el                   source-generic mutation engine
+dorg-parse-tests.el                    Org parser and region parser behavior
+dorg-perf-tests.el                     parse/query/mutation benchmarks outside default selector
+dorg-placement-tests.el                placement invariants and promoted-orphan quarantine
+dorg-project-tests.el                  module/test/doc map drift and documentation guards
+dorg-projection-tests.el               projection-buffer regions, marker scan, replacement
+dorg-ql-ast-tests.el                   normalized query AST and reader
+dorg-ql-eval-tests.el                  query evaluator/pipeline behavior
+dorg-ql-tests.el                       query API and adapters
+dorg-reload-tests.el                   module reload discovery and schema heal
+dorg-render-tests.el                   renderer behavior
+dorg-roundtrip-corpus-tests.el         semantic release corpus parse/store/render round trips
+dorg-session-tests.el                  warm read-only sessions and freshness
+dorg-sexp-file-tests.el                atomic sexp-file protocol
+dorg-sortkey-tests.el                  fractional sort-key algorithm
+dorg-sql-gen-tests.el                  SQL generation and heading-op lowering
+dorg-test-infra-tests.el               shared server and CLI seam test infrastructure
+dorg-test-scratch-tests.el             kill-resilient owned scratch roots and cleanup
+dorg-timestamp-tests.el                structured timestamp parser
+dorg-transport-tests.el                SQL transport/client protocol
+dorg-vfs-tests.el                      read-only /dorg: file-name-handler
+#+end_example
+
+* Build And Test Commands
+
+#+begin_src sh
+make test                         # full default ERT selector, ^dorg-test-
+make test SELECT='^dorg-test-ql-' # focused selector
+make test-fast                    # Dolt-free fast partition
+make test-medium                  # Dolt/integration partition
+make compile                      # byte-compile
+make mutate-grammar               # regenerate docs/generated/mutate-grammar.org
+make clean                        # remove build artifacts
+#+end_src
+
+Documentation map changes are guarded by:
+
+#+begin_src sh
+make test SELECT='^dorg-test-project-'
+#+end_src
+
+That selector is the repository's docs checker.  It verifies module/test maps,
+API census rows, demoted-symbol exclusions, CLI external-Dolt-SQL wording, and
+install-surface constraints without starting Dolt.
+
+* Code Style
+
+- Use =lexical-binding: t= in Emacs Lisp files.
+- Prefix public symbols with ~dorg-~ and private implementation helpers with a
+  double-hyphen namespace such as ~dorg-mutate--~.
+- Keep public functions documented with docstrings.
+- Prefer source-generic APIs at boundaries; storage-specific helpers stay below
+  their adapter.
+- Treat Dolt-backed Org buffers and =/dorg:= views as read-only projections.
+  Add a typed command when a write workflow is missing.
+- Keep generated artifacts generated.  In this tree,
+  [[file:docs/generated/mutate-grammar.org][docs/generated/mutate-grammar.org]]
+  is produced by =make mutate-grammar=.
+
+* Adding A Module
+
+1. Add the root module file and provide feature.
+2. Add a direct or transitive require where the module belongs.
+3. If the module defines structs or macros, update ~dorg--reload-priority~ in
+   [[file:dorg.el][dorg.el]].
+4. Add or update tests under =tests/= and require them from
+   [[file:tests/dorg-tests-runner.el][tests/dorg-tests-runner.el]].
+5. Update the [[*Modules][Modules]] and [[*Tests][Tests]] example blocks in this
+   file.
+6. Run the focused tests for the changed area and
+   =make test SELECT='^dorg-test-project-'= when maps or public docs changed.
+
+* History
+
+** Machine-First Reset
+
+The 2026-07-24 machine-first reset stopped treating whole-file three-way
+write-back as the release path.  Subsequent landings removed reconciliation
+modules and conflict-runtime support; the surviving architecture is
+DB-as-truth storage plus read-only projections and typed mutation.
+
+** Deep-DOrg Ratification
+
+The August 2026 mutation and projection work made the single write door
+executable: public requests lower to typed patch IR, the engine simulates a
+candidate image, validates core and extension postconditions before commit, and
+returns structured receipts.  [[file:docs/mutate.org][docs/mutate.org]],
+[[file:docs/api.org][docs/api.org]], and
+[[file:docs/backend-extension.org][docs/backend-extension.org]] are the public
+details; this file records the system shape.

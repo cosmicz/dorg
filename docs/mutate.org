@@ -1,0 +1,975 @@
+#+title: DOrg Mutation API — public DSL and typed patch IR v2
+
+#+begin_quote
+*DOrg 0.1.0 mutation surface.*  This document describes the first public
+mutation interface.
+#+end_quote
+
+This page is the canonical specification for the DOrg 0.1.0
+*mutate* surface.  It is a child of [[file:api.org][docs/api.org]] (the public
+command API entry point) and the write-side companion to the ~dorg-ql~ read surface
+([[file:query.org][docs/query.org]]), whose =where= predicate language is *also* the
+mutation target language.
+
+DOrg *editing DSL*: [[file:cli.org][CLI]] · [[file:query.org][query language]] · *mutation API*.
+
+The mutate surface is a *storage-write contract* over generic Org-shaped
+data: headings, heading metadata, properties, planning, root-level file
+keywords, and tree movement.  It is deliberately *not* a task/bead API:
+it contains no downstream-domain vocabulary (no claim/advance/note/status
+verbs).  Downstream libraries compose their own domain operations out of
+these storage primitives (see [[*Downstream composition][Downstream composition]]).
+
+* Layered architecture
+
+The mutate surface is three layers above the storage executors.  One
+normalization path serves both dry-run and apply.
+
+#+begin_example
+public DSL form  (on …)/(insert (heading …) …)/(batch …)
+   │  dorg-api-read        parse one form, shape-validate
+   ▼
+public forms
+   │  dorg-api-normalize SOURCE
+   │    · lower each public ACTION to TYPED PATCH IR v2
+   │    · expand (where QUERY) targets via dorg-ql-select → concrete ids
+   ▼
+typed patch IR v2   (:op … :target … …)            ← canonical mutation IR
+   │  IR-native engine boundary: the API passes typed patches DIRECTLY —
+   │  dorg-mutate--plan-patches (dry-run) | dorg-mutate--apply-patches (apply)
+   ▼
+shared typed plan/execute core (+ validation and safety guards)
+   │
+   ├── plain-org source-preserving patch executor
+   └── Dolt patch executor → model delta → SQL db-ops
+#+end_example
+
+- *Typed patch IR v2* is THE canonical *semantic* mutation IR — the
+  interface ~dorg-api-execute~ speaks to the engine, and the layer tests and
+  docs freeze.  The IR-native engine boundary is ~dorg-mutate--plan-patches~
+  / ~dorg-mutate--apply-patches~; the command layer and executors carry the
+  same typed patch values end to end.
+- *Database operations* in a Dolt plan are SQL delta statements under
+  ~:db-ops~.  They are storage diagnostics generated after typed execution,
+  not a caller-facing mutation vocabulary.
+
+* DOrg 0.1.0 public mutate DSL
+
+A program is one *form*:
+
+#+begin_example
+FORM   := (on TARGET ACTION...) | (insert HEADING (under STRUCTURAL-TARGET [ANCHOR])) | (batch FORM...)
+TARGET := (id N) | (key V) | document | (where QUERY)
+STRUCTURAL-TARGET := (id N) | (key V) | document
+ANCHOR := (before STRUCTURAL-TARGET) | (after STRUCTURAL-TARGET)
+HEADING := (heading CLAUSE...)
+CLAUSE := (title STRING) | (todo TOKEN) | (priority LETTER) | (tags TAG...)
+        | (property KEY VALUE) | (commented BOOL)
+#+end_example
+
+- ~(id N)~ — one heading by =DORG_ID= (integer or numeric string).
+- ~(key V)~ — one heading by the source's configured identity.  It resolves
+  exactly once at the API boundary: zero matches is =invalid-target= and more
+  than one is =identity-violation=.
+- =document= — the level-0 document host that owns file-level preamble
+  keywords.  Legal *only* for property/keyword/keywords/planning actions;
+  rejected for heading-field, move, and delete-heading actions
+  (=invalid-target=).
+- ~(where QUERY)~ — a ~dorg-ql~ predicate form ([[file:query.org][docs/query.org]]).  It
+  expands to *one patch per matched id* during the same normalization
+  path dry-run uses (see [[*Query-scoped mutation][Query-scoped mutation]]).
+- ~(batch FORM...)~ — an ordered sequence of forms applied as one unit.
+
+#+INCLUDE: "generated/mutate-grammar.org"
+
+** Value domains
+
+Every DSL value has a defined domain; a wrong-typed or out-of-domain
+value signals =invalid-target= (it is never coerced or silently
+dropped).  Values are stored as the *raw* Org text they normalize to —
+DOrg does not interpret property/keyword semantics.
+
+| Slot                    | Domain                                                                 |
+|-------------------------+-----------------------------------------------------------------------|
+| =KEY= (property)        | a non-empty Org property name string; =DORG_ID= rejected              |
+| =KEY= (keyword)         | a non-empty keyword name string; =DORG_=-prefixed names rejected      |
+| property / keyword =VALUE= | a string (the raw text after =KEY:=).  The empty string ="​"= is a legal value; =nil= is *not* — clear a property with ~(delete (property KEY))~ and a keyword with ~(delete (keyword …))~ or ~(delete (keywords …))~, not by writing =nil= |
+| heading =title=         | a string (may be empty)                                               |
+| heading =todo=          | a single whitespace-free token string (e.g. ="DONE"=), or =nil= / ="​"= to clear.  DOrg does *not* validate the token against a configured TODO set — that is a downstream concern |
+| heading =priority=      | a single character ="A"=..="Z"= (or the bare char), or =nil= to clear |
+| heading =tags=          | a list of tag strings, each matching =[A-Za-z0-9_@#%]+=; the empty list ~()~ clears all tags.  Duplicate/!ordering is preserved as given |
+| heading =commented=     | an exact boolean: =t= renders the heading with Org =COMMENT= syntax; =nil= removes =COMMENT=.  Other values are =invalid-target= and are never coerced.  In an =insert heading= constructor the clause is singleton and explicit =nil= is a value, not omission |
+| planning =scheduled= / =deadline= / =closed= | a raw Org timestamp string (e.g. ="<2026-07-01 Wed>"= or ="[2026-07-01]"=), normalized via ~dorg-timestamp~; =nil= clears that planning entry |
+| ~(occurrence N)~        | a *positive integer* N ≥ 1 (one-based).  =0=, a negative, or a non-integer is =invalid-target= |
+| ~(after-last)~          | target-relative collection position.  Insert immediately after the final addressed member; if the collection is empty, use the host item-sequence end |
+| drawer-line =NAME=      | a string matching =[_[:word:]-]+=; spelling is preserved exactly; =PROPERTIES= and =END= are rejected case-insensitively |
+| drawer-line =RAW-LINE=  | one physical string with no CR, LF, or NUL; a complete ~:NAME:~ drawer marker after optional horizontal whitespace is rejected |
+| ~(replace (keywords KEY) V…)~ values | one or more strings.  An *empty* value list is rejected — to remove every occurrence use ~(delete (keywords KEY))~ (one canonical spelling per intent) |
+
+A =VALUE= passed where a list is required (or vice versa), a
+non-string where a string is required, and a missing required value all
+signal =invalid-target= with the offending slot in the error data.
+
+On plain-org, =commented= has two bounded C3 cells.  Updating a concrete heading
+is the sole field-granular exception to the general heading-update refusal; its
+source-preserving editor inserts or removes only the literal =COMMENT = span and
+deliberately does not realign the tag column.  A
+constructor with an explicitly present ~(commented t|nil)~ clause may append one
+child under a concrete heading without a sibling anchor.  Title, TODO, priority,
+tags, and public property clauses may accompany it.  Omitted =commented=,
+=document= parents, sibling anchors, and broader raw typed payloads remain
+unsupported on plain-org.  The new heading is written in its first committed
+image with the requested COMMENT state: there is no visible intermediate image.
+
+Under ~dorg~ identity that same write mints one =DORG_ID= and reports it in
+~:affected :created~.  Under ~(:property KEY)~ identity the constructor must
+carry exactly one =KEY= property, creates no synthetic =DORG_ID=, and reports no
+numeric created id.  Missing, duplicate, or already-existing identity carriers
+fail before any source byte changes.  Dolt retains its full pre-existing
+constructor surface; the bounded plain-org cell does not narrow it.
+
+** Keyword occurrence vs sequence semantics
+
+This is the subtle part of the surface: creation, replacement, and deletion
+must remain explicit rather than collapsing into an implicit upsert.
+
+A host may carry *repeated* same-key keywords — several =#+KEY: …= lines
+with the same =KEY= (e.g. multiple =#+REVIEWERS:= lines).
+DOrg distinguishes two addressable things:
+
+- a *keyword occurrence* — one concrete =#+KEY: VALUE= line under a host,
+  addressed among same-key siblings by a *one-based* ~(occurrence N)~;
+- a *keyword sequence* — the ordered run of *all* same-key occurrences
+  under a host.
+
+The rules:
+
+1. *Whole-sequence* edits operate on the sequence and never need an
+   occurrence selector:
+   - ~(replace (keywords KEY) V1 V2 …)~ sets the sequence to exactly the
+     given values, in order.  At least one value is required; supplying
+     *one* value is the natural *singleton upsert* (a =#+TITLE:=-style
+     single keyword).  To clear every occurrence use =(delete (keywords
+     KEY))=, not an empty =replace=.
+   - ~(delete (keywords KEY))~ removes every occurrence of =KEY=.
+2. *Single-occurrence* edits *require* an explicit occurrence selector and
+   *error* when the occurrence is missing — they never silently append or
+   create:
+   - ~(replace (keyword KEY (occurrence N)) VALUE)~ rewrites occurrence =N=
+     *in place*, preserving its position among siblings.
+   - ~(delete (keyword KEY (occurrence N)))~ removes exactly occurrence =N=.
+3. *Creation is explicit*: a new occurrence is added only by
+   ~(insert (keyword KEY) (after-last) VALUE)~.  =after-last= is relative to
+   the addressed same-key collection: the new item lands immediately after
+   the final existing =KEY= occurrence, before any trailing different-kind or
+   different-key item.  When =KEY= is absent, the creation slot is the end of
+   the host item sequence (index zero for an empty host).
+
+Why this shape:
+
+- The name =occurrence= is *always one-based*: =occurrence 1= is the first
+  same-key line in both the public selector and typed IR.  Only the executor's
+  anonymous list index is zero-based, computed as =nth (1- occurrence)= at the
+  final selection boundary.  One word therefore never carries two bases.
+- There is *no* public ~(set (keyword KEY) VALUE)~.  Such an implicit
+  upsert/append would make create-vs-replace depend on whether an occurrence
+  already exists and hide that decision from the caller.  Singleton set is
+  ~(replace (keywords KEY) V)~; occurrence edits are the explicit verbs
+  above.
+- DOrg stays *schema-neutral*.  It does not know that, say,
+  =REVIEWERS= holds a comma-separated string-list, and it
+  offers *no* "remove one value from a keyword-list" verb.  Removing one
+  reviewer is a downstream (schema-aware consumer) operation: the extension parses the
+  string-list, drops the value, and asks DOrg to
+  ~(replace (keywords "REVIEWERS") "<rewritten>")~.
+
+Examples:
+
+#+begin_src emacs-lisp
+;; Singleton upsert
+(on document (replace (keywords "CATEGORY") "inbox"))
+
+;; Replace the whole repeated-key sequence (order-preserving)
+(on document (replace (keywords "SEQ_TODO") "TODO" "NEXT" "DONE"))
+
+;; Rewrite just the 2nd occurrence in place (errors if there is none)
+(on document (replace (keyword "REVIEWERS" (occurrence 2)) "alice,bob"))
+
+;; Insert immediately after the final same-key occurrence
+(on document (insert (keyword "REVIEWERS") (after-last) "carol"))
+
+;; Delete the 1st occurrence; or delete every occurrence
+(on document (delete (keyword "REVIEWERS" (occurrence 1))))
+(on document (delete (keywords "REVIEWERS")))
+#+end_src
+
+** Text collection vs occurrence semantics
+
+A heading's item sequence may interleave prose text, planning, keywords, and
+drawers.  =text= therefore names the prose *element* being addressed; it does
+not name or replace the whole body container.  Creation addresses the plural
+collection, while strict replacement addresses one singular occurrence:
+
+#+begin_example
+(insert  (text) (after-last) TEXT)
+  -> (:op insert :target (:texts :host H)
+       :position :after-last :value TEXT)
+
+(replace (text (occurrence 1)) TEXT)
+  -> (:op replace :target (:text :host H :occurrence 1)
+       :missing :error :value TEXT)
+#+end_example
+
+The initial replacement capability is deliberately bounded to occurrence 1.
+Another occurrence, a missing selector, or a missing first text item refuses;
+replacement never creates.  Creation accepts only ~(after-last)~.
+
+As with keyword insertion, =after-last= is relative to the addressed
+collection.  A trailing different-kind item does not move the text insertion
+slot to host end:
+
+#+begin_example
+[text OLD, LOGBOOK] + insert text NEW
+  -> [text OLD, text NEW, LOGBOOK]
+#+end_example
+
+When the text collection is empty, its creation slot defaults to the end of
+the host item sequence:
+
+#+begin_example
+[LOGBOOK] + insert text NEW
+  -> [LOGBOOK, text NEW]
+#+end_example
+
+The first rule is an intentional behavior change from the retired
+~(append body TEXT)~ spelling, which appended at whole-host end.  Both old
+body forms are hard-cut: there is no alias or compatibility normalization.
+
+** Generic drawer-line insertion
+
+~(insert (drawer-line NAME (occurrence 1)) (before-first) RAW-LINE)~ is a
+deliberately narrow capability.  It addresses the *first exact-spelling*
+generic drawer named =NAME= and inserts =RAW-LINE= before its existing raw
+lines.  Later same-name drawers, sibling items, and the targeted drawer's
+post-blank are preserved byte-for-byte.  Repeating the command repeats the
+line; deduplication is not part of mutation semantics.
+
+The occurrence is one-based and fixed at =1= in both the public selector and
+typed target.  ~(before-first)~ is the only position
+token, and its order after ~(occurrence 1)~ is part of the grammar.  Any other
+occurrence, position, or selector order signals =invalid-target=.  This closed
+surface exposes no general drawer occurrence editing.
+
+If the named drawer is absent, occurrence 1 is created after leading planning
+and the local property-typed =PROPERTIES= drawer, before body content.  This is
+an explicit exception to the keyword occurrence rule: missing
+~(replace|delete keyword ... (occurrence N))~ is strict and errors, while this
+one drawer-line insertion carries deliberate create-on-absent semantics.
+The protected structural drawers =PROPERTIES= and =END= cannot be targeted.
+
+** DORG_* metadata protection
+
+DOrg-owned metadata is rejected by the public surface, at the typed-IR
+validation layer (early and deterministic), not only deep in the engine:
+
+- The =DORG_ID= property is *identity*, never a mutable property —
+  ~(set (property "DORG_ID") …)~ / ~(delete (property "DORG_ID"))~ are
+  rejected (=invalid-target=).
+- Any keyword whose name begins with =DORG_= (identity, hash, Dolt-dir,
+  and future bookkeeping keywords) is rejected by every keyword action.
+
+** Worked examples
+
+#+begin_src emacs-lisp
+(on (id 100) (set (property "STATUS") "DONE"))
+(on (id 100) (set (heading todo) "DONE"))
+(on (id 100) (set (heading commented) t))
+(on (id 100) (set (heading commented) nil)) ; clear COMMENT
+(on (id 100) (set (planning scheduled) "<2026-07-01>"))
+(on (id 100)
+    (insert (drawer-line "LOGBOOK" (occurrence 1)) (before-first)
+            "- State \"DONE\" from \"TODO\""))
+(insert (heading (title "Inbox") (todo "TODO")) (under document))
+(insert (heading (title "Resolution") (commented t)) (under (key "task-1")))
+(on (id 42) (move (subtree) (under (id 7) (after (id 9)))))
+(batch
+ (on (id 1) (set (property "A") "1"))
+ (on (id 2) (set (property "A") "2")))
+;; query-scoped
+(on (where (property "STATUS" "OPEN")) (set (property "STATUS") "DONE"))
+#+end_src
+
+* Typed patch IR v2
+
+A *patch* is a plist ~(:op OP :target TARGET …)~.  A *program* is one
+patch or ~(:batch PATCH…)~.
+
+=OP= ∈ { =put=, =delete=, =replace=, =insert=, =update=, =move=, =splice= }:
+
+| =OP=     | Meaning                                                        |
+|----------+----------------------------------------------------------------|
+| =put=    | upsert one singleton cell (a property)                          |
+| =replace= | replace existing value(s) in place — one keyword occurrence (~:keyword~ target) or a whole sequence (~:keywords~ target) |
+| =insert= | add one new element (a keyword occurrence, a drawer line, or a heading into the tree) |
+| =delete= | remove a cell / occurrence / group / heading / subtree         |
+| =update= | partial multi-field update of a structured target (heading fields; planning) |
+| =move=   | relocate a heading subtree                                      |
+| =splice= | RESERVED for ordered item-list edits — grammar-only, not implemented |
+
+=put= and =replace= stay distinct (=put= is singleton upsert; =replace= is
+existing-value replacement), so the public surface never reintroduces the
+=set= upsert/append ambiguity.  =update= was formerly named =patch=;
+=update= reads as public semantics rather than an implementation term.
+
+** Target address grammar
+
+#+begin_example
+HOST   := (:heading :id ID) | :root      ; a heading by id, or the root host
+
+TARGET := (:property :host HOST :name NAME)          ; one property cell
+        | (:keyword  :host HOST :name NAME :occurrence N) ; one occurrence, 1-based
+        | (:keywords :host HOST :name NAME)          ; the repeated-key sequence
+        | (:drawer-lines :host HOST :name NAME :occurrence 1) ; first generic drawer
+        | (:planning :host HOST)                     ; the planning line
+        | (:heading  :id ID)                         ; the heading itself (fields / delete)
+        | (:subtree  :id ID)                         ; move / delete-subtree
+        | (:tree :under HOST :before ID? :after ID?) ; an insertion slot
+#+end_example
+
+*One target algebra.*  Every address is a HOST, a heading/subtree, or a
+tree slot, and a HOST is ~(:heading :id ID)~ or ~:root~ — there is no
+separate "bare id" address and no root pseudo-id.  The *same* address
+model is shared everywhere: query-target expansion, mutate ~:targets~ and
+~:expected-targets~, and the CLI / HTTP / Elisp transports.  A heading is
+addressed identically as a host (~:host (:heading :id 100)~) and as a
+target (~(:heading :id 100)~).
+
+The typed ~:occurrence~ is *one-based*, exactly like public
+~(occurrence N)~.  The executor converts N to a zero-based list index only at
+the final =nth (1- N)= selection boundary.  ~:root~ is
+legal only for ~:property~ / ~:keyword~ / ~:keywords~ / ~:planning~
+targets, never for ~:heading~ / ~:subtree~ / ~:tree~.
+The ~:drawer-lines~ target requires a heading host; ~:root~ is rejected.
+
+*Vocabulary: ~:name~ describes, ~:key~ names identity.*  A property /
+keyword target's identifier field is ~:name~ — it merely /describes/
+which cell (a NAME, never an identity handle).  The field ~:key~ is
+reserved for a binding-declared identity: it appears only on the extern
+host ~(:heading :extern t :key IDENTITY-KEY :value V)~ below, where it
+carries the identity-key NAME.  The two never collide on one target — a
+property patch under an extern host reads ~:name~ off the target and
+~:key~ off its ~:host~.
+
+*Root is not query-reachable* (see [[file:query.org][docs/query.org]], /Result shape and
+selection granularity/): ~(where …)~ resolves heading hosts only, so
+query-target expansion yields heading hosts and the externally-shared target
+sets (~:targets~, ~:expected-targets~, =--expect-targets=) contain their
+policy-projected identities: integer ids and/or extern keys.  The ~:root~ host
+enters the algebra only through the public =document= DSL target.
+
+*Identity projection is policy-specific.*  ~(where QUERY)~ keeps its ratified
+multi-target per-id semantics unchanged; only the IDENTITY PROJECTION of the
+matched set depends on the binding's identity POLICY (see [[*Identity policy][Identity policy]]):
+
+- ~dorg~ (Dolt root, or plain-org WITH a ~:DORG_ID:~ drawer) → the integer
+  heading id.  A matched heading with no =DORG_ID= cannot be projected: ~dorg~
+  identity requires an existing id and provisioning is UNAVAILABLE (=unsupported=
+  / =identity-provisioning-unavailable=).  DOrg never injects a =DORG_ID= into a
+  ~(where …)~ match.
+- ~(:property K)~ (a domain PROPERTIES key K is the stable identity) → a hit
+  carrying K projects to the *extern* host
+  ~(:heading :extern t :key K :value VALUE)~.  For a /descriptive/
+  ~(where QUERY)~ only, a hit with K absent but an existing =DORG_ID= projects
+  to ~(:heading :id N)~.  A hit with neither K nor an id is =invalid-target=;
+  a present malformed K is also =invalid-target= and never falls back.  This
+  consumes existing identity only: it never injects =DORG_ID= or K.  Applies
+  are surgical (byte-identical to an in-place =org-entry-put=).
+- =none= → read-only: query-scoped mutation targeting signals =unsupported= /
+  =identity-none= before any plan or write.
+
+*Identity selector ~(key V)~ and its contract.*  A machine caller holding a
+heading's exact identity addresses it directly with the ~(key V)~ selector
+~(~(on (key V) ACTION…)=), parallel to ~(id N)~.  =V= is the identity value;
+the key NAME comes
+from the identity POLICY, never the form: ~(:property K)~ lowers ~(key V)~ to
+~(property K V)~; ~dorg~ lowers it to ~(id V)~ (=DORG_ID= is the owned identity);
+=none= is read-only and signals =unsupported= / =identity-none=.
+It is exactly-one by contract: 0 matches → =invalid-target= (=missing=; but under
+~dorg~, a zero match against a source that CONTAINS an idless heading is instead
+=invalid-target= / =id-bootstrap-unsupported= — an id/key selector cannot
+bootstrap identity onto an unidentified heading); >1 → =identity-violation= (a
+distinct closed reason — store corruption, not a query miss).  Because it
+asserts cardinality ≤ 1, a ~(key V)~ (or ~(one …)~) apply is EXEMPT from the
+~:expected-targets~ ceremony.  The policy identity key is WRITE-PROTECTED:
+~(set (property KEY) …)~ / ~(delete (property KEY))~ is =invalid-target= (the same
+class as the unconditional =DORG_ID= guard), since mutating it would sever the
+identity the extern machinery anchors on.
+
+Direct ~(key V)~ resolution is uniform across surgical and structural forms:
+the API rewrites it through the source identity policy, queries, and enforces
+the exactly-one contract before emitting the typed host.  Nested operands in
+=move= and heading insertion use the same direct ~(key V)~ spelling.  They do
+not accept ~(where …)~ wrappers, and exact key resolution never falls back to
+an id when K is absent.  The wrapper remains legal only as an outer query
+target, ~(on (where (key V)) ACTION…)~, where the special key path keeps that
+same exact identity contract even though it is syntactically query-composed.
+
+*Canonical target token.*  Because ~:targets~ / ~:expected-targets~ /
+=--expect-targets= cross Elisp/JSON/CLI/HTTP, every identity has ONE
+transport-safe wire token, and mixed id+extern sets sort by it deterministically:
+
+- integer id → its decimal string (=101=); JSON keeps it a number;
+- extern → =key:<pct(KEY)>=<pct(VALUE)>=, where =pct= percent-encodes the
+  reserved characters =% , : == plus whitespace, so a comma/whitespace split
+  cannot corrupt a value.
+
+A dry-run returns each match's token in ~:targets~; feeding the identical set
+back as ~:expected-targets~ (Elisp), =--expect-targets= (CLI, comma-separated),
+or the =expect-targets= HTTP parameter confirms the set before apply.
+
+** DSL → typed IR mapping
+
+Here =H= / =HT= are HOSTs — ~(:heading :id N)~ (lowered from a DSL =(id
+N)=), an external-key host ~(:heading :extern t :key K :value V)~ (lowered
+from ~(key V)~ under a ~(:property K)~ binding), or ~:root~ (lowered from
+the public =document= target).  Heading/subtree targets use one inline algebra:
+~(:heading :id N)~ / ~(:subtree :id N)~ for concrete ids and
+~(:heading :extern t :key K :value V)~ / ~(:subtree :extern t :key K :value V)~
+for external-key hosts.  Numeric and external-key sibling anchors both carry
+the typed heading host through native validation.  Nested bounded-key operands
+use the same ~(key V)~ vocabulary as subjects; no separate parent/anchor key
+syntax exists.
+
+#+begin_example
+(set (property K) V)                   → (:op put     :target (:property :host H :name K) :value V)
+(delete (property K))                  → (:op delete  :target (:property :host H :name K))
+(replace (keywords K) V...)            → (:op replace :target (:keywords :host H :name K) :values (V...))
+(delete (keywords K))                  → (:op delete  :target (:keywords :host H :name K))
+(replace (keyword K (occurrence N)) V) → (:op replace :target (:keyword :host H :name K :occurrence N) :value V :missing :error)
+(delete (keyword K (occurrence N)))    → (:op delete  :target (:keyword :host H :name K :occurrence N) :missing :error)
+(insert (keyword K) (after-last) V)    → (:op insert  :target (:keywords :host H :name K) :value V :position :after-last)
+(insert (drawer-line NAME (occurrence 1)) (before-first) LINE)
+                                      → (:op insert  :target (:drawer-lines :host H :name NAME :occurrence 1)
+                                                   :position :front :missing :create :value LINE)
+(set (heading FIELD) V)                → (:op update  :target (:heading :id N|:extern t :key K :value V) :fields (:FIELD V))
+(set (planning FIELD) V)               → (:op update  :target (:planning :host H) :FIELD V)
+(move (subtree) (under T (before|after T2)))
+                                      → (:op move    :target (:subtree :id N|:extern t :key K :value V) :to (:under HT :before|:after H))
+(delete (heading))                     → (:op delete  :target (:heading :id N|:extern t :key K :value V))
+(delete (subtree))                     → (:op delete  :target (:subtree :id N|:extern t :key K :value V))
+(insert (heading …) (under T …))     → (:op insert  :target (:tree :under HT :before? :after?)
+                                                     :heading (:title T :todo TD? :priority P? :tags(..)?
+                                                               :commented BOOL? :items(ITEM…)?))
+#+end_example
+
+Public ~(property K V)~ clauses on an inserted heading normalize immediately
+into one structured =PROPERTIES= drawer item in ~:heading :items~, preserving
+clause order.  Duplicate property keys are preserved as written; this surface
+does not add a duplicate-key policy.  Insert patches do not carry a separate
+~:properties~ field.
+
+The ~(commented BOOL)~ constructor clause normalizes to a present
+~:heading :commented BOOL~ slot.  It is singleton; duplicate clauses and
+non-boolean values are =invalid-target=.  Explicit =nil= survives normalization
+as a present value and therefore differs from an omitted clause.
+
+~(delete (heading))~ removes the heading only — its *direct children* are
+promoted to the deleted heading's parent, keeping their order and
+adjusting levels.  ~(delete (subtree))~ removes the heading and all
+descendants.  Both require a heading host — =document= is rejected
+(=invalid-target=).
+
+** Validation
+
+The normalizer never widens or degrades.  A malformed form, an unknown
+action, a wrong-typed value, a missing required occurrence selector, a
+=document= host on a heading/subtree target, or a =DORG_=-protected
+key/property all *signal* (=invalid-op= / =invalid-target=) — they never
+become a broad or best-effort edit.  This mirrors the read-side rule that
+a malformed query signals ~dorg-ql-error~ rather than matching
+everything.
+
+* Typed engine boundary
+
+The command API hands canonical typed patches directly to the engine.  There
+is no executor-operation adapter and no second mutation vocabulary:
+
+#+begin_src emacs-lisp
+(dorg-mutate--plan-patches  SOURCE PATCHES &optional EXT-INPUTS &rest OPTIONS)
+(dorg-mutate--apply-patches SOURCE PATCHES &optional EXT-INPUTS &rest OPTIONS)
+#+end_src
+
+These are private engine seams used by ~dorg-api-execute~, history restore,
+and in-repository integration code.  External callers use ~dorg-api-execute~
+with either a public FORM or a ~dorg-api-make-mutation-intent~ value so target
+expansion, safety gates, extension-input validation, and the stable command
+envelope remain in force.  The first-class value stores the public form and
+mode-neutral safety options, not typed patches; both public spellings converge
+on the same normalization and execution core.
+
+The engine validates a closed matrix of typed ~(verb target-kind)~ pairs and
+their allowed fields.  Unknown fields, unknown pairs, malformed typed
+addresses, invalid position policies, and DOrg-protected metadata fail closed;
+validation never discards an unrecognized field.  Planning returns
+~:patches~ and ~:patch-support~.  Apply executes those same patches.  Both
+paths share validation and capability classification.
+
+Plain Org applies supported property, keyword, text, and item-sequence patches
+with source-preserving edits.  Dolt applies the same typed patches through its
+working model and lowers only the resulting database delta to ~:db-ops~ SQL.
+The SQL field is a persistence diagnostic, not another mutation language.
+
+Keyword and text insertion implement ~:position :after-last~ natively: each
+inserts after the final member of its addressed collection, or at host end
+when that collection is absent.  No private ordinal sentinel exists.  Text
+replace strictly addresses typed ~:text :occurrence 1~ with ~:missing :error~.
+Whole =replace items=
+replaces the addressed heading's ordered body sequence while the
+source-preserving path keeps its authoritative identity drawer out of band.
+
+* Source descriptors
+
+=SOURCE= names a *storage binding*, never a domain object:
+
+| =SOURCE=                          | Resolves to                                  |
+|-----------------------------------+----------------------------------------------|
+| =nil=                             | the current buffer's registered backend      |
+| a buffer (object or name string)  | that buffer's registered backend             |
+| ~(:buffer BUFFER)~                | a registered live buffer                     |
+| ~(:file PATH)~ / ~(:plain-org PATH)~ | an explicit plain-org file                |
+| ~(:dolt-dir DIR :root-id ID)~     | an explicit Dolt root                        |
+
+A ~:dolt-dir~ requires a string directory *and* an explicit numeric
+~:root-id~.  A buffer/current source with no DOrg registration is
+rejected — there is no backing storage to write.  All resolution failures
+are =invalid-target=.
+
+An explicit ~(:file …)~ / ~(:dolt-dir …)~ descriptor may also carry an
+~:identity~ policy (see [[*Identity policy][Identity policy]]); a buffer/current source takes its
+policy from the registration.  The descriptor key set is closed — any key
+outside ={:buffer :file :plain-org :dolt-dir :root-id :identity}= (including the
+removed legacy ~:faithful~ / ~:identity-key~ keys) is a hard =invalid-target= /
+=unknown-descriptor-key=.
+
+* Identity policy
+
+Every binding has one *identity policy* — the single interpretation of how a
+heading is addressed and which key, if any, is its stable identity.  A resolved
+source exposes it through *one resolver* (~dorg-mutate--source-identity~)
+consumed by the query rewrite, target projection, capability report, write
+guard, and executor alike; there is no second, divergent notion of identity and
+no faithful-versus-non-faithful *write* choice (source preservation is
+backend-derived — every plain-org edit preserves unaffected bytes).
+
+| ~:identity~      | Meaning                                                            |
+|------------------+--------------------------------------------------------------------|
+| ~dorg~           | DOrg owns identity via =DORG_ID=; headings address by integer id.  |
+| ~(:property "K")~ | K is stable identity for keyed headings; descriptive where may project a keyless hit by an existing DORG_ID. |
+| =none=           | read-only: every mutation is refused.                              |
+| nil (unset)      | DERIVE the default from the backend — both Dolt and plain-org default to ~dorg~. |
+
+- The policy is set *programmatically only* — on a ~dorg-registration~ or an
+  explicit descriptor's ~:identity~ key.  Neither the CLI (~dorg mutate~) nor
+  the HTTP (=POST /mutate=) transport exposes ~:identity~; both invoke the same
+  ~dorg-app--mutate-source~ seam and resolve to the derived ~dorg~ default.
+  There is no HTTP-specific default.
+- A malformed ~:identity~ value signals =invalid-target= /
+  =identity-policy-malformed= at source resolution, before any engine work.
+- ~(:property "K")~ NEVER creates, deletes, or changes K: it is write-protected
+  the same as =DORG_ID=, including when a descriptive hit was projected by id.
+  A matched heading missing both K and an existing =DORG_ID= is a structured
+  =invalid-target=.  A present malformed K refuses without id fallback.
+- ~dorg~ NEVER injects a missing =DORG_ID=: provisioning is unavailable
+  (=identity-provisioning-unavailable= on projection; =id-bootstrap-unsupported=
+  on a ~(key V)~ against an idless source).
+- =none= is fail-closed: a non-empty batch signals =unsupported= /
+  =identity-none= before any plan/render/write, and ~(key V)~ /
+  ~(where …)~-scoped mutation targeting under =none= signals the same pair.  The
+  capability report under =none= is a pure all-=unsupported= report (it never
+  signals).
+
+* Command envelope, dry-run/apply, and safety gates
+
+The =mutate= verb wraps the engine in the command envelope and the
+mode/safety contract shared with =query= (see [[file:api.org][docs/api.org]], /DOrg
+Public Command API/).
+
+Envelope (internal, JSON-serializable):
+
+#+begin_src emacs-lisp
+(:command mutate
+ :source (:file P) | (:dolt-dir D :root-id R) | (:buffer B)
+ :mode dry-run | apply
+ :forms (PUBLIC-FORM…) :patches (TYPED-IR…) :targets (IDS…)
+ :base TOKEN? :expected-targets (IDS…)? :allow-broad BOOL?
+ :save BOOL? :message STRING?)
+#+end_src
+
+Mode: *exactly one* of =--dry-run= / =--apply= is required; there is no
+default apply.  Neither/both is a =mode-error=.
+
+The last two keys are Elisp execution options, forwarded only when explicitly
+supplied.  On apply to a live plain-org buffer, ~:save t~ uses DOrg's atomic
+persistence path; nil or omission leaves the buffer modified and unsaved.  An
+explicit file source is atomically rewritten by apply itself, while Dolt
+ignores ~:save~.  ~:message STRING~ supplies the Dolt commit message; omission
+uses the backend default and plain-org ignores it.  Dry-run remains write-free
+even if either option is supplied.  The file-backed CLI apply supplies
+~:save t~ internally; these are not separate public CLI flags.
+
+Safety gates on apply:
+
+- *Base token* (~:base~) — the optimistic-concurrency check, BACKEND-AWARE at
+  the command layer.  For *plain-org*, ~:base~ reflects the ACTUAL resolved
+  source state: a live-buffer token shaped ~(:kind buffer :buffer NAME :file F :tick TICK)~
+  when a buffer visits the source (so an unsaved buffer edit between dry-run and
+  apply is caught), otherwise the file token ~(:kind file :file F :mtime M)~.
+  A supplied ~:base~ is validated HERE at the command layer and is
+  NEVER forwarded to the engine as ~:base-revision~.  For *Dolt*, ~:base~ is the
+  engine's own commit hash, forwarded ONLY as ~:base-commit~ so the native
+  =HASHOF('HEAD')= CAS runs.  A mismatch signals =stale=; a =nil= base means "no
+  check requested".  A dry-run returns the current token as ~:base~; the caller
+  feeds it back on apply.
+- *Dolt attempt and rollback law* — every actual Dolt attempt records the HEAD
+  it loaded, the roots and identity slice it read (or explicit whole-root
+  ~:all~), its write set, and its generated SQL.  Only an equal in-gate HEAD may
+  execute that SQL.  Movement before SQL preserves first-committer-wins:
+  overlapping writes are terminal and disjoint state is loaded and planned
+  again.  Once SQL has run, retry additionally requires a confirmed same-session
+  rollback *and* a public ~:op-id~.  A serialization retry discards the old SQL,
+  releases the gate, and performs a complete bounded re-read/re-plan; without an
+  op-id or after the shared deadline it returns =stale= / =serialization=.  A
+  sibling-order 1062 under a proven equal HEAD is instead terminal
+  =invariant= / =sibling-order-planner-defect=: it is a deterministic planner
+  defect, not concurrent state.  Commit-bearing batches record the closed
+  transaction phase.  A transport-typed failure after the =DOLT_COMMIT=
+  request starts is =indeterminate= / =commit-indeterminate= even when its
+  response hash was lost: classification uses condition type plus
+  =in-commit= phase before database-message classification, sends no
+  =ROLLBACK=, and never enters the re-plan loop.  The caller reconciles with
+  the same op-id.  A non-transport SQL fault in the same phase remains eligible
+  for a definite same-session rollback; phase alone does not imply ambiguity.
+  Raw MySQL messages, SQLSTATE prose, statements, and duplicate values never
+  cross the typed error boundary.
+- *Expected target set* (query-scoped apply only) — applying a form whose
+  target is ~(where QUERY)~ *requires* the caller to pass the exact id set
+  a prior dry-run resolved, as ~:expected-targets~.  Apply re-expands the
+  query and signals =target-set-changed= if the freshly resolved set
+  differs from ~:expected-targets~ (in membership; order is ignored).
+  Omitting ~:expected-targets~ on a query-scoped apply is a hard
+  =expected-targets-required= error — there is no implicit "mutate
+  whatever matches now"; the caller must dry-run, inspect ~:targets~, and
+  confirm.  Single-target forms (~(id N)~, ~(key V)~, =document=) take no
+  expected set.
+  The spelling per transport:
+  - *Elisp*: ~:expected-targets '(101 102)~ (a list of ids);
+  - *CLI*: =--expect-targets 101,102= (comma-separated);
+  - *HTTP*: an =expect-targets= query/body parameter (comma-separated, or
+    a JSON array in a JSON body).
+- *Broad-write threshold* — ~dorg-api-broad-write-threshold~ (default
+  100); an apply over more targets requires =--allow-broad=, else
+  =broad-write-refused=.  This is independent of ~:expected-targets~: a
+  large *confirmed* set still needs =--allow-broad=.
+- *Unsupported patches* — explicit error on apply, data on dry-run; never
+  silently dropped.
+
+* Query-scoped mutation
+
+~(on (where QUERY) ACTION...)~ expands during the *same* normalization
+path dry-run uses: =QUERY= runs through ~dorg-ql-select~ ([[file:query.org][docs/query.org]]),
+yielding concrete ids, and each id gets its own patch.  The selection
+step is the read engine; the mutation step is explicit per-id patches —
+there is no fused "update where" primitive that mutates an unplanned live
+match set.
+
+Selection is *heading-granular* (see [[file:query.org][docs/query.org]], /Result shape and
+selection granularity/): ~(where …)~ resolves real headings only, so a
+query-scoped action edits each matched heading's own
+properties/keywords/planning.  The =document= host is outside the query
+domain — it never appears in a ~(where …)~ target set — so file-level
+keywords are edited only by naming =document= explicitly, e.g.
+~(on document (replace (keyword "REVIEWERS" (occurrence 2)) …))~.
+~(where (keyword KEY …))~ instead selects the *headings* that carry a
+heading-level =#+KEY:= keyword.
+
+The required two-phase flow:
+
+1. *Dry-run* — returns the matched ids in ~:targets~, the per-id patches,
+   the count, and the current source freshness token in
+   ~:base~ (the backend-aware public token: a plain-org buffer/file token,
+   or the Dolt commit).  It *never* mutates.
+2. *Apply* — the caller passes back the dry-run's id set as
+   ~:expected-targets~ (and, normally, the token as ~:base~).  Apply
+   re-expands =QUERY=; if the resolved set differs it signals
+   =target-set-changed= (and =stale= if the token moved).  Omitting
+   ~:expected-targets~ is =expected-targets-required=.  An apply over more
+   than ~dorg-api-broad-write-threshold~ confirmed targets additionally
+   requires =--allow-broad=.
+
+#+begin_src emacs-lisp
+;; Phase 1
+(let* ((intent
+        (dorg-api-make-mutation-intent
+         '(on (where (property "STATUS" "OPEN"))
+              (set (property "STATUS") "DONE"))))
+       (plan (dorg-api-execute intent :mode 'dry-run))
+       ;; Phase 2 — functionally promote the request with the exact approval.
+       (approved
+        (dorg-api-mutation-intent-with
+         intent
+         :expected-targets (plist-get plan :targets)
+         :base (plist-get plan :base))))
+  (dorg-api-execute approved :mode 'apply))
+#+end_src
+
+The raw FORM + keyword spelling remains equivalent.  The intent spelling is
+useful when the same logical request crosses an approval boundary: the
+original remains unchanged, while the promoted value owns the returned base
+and target confirmation.  It is an in-memory request value, not a persisted
+or pre-lowered plan.
+
+* Plan and result plists (engine layer)
+
+** Typed engine plan
+
+#+begin_src emacs-lisp
+ (:ok t :dry-run t :source-kind KIND :root-id ID?
+ :base-commit C? :base-revision TOKEN?
+ :patches (TYPED-PATCH ...)
+ :patch-support (CLASSIFICATION ...)
+ :unsupported (CLASSIFICATION ...) :supported BOOL)
+#+end_src
+
+Each =CLASSIFICATION= includes the typed ~:patch~, ~:supported~ boolean, and
+optional ~:reason~ / ~:detail~ fields.  For a readable Dolt repository the plan is enriched in memory (no
+commit) with ~:head-commit~, ~:db-ops~, and ~:created~ / ~:changed~ /
+~:deleted~ id lists.  Typed apply with ~:dry-run t~ returns this same plan.
+The =mutate= command reshapes it into the [[file:api.org][canonical response]]
+and adds ~:intent~.
+
+** Typed engine apply result
+
+#+begin_src emacs-lisp
+;; plain-org
+(:ok t :dry-run nil :source-kind plain-org :root-id ID
+ :base-revision TOKEN? :revision TOKEN :saved BOOL
+ :patches (TYPED-PATCH ...) :created (...) :changed (...) :deleted (...))
+;; dolt (same-root)
+(:ok t :dry-run nil :source-kind dolt :root-id ID
+ :base-commit C? :commit HASH
+ :patches (TYPED-PATCH ...) :created (...) :changed (...) :deleted (...))
+#+end_src
+
+For plain-org, ~:saved~ reflects whether the file was written.  For Dolt,
+a batch whose net effect is empty short-circuits with no commit.
+
+The public CLI/HTTP JSON envelope wraps mutate results under =data=:
+
+#+begin_src json
+{"ok": true,
+ "data": {"command":"mutate","mode":"dry-run",
+          "intent":[...],"patches":[...],"targets":[...],
+          "affected":{...},
+          "supported":true,"unsupported":[],"base-commit":null,
+          "base-revision":"...","new-token":"...",
+          "invalidation":{"roots":[1],"ext-dirty":[]}},
+ "error": null}
+#+end_src
+
+Top-level JSON keys are exactly =ok=, =data=, and =error=; mutate fields such
+as =command=, =mode=, =intent=, =patches=, =targets=, =affected=,
+=base-commit=, =base-revision=, =new-token=, and =invalidation= live only
+under =data=.  ~:intent~ is the public form as written; ~:patches~ is the
+canonical typed IR v2 used by both dry-run and apply.
+
+~:invalidation~ is present only when the engine result contains the key; the
+public reshape preserves even an explicit nil and omits the field when the
+engine omits it (including plain-org).  Its stable scope is ~:roots~ plus
+~:ext-dirty~ — the latter derived deterministically by DOrg from the single
+index-projector result (the owned tables the derived effects touched), not a
+separate ~:dirty-scope~ callback (retired).  A Dolt apply
+additionally carries the advancing ~:head~ and source identity fields
+~:dolt-dir~ / ~:file~; a dry-run in which an index projector ran carries only the
+stable preview, without a head.  Compare that stable subset across
+dry-run/apply, not the apply-only freshness token.  Failures use
+=error.reason=, =error.message=, and optional =error.details=.
+
+** Dry-run projections
+
+A *supported, readable plain-org dry-run* additionally carries a
+~:projections~ list — one entry per target, in canonical token order, giving a
+human-usable before/after preview:
+
+#+begin_src emacs-lisp
+(:target TOKEN :change-kind property|keyword|item|body
+ :before STRING :after STRING :provision P)
+#+end_src
+
+The before/after regions are computed on an ISOLATED copy of the source run
+through the real source-preserving executor, so the live source is never
+touched.  ~:change-kind~ names the kind of edit at that host; ~:provision~ is a
+reserved field, always =nil= (~dorg~ never provisions a =DORG_ID=).  When the
+plan is eligible the field is ALWAYS PRESENT (nil for a zero-match plan); it is
+OMITTED for a Dolt/unsupported/unreadable source or any apply.
+
+* Error model
+
+All failures use one condition.  At the command layer it is
+~dorg-api-error~; at the engine layer it is ~dorg-mutate-error~.  Both
+carry data ~(MESSAGE PLIST)~, where =PLIST= begins with ~:reason~
+followed by structured fields.  Accessors read it without parsing the
+message and mirror each other exactly:
+
+#+begin_src emacs-lisp
+(dorg-api-error-reason ERR)     (dorg-mutate-error-reason ERR)   ; the :reason symbol
+(dorg-api-error-data   ERR)     (dorg-mutate-error-data   ERR)   ; the whole plist
+#+end_src
+
+Both conditions are children of the single public root ~dorg-error~
+(=dorg-error.el=), alongside ~dorg-ql-error~.  A ~(dorg-error ...)~ handler
+catches any of the three, and the generic accessors ~dorg-error-reason~ /
+~dorg-error-data~ read the ~:reason~ and structured plist across the whole
+taxonomy without knowing which leaf is in hand.  The per-symbol accessors
+above delegate to ~dorg-error-data~ but keep their exact per-symbol
+isolation (an api error is not read by ~dorg-mutate-error-data~, and vice
+versa).
+
+The engine reason set (~dorg-mutate-error-reasons~):
+
+| ~:reason~        | Meaning                                                          |
+|------------------+------------------------------------------------------------------|
+| =invalid-op=     | the form/patch is malformed, its verb unknown, or a deferred verb |
+| =invalid-target= | an id, selector, key, value, occurrence, or host is the wrong shape/type, missing, or names DOrg-protected metadata |
+| =unsupported=    | the resolved source cannot execute the patch (contract gap)      |
+| =stale=          | optimistic-concurrency failure: live revision/commit ≠ base      |
+| =invariant=      | a tree/order/schema invariant would be violated                  |
+
+The command envelope adds five reasons: =mode-error= (neither/both of
+dry-run/apply), =expected-targets-required= (a query-scoped apply with no
+~:expected-targets~), =target-set-changed= (the re-expanded query set
+differs from ~:expected-targets~), =broad-write-refused= (over-threshold apply
+without =--allow-broad=), and =identity-violation= (a ~(key V)~ / ~(one …)~
+selector matching more than one heading — store corruption, distinct from a
+=missing= query miss).  Over HTTP these map to 4xx.
+
+Executor-time duplicate external identity is mapped to public
+=identity-violation= only at the API boundary, and only for the narrow engine
+shape =invalid-target= with ~:detail ambiguous~ and a canonical ~(:extern ...)~
+target.  Direct private-engine callers receive ~(invalid-target / ambiguous)~
+unchanged; unrelated ambiguous item selectors are not remapped.
+
+The ~:reason~ set is closed and small; identity-policy and capability specifics
+ride the ~:detail~ field beneath =invalid-target= / =unsupported=:
+
+| ~:detail~                          | Under            | Meaning                                             |
+|------------------------------------+------------------+-----------------------------------------------------|
+| =identity-policy-malformed=        | =invalid-target= | an ~:identity~ descriptor/registration value is not ~dorg~ / ~(:property K)~ / =none= |
+| =unknown-descriptor-key=           | =invalid-target= | a source-descriptor key outside the closed set (e.g. removed ~:faithful~) |
+| =identity-none=                    | =unsupported=    | a mutation (or ~(key V)~) under an =identity=none= (read-only) binding |
+| =identity-provisioning-unavailable= | =unsupported=   | a ~(where …)~ match under ~dorg~ lacks a =DORG_ID= and DOrg will not inject one |
+| =id-bootstrap-unsupported=         | =invalid-target= | a ~(key V)~ under ~dorg~ against a source containing an idless heading |
+| =no-source-preserving-editor=      | =unsupported=    | a plain-org verb/host cell with no in-place editor (root variant, or a whole-verb structural/heading/planning patch); carries the exact C3 ~:variant~ |
+| =missing=                          | =invalid-target= | an absent occurrence, or a ~(key V)~ that simply misses on an all-identified source |
+
+Dolt commit failures keep the same closed top-level reasons and use stable
+~:detail~ values:
+
+| ~:detail~                         | Under       | Meaning |
+|-----------------------------------+-------------+---------|
+| =serialization=                  | =stale=     | transaction serialization failed; rollback completed, but no authorized replan remained |
+| =concurrent-state-unproven=       | =stale=     | a sibling collision occurred without a proven equal attempt HEAD |
+| =sibling-order-planner-defect=    | =invariant= | generated SQL violated =uq_heading_sibling_order= while the gate proved attempt HEAD equality |
+| =constraint=                      | =invariant= | another recognized deterministic database constraint failed |
+| =database-failure=                | =invariant= | an unclassified database failure was rolled back |
+| =rollback-failed=                 | =invariant= | the transaction failed and same-session rollback could not be confirmed |
+| =commit-indeterminate=            | =indeterminate= | transport failed while =DOLT_COMMIT= was in flight or after its hash returned; no rollback is claimed |
+
+These failures may carry stable ~:plan-base~, ~:observed-head~, ~:root-scope~,
+~:identity-scope~, ~:transaction-phase~, numeric ~:db-code~, and normalized
+~:constraint~ facts.  Only the planner-defect verdict carries
+~:head-equal-at-failure t~.  They never carry ~:underlying~ or raw database
+text.
+
+* Edge cases
+
+- *Missing occurrence* — ~(replace|delete keyword KEY (occurrence N))~
+  with no Nth occurrence is =invalid-target= (~:detail missing~), never a
+  silent append/no-op.
+- *Drawer selector boundary* — drawer-line insertion accepts exactly
+  ~(occurrence 1) (before-first)~ in that order.  Other values or positions
+  are =invalid-target=; an absent first drawer is deliberately created.
+- *document on a heading target* — ~(on document (set (heading …) …))~,
+  ~(on document (move …))~, and heading-delete on =document= are =invalid-target=.
+- *both before and after* — supplying both sibling anchors to a move /
+  insert is =invalid-target=.
+- *move under self* — a statically detected =invariant= error.
+- *DORG_-protected* — any =DORG_ID= property or =DORG_=-prefixed keyword
+  action is =invalid-target= at the typed-IR layer.
+- *empty query match* — ~(on (where Q) …)~ matching nothing yields zero
+  patches; dry-run reports an empty target set; an apply confirming that
+  empty set (~:expected-targets ()~) is a no-op success.
+- *query-scoped apply without confirmation* — ~(on (where Q) …) --apply~
+  with no ~:expected-targets~ is =expected-targets-required=; a stale set
+  is =target-set-changed=.
+- *empty replace keywords* — ~(replace (keywords KEY))~ with no values is
+  =invalid-target=; use ~(delete (keywords KEY))~ to clear.
+- *out-of-range occurrence* — ~(occurrence 0)~ or a negative/non-integer
+  is =invalid-target=; an in-range-but-absent occurrence is =invalid-target=
+  with ~:detail missing~.
+- *empty batch / net-zero batch* — a batch with no effective change
+  short-circuits with no commit (Dolt) and ~:saved nil~ where applicable.
+- *cross-root / cross-source move* — only same-root (plain-org + Dolt) and
+  the bounded same-Dolt-dir cross-root archive move are supported; other
+  moves are =unsupported= and surface in dry-run, never silently fail (see
+  [[*Move semantics (engine)][Move semantics]]).
+
+* Move semantics (engine)
+
+A move re-homes a heading and its descendants under a new parent.
+Same-root moves are supported on plain-org and Dolt.  The bounded
+same-Dolt-dir, *different-root* archive move is supported on Dolt as a
+single id-preserving atomic commit (exactly one cross-root move, no other
+patches in the batch).  Cross-repository, Dolt↔plain-org, and plain-org
+different-file moves are =unsupported= in DOrg 0.1.0 — a dry-run never promises
+a move a real apply would reject at dispatch.
+
+* Out of scope
+
+General item-mutation public DSL beyond the narrow drawer-line insertion (the
+reserved =splice= verb and generic item insertion); persisted/executable plan artifacts;
+query group-by/aggregate/projection/order/limit and table results
+(reporting, deferred); a stable item-identity
+mutation DSL (deferred).
+
+* Downstream composition
+
+#+begin_quote
+*This section is downstream composition, not DOrg semantics.*  The mutate
+surface has no knowledge of tasks or any workflow.  A downstream tool
+maps its own domain verbs onto generic heading/property/keyword actions.
+#+end_quote
+
+A downstream "set status" is a property write; "reparent task" is a move;
+"remove a reviewer from a config string-list" is the extension parsing
+the list, dropping the value, and calling =(on document (replace (keywords
+KEY) "<rewritten>"))=.  These mappings live entirely in the downstream
+layer; DOrg stays schema-neutral.
+
+For example, a downstream tool with external key =ID= may insert a raw
+activity line with:
+
+#+begin_src emacs-lisp
+(on (key ID)
+    (insert (drawer-line "LOGBOOK" (occurrence 1))
+            (before-first) RAW-LINE))
+#+end_src
+
+The direct ~(key ID)~ target carries the exactly-one identity contract; the
+drawer-line action itself is defined against any legal heading =TARGET=.
+
+* See also
+
+- [[file:api.org][docs/api.org]] — the public command API entry point.
+- [[file:query.org][docs/query.org]] — the read-side query API and the shared selector sublanguage.
+- [[file:cli.org][docs/cli.org]] — =bin/dorg= =query= / =mutate= command-line surface.
+- [[file:schema.org][docs/schema.org]] — relational schema and sort-key storage contract.

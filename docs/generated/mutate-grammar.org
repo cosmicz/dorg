@@ -1,0 +1,95 @@
+# This file is generated from dorg-mutate-grammar.el.  Do not edit.
+** Semantic mutation grammar
+
+The inventory below is the single semantic source for reference prose, CLI help, and Emacs completion.  The accepted language remains =dorg-api-normalize=; every inventory example is checked against it.
+
+*** Targets and safety
+
+| Target | Cardinality | Missing | Duplicates | Projection | Confirmation |
+|--------+-------------+---------+------------+------------+--------------|
+| ~(id N)~ | exactly-one | invalid-target | impossible | numeric-heading-id | none |
+| ~(key V)~ | exactly-one | invalid-target | identity-violation | exact-source-identity | none |
+| ~document~ | exactly-one | impossible | impossible | document-host | none |
+| ~(where QUERY)~ | zero-many | empty-selection | deduplicated | policy-key-when-present-else-existing-heading-id | expected targets on apply |
+
+A supplied base revision is checked by CAS; omitting it does not imply a check.  Query-scoped apply requires the exact targets resolved by dry-run. Broad-write confirmation is an independent safety gate.
+
+*** Address-refinement law
+
+Collection address components refine left-to-right.  An =occurrence= selector chooses an element of that collection; a position token chooses an insertion slot.  Arity follows the declared address depth and is never padded with a selector that has no referent.
+
+*** Verb laws
+
+- *set*: Assign an intrinsic slot or upsert a unique addressed cell; it may create the cell when absent.
+- *replace-element*: Strictly rewrite an addressed existing occurrence; a missing occurrence is an error.
+- *replace-sequence*: Make the complete sequence equal the supplied non-empty sequence; keyword sequences may materialize when absent.
+- *insert*: Create one element at an explicit position; drawer-line insertion may create its missing first drawer.
+- *delete*: Remove the addressed cell, occurrence, sequence, heading, or subtree.
+
+There is no universal rule that insert is the only creator: property set, keyword-sequence replace, and bounded drawer-line insertion have the creation behavior stated above.
+
+*** Heading fields
+
+Heading fields are intrinsic singleton slots.  Their value domains, clearing assignments, and relational projections are explicit below.
+
+| Field | Value domain | Cardinality | Clearing | Projection |
+|-------+--------------+-------------+----------+------------|
+| title | string | singleton | empty-string | headings.title |
+| todo | token-string-or-nil | singleton | nil-or-empty-string | headings.todo_keyword |
+| priority | priority-string-or-nil | singleton | nil | headings.priority |
+| tags | tag-list | singleton | empty-list | heading_tags |
+| commented | boolean-nil-or-t | singleton | nil | headings.commented |
+
+*** Insert-heading constructor clauses
+
+Constructor clauses initialize one bounded heading subtree in the same mutation. The =commented= clause is an exact singleton boolean; explicit =nil= is a value, not omission.  Empty =items= and =children= clauses likewise remain explicit empty singleton values.  Literal descendants are finite constructor payload, not expanded targets: their created-set size does not feed =dorg-api-broad-write-threshold=; the resolved target count remains independently gated.
+
+| Clause | Value domain | Cardinality | IR field | Projection |
+|--------+--------------+-------------+----------+------------|
+| title | string-or-nil | singleton | title | headings.title |
+| todo | token-string-or-nil | singleton | todo | headings.todo_keyword |
+| priority | priority-string-or-nil | singleton | priority | headings.priority |
+| tags | tag-list | singleton | tags | heading_tags |
+| property | property-key-and-string | repeatable | items | property_entries |
+| commented | boolean-nil-or-t | singleton | commented | headings.commented |
+| items | ordered-item-forms | singleton | items | heading-items |
+| children | recursive-heading-constructors | singleton | children | headings |
+
+*** Clearing law
+
+Clearing is defined per exposed target kind, with one canonical spelling for each supported intent.
+
+| Kind | Clearing | Canonical spelling |
+|------+----------+--------------------|
+| property | delete | ~(delete (property KEY))~ |
+| keyword-occurrence | delete | ~(delete (keyword KEY (occurrence N)))~ |
+| keyword-sequence | delete | ~(delete (keywords KEY))~ |
+| heading | empty-assignment | ~documented nil, empty string, or empty list by FIELD~ |
+| planning | empty-assignment | ~nil~ |
+| items | unsupported-public | ~no public clear; replace requires at least one item~ |
+| text | unsupported-public | ~no public clear~ |
+| drawer-line | unsupported-public | ~no public clear~ |
+
+The full items replacement is a broad hammer: it assigns the complete ordered item sequence and requires at least one item.  The public grammar has no clear-items operation.
+
+*** Productions
+
+| Family | Production | Address depth | Cardinality | Missing | Position | Clearing | Safety |
+|--------+------------+---------------+-------------+---------+----------+----------+--------|
+| Property | ~(set (property KEY) VALUE)~ | 1 | singleton | create | none | delete | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Property | ~(delete (property KEY))~ | 1 | singleton | no-op | none | canonical | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Keyword sequence | ~(replace (keywords KEY) VALUE...)~ | 1 | whole-sequence | materialize | none | delete-only | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Keyword sequence | ~(delete (keywords KEY))~ | 1 | whole-sequence | no-op | none | canonical | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Keyword occurrence | ~(replace (keyword KEY (occurrence N)) VALUE)~ | 1 | one-occurrence | error | none | delete-only | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Keyword occurrence | ~(delete (keyword KEY (occurrence N)))~ | 1 | one-occurrence | error | none | canonical | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Keyword occurrence | ~(insert (keyword KEY) POSITION VALUE)~ | 1 | one-new-occurrence | create-at-host-end | before-first, after-last | unsupported | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Drawer line | ~(insert (drawer-line NAME (occurrence 1)) POSITION RAW-LINE)~ | 2 | one-new-line | create-or-error | before-first, after-last | unsupported | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Heading field | ~(set (heading FIELD) VALUE)~ | 1 | singleton | error | none | empty-assignment-by-field | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Planning field | ~(set (planning FIELD) VALUE)~ | 1 | singleton | error | none | nil-assignment | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Text | ~(insert (text) POSITION TEXT)~ | 0 | one-new-element | create-at-host-end | before-first, after-last | unsupported | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Text | ~(replace (text (occurrence 1)) TEXT)~ | 0 | first-occurrence-only | error | none | unsupported | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Full item sequence | ~(replace (items) ITEM...)~ | 0 | whole-non-empty-sequence | error | none | unsupported-public | base=when-supplied, expected-targets=when-where, broad-write=full-ordered-item-sequence |
+| Tree structure | ~(move (subtree) (under TGT [ANCHOR]))~ | 0 | one-subtree | error | under, before, after | not-applicable | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Tree structure | ~(delete (heading))~ | 0 | one-heading-promote-children | error | none | destructive | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Tree structure | ~(delete (subtree))~ | 0 | one-subtree | error | none | destructive | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Tree structure | ~(insert (heading CLAUSE...) (under TGT [ANCHOR]))~ | 0 | one-new-subtree | error | under, before, after | not-applicable | base=when-supplied, expected-targets=not-applicable, broad-write=bounded-constructor-subtree |
