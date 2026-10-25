@@ -240,6 +240,277 @@ The transient registration is not stored in `dorg--registry'."
     (with-temp-buffer
       (should-not (dorg-current-registration)))))
 
+(ert-deftest dorg-test-current-registration-file-source-is-pure-and-nonvisiting ()
+  "A file string classifies its preamble without binding or visiting it."
+  (let ((dorg--registry nil)
+        (temp-base (make-temp-file "dorg-curreg-file-" t)))
+    (unwind-protect
+        (let* ((org-file (expand-file-name "doc.org" temp-base))
+               (dolt-dir (expand-file-name "store" temp-base)))
+          (make-directory dolt-dir)
+          (with-temp-file org-file
+            (insert "#+DORG_DOLT_DIR: store\n* Heading\n"))
+          (cl-letf (((symbol-function 'dorg-bind-dolt)
+                     (lambda (&rest _) (ert-fail "file classification bound")))
+                    ((symbol-function 'dorg--ensure-registration)
+                     (lambda (&rest _) (ert-fail "file classification ensured"))))
+            (let ((reg (dorg-current-registration org-file)))
+              (should (dorg-registration-p reg))
+              (should (dorg-backend-dolt-p (dorg-registration-backend reg)))
+              (should-not (dorg-backend-root-id (dorg-registration-backend reg)))
+              (should (equal (file-truename org-file)
+                             (dorg-registration-file reg)))
+              (should-not (find-buffer-visiting org-file))
+              (should-not dorg--registry))))
+      (delete-directory temp-base t))))
+
+(ert-deftest dorg-test-current-registration-file-prefers-modified-visiting-buffer ()
+  "A file string returns a visiting buffer's registration without ensuring it."
+  (let ((dorg--registry nil)
+        (temp-base (make-temp-file "dorg-curreg-visiting-" t)))
+    (unwind-protect
+        (let* ((org-file (expand-file-name "doc.org" temp-base))
+               (dolt-dir (expand-file-name "store" temp-base)))
+          (make-directory dolt-dir)
+          (with-temp-file org-file (insert "* Disk plain\n"))
+          (with-temp-buffer
+            (set-visited-file-name org-file t)
+            (insert "#+DORG_DOLT_DIR: store\n* Modified\n")
+            (set-buffer-modified-p t)
+            (cl-letf (((symbol-function 'dorg-bind-dolt)
+                       (lambda (&rest _) (ert-fail "visiting file bound")))
+                      ((symbol-function 'dorg--ensure-registration)
+                       (lambda (&rest _) (ert-fail "visiting file ensured"))))
+              (let ((reg (dorg-current-registration org-file)))
+                (should (dorg-registration-p reg))
+                (should (dorg-backend-dolt-p (dorg-registration-backend reg)))
+                (should-not (dorg-backend-root-id (dorg-registration-backend reg)))
+                (should-not dorg--registry)))))
+      (delete-directory temp-base t))))
+
+(ert-deftest dorg-test-current-registration-file-ignores-block-marker ()
+  "A DOrg keyword in a source block cannot bind a file string."
+  (let ((dorg--registry nil)
+        (temp-base (make-temp-file "dorg-curreg-block-" t)))
+    (unwind-protect
+        (let* ((org-file (expand-file-name "doc.org" temp-base))
+               (dolt-dir (expand-file-name "store" temp-base)))
+          (make-directory dolt-dir)
+          (with-temp-file org-file
+            (insert "#+begin_src text\n#+DORG_DOLT_DIR: store\n#+end_src\n* Heading\n"))
+          (let ((reg (dorg-current-registration org-file)))
+            (should (dorg-registration-p reg))
+            (should (dorg-backend-plain-org-p (dorg-registration-backend reg)))
+            (should-not (find-buffer-visiting org-file))))
+      (delete-directory temp-base t))))
+
+(ert-deftest dorg-test-current-registration-file-ignores-example-and-body-markers ()
+  "Example and body literals cannot become file-source binding declarations."
+  (let ((dorg--registry nil)
+        (temp-base (make-temp-file "dorg-curreg-example-" t)))
+    (unwind-protect
+        (let ((org-file (expand-file-name "doc.org" temp-base)))
+          (with-temp-file org-file
+            (insert "#+begin_example\n#+DORG_DOLT_DIR: ignored-example\n#+end_example\n"
+                    "* Heading\n#+DORG_DOLT_DIR: ignored-body\n"))
+          (let ((reg (dorg-current-registration org-file)))
+            (should (dorg-backend-plain-org-p (dorg-registration-backend reg)))
+            (should-not (find-buffer-visiting org-file))))
+      (delete-directory temp-base t))))
+
+(ert-deftest dorg-test-current-registration-file-missing-signals-file-error ()
+  "A relative missing file has an explicit ordinary file failure."
+  (let ((temp-base (make-temp-file "dorg-curreg-missing-" t)))
+    (unwind-protect
+        (let ((default-directory temp-base))
+          (should-error (dorg-current-registration "missing.org")
+                        :type 'file-missing))
+      (delete-directory temp-base t))))
+
+(ert-deftest dorg-test-current-registration-file-unreadable-preserves-file-error ()
+  "A present but unreadable file is not misreported as missing."
+  (let ((temp-base (make-temp-file "dorg-curreg-unreadable-" t)))
+    (unwind-protect
+        (let ((org-file (expand-file-name "doc.org" temp-base)))
+          (with-temp-file org-file (insert "* Present\n"))
+          (cl-letf (((symbol-function 'file-readable-p) (lambda (_) nil)))
+            (let ((err (should-error (dorg-current-registration org-file)
+                                     :type 'file-error)))
+              (should-not (eq 'file-missing (car err))))))
+      (delete-directory temp-base t))))
+
+(ert-deftest dorg-test-current-registration-file-long-preamble-is-equivalent ()
+  "A long preamble retains its genuine leading Dolt keyword."
+  (let ((dorg--registry nil)
+        (temp-base (make-temp-file "dorg-curreg-long-" t)))
+    (unwind-protect
+        (let* ((org-file (expand-file-name "doc.org" temp-base))
+               (dolt-dir (expand-file-name "store" temp-base)))
+          (make-directory dolt-dir)
+          (with-temp-file org-file
+            (insert "#+DORG_DOLT_DIR: store\n")
+            (dotimes (_ 2100) (insert "#+AUTHOR: preamble filler\n"))
+            (insert "* Heading\n"))
+          (let ((file-reg (dorg-current-registration org-file))
+                (buffer-reg (with-temp-buffer
+                              (set-visited-file-name org-file t)
+                              (insert-file-contents org-file)
+                              (org-mode)
+                              (dorg-current-registration))))
+            (should (dorg-backend-dolt-p (dorg-registration-backend file-reg)))
+            (should (equal (dorg-backend-dolt-dir (dorg-registration-backend file-reg))
+                           (dorg-backend-dolt-dir (dorg-registration-backend buffer-reg))))))
+      (delete-directory temp-base t))))
+
+(ert-deftest dorg-test-current-registration-file-multibyte-preamble-is-equivalent ()
+  "One byte-zero decode preserves a multibyte preamble exactly as a visit does."
+  (let ((dorg--registry nil)
+        (temp-base (make-temp-file "dorg-curreg-utf8-" t)))
+    (unwind-protect
+        (let* ((org-file (expand-file-name "doc.org" temp-base))
+               (dolt-dir (expand-file-name "store" temp-base)))
+          (make-directory dolt-dir)
+          (with-temp-file org-file
+            (insert "#+DORG_DOLT_DIR: store\n")
+            ;; Crosses the old 8 KiB chunk boundary in a multibyte character.
+            (insert "#+DESCRIPTION: " (make-string 8200 ?x) "\u2603\n* Heading\n"))
+          (let ((file-reg (dorg-current-registration org-file))
+                (buffer-reg (with-temp-buffer
+                              (set-visited-file-name org-file t)
+                              (insert-file-contents org-file)
+                              (org-mode)
+                              (dorg-current-registration))))
+            (should (dorg-backend-dolt-p (dorg-registration-backend file-reg)))
+            (should (equal (dorg-backend-dolt-dir (dorg-registration-backend file-reg))
+                           (dorg-backend-dolt-dir (dorg-registration-backend buffer-reg))))))
+      (delete-directory temp-base t))))
+
+(ert-deftest dorg-test-current-registration-file-inlinetask-preamble-terminates ()
+  "An inline task before the first ordinary heading cannot stall classification."
+  (require 'org-inlinetask)
+  (let ((dorg--registry nil)
+        (temp-base (make-temp-file "dorg-curreg-inline-" t)))
+    (unwind-protect
+        (let* ((org-file (expand-file-name "doc.org" temp-base))
+               (dolt-dir (expand-file-name "store" temp-base)))
+          (make-directory dolt-dir)
+          (with-temp-file org-file
+            (insert "#+DORG_DOLT_DIR: store\n*************** Inline\n*************** END\n* Heading\n"))
+          (let ((reg (dorg-current-registration org-file)))
+            (should (dorg-backend-dolt-p (dorg-registration-backend reg)))))
+      (delete-directory temp-base t))))
+
+(ert-deftest dorg-test-current-registration-file-legacy-and-literals-match-buffer ()
+  "Legacy, absolute, example, and body literals retain canonical semantics."
+  (let ((dorg--registry nil)
+        (temp-base (make-temp-file "dorg-curreg-literals-" t)))
+    (unwind-protect
+        (let* ((org-file (expand-file-name "doc.org" temp-base))
+               (dolt-dir (expand-file-name "store" temp-base)))
+          (make-directory dolt-dir)
+          (with-temp-file org-file
+            (insert (format "#+DORG_DIR: %s\n" dolt-dir)
+                    "#+begin_example\n#+DORG_DOLT_DIR: ignored-example\n#+end_example\n"
+                    "* Heading\n#+DORG_DOLT_DIR: ignored-body\n"))
+          (let ((file-reg (dorg-current-registration org-file))
+                (buffer-reg (with-temp-buffer
+                              (set-visited-file-name org-file t)
+                              (insert-file-contents org-file)
+                              (org-mode)
+                              (dorg-current-registration))))
+            (should (dorg-backend-dolt-p (dorg-registration-backend file-reg)))
+            (should (equal (file-name-as-directory (file-truename dolt-dir))
+                           (dorg-backend-dolt-dir (dorg-registration-backend file-reg))))
+            (should (equal (dorg-backend-dolt-dir (dorg-registration-backend file-reg))
+                           (dorg-backend-dolt-dir (dorg-registration-backend buffer-reg))))))
+      (delete-directory temp-base t))))
+
+(ert-deftest dorg-test-current-registration-file-prefers-deleted-visiting-buffer ()
+  "A visiting buffer remains authoritative after its backing file disappears."
+  (let ((dorg--registry nil)
+        (temp-base (make-temp-file "dorg-curreg-deleted-" t)))
+    (unwind-protect
+        (let* ((org-file (expand-file-name "doc.org" temp-base))
+               (dolt-dir (expand-file-name "store" temp-base)))
+          (make-directory dolt-dir)
+          (with-temp-file org-file (insert "* Disk plain\n"))
+          (with-temp-buffer
+            (set-visited-file-name org-file t)
+            (insert "#+DORG_DOLT_DIR: store\n* Unsaved\n")
+            (delete-file org-file)
+            (cl-letf (((symbol-function 'dorg-bind-dolt)
+                       (lambda (&rest _) (ert-fail "visiting file bound")))
+                      ((symbol-function 'dorg--ensure-registration)
+                       (lambda (&rest _) (ert-fail "visiting file ensured"))))
+              (should (dorg-backend-dolt-p
+                       (dorg-registration-backend (dorg-current-registration org-file)))))))
+      (delete-directory temp-base t))))
+
+(ert-deftest dorg-test-current-registration-file-cleans-scratch-on-error ()
+  "An error while creating the reader cannot retain the owned preamble buffer."
+  (let ((temp-base (make-temp-file "dorg-curreg-cleanup-" t)))
+    (unwind-protect
+        (let ((org-file (expand-file-name "doc.org" temp-base)))
+          (with-temp-file org-file (insert "* Heading\n"))
+          (cl-letf (((symbol-function 'org-mode)
+                     (lambda (&rest _) (error "fixture reader error"))))
+            (should-error (dorg-current-registration org-file))
+            (should-not
+             (catch 'found
+               (dolist (buffer (buffer-list))
+                 (when (string-prefix-p " *dorg-preamble*" (buffer-name buffer))
+                   (throw 'found t)))))))
+      (delete-directory temp-base t))))
+
+(ert-deftest dorg-test-current-registration-file-reader-delays-major-mode-hooks ()
+  "A private reader does not activate generic major-mode hooks."
+  (let ((temp-base (make-temp-file "dorg-curreg-hooks-" t))
+        (major-mode-ran nil))
+    (unwind-protect
+        (let ((org-file (expand-file-name "doc.org" temp-base))
+              (after-change-major-mode-hook
+               (list (lambda () (setq major-mode-ran t)))))
+          (with-temp-file org-file (insert "* Plain\n"))
+          (dorg-current-registration org-file)
+          (should-not major-mode-ran))
+      (delete-directory temp-base t))))
+
+(ert-deftest dorg-test-current-registration-file-enters-org-mode-empty ()
+  "The reader initializes Org before it owns any projection bytes."
+  (let ((temp-base (make-temp-file "dorg-curreg-empty-mode-" t))
+        sizes)
+    (unwind-protect
+        (let ((org-file (expand-file-name "doc.org" temp-base))
+              (original-org-mode (symbol-function 'org-mode)))
+          (with-temp-file org-file
+            (insert "#+DORG_DOLT_DIR: store\n" (make-string 50000 ?x) "\n* Heading\n"))
+          (cl-letf (((symbol-function 'org-mode)
+                     (lambda (&rest args)
+                       (push (buffer-size) sizes)
+                       (apply original-org-mode args))))
+            (should (dorg-current-registration org-file))
+            ;; The insert-before-org-mode mutant observes the full body here.
+            (should (equal '(0) sizes))))
+      (delete-directory temp-base t))))
+
+(ert-deftest dorg-test-current-registration-file-does-not-read-setupfile ()
+  "A source SETUPFILE is inert while the empty reader enters Org mode."
+  (let ((temp-base (make-temp-file "dorg-curreg-setupfile-" t))
+        reads)
+    (unwind-protect
+        (let ((org-file (expand-file-name "doc.org" temp-base))
+              (original-insert-file-contents (symbol-function 'insert-file-contents)))
+          (with-temp-file org-file
+            (insert "#+SETUPFILE: missing-setup.org\n#+DORG_DOLT_DIR: store\n* Heading\n"))
+          (cl-letf (((symbol-function 'insert-file-contents)
+                     (lambda (file &rest args)
+                       (push (expand-file-name file) reads)
+                       (apply original-insert-file-contents file args))))
+            (should (dorg-current-registration org-file))
+            (should (equal (list (file-truename org-file))
+                           (mapcar #'file-truename reads)))))
+      (delete-directory temp-base t))))
+
 ;;; ─── Pure Classification vs. Strict Ensure (tracked-regression) ────────────
 ;;
 ;; The registry must separate PURE source classification from EFFECTFUL
@@ -726,6 +997,238 @@ itself instead of delegating."
         ;; No strict-bind DDL leaked into the registry.
         (should-not leaks)))))
 
+(ert-deftest dorg-test-bind-existing-dolt-resolves-only-existing-root ()
+  "The safe reader bind uses only the read-only schema/root path.
+It records a registration only after canonicalization, compatibility, and a
+concrete existing root all succeed; every strict or write primitive is a hard
+failure seam."
+  (let ((dorg--registry nil)
+        (calls '())
+        (raw-file "/Base/Doc.org")
+        (raw-dir "/Base/DB")
+        (want-file "/base/doc.org")
+        (want-dir "/base/db/"))
+    (cl-letf (((symbol-function 'file-truename) #'identity)
+              ((symbol-function 'dorg--canonical-existing-case)
+               (lambda (path) (downcase path)))
+              ((symbol-function 'file-directory-p)
+               (lambda (path)
+                 (member path (list want-dir
+                                    (expand-file-name ".dolt" want-dir)))))
+              ((symbol-function 'dorg-repo-ensure-schema)
+               (lambda (dir) (push (list 'schema dir) calls)))
+              ((symbol-function 'dorg-repo-check-schema-compat)
+               (lambda (&rest _)
+                 (ert-fail "safe bind used core-only compatibility")))
+              ((symbol-function 'dorg-repo-root-id)
+               (lambda (dir file) (push (list 'root dir file) calls) 31337))
+              ((symbol-function 'dorg-bind-dolt)
+               (lambda (&rest _) (ert-fail "safe bind reached strict bind")))
+              ((symbol-function 'dorg-repo-ensure-root)
+               (lambda (&rest _) (ert-fail "safe bind reached strict root")))
+              ((symbol-function 'dorg-init)
+               (lambda (&rest _) (ert-fail "safe bind initialized")))
+              ((symbol-function 'dorg-migrate-schema)
+               (lambda (&rest _) (ert-fail "safe bind migrated")))
+              ((symbol-function 'dorg--create-root)
+               (lambda (&rest _) (ert-fail "safe bind created root")))
+              ((symbol-function 'dorg-repo-file-row-count)
+               (lambda (&rest _) (ert-fail "safe bind counted rows")))
+              ((symbol-function 'dorg-sql-batch)
+               (lambda (&rest _) (ert-fail "safe bind batched SQL")))
+              ((symbol-function 'dorg-commit)
+               (lambda (&rest _) (ert-fail "safe bind committed"))))
+      (let ((reg (dorg-bind-existing-dolt raw-file raw-dir)))
+        (should (equal (nreverse calls)
+                       (list (list 'schema want-dir)
+                             (list 'root want-dir want-file))))
+        (should (= 31337 (dorg-backend-root-id
+                          (dorg-registration-backend reg))))
+        (should (assoc want-file dorg--registry))))))
+
+(ert-deftest dorg-test-bind-existing-dolt-unbound-is-path-mismatch ()
+  "An unbound file refuses without observing row count or mutating registry.
+This reason is intentionally distinct from the existing corrupt-root
+`missing-root' condition emitted by `dorg-repo-root-id'."
+  (let* ((stored (make-dorg-registration
+                  :backend (dorg-backend-dolt "/other/" 9)
+                  :file "/other/doc.org"))
+         (dorg--registry (list (cons "/other/doc.org" stored)))
+         (before dorg--registry)
+         (dir "/store/")
+         (file "/source.org"))
+    (cl-letf (((symbol-function 'file-truename) #'identity)
+              ((symbol-function 'dorg--canonical-existing-case) #'identity)
+              ((symbol-function 'file-directory-p)
+               (lambda (path)
+                 (member path (list dir (expand-file-name ".dolt" dir)))))
+              ((symbol-function 'dorg-repo-ensure-schema) (lambda (&rest _) nil))
+              ((symbol-function 'dorg-repo-root-id) (lambda (&rest _) nil))
+              ((symbol-function 'dorg-bind-dolt)
+               (lambda (&rest _) (ert-fail "unbound safe bind reached strict bind")))
+              ((symbol-function 'dorg-repo-ensure-root)
+               (lambda (&rest _) (ert-fail "unbound safe bind reached strict root")))
+              ((symbol-function 'dorg-init)
+               (lambda (&rest _) (ert-fail "unbound safe bind initialized")))
+              ((symbol-function 'dorg-migrate-schema)
+               (lambda (&rest _) (ert-fail "unbound safe bind migrated")))
+              ((symbol-function 'dorg-repo-file-row-count)
+               (lambda (&rest _) (ert-fail "unbound safe bind counted rows")))
+              ((symbol-function 'dorg--create-root)
+               (lambda (&rest _) (ert-fail "unbound safe bind created root")))
+              ((symbol-function 'dorg-sql-batch)
+               (lambda (&rest _) (ert-fail "unbound safe bind batched SQL")))
+              ((symbol-function 'dorg-commit)
+               (lambda (&rest _) (ert-fail "unbound safe bind committed"))))
+      (let ((err (should-error (dorg-bind-existing-dolt file dir)
+                               :type 'dorg-binding-error)))
+        (should (eq 'path-mismatch (dorg-binding-error-reason err)))
+        (should (equal dir (plist-get (dorg-binding-error-data err) :dolt-dir)))
+        (should (equal file (plist-get (dorg-binding-error-data err) :file)))
+        (should (eq before dorg--registry))))))
+
+(ert-deftest dorg-test-bind-existing-dolt-missing-store-precedes-effects ()
+  "A missing store produces the typed refusal before SQL or server startup."
+  (let ((dorg--registry nil)
+        (dir "/missing-store/")
+        (file "/source.org"))
+    (cl-letf (((symbol-function 'file-truename) #'identity)
+              ((symbol-function 'dorg--canonical-existing-case) #'identity)
+              ((symbol-function 'file-directory-p) (lambda (&rest _) nil))
+              ((symbol-function 'dorg-sql)
+               (lambda (&rest _) (ert-fail "missing store reached SQL")))
+              ((symbol-function 'dorg-repo--ordinary-read)
+               (lambda (&rest _) (ert-fail "missing store read schema")))
+              ((symbol-function 'dorg-dolt-server--start-bootstrap)
+               (lambda (&rest _) (ert-fail "missing store started server")))
+              ((symbol-function 'dorg-bind-dolt)
+               (lambda (&rest _) (ert-fail "missing store reached strict bind")))
+              ((symbol-function 'dorg-repo-ensure-root)
+               (lambda (&rest _) (ert-fail "missing store reached strict root")))
+              ((symbol-function 'dorg-init)
+               (lambda (&rest _) (ert-fail "missing store initialized")))
+              ((symbol-function 'dorg-migrate-schema)
+               (lambda (&rest _) (ert-fail "missing store migrated")))
+              ((symbol-function 'dorg--create-root)
+               (lambda (&rest _) (ert-fail "missing store created root")))
+              ((symbol-function 'dorg-repo-file-row-count)
+               (lambda (&rest _) (ert-fail "missing store counted rows")))
+              ((symbol-function 'dorg-sql-batch)
+               (lambda (&rest _) (ert-fail "missing store batched SQL")))
+              ((symbol-function 'dorg-commit)
+               (lambda (&rest _) (ert-fail "missing store committed")))
+              ((symbol-function 'dorg-repo-ensure-schema)
+               (lambda (&rest _) (ert-fail "missing store checked schema")))
+              ((symbol-function 'dorg-repo-root-id)
+               (lambda (&rest _) (ert-fail "missing store looked up root"))))
+      (let ((err (should-error (dorg-bind-existing-dolt file dir)
+                               :type 'dorg-binding-error)))
+        (should (eq 'missing-store (dorg-binding-error-reason err)))
+        (should (equal dir (plist-get (dorg-binding-error-data err) :dolt-dir)))
+        (should (equal file (plist-get (dorg-binding-error-data err) :file)))
+        (should-not dorg--registry)))))
+
+(ert-deftest dorg-test-bind-existing-dolt-rejects-missing-or-file-dolt-dir ()
+  "A real store directory without a `.dolt' directory never reaches effects.
+This distinguishes a missing `.dolt' entry from a missing store directory and
+also rejects a regular file named `.dolt'."
+  (let* ((root (make-temp-file "dorg-mxwnw-missing-store-" t))
+         (store (expand-file-name "store" root))
+         (file (expand-file-name "source.org" root))
+         (dorg--registry nil))
+    (unwind-protect
+        (progn
+          (make-directory store)
+          (with-temp-file file (insert "* Source\n"))
+          (cl-letf (((symbol-function 'dorg-sql)
+                     (lambda (&rest _) (ert-fail "missing store reached SQL")))
+                    ((symbol-function 'dorg-repo--ordinary-read)
+                     (lambda (&rest _) (ert-fail "missing store read schema")))
+                    ((symbol-function 'dorg-dolt-server--start-bootstrap)
+                     (lambda (&rest _) (ert-fail "missing store started server")))
+                    ((symbol-function 'dorg-bind-dolt)
+                     (lambda (&rest _) (ert-fail "missing store reached strict bind")))
+                    ((symbol-function 'dorg-repo-ensure-root)
+                     (lambda (&rest _) (ert-fail "missing store reached strict root")))
+                    ((symbol-function 'dorg-init)
+                     (lambda (&rest _) (ert-fail "missing store initialized")))
+                    ((symbol-function 'dorg-migrate-schema)
+                     (lambda (&rest _) (ert-fail "missing store migrated")))
+                    ((symbol-function 'dorg--create-root)
+                     (lambda (&rest _) (ert-fail "missing store created root")))
+                    ((symbol-function 'dorg-repo-file-row-count)
+                     (lambda (&rest _) (ert-fail "missing store counted rows")))
+                    ((symbol-function 'dorg-sql-batch)
+                     (lambda (&rest _) (ert-fail "missing store batched SQL")))
+                    ((symbol-function 'dorg-commit)
+                     (lambda (&rest _) (ert-fail "missing store committed"))))
+            (dolist (case '(absent regular-file))
+              (when (eq case 'regular-file)
+                (with-temp-file (expand-file-name ".dolt" store)
+                  (insert "not a directory")))
+              (let ((err (should-error (dorg-bind-existing-dolt file store)
+                                       :type 'dorg-binding-error)))
+                (should (eq 'missing-store (dorg-binding-error-reason err)))
+                (should (equal (file-name-as-directory (file-truename store))
+                               (plist-get (dorg-binding-error-data err) :dolt-dir)))
+                (should (equal (file-truename file)
+                               (plist-get (dorg-binding-error-data err) :file)))
+                (should-not dorg--registry)))))
+      (delete-directory root t))))
+
+(ert-deftest dorg-test-bind-existing-dolt-cold-loads-typed-missing-store ()
+  "A cold registry-only process reaches the typed missing-store refusal.
+The child proves the function loads `dorg-repo' before it constructs the
+binding condition; deleting that require yields an untyped void-function."
+  (let* ((root (file-name-directory (locate-library "dorg-registry")))
+         (expr
+          "(progn (require 'dorg-registry) (let ((err (condition-case e (progn (dorg-bind-existing-dolt \"/nonexistent-mx/source.org\" \"/nonexistent-mx/db\") nil) (error e)))) (unless (and (eq (car err) 'dorg-binding-error) (eq (dorg-binding-error-reason err) 'missing-store)) (error \"wrong cold refusal: %S\" err))))"))
+    (with-temp-buffer
+      (let ((status (call-process "emacs" nil (current-buffer) nil
+                                  "--batch" "-Q"
+                                  "-L" root
+                                  "-L" (expand-file-name "lib/clime" root)
+                                  "--eval" expr)))
+        (ert-info ((buffer-string))
+          (should (equal 0 status)))))))
+
+(ert-deftest dorg-test-bind-existing-dolt-preserves-corrupt-root-refusal ()
+  "The safe reader does not collapse a corrupt binding into an unbound miss."
+  (let ((dorg--registry nil)
+        (dir "/store/")
+        (file "/source.org"))
+    (cl-letf (((symbol-function 'file-truename) #'identity)
+              ((symbol-function 'dorg--canonical-existing-case) #'identity)
+              ((symbol-function 'file-directory-p)
+               (lambda (path)
+                 (member path (list dir (expand-file-name ".dolt" dir)))))
+              ((symbol-function 'dorg-repo-ensure-schema) (lambda (&rest _) nil))
+              ((symbol-function 'dorg-repo-root-id)
+               (lambda (&rest _)
+                 (dorg-repo--binding-error
+                  'missing-root "corrupt root" :root-id 88)))
+              ((symbol-function 'dorg-bind-dolt)
+               (lambda (&rest _) (ert-fail "corrupt safe bind reached strict bind")))
+              ((symbol-function 'dorg-repo-ensure-root)
+               (lambda (&rest _) (ert-fail "corrupt safe bind reached strict root")))
+              ((symbol-function 'dorg-init)
+               (lambda (&rest _) (ert-fail "corrupt safe bind initialized")))
+              ((symbol-function 'dorg-migrate-schema)
+               (lambda (&rest _) (ert-fail "corrupt safe bind migrated")))
+              ((symbol-function 'dorg--create-root)
+               (lambda (&rest _) (ert-fail "corrupt safe bind created root")))
+              ((symbol-function 'dorg-repo-file-row-count)
+               (lambda (&rest _) (ert-fail "corrupt safe bind counted rows")))
+              ((symbol-function 'dorg-sql-batch)
+               (lambda (&rest _) (ert-fail "corrupt safe bind batched SQL")))
+              ((symbol-function 'dorg-commit)
+               (lambda (&rest _) (ert-fail "corrupt safe bind committed"))))
+      (let ((err (should-error (dorg-bind-existing-dolt file dir)
+                               :type 'dorg-binding-error)))
+        (should (eq 'missing-root (dorg-binding-error-reason err)))
+        (should (= 88 (plist-get (dorg-binding-error-data err) :root-id)))
+        (should-not dorg--registry)))))
+
 (ert-deftest dorg-test-registry-owns-no-strict-bind-ddl ()
   "The registry no longer straddles into strict-bind DDL.
 The relocated primitives and the orchestrator are owned by the `dorg-repo'
@@ -748,8 +1251,9 @@ defined the DDL, declared six Dolt stubs, and required `dorg-id' itself."
                     (insert-file-contents (find-library-name "dorg-repo"))
                     (buffer-string)))
         (case-fold-search nil))
-    ;; (i) Only the lazy strict-bind entry point is declared.  The neutral
-    ;;     projection capability is a direct lightweight dependency.
+    ;; (i) The registry declares its strict entry and the three read-only
+    ;;     existing-store helpers.  The neutral projection capability is a
+    ;;     direct lightweight dependency.
     (let ((decls '()))
       (with-temp-buffer
         (insert reg-src)
@@ -758,12 +1262,14 @@ defined the DDL, declared six Dolt stubs, and required `dorg-id' itself."
                 "(declare-function[ \t]+\\([^ \t\n]+\\)" nil t)
           (push (match-string 1) decls)))
       (should (equal (sort (delete-dups decls) #'string<)
-                     '("dorg-repo-ensure-root"))))
+                     '("dorg-repo--binding-error"
+                       "dorg-repo-ensure-root"
+                       "dorg-repo-ensure-schema"
+                       "dorg-repo-root-id"))))
     (should (string-match-p "(require 'dorg-projection)" reg-src))
     ;; (ii) NO direct call to any member of the full strict-bind DDL set.
     (dolist (fn '("dorg-sql" "dorg-sql-batch" "dorg-sql-quote" "dorg-commit"
-                  "dorg-init" "dorg-repo-ensure-schema"
-                  "dorg-repo-root-id" "dorg--create-root"))
+                  "dorg-init" "dorg--create-root"))
       (should-not (string-match-p
                    (concat "(" (regexp-quote fn) "\\_>") reg-src)))
     ;; (iii) The dorg-id dependency moved with the helper: registry drops it,

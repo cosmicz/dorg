@@ -67,6 +67,34 @@ Body line two after a blank.
   "Explicit faithful plain-org source descriptor for FILE (identity-key BEAD_ID)."
   (list :file file :identity '(:property "BEAD_ID")))
 
+(defun dorg-test-faithful--unit-file ()
+  "Return a fresh nonexistent source in a writable temp directory."
+  (concat (make-temp-name
+           (expand-file-name (format "dorg-test-faithful-unit-%s-" (emacs-pid))
+                             temporary-file-directory))
+          ".org"))
+
+(defmacro dorg-test-faithful--with-unit-files (&rest body)
+  "Run BODY and check that its synthetic source locks are reclaimed."
+  (declare (indent 0))
+  `(let (unit-files body-completed)
+     (cl-flet ((dorg-test-faithful--unit-file ()
+                 (let ((file (dorg-test-faithful--unit-file)))
+                   (push file unit-files)
+                   file)))
+       (unwind-protect
+           (prog1 (progn ,@body)
+             (setq body-completed t))
+         (let (leftovers)
+           (dolist (file unit-files)
+             (let ((lock (dorg-file-lock-path file)))
+               (dolist (path (list lock (concat lock ".reclaim")))
+                 (when (file-attributes path 'string)
+                   (push path leftovers)
+                   (ignore-errors (delete-file path))))))
+           (when body-completed
+             (should-not leftovers)))))))
+
 (defun dorg-test-faithful--kill-visiting (file)
   "Kill FILE's visiting buffer when one exists."
   (let ((buf (find-buffer-visiting file)))
@@ -418,43 +446,44 @@ still expands to per-id patches exactly as the ratified contract requires."
 
 (ert-deftest dorg-test-51gsn-mixed-target-dry-run-apply-roundtrip ()
   "Mixed extern+ID query targets survive the expected-target safety envelope."
-  (let ((applied 0)
-        (hits '((:heading-id 202
-                 :properties (("BEAD_ID" . "bead-002") ("STATUS" . "OPEN")))
-                (:heading-id 101 :properties (("STATUS" . "OPEN"))))))
-    (cl-letf (((symbol-function 'dorg-ql-select) (lambda (&rest _) hits))
-              ((symbol-function 'dorg-mutate--plan-patches)
-               (lambda (&rest _)
-                 '(:ok t :dry-run t :source-kind plain-org :root-id 1
-                   :base-revision "t" :supported t :patches nil)))
-              ((symbol-function 'dorg-mutate--apply-patches)
-               (lambda (&rest _)
-                 (setq applied (1+ applied))
-                 '(:ok t :dry-run nil :source-kind plain-org :root-id 1
-                   :revision "t2" :created nil :changed (101 202) :deleted nil
-                   :patches nil))))
-      (let* ((src (dorg-test-faithful--source "/x.org"))
-             (form '(on (where (property "STATUS" "OPEN"))
-                        (set (property "STATUS") "DONE")))
-             (dry (dorg-api-execute form :mode 'dry-run :source src))
-             (targets (plist-get dry :targets)))
-        (should
-         (equal '(101 (:extern :key "BEAD_ID" :value "bead-002")) targets))
-        (should (equal targets
-                       (mapcar (lambda (token)
-                                 (dorg-api-parse-target-token
-                                  (dorg-api-target-token token)))
-                               targets)))
-        (dorg-api-execute form :mode 'apply :source src
-                          :expected-targets targets)
-        (should (= 1 applied))
-        (should
-         (eq 'target-set-changed
-             (dorg-test-faithful--api-reason
-              (lambda ()
-                (dorg-api-execute form :mode 'apply :source src
-                                  :expected-targets '(101))))))
-        (should (= 1 applied))))))
+  (dorg-test-faithful--with-unit-files
+   (let ((applied 0)
+         (hits '((:heading-id 202
+			      :properties (("BEAD_ID" . "bead-002") ("STATUS" . "OPEN")))
+                 (:heading-id 101 :properties (("STATUS" . "OPEN"))))))
+     (cl-letf (((symbol-function 'dorg-ql-select) (lambda (&rest _) hits))
+               ((symbol-function 'dorg-mutate--plan-patches)
+		(lambda (&rest _)
+                  '(:ok t :dry-run t :source-kind plain-org :root-id 1
+			:base-revision "t" :supported t :patches nil)))
+               ((symbol-function 'dorg-mutate--apply-patches)
+		(lambda (&rest _)
+                  (setq applied (1+ applied))
+                  '(:ok t :dry-run nil :source-kind plain-org :root-id 1
+			:revision "t2" :created nil :changed (101 202) :deleted nil
+			:patches nil))))
+	      (let* ((src (dorg-test-faithful--source (dorg-test-faithful--unit-file)))
+		     (form '(on (where (property "STATUS" "OPEN"))
+				(set (property "STATUS") "DONE")))
+		     (dry (dorg-api-execute form :mode 'dry-run :source src))
+		     (targets (plist-get dry :targets)))
+		(should
+		 (equal '(101 (:extern :key "BEAD_ID" :value "bead-002")) targets))
+		(should (equal targets
+			       (mapcar (lambda (token)
+					 (dorg-api-parse-target-token
+					  (dorg-api-target-token token)))
+				       targets)))
+		(dorg-api-execute form :mode 'apply :source src
+				  :expected-targets targets)
+		(should (= 1 applied))
+		(should
+		 (eq 'target-set-changed
+		     (dorg-test-faithful--api-reason
+		      (lambda ()
+			(dorg-api-execute form :mode 'apply :source src
+					  :expected-targets '(101))))))
+		(should (= 1 applied)))))))
 
 (ert-deftest dorg-test-51gsn-identity-write-guard-covers-id-projected-hit ()
   "The declared K stays write-protected after descriptive ID projection."
@@ -533,32 +562,33 @@ and extern tokens."
   "A query-scoped dry-run on a faithful DORG_ID-less source returns extern
 tokens in :targets; feeding the identical set back as :expected-targets passes
 the safety gate and reaches apply (B3 handshake)."
-  (let ((reached nil))
-    (cl-letf (((symbol-function 'dorg-ql-select)
-               (lambda (&rest _)
-                 '((:heading-id nil :properties (("BEAD_ID" . "bead-001")
-                                                 ("STATUS" . "OPEN"))))))
-              ((symbol-function 'dorg-mutate--plan-patches)
-               (lambda (&rest _)
-                 '(:ok t :dry-run t :source-kind plain-org :root-id 1
-                   :base-revision "t" :supported t :patches nil)))
-              ((symbol-function 'dorg-mutate--apply-patches)
-               (lambda (&rest _)
-                 (setq reached t)
-                 '(:ok t :dry-run nil :source-kind plain-org :root-id 1
-                   :revision "t2" :created nil :changed nil :deleted nil
-                   :patches nil))))
-      (let* ((src (dorg-test-faithful--source "/x.org"))
-             (plan (dorg-api-execute
-                    '(on (where (property "BEAD_ID" "bead-001"))
-                         (set (property "STATUS") "DONE"))
-                    :mode 'dry-run :source src))
-             (targets (plist-get plan :targets)))
-        (should (member '(:extern :key "BEAD_ID" :value "bead-001") targets))
-        (dorg-api-execute
-         '(on (where (property "BEAD_ID" "bead-001")) (set (property "STATUS") "DONE"))
-         :mode 'apply :expected-targets targets :source src)
-        (should reached)))))
+  (dorg-test-faithful--with-unit-files
+   (let ((reached nil))
+     (cl-letf (((symbol-function 'dorg-ql-select)
+		(lambda (&rest _)
+                  '((:heading-id nil :properties (("BEAD_ID" . "bead-001")
+                                                  ("STATUS" . "OPEN"))))))
+               ((symbol-function 'dorg-mutate--plan-patches)
+		(lambda (&rest _)
+                  '(:ok t :dry-run t :source-kind plain-org :root-id 1
+			:base-revision "t" :supported t :patches nil)))
+               ((symbol-function 'dorg-mutate--apply-patches)
+		(lambda (&rest _)
+                  (setq reached t)
+                  '(:ok t :dry-run nil :source-kind plain-org :root-id 1
+			:revision "t2" :created nil :changed nil :deleted nil
+			:patches nil))))
+	      (let* ((src (dorg-test-faithful--source (dorg-test-faithful--unit-file)))
+		     (plan (dorg-api-execute
+			    '(on (where (property "BEAD_ID" "bead-001"))
+				 (set (property "STATUS") "DONE"))
+			    :mode 'dry-run :source src))
+		     (targets (plist-get plan :targets)))
+		(should (member '(:extern :key "BEAD_ID" :value "bead-001") targets))
+		(dorg-api-execute
+		 '(on (where (property "BEAD_ID" "bead-001")) (set (property "STATUS") "DONE"))
+		 :mode 'apply :expected-targets targets :source src)
+		(should reached))))))
 
 ;;; ─── F: faithful surgical keyword/body/item ops (tracked-regression) ───────────
 ;;
@@ -617,7 +647,7 @@ must preserve.  Beta is the untouched sibling heading.")
              src
              (list (dorg-test--keyword-occurrence-patch
                     'replace dorg-test-faithful--alpha-host "FOO" 1
-                    :value "changed" :missing :error)))
+                    :value "changed")))
             :ok))
           (let ((out (dorg-test-faithful--slurp file)))
             ;; changed occurrence re-rendered; sibling occurrence verbatim
@@ -661,8 +691,7 @@ must preserve.  Beta is the untouched sibling heading.")
           (dorg-test-faithful--apply
            src
            (list (dorg-test--keyword-occurrence-patch
-                  'delete dorg-test-faithful--alpha-host "FOO" 1
-                  :missing :error)))
+                  'delete dorg-test-faithful--alpha-host "FOO" 1)))
           (let ((out (dorg-test-faithful--slurp file)))
             (should (string-match-p ":END:\n#\\+FOO:  second\nAlpha body one\\." out))
             ;; exactly one #+FOO line remains
@@ -686,7 +715,7 @@ must preserve.  Beta is the untouched sibling heading.")
                           src
                           (list (dorg-test--keyword-occurrence-patch
                                  'delete dorg-test-faithful--alpha-host
-                                 "FOO" 6 :missing :error)))))))
+                                 "FOO" 6)))))))
           (should (equal dorg-test-faithful--item-fixture
                          (dorg-test-faithful--slurp file))))
       (delete-file file))))
@@ -717,7 +746,7 @@ must preserve.  Beta is the untouched sibling heading.")
           (dorg-test-faithful--apply
            src
            (list (list :op 'insert
-                       :target (list :texts :host dorg-test-faithful--alpha-host)
+                       :target (list :text :host dorg-test-faithful--alpha-host)
                        :position :after-last
                        :value "Appended para.")))
           (let ((out (dorg-test-faithful--slurp file)))
@@ -737,8 +766,7 @@ must preserve.  Beta is the untouched sibling heading.")
            src
            (list (list :op 'replace
                        :target (list :text :host dorg-test-faithful--alpha-host
-                                     :occurrence 1)
-                       :missing :error
+                                     :select '(:occurrence 1))
                        :value "First body, rewritten.")))
           (let ((out (dorg-test-faithful--slurp file)))
             (should (string-match-p "First body, rewritten\\." out))
@@ -876,10 +904,10 @@ must preserve.  Beta is the untouched sibling heading.")
                          (dorg-test-faithful--slurp file))))
       (delete-file file))))
 
-;; F9e — EMPTY is a positive BODY-CLEAR: an empty replace-items clears the
+;; F9e — explicit occurrence deletes clear the
 ;; heading's BODY items while the out-of-band BEAD_ID drawer is preserved
 ;; verbatim (identity is never in the body, so clearing it cannot brick).
-(ert-deftest dorg-test-faithful-replace-items-empty-clears-body-preserves-drawer ()
+(ert-deftest dorg-test-faithful-delete-items-clears-body-preserves-drawer ()
   (let* ((file (dorg-test-faithful--tmpfile dorg-test-faithful--item-fixture))
          (src (dorg-test-faithful--source file))
          (expected
@@ -894,8 +922,10 @@ must preserve.  Beta is the untouched sibling heading.")
            (plist-get
             (dorg-test-faithful--apply
              src
-             (list (dorg-test--items-replace-patch
-                    dorg-test-faithful--alpha-host nil)))
+             (cl-loop for n downfrom 4 to 1
+                      collect (list :op 'delete
+                                    :target (list :item :host dorg-test-faithful--alpha-host
+                                                  :select (list :occurrence n)))))
             :ok))
           (let ((out (dorg-test-faithful--slurp file)))
             (should (equal expected out))
@@ -920,10 +950,10 @@ must preserve.  Beta is the untouched sibling heading.")
                           (list
                            (dorg-test--keyword-occurrence-patch
                             'replace dorg-test-faithful--alpha-host "FOO" 1
-                            :value "changed" :missing :error)
+                            :value "changed")
                            (dorg-test--keyword-occurrence-patch
                             'replace (dorg-test-faithful--external "nope")
-                            "FOO" 1 :value "x" :missing :error)))))))
+                            "FOO" 1 :value "x")))))))
           (should (equal dorg-test-faithful--item-fixture
                          (dorg-test-faithful--slurp file))))
       (delete-file file))))
@@ -962,7 +992,7 @@ must preserve.  Beta is the untouched sibling heading.")
                       ;; would smuggle identity); the BEAD_ID drawer is preserved
                       ;; verbatim out-of-band.
                       '(on (key "a-1")
-                           (replace (items)
+                           (replace (item (all))
                                     (text "New body.")
                                     (keyword "FOO" "solo")))
                       :mode 'apply :source src)))
@@ -992,7 +1022,7 @@ must preserve.  Beta is the untouched sibling heading.")
           (should (plist-get
                    (dorg-api-execute
                     '(on (key "a-1")
-                         (replace (items)
+                         (replace (item (all))
                                   (text "New body.")
                                   (keyword "FOO" "solo")))
                     :mode 'apply :source src)
@@ -1029,7 +1059,7 @@ must preserve.  Beta is the untouched sibling heading.")
 A8: the payload OMITS the identity drawer (submitting it would smuggle
 identity); the BEAD_ID drawer is preserved verbatim out-of-band."
   '(on (key "a-1")
-       (replace (items)
+       (replace (item (all))
                 (text "New body.")
                 (keyword "FOO" "solo"))))
 
@@ -1177,7 +1207,7 @@ shim before `(key ...)' can run."
          (batch
           (list (dorg-test--keyword-occurrence-patch
                  'replace dorg-test-faithful--alpha-host "FOO" 1
-                 :value "changed" :missing :error)
+                 :value "changed")
                 (dorg-test--property-delete-patch
                  dorg-test-faithful--alpha-host "BEAD_ID"))))
     (unwind-protect
@@ -1330,6 +1360,10 @@ shim before `(key ...)' can run."
 (defconst dorg-test-idp--prop-fixture
   "#+title: tasks\n\n* TODO Alpha  :work:\n:PROPERTIES:\n:BEAD_ID:  a-1\n:STATUS:   OPEN\n:END:\nBody.\n* TODO Beta  :misc:\n:PROPERTIES:\n:BEAD_ID:  b-2\n:END:\nBeta body.\n"
   "A plain-org file whose stable identity is the domain property BEAD_ID.")
+
+(defconst dorg-test-idp--planning-fixture-after
+  "#+title: tasks\n\n* TODO Alpha  :work:\nSCHEDULED: <2026-10-15 Thu>\n:PROPERTIES:\n:BEAD_ID:  a-1\n:STATUS:   OPEN\n:END:\nBody.\n* TODO Beta  :misc:\n:PROPERTIES:\n:BEAD_ID:  b-2\n:END:\nBeta body.\n"
+  "Independent literal postimage for the a-1 scheduled planning update.")
 
 ;; An idless heading (no DORG_ID, addressed only by a domain property).
 (defconst dorg-test-idp--idless-fixture
@@ -1812,7 +1846,7 @@ slots only) could not give, so B3 no longer false-passes."
  ("api-target-hosts"          "dorg-api.el"    "dorg-api--target-hosts")
  ("api-project-hit"           "dorg-api.el"    "dorg-api--project-hit")
  ("api-guard-identity-writes" "dorg-api.el"    "dorg-api--guard-identity-key-writes")
- ("api-execute-expected-target" "dorg-api.el"  "dorg-api--execute-intent")
+ ("api-execute-expected-target" "dorg-api.el"  "dorg-api--execute-intent-locked")
  ("executor-patch-support"    "dorg-mutate.el" "dorg-mutate--executor-patch-support")
  ("plain-org-execute"         "dorg-mutate.el" "dorg-mutate--plain-org-execute"))
 
@@ -1884,9 +1918,8 @@ before any write; the source stays byte-unchanged."
 
 ;;; ─── A6: variant-granular capability entries (C3 schema) ───────────────────
 
-(ert-deftest dorg-test-idp-unsupported-variant-exact-error ()
-  "A typed heading update with no source-preserving editor refuses
-with the exact `unsupported'/`no-source-preserving-editor' contract, byte-unchanged."
+(ert-deftest dorg-test-idp-unsupported-post-blank-variant-exact-error ()
+  "A non-line heading field still refuses with its exact C3 contract, byte-unchanged."
   (let* ((file (dorg-test-idp--tmpfile dorg-test-idp--prop-fixture))
          (src (list :file file :identity '(:property "BEAD_ID"))))
     (unwind-protect
@@ -1897,7 +1930,7 @@ with the exact `unsupported'/`no-source-preserving-editor' contract, byte-unchan
                             (dorg-test-faithful--apply
                              src (list (list :op 'update
                                              :target (dorg-test-faithful--external "a-1")
-                                             :fields '(:title "New"))))))))
+                                             :fields '(:post-blank 1))))))))
           (should (equal dorg-test-idp--prop-fixture (dorg-test-idp--slurp file))))
       (delete-file file))))
 
@@ -2114,29 +2147,28 @@ changed value; no whole-tree re-render, no DORG_* added to the unaffected siblin
   "* TODO A\n:PROPERTIES:\n:DORG_ID: 100\n:END:\n")
  ("set-keyword"
   "* TODO A\n:PROPERTIES:\n:DORG_ID: 100\n:END:\nbody\n"
-  (:op insert :target (:keywords :host (:heading :id 100) :name "FOO")
+  (:op insert :target (:keyword :host (:heading :id 100) :name "FOO")
        :position :after-last :value "bar")
   "* TODO A\n:PROPERTIES:\n:DORG_ID: 100\n:END:\nbody\n#+FOO: bar\n")
  ("delete-keyword"
   "* TODO A\n:PROPERTIES:\n:DORG_ID: 100\n:END:\n#+FOO: bar\nbody\n"
-  (:op delete :target (:keywords :host (:heading :id 100) :name "FOO"))
+  (:op delete :target (:keyword :host (:heading :id 100) :name "FOO" :select (:all)))
   "* TODO A\n:PROPERTIES:\n:DORG_ID: 100\n:END:\nbody\n")
  ("insert-item"
   "* TODO A\n:PROPERTIES:\n:DORG_ID: 100\n:END:\nbody\n"
-  (:op insert :target (:texts :host (:heading :id 100))
+  (:op insert :target (:text :host (:heading :id 100))
        :position :after-last :value "EXTRA")
   "* TODO A\n:PROPERTIES:\n:DORG_ID: 100\n:END:\nbody\n\nEXTRA\n")
  ("replace-item"
   "* TODO A\n:PROPERTIES:\n:DORG_ID: 100\n:END:\nold\n"
-  (:op replace :target (:text :host (:heading :id 100) :occurrence 1)
-       :missing :error :value "new")
+  (:op replace :target (:text :host (:heading :id 100) :select (:occurrence 1)) :value "new")
   "* TODO A\n:PROPERTIES:\n:DORG_ID: 100\n:END:\nnew\n")
  ;; MIXED drawer (identity DORG_ID + non-identity OWNER with distinctive 4-space
  ;; alignment): the exact whole-file pin proves the ENTIRE drawer is preserved
  ;; verbatim out-of-band, not reconstructed from the identity line alone.
  ("replace-items"
   "* TODO A\n:PROPERTIES:\n:DORG_ID: 100\n:OWNER:    bob\n:END:\nold body\n"
-  (:op replace :target (:items :host (:heading :id 100))
+  (:op replace :target (:item :host (:heading :id 100) :select (:all))
        :items ((:kind text :text "fresh")))
   "* TODO A\n:PROPERTIES:\n:DORG_ID: 100\n:OWNER:    bob\n:END:\nfresh\n"))
 
@@ -2364,25 +2396,24 @@ a refused mutation."
   "* TODO A\n:PROPERTIES:\n:BEAD_ID: a-1\n:END:\n")
  ("set-keyword"
   "* TODO A\n:PROPERTIES:\n:BEAD_ID: a-1\n:END:\nbody\n"
-  (:op insert :target (:keywords :host (:heading :extern t :key "BEAD_ID" :value "a-1")
+  (:op insert :target (:keyword :host (:heading :extern t :key "BEAD_ID" :value "a-1")
                                 :name "FOO")
        :position :after-last :value "bar")
   "* TODO A\n:PROPERTIES:\n:BEAD_ID: a-1\n:END:\nbody\n#+FOO: bar\n")
  ("delete-keyword"
   "* TODO A\n:PROPERTIES:\n:BEAD_ID: a-1\n:END:\n#+FOO: bar\nbody\n"
-  (:op delete :target (:keywords :host (:heading :extern t :key "BEAD_ID" :value "a-1")
-                                :name "FOO"))
+  (:op delete :target (:keyword :host (:heading :extern t :key "BEAD_ID" :value "a-1")
+                                :name "FOO" :select (:all)))
   "* TODO A\n:PROPERTIES:\n:BEAD_ID: a-1\n:END:\nbody\n")
  ("insert-item"
   "* TODO A\n:PROPERTIES:\n:BEAD_ID: a-1\n:END:\nbody\n"
-  (:op insert :target (:texts :host (:heading :extern t :key "BEAD_ID" :value "a-1"))
+  (:op insert :target (:text :host (:heading :extern t :key "BEAD_ID" :value "a-1"))
        :position :after-last :value "EXTRA")
   "* TODO A\n:PROPERTIES:\n:BEAD_ID: a-1\n:END:\nbody\n\nEXTRA\n")
  ("replace-item"
   "* TODO A\n:PROPERTIES:\n:BEAD_ID: a-1\n:END:\nold\n"
   (:op replace :target (:text :host (:heading :extern t :key "BEAD_ID" :value "a-1")
-                             :occurrence 1)
-       :missing :error :value "new")
+                             :select (:occurrence 1)) :value "new")
   "* TODO A\n:PROPERTIES:\n:BEAD_ID: a-1\n:END:\nnew\n")
  ;; replace-items: caller payload has ONLY the non-identity item; the executor
  ;; preserves the WHOLE identity drawer OUT-OF-BAND (A8, not the legacy brick).
@@ -2391,7 +2422,7 @@ a refused mutation."
  ;; the identity line — survives verbatim (no reconstruct/reformat).
  ("replace-items"
   "* TODO A\n:PROPERTIES:\n:BEAD_ID: a-1\n:OWNER:    bob\n:END:\nold body\n"
-  (:op replace :target (:items :host (:heading :extern t :key "BEAD_ID" :value "a-1"))
+  (:op replace :target (:item :host (:heading :extern t :key "BEAD_ID" :value "a-1") :select (:all))
        :items ((:kind text :text "fresh")))
   "* TODO A\n:PROPERTIES:\n:BEAD_ID: a-1\n:OWNER:    bob\n:END:\nfresh\n"))
 
@@ -2438,31 +2469,16 @@ a refused mutation."
   (:op delete :target (:property :host :root :name "K"))
   (:host root))
  ("insert-keyword-root"
-  (:op insert :target (:keywords :host :root :name "K")
+  (:op insert :target (:keyword :host :root :name "K")
        :position :after-last :value "V")
   (:host root))
  ("delete-keyword-root"
-  (:op delete :target (:keywords :host :root :name "K"))
-  (:host root))
- ("insert-texts-root"
-  (:op insert :target (:texts :host :root) :position :after-last :value "x")
-  (:host root))
- ("replace-text-root"
-  (:op replace :target (:text :host :root :occurrence 1)
-       :missing :error :value "x")
-  (:host root))
- ("replace-items-root"
-  (:op replace :target (:items :host :root)
-       :items ((:kind text :text "x")))
+  (:op delete :target (:keyword :host :root :name "K" :select (:all)))
   (:host root))
  ;; Structural rows -> collapsed empty variant nil.
- ("update-heading"
+ ("update-heading-post-blank"
   (:op update :target (:heading :extern t :key "BEAD_ID" :value "a-1")
-       :fields (:title "New")) nil)
- ("update-planning"
-  (:op update
-       :target (:planning :host (:heading :extern t :key "BEAD_ID" :value "a-1"))
-       :scheduled "<2026-01-01 Wed>") nil)
+       :fields (:post-blank 1)) nil)
  ("insert-heading"
   (:op insert :target (:tree :under :root) :heading (:title "New")) nil)
  ("delete-heading"
@@ -2472,6 +2488,43 @@ a refused mutation."
  ("move-subtree"
   (:op move :target (:subtree :extern t :key "BEAD_ID" :value "a-1")
        :to (:under :root)) nil))
+
+(ert-deftest dorg-test-idp-update-planning-supported ()
+  "A BEAD_ID-addressed planning update has an independent literal postimage."
+  (let* ((file (dorg-test-idp--tmpfile dorg-test-idp--prop-fixture))
+         (source (list :file file :identity '(:property "BEAD_ID")))
+         (patch '(:op update
+                       :target (:planning :host (:heading :extern t :key "BEAD_ID" :value "a-1"))
+                       :scheduled "<2026-10-15 Thu>")))
+    (unwind-protect
+        (progn
+          (should (plist-get (dorg-test--apply-patches source (list patch)) :ok))
+          (should (equal dorg-test-idp--planning-fixture-after
+                         (dorg-test-idp--slurp file))))
+      (delete-file file))))
+
+(ert-deftest dorg-test-idp-root-sequence-cells-refuse-before-capability ()
+  "The current root-illegal cells refuse before C3, rendering, or writes."
+  (dolist (patch '((:op insert :target (:text :host :root)
+                          :position :after-last :value "x")
+                   (:op replace :target (:text :host :root :select (:occurrence 1))
+                          :value "x")
+                   (:op replace :target (:item :host :root :select (:all))
+                          :items ((:kind text :text "x")))))
+    (let* ((file (dorg-test-idp--tmpfile dorg-test-idp--prop-fixture))
+           (src (list :file file :identity '(:property "BEAD_ID"))))
+      (unwind-protect
+          (cl-letf (((symbol-function 'dorg-mutate--c3-refusal)
+                     (lambda (&rest _) (ert-fail "root-illegal cell reached C3")))
+                    ((symbol-function 'dorg-model-render-tree)
+                     (lambda (&rest _) (ert-fail "root-illegal cell rendered")))
+                    ((symbol-function 'dorg-mutate--source-preserving-apply-patch)
+                     (lambda (&rest _) (ert-fail "root-illegal cell wrote"))))
+            (let ((err (should-error (dorg-test--apply-patches src (list patch))
+                                     :type 'dorg-mutate-error)))
+              (should (eq 'invalid-target (dorg-mutate-error-reason err))))
+            (should (equal dorg-test-idp--prop-fixture (dorg-test-idp--slurp file))))
+        (delete-file file)))))
 
 ;;; ─── A7 (cont.): BOTH negative bootstrap selectors under dorg ──────────────
 
@@ -2737,8 +2790,7 @@ the addressed body text changes.  Exact whole-file, before != after."
                     src (list (list :op 'replace
                                     :target (list :text :host
                                                   (dorg-test--heading-address 100)
-                                                  :occurrence 1)
-                                    :missing :error
+                                                  :select '(:occurrence 1))
                                     :value "new body")))
                    :ok))
           (let ((out (dorg-test-idp--slurp file)))
@@ -3260,7 +3312,7 @@ against a whole-section render."
          (file (dorg-test-faithful--tmpfile before))
          (source (dorg-test-faithful--source file))
          (form '(on (key "bead-001")
-                    (insert (drawer-line "LOGBOOK" (occurrence 1)) (before-first) "- new"))))
+                    (insert (drawer-line "LOGBOOK") (before-first) "- new"))))
     (unwind-protect
         (let* ((preview (dorg-api-execute form :mode 'dry-run :source source))
                (projection (car (plist-get preview :projections))))
@@ -3273,6 +3325,484 @@ against a whole-section render."
           (should (equal after (dorg-test-faithful--slurp file))))
       (dorg-test-faithful--kill-visiting file)
       (delete-file file))))
+
+;;; ─── 1qdtb: byte-preserving heading-line editor SPEC ──────────────────
+;; Expected documents below are literal fragments, never output from a renderer
+;; or from the editor under test.  Field-width changes may move the visual tag
+;; column; literal separators are preserved, with no tag realignment.
+
+(defconst dorg-test-1qdtb--preamble
+  "#+title: Hand-written café\n#+TODO: TODO WAIT | DONE\n\n")
+
+(defconst dorg-test-1qdtb--section-tail
+  (concat "SCHEDULED: <2026-10-15 Thu>\n"
+          ":PROPERTIES:\n:BEAD_ID:  line-a\n:STATUS:   OPEN\n:END:\n"
+          ":LOGBOOK:\n- Existing note.\n:END:\n"
+          "Body with TODO, COMMENT and :alpha:beta: unchanged.  \n\n"))
+
+(defconst dorg-test-1qdtb--following
+  (concat "** Child stays\n:PROPERTIES:\n:BEAD_ID: child\n:END:\n"
+          "Child body.\n* WAIT Sibling  :keep:\n"
+          ":PROPERTIES:\n:BEAD_ID: sibling\n:END:\nSibling body.\n"))
+
+(defun dorg-test-1qdtb--document (heading &optional preamble)
+  "Surround literal HEADING with untouched fixture bytes and PREAMBLE."
+  (concat (or preamble dorg-test-1qdtb--preamble) heading
+          dorg-test-1qdtb--section-tail dorg-test-1qdtb--following))
+
+(defun dorg-test-1qdtb--raw (file)
+  "Read FILE as literal unibyte data, independently of DOrg's persist helpers."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally file)
+    (buffer-string)))
+
+(cl-defmacro dorg-test-1qdtb--with-source ((source file) kind contents &body body)
+  "Run BODY with SOURCE and FILE of KIND, initially containing CONTENTS.
+A buffer source actually visits its owned fixture file.  A file source has
+no visitor at entry.  Cleanup discards only this fixture's unsaved edits."
+  (declare (indent 2))
+  (let ((text (make-symbol "text"))
+        (which (make-symbol "kind"))
+        (buf (make-symbol "buffer")))
+    `(let* ((,text ,contents)
+            (,which ,kind)
+            (coding-system-for-write 'utf-8-unix)
+            (,file (make-temp-file "dorg-1qdtb-" nil ".org" ,text))
+            (,buf (if (eq ,which 'buffer) (find-file-noselect ,file)
+                    (generate-new-buffer " *1qdtb-file-source*"))))
+       (unwind-protect
+           (with-current-buffer ,buf
+             (unless (eq ,which 'buffer) (insert ,text))
+             (let ((org-inhibit-startup t)) (org-mode))
+             (let ((,source (append (if (eq ,which 'buffer)
+                                       (list :buffer ,buf) (list :file ,file))
+                                   '(:identity (:property "BEAD_ID")))))
+               ,@body))
+         (when (buffer-live-p ,buf)
+           (with-current-buffer ,buf (set-buffer-modified-p nil))
+           (kill-buffer ,buf))
+         (when-let ((visitor (find-buffer-visiting ,file)))
+           (with-current-buffer visitor (set-buffer-modified-p nil))
+           (kill-buffer visitor))
+         (delete-file ,file)))))
+
+(defun dorg-test-1qdtb--assert-edit (heading expected-heading form &optional preamble)
+  "Apply public FORM to HEADING, expecting literal EXPECTED-HEADING.
+Exercise file and visiting-buffer sources with PREAMBLE, then repeat the
+assignment as a byte no-op.  The first apply must be a real transformation."
+  (let ((before (dorg-test-1qdtb--document heading preamble))
+        (expected (dorg-test-1qdtb--document expected-heading preamble)))
+    (should-not (equal before expected))
+    (dolist (kind '(buffer file))
+      (ert-info ((format "source=%s form=%S" kind form))
+        (dorg-test-1qdtb--with-source (source file) kind before
+          (dotimes (_ 2)
+            (should (plist-get
+                     (dorg-api-execute form :mode 'apply :source source) :ok))
+            (if (eq kind 'buffer)
+                (progn
+                  (should (equal expected (buffer-string)))
+                  ;; Buffer edits without :save must leave the backing file alone.
+                  (should (equal (encode-coding-string before 'utf-8-unix)
+                                 (dorg-test-1qdtb--raw file))))
+              (should (equal (encode-coding-string expected 'utf-8-unix)
+                             (dorg-test-1qdtb--raw file))))))))))
+
+(defmacro dorg-test-1qdtb--edit-case (name before after form &optional preamble)
+  "Define a literal byte transformation NAME from BEFORE to AFTER using FORM."
+  `(ert-deftest ,(intern (concat "dorg-test-1qdtb-" (symbol-name name))) ()
+     ,(format "Public heading edit %s preserves every other source byte." name)
+     (dorg-test-1qdtb--assert-edit ,before ,after ',form ,preamble)))
+
+(dorg-test-1qdtb--edit-case title
+  "*  TODO   [#B]  COMMENT Old café\t  :alpha:beta:  \n"
+  "*  TODO   [#B]  COMMENT A much longer λ title\t  :alpha:beta:  \n"
+  (on (key "line-a") (set (heading title) "A much longer λ title")))
+(dorg-test-1qdtb--edit-case todo
+  "*  TODO   [#B]  COMMENT Old café\t  :alpha:beta:  \n"
+  "*  WAIT   [#B]  COMMENT Old café\t  :alpha:beta:  \n"
+  (on (key "line-a") (set (heading todo) "WAIT")))
+(dorg-test-1qdtb--edit-case priority
+  "*  TODO   [#B]  COMMENT Old café\t  :alpha:beta:  \n"
+  "*  TODO   [#A]  COMMENT Old café\t  :alpha:beta:  \n"
+  (on (key "line-a") (set (heading priority) "A")))
+(dorg-test-1qdtb--edit-case tags
+  "*  TODO   [#B]  COMMENT Old café\t  :alpha:beta:  \n"
+  "*  TODO   [#B]  COMMENT Old café\t  :new:tag_2:  \n"
+  (on (key "line-a") (set (heading tags) ("new" "tag_2"))))
+(dorg-test-1qdtb--edit-case todo-insert
+  "* Plain  \n" "* TODO Plain  \n"
+  (on (key "line-a") (set (heading todo) "TODO")))
+(dorg-test-1qdtb--edit-case priority-insert
+  "* Plain  \n" "* [#A] Plain  \n"
+  (on (key "line-a") (set (heading priority) "A")))
+(dorg-test-1qdtb--edit-case tags-insert
+  "* Plain  \n" "* Plain :new:  \n"
+  (on (key "line-a") (set (heading tags) ("new"))))
+(dorg-test-1qdtb--edit-case title-clear
+  "* TODO [#B] Old :alpha:\n" "* TODO [#B]  :alpha:\n"
+  (on (key "line-a") (set (heading title) "")))
+(dorg-test-1qdtb--edit-case title-insert
+  "* TODO [#B]  :alpha:\n" "* TODO [#B] Old :alpha:\n"
+  (on (key "line-a") (set (heading title) "Old")))
+(dorg-test-1qdtb--edit-case todo-clear-nil
+  "*  TODO   [#B]  Plain\n" "*    [#B]  Plain\n"
+  (on (key "line-a") (set (heading todo) nil)))
+(dorg-test-1qdtb--edit-case todo-clear-empty
+  "* TODO Plain\n" "* Plain\n"
+  (on (key "line-a") (set (heading todo) "")))
+(dorg-test-1qdtb--edit-case priority-clear
+  "* TODO [#B] Plain\n" "* TODO Plain\n"
+  (on (key "line-a") (set (heading priority) nil)))
+(dorg-test-1qdtb--edit-case priority-clear-multiple-spaces
+  "*  TODO   [#B]  Plain\n" "*  TODO    Plain\n"
+  (on (key "line-a") (set (heading priority) nil)))
+(dorg-test-1qdtb--edit-case tags-clear
+  "* Plain :alpha:  \n" "* Plain  \n"
+  (on (key "line-a") (set (heading tags) ())))
+(dorg-test-1qdtb--edit-case tags-clear-tab-and-spaces
+  "*  TODO   [#B]  COMMENT Old café\t  :alpha:beta:  \n"
+  "*  TODO   [#B]  COMMENT Old café\t   \n"
+  (on (key "line-a") (set (heading tags) ())))
+(dorg-test-1qdtb--edit-case priority-insert-after-todo
+  "* TODO Plain\n" "* TODO [#A] Plain\n"
+  (on (key "line-a") (set (heading priority) "A")))
+(dorg-test-1qdtb--edit-case todo-insert-before-priority
+  "* [#A] Plain\n" "* TODO [#A] Plain\n"
+  (on (key "line-a") (set (heading todo) "TODO")))
+(dorg-test-1qdtb--edit-case todo-insert-before-comment
+  "* COMMENT Plain\n" "* TODO COMMENT Plain\n"
+  (on (key "line-a") (set (heading todo) "TODO")))
+(dorg-test-1qdtb--edit-case tags-insert-no-trailing-space
+  "* Plain\n" "* Plain :new:\n"
+  (on (key "line-a") (set (heading tags) ("new"))))
+(dorg-test-1qdtb--edit-case custom-todo-and-tab-prefix
+  "* \tNEXT   Plain\t:keep:\n" "* \tPARK   Plain\t:keep:\n"
+  (on (key "line-a") (set (heading todo) "PARK"))
+  "#+TODO: NEXT PARK | FINISHED\n")
+(dorg-test-1qdtb--edit-case sequential-five-fields
+  "* TODO [#B] COMMENT Old :old:\n"
+  "* WAIT [#A] A longer λ title :new:two:\n"
+  (on (key "line-a") (set (heading title) "A longer λ title")
+      (set (heading todo) "WAIT") (set (heading priority) "A")
+      (set (heading tags) ("new" "two")) (set (heading commented) nil)))
+
+;; These two controls must be GREEN even on the pre-editor base.  They exercise
+;; the same public fixture, addressing and persistence used by the RED cases.
+(ert-deftest dorg-test-1qdtb-control-commented ()
+  "COMMENT set is exact, and an existing COMMENT is simulation-idempotent."
+  (let ((commented "* TODO [#B] COMMENT Plain  :alpha:\n"))
+    (with-temp-buffer
+      (org-mode)
+      (insert commented)
+      (goto-char (point-min))
+      (should
+       (equal commented
+              (dorg-mutate--source-preserving-heading-line-simulate
+               commented (list :commented t)
+               (dorg-mutate--source-preserving-heading-line-grammar))))))
+  (dorg-test-1qdtb--assert-edit
+   "* TODO [#B] Plain  :alpha:\n" "* TODO [#B] COMMENT Plain  :alpha:\n"
+   '(on (key "line-a") (set (heading commented) t))))
+(dorg-test-1qdtb--edit-case control-uncommented
+  "* TODO [#B] COMMENT Plain  :alpha:\n" "* TODO [#B] Plain  :alpha:\n"
+  (on (key "line-a") (set (heading commented) nil)))
+
+(ert-deftest dorg-test-1qdtb-absent-clears-are-byte-noops ()
+  "Clearing absent fields must not synthesize spaces, cookies or tag text."
+  (let ((before (dorg-test-1qdtb--document "* Plain  \n")))
+    (dolist (kind '(buffer file))
+      (dorg-test-1qdtb--with-source (source file) kind before
+        (dorg-api-execute
+         '(on (key "line-a") (set (heading todo) nil)
+              (set (heading priority) nil) (set (heading tags) ())
+              (set (heading commented) nil)) :mode 'apply :source source)
+        (should (equal before (buffer-string)))
+        (should (equal (encode-coding-string before 'utf-8-unix)
+                       (dorg-test-1qdtb--raw file)))))))
+
+(ert-deftest dorg-test-1qdtb-all-field-subsets-have-one-capability ()
+  "Classify all 31 nonempty subsets and reverse orders at a heading.
+This is the classifier table; mixed and sequential tests exercise plan/apply."
+  (let ((pairs '((:title "New") (:todo "WAIT") (:priority "A")
+                 (:tags ("new")) (:commented t))))
+    (dotimes (mask 31)
+      (let* ((selected (cl-loop for pair in pairs for bit from 0
+                                when (/= 0 (logand (1+ mask) (ash 1 bit)))
+                                collect pair))
+             (forward (apply #'append selected))
+             (backward (apply #'append (reverse selected))))
+        (dolist (fields (list forward backward))
+          (ert-info ((format "fields=%S" fields))
+            (should (equal '(supported . S1)
+                           (dorg-mutate--c3-cell
+                            (list :op 'update :target '(:heading :id 1001)
+                                  :fields fields) 'heading)))))))))
+
+(ert-deftest dorg-test-1qdtb-mixed-typed-field-order-and-dorg-identity ()
+  "One mixed patch works with either field order and the intrinsic DORG_ID."
+  (dolist (fields '((:title "New λ" :todo "WAIT" :priority "A"
+                    :tags ("new" "two") :commented nil)
+                   (:commented nil :tags ("new" "two") :priority "A"
+                    :todo "WAIT" :title "New λ")))
+    (dorg-test-1qdtb--with-source (fixture-source fixture-file) 'buffer "#+TODO: TODO WAIT | DONE\n* TODO [#B] COMMENT Old :old:\n:PROPERTIES:\n:DORG_ID: 1001\n:END:\nBody.\n"
+      (let ((before (buffer-string)))
+        (dorg-mutate--apply-patches
+         (current-buffer)
+         (list (list :op 'update :target '(:heading :id 1001) :fields fields)))
+        (should (equal "#+TODO: TODO WAIT | DONE\n* WAIT [#A] New λ :new:two:\n:PROPERTIES:\n:DORG_ID: 1001\n:END:\nBody.\n"
+                       (buffer-string)))
+        ;; Keep the literal post-apply bytes as the first assertion: the
+        ;; evidence runner's no-op editor mutant must fail this oracle.
+        (should-not (equal before (buffer-string)))))))
+
+(defun dorg-test-1qdtb--failure (thunk)
+  "Return typed failure data from THUNK, failing if it unexpectedly succeeds."
+  (condition-case err
+      (progn (funcall thunk) (ert-fail "expected a typed mutation refusal"))
+    (dorg-api-error (dorg-api-error-data err))
+    (dorg-mutate-error (dorg-mutate-error-data err))))
+
+(ert-deftest dorg-test-1qdtb-unrepresentable-fields-refuse-before-apply ()
+  "Reject values which change the parsed meaning; phase two never starts."
+  ;; This direct validator proof keeps the :priority branch structurally
+  ;; covered even if an earlier field is absent from an API payload.
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Plain\n")
+    (goto-char (point-min))
+    (let ((before (buffer-string)))
+      (condition-case err
+          (progn
+            (dorg-mutate--source-preserving-heading-line-check-fields
+             (list :priority "AA"))
+            (ert-fail "priority AA must be unrepresentable"))
+        (dorg-mutate-error
+         (let ((data (dorg-mutate-error-data err)))
+           (should (eq 'invalid-target (plist-get data :reason)))
+           (should (eq :priority (plist-get data :field))))))
+      (should (equal before (buffer-string)))))
+  (dolist (assignment '((title "bad\n* Injected") (title "bad\rInjected")
+                         (title "TODO Ambiguous") (title "COMMENT Ambiguous")
+                         (title "[#A] Ambiguous") (title "Ambiguous :tag:")
+                         (title " leading") (title "trailing ")
+                         (todo "UNKNOWN") (priority "AA")
+                         (tags ("bad tag")) (tags ("bad:tag"))))
+    (ert-info ((format "assignment=%S" assignment))
+      (dorg-test-1qdtb--with-source (fixture-source fixture-file) 'buffer (dorg-test-1qdtb--document "* Plain\n")
+        (let ((before (buffer-string))
+              (tick (buffer-chars-modified-tick))
+              (source (list :buffer (current-buffer) :identity '(:property "BEAD_ID")))
+              (apply-count 0)
+              (real-apply (symbol-function 'dorg-mutate--source-preserving-apply-patch)))
+          (cl-letf (((symbol-function 'dorg-mutate--source-preserving-apply-patch)
+                     (lambda (&rest args)
+                       (cl-incf apply-count)
+                       (apply real-apply args))))
+            (let ((data (dorg-test-1qdtb--failure
+                         (lambda ()
+                           (dorg-api-execute
+                            `(on (key "line-a")
+                                 (set (property "STATUS") "CHANGED")
+                                 (set (heading ,(car assignment)) ,(cadr assignment)))
+                            :mode 'apply :source source)))))
+              (should (eq 'invalid-target (plist-get data :reason)))
+              (should (eq 'heading-line-unrepresentable (plist-get data :detail)))))
+          (should (= 0 apply-count))
+          (should (= tick (buffer-chars-modified-tick)))
+          (should (equal before (buffer-string))))))))
+
+(ert-deftest dorg-test-1qdtb-preview-isolated-and-identical-to-apply ()
+  "A custom TODO preview equals apply without transient source-buffer writes."
+  (let* ((preamble "#+TODO: NEXT PARK | FINISHED\n")
+         (before (dorg-test-1qdtb--document "* NEXT Old  :keep:\n" preamble))
+         (after (dorg-test-1qdtb--document "* PARK New λ  :keep:\n" preamble))
+         (form '(on (key "line-a") (set (heading todo) "PARK")
+                    (set (heading title) "New λ"))))
+    (dolist (kind '(file buffer))
+      (dorg-test-1qdtb--with-source (source file) kind before
+        (let* ((tick (buffer-chars-modified-tick))
+               (preview (dorg-api-execute form :mode 'dry-run :source source))
+               (projections (plist-get preview :projections)))
+          (should (plist-get preview :supported))
+          (should (= 1 (length projections)))
+          (should (equal "key:BEAD_ID=line-a" (plist-get (car projections) :target)))
+          (should (equal (concat "* NEXT Old  :keep:\n" dorg-test-1qdtb--section-tail)
+                         (plist-get (car projections) :before)))
+          (should (equal (concat "* PARK New λ  :keep:\n" dorg-test-1qdtb--section-tail)
+                         (plist-get (car projections) :after)))
+          (should (= tick (buffer-chars-modified-tick)))
+          (should (equal before (buffer-string)))
+          (should (equal (encode-coding-string before 'utf-8-unix)
+                         (dorg-test-1qdtb--raw file)))
+          (dorg-api-execute form :mode 'apply :source source)
+          (if (eq kind 'buffer)
+              (should (equal after (buffer-string)))
+            (should (equal (encode-coding-string after 'utf-8-unix)
+                           (dorg-test-1qdtb--raw file)))))))))
+
+(ert-deftest dorg-test-1qdtb-persist-failure-keeps-buffer-and-file ()
+  "A forced pre-rename failure retains both old images and cleans the temp file."
+  (let* ((before "* TODO Old\n:PROPERTIES:\n:BEAD_ID: line-a\n:END:\nBody.\n")
+         (dir (make-temp-file "dorg-1qdtb-persist-" t))
+         (file (expand-file-name "fixture.org" dir))
+         (rename-count 0))
+    (unwind-protect
+        (progn
+          (write-region before nil file nil 'silent)
+          (with-current-buffer (find-file-noselect file)
+            (let ((source (list :buffer (current-buffer) :identity '(:property "BEAD_ID"))))
+              (cl-letf (((symbol-function 'dorg-mutate--persist-rename)
+                         (lambda (_tmp _target)
+                           (cl-incf rename-count)
+                           (signal 'file-error '("1qdtb injected rename failure")))))
+                (should-error
+                 (dorg-api-execute '(on (key "line-a") (set (heading title) "New"))
+                                   :mode 'apply :source source :save t)
+                 :type 'file-error))
+              (should (= 1 rename-count))
+              (should (equal before (buffer-string)))
+              (should-not (buffer-modified-p))))
+          (should (equal before (dorg-test-1qdtb--raw file)))
+          (should (equal '("fixture.org") (directory-files dir nil "^[^.]"))))
+      (dorg-test-faithful--kill-visiting file)
+      (delete-directory dir t))))
+
+(ert-deftest dorg-test-1qdtb-crlf-file-is-byte-preserved ()
+  "The file editor retains CRLF and Unicode, not just decoded text equality."
+  (let* ((before "* TODO Café  :keep:\r\n:PROPERTIES:\r\n:BEAD_ID: line-a\r\n:END:\r\nBody.\r\n")
+         (after "* TODO Renamed λ  :keep:\r\n:PROPERTIES:\r\n:BEAD_ID: line-a\r\n:END:\r\nBody.\r\n")
+         (coding-system-for-write 'utf-8-unix)
+         (file (make-temp-file "dorg-1qdtb-crlf-" nil ".org" before)))
+    (unwind-protect
+        (progn
+          (should (equal (encode-coding-string before 'utf-8-unix)
+                         (dorg-test-1qdtb--raw file)))
+          (dorg-api-execute '(on (key "line-a") (set (heading title) "Renamed λ"))
+                            :mode 'apply :source (dorg-test-faithful--source file))
+          (should-not (equal before after))
+          (should (equal (encode-coding-string after 'utf-8-unix)
+                         (dorg-test-1qdtb--raw file))))
+      (dorg-test-faithful--kill-visiting file)
+      (delete-file file))))
+
+(ert-deftest dorg-test-1qdtb-no-org-command-side-effects ()
+  "Explicit field edits never call interactive Org logging/alignment commands."
+  (cl-letf (((symbol-function 'org-todo)
+             (lambda (&rest _) (ert-fail "org-todo called")))
+            ((symbol-function 'org-priority)
+             (lambda (&rest _) (ert-fail "org-priority called")))
+            ((symbol-function 'org-set-tags)
+             (lambda (&rest _) (ert-fail "org-set-tags called")))
+            ((symbol-function 'org-align-tags)
+             (lambda (&rest _) (ert-fail "org-align-tags called"))))
+    (let ((org-log-done 'time)
+          (org-log-into-drawer "LOGBOOK")
+          (org-auto-align-tags t))
+      (dorg-test-1qdtb--assert-edit
+       "* TODO [#B] Old  :old:\n" "* DONE [#A] New  :new:\n"
+       '(on (key "line-a") (set (heading todo) "DONE")
+            (set (heading priority) "A") (set (heading title) "New")
+            (set (heading tags) ("new")))))))
+
+(ert-deftest dorg-test-1qdtb-control-root-and-post-blank-stay-refused ()
+  "Intrinsic line support does not admit root or post-blank mutations."
+  (dolist (entry '((root (:heading :root) (:title "New"))
+                   (heading (:heading :id 1001) (:post-blank 2))
+                   (heading (:heading :id 1001) (:title "New" :post-blank 2))))
+    (let ((patch (list :op 'update :target (nth 1 entry) :fields (nth 2 entry))))
+      (should (equal '(unsupported . S1)
+                     (dorg-mutate--c3-cell patch (car entry)))))))
+
+(ert-deftest dorg-test-1qdtb-apply-failure-restores-first-edit ()
+  "A later apply fault restores an earlier successful heading edit and flags."
+  (dorg-test-1qdtb--with-source (fixture-source fixture-file) 'buffer (dorg-test-1qdtb--document "* TODO Old :keep:\n")
+    (set-buffer-modified-p nil)
+    (let ((before (buffer-string))
+          (source (list :buffer (current-buffer) :identity '(:property "BEAD_ID")))
+          (real-apply (symbol-function 'dorg-mutate--source-preserving-apply-patch))
+          (apply-count 0)
+          observed-first-change)
+      (cl-letf (((symbol-function 'dorg-mutate--source-preserving-apply-patch)
+                 (lambda (&rest args)
+                   (cl-incf apply-count)
+                   (if (= apply-count 2)
+                       (error "1qdtb injected apply failure")
+                     (prog1 (apply real-apply args)
+                       (setq observed-first-change
+                             (not (equal before (buffer-string)))))))))
+        (should-error
+         (dorg-api-execute
+          '(on (key "line-a") (set (heading title) "Longer λ title")
+               (set (heading todo) "WAIT"))
+          :mode 'apply :source source)))
+      (should (= 2 apply-count))
+      (should observed-first-change)
+      (should (equal before (buffer-string)))
+      (should-not (buffer-modified-p)))))
+
+(ert-deftest dorg-test-1qdtb-control-stale-preview-refuses ()
+  "A heading edit must retain the public freshness guard before mutation."
+  (dorg-test-1qdtb--with-source (fixture-source fixture-file) 'buffer (dorg-test-1qdtb--document "* TODO Old :keep:\n")
+    (let* ((source (list :buffer (current-buffer) :identity '(:property "BEAD_ID")))
+           ;; Use already-supported COMMENT to capture the public base on the
+           ;; pre-editor tree too; the later title request still has to refuse.
+           (plan (dorg-api-execute
+                  '(on (key "line-a") (set (heading commented) t))
+                  :mode 'dry-run :source source)))
+      (goto-char (point-max)) (insert "External edit.\n")
+      (let* ((before (buffer-string))
+             (data (dorg-test-1qdtb--failure
+                    (lambda ()
+                      (dorg-api-execute
+                       '(on (key "line-a") (set (heading title) "New"))
+                       :mode 'apply :source source :base (plist-get plan :base))))))
+        (should (eq 'stale (plist-get data :reason)))
+        (should (eq 'base-revision (plist-get data :detail)))
+        (should (equal before (buffer-string)))))))
+
+(ert-deftest dorg-test-1qdtb-cli-apply-uses-the-same-editor ()
+  "The native CLI dispatcher persists a heading edit through the public door."
+  (let* ((before "* TODO Café  :keep:\n:PROPERTIES:\n:DORG_ID: 1001\n:END:\nBody.\n")
+         (after "* TODO New λ  :keep:\n:PROPERTIES:\n:DORG_ID: 1001\n:END:\nBody.\n")
+         (coding-system-for-write 'utf-8-unix)
+         (file (make-temp-file "dorg-1qdtb-cli-" nil ".org" before)))
+    (unwind-protect
+        (progn
+          (with-output-to-string
+            (should (= 0 (clime-run
+                          dorg-cli
+                          (list "mutate" "(on (id 1001) (set (heading title) \"New λ\"))"
+                                "--apply" "-f" file "--json")))))
+          (should-not (equal before after))
+          (should (equal (encode-coding-string after 'utf-8-unix)
+                         (dorg-test-1qdtb--raw file))))
+      (dorg-test-faithful--kill-visiting file)
+      (delete-file file))))
+
+(ert-deftest dorg-test-1qdtb-control-none-precedes-unrepresentable ()
+  "Identity-none retains precedence over the new heading-line refusal."
+  (dorg-test-1qdtb--with-source (fixture-source fixture-file) 'buffer (dorg-test-1qdtb--document "* Plain\n")
+    (let ((source (list :buffer (current-buffer) :identity 'none))
+          (before (buffer-string))
+          (tick (buffer-chars-modified-tick)))
+      (dolist (door '(public typed))
+        (let ((data (dorg-test-1qdtb--failure
+                     (lambda ()
+                       (if (eq door 'public)
+                           (dorg-api-execute
+                            '(on (key "line-a") (set (heading title) "bad\n* Injected"))
+                            :mode 'apply :source source)
+                         (dorg-mutate--apply-patches
+                          source
+                          '((:op update
+                             :target (:heading :extern t :key "BEAD_ID" :value "line-a")
+                             :fields (:title "bad\n* Injected")))))))))
+          (should (eq 'unsupported (plist-get data :reason)))
+          (should (eq 'identity-none (plist-get data :detail))))
+        (should (= tick (buffer-chars-modified-tick)))
+        (should (equal before (buffer-string)))))))
 
 (provide 'dorg-faithful-tests)
 ;;; dorg-faithful-tests.el ends here

@@ -17,6 +17,9 @@
 (require 'dorg-repo)
 (require 'dorg-registry)
 (require 'dorg-render)
+(require 'dorg-envelope)
+(require 'dorg-test-helpers)
+(require 'json)
 
 ;;; Helpers
 
@@ -35,6 +38,136 @@ Skips if dolt is not installed or unsupported."
      (dorg-test--with-temp-db dolt-dir
        ,@body)))
 
+(defmacro dorg-test-with-clean-extensions (&rest body)
+  "Execute BODY with `dorg--extensions' let-bound to nil."
+  (declare (indent 0))
+  `(let ((dorg--extensions nil))
+     ,@body))
+
+(defconst dorg-test-mxwnw--transport-entry-allowlist
+  '(".doltcfg" ".dorg" "config.yaml")
+  "Store-local entries transport may create while attaching a reader.
+`.doltcfg' and `config.yaml' are Dolt sql-server artifacts; `.dorg' holds
+DOrg's server lifecycle claim.  They are not repository initialization.")
+
+(defun dorg-test-mxwnw--existing-store-snapshot (dolt-dir)
+  "Return the observable existing-store state around a safe-reader bind.
+The directory comparison deliberately excludes only the documented transport
+allowlist; table and status observations remain exact."
+  (let (entries)
+    (dolist (entry (directory-files dolt-dir nil))
+      (unless (or (member entry '("." ".."))
+                  (member entry dorg-test-mxwnw--transport-entry-allowlist))
+        (push entry entries)))
+    (list :head (dorg-head-commit dolt-dir)
+          :status (dorg-sql dolt-dir
+                            "SELECT * FROM dolt_status ORDER BY table_name")
+          :counts
+          (mapcar
+           (lambda (table)
+             (cons table
+                   (alist-get 'n
+                              (car (dorg-sql dolt-dir
+                                             (format "SELECT COUNT(*) AS n FROM %s"
+                                                     table))))))
+           '("dorg_files" "headings" "dorg_meta"))
+          :entries (sort entries #'string<))))
+
+(ert-deftest dorg-test-bind-existing-dolt-preserves-existing-store-state ()
+  "Safe existing-store binding reuses a root and refuses an unbound sibling.
+Neither outcome may create a root or commit after the strict setup bind."
+  (dorg-test-with-dolt
+    (let* ((root (make-temp-file "dorg-mxwnw-" t))
+           (file (expand-file-name "doc.org" root))
+           (other (expand-file-name "other.org" root)))
+      (unwind-protect
+          (progn
+            (with-temp-file file (insert "* Existing\n"))
+            (with-temp-file other (insert "* Unbound\n"))
+            (let ((dorg--registry nil))
+              (let* ((strict (dorg-bind-dolt file dolt-dir))
+                     (root-id (dorg-backend-root-id
+                               (dorg-registration-backend strict)))
+                     (snapshot
+                      (dorg-test-mxwnw--existing-store-snapshot dolt-dir)))
+                (should-not (plist-get snapshot :status))
+                (setq dorg--registry nil)
+                (let ((safe (dorg-bind-existing-dolt file dolt-dir)))
+                  (should (= root-id
+                             (dorg-backend-root-id
+                              (dorg-registration-backend safe))))
+                  (should (equal (dorg-registration-backend strict)
+                                 (dorg-registration-backend safe)))
+                  (should (equal (file-truename file)
+                                 (dorg-registration-file safe)))
+                  (should (assoc (file-truename file) dorg--registry)))
+                (should (equal snapshot
+                               (dorg-test-mxwnw--existing-store-snapshot
+                                dolt-dir)))
+                (let ((err (should-error
+                            (dorg-bind-existing-dolt other dolt-dir)
+                            :type 'dorg-binding-error)))
+                  (should (eq 'path-mismatch (dorg-binding-error-reason err)))
+                  (should (equal snapshot
+                                 (dorg-test-mxwnw--existing-store-snapshot
+                                  dolt-dir))))))
+        (delete-directory root t))))))
+
+(ert-deftest dorg-test-bind-existing-dolt-empty-store-miss-preserves-state ()
+  "An empty initialized store refuses an unbound safe-reader bind without root creation."
+  (dorg-test-with-dolt
+    (let* ((root (make-temp-file "dorg-mxwnw-empty-" t))
+           (file (expand-file-name "doc.org" root)))
+      (unwind-protect
+          (progn
+            (with-temp-file file (insert "* Unbound\n"))
+            (let ((dorg--registry nil)
+                  (snapshot (dorg-test-mxwnw--existing-store-snapshot dolt-dir)))
+              (should-not (plist-get snapshot :status))
+              (should (zerop (cdr (assoc "dorg_files"
+                                         (plist-get snapshot :counts)))))
+              (let ((err (should-error (dorg-bind-existing-dolt file dolt-dir)
+                                       :type 'dorg-binding-error)))
+                (should (eq 'path-mismatch (dorg-binding-error-reason err)))
+                (should (equal snapshot
+                               (dorg-test-mxwnw--existing-store-snapshot
+                                dolt-dir)))
+                (should-not dorg--registry))))
+        (delete-directory root t)))))
+
+(defvar dorg-test-bx6op--receipt-schema-reads nil
+  "Receipt metadata reads made by the explicit-migration fixtures.")
+
+(defun dorg-test-bx6op--receipt-schema-rows (query)
+  "Return concrete metadata for an existing compatible receipt table.
+Only the leased SQL transport is doubled; production validates these facts."
+  (cond
+   ((equal query
+           (concat "SELECT table_name FROM information_schema.tables"
+                   " WHERE table_schema = DATABASE()"
+                   " AND table_name = 'dorg_mutation_log'"))
+    (push 'tables dorg-test-bx6op--receipt-schema-reads)
+    '(((TABLE_NAME . "dorg_mutation_log"))))
+   ((equal query
+           (concat "SELECT column_name AS column_name,"
+                   " column_type AS column_type, is_nullable AS is_nullable"
+                   " FROM information_schema.columns"
+                   " WHERE table_schema = DATABASE()"
+                   " AND table_name = 'dorg_mutation_log'"
+                   " ORDER BY ordinal_position"))
+    (push 'columns dorg-test-bx6op--receipt-schema-reads)
+    '(((COLUMN_NAME . "op_id")
+       (COLUMN_TYPE . "varchar(255)") (IS_NULLABLE . "NO"))
+      ((COLUMN_NAME . "gen_id")
+       (COLUMN_TYPE . "varchar(64)") (IS_NULLABLE . "NO"))
+      ((COLUMN_NAME . "intent_digest")
+       (COLUMN_TYPE . "varchar(64)") (IS_NULLABLE . "NO"))
+      ((COLUMN_NAME . "ts")
+       (COLUMN_TYPE . "bigint") (IS_NULLABLE . "NO"))
+      ((COLUMN_NAME . "postimages_v1")
+       (COLUMN_TYPE . "text") (IS_NULLABLE . "YES"))))
+   (t (ert-fail (format "unexpected receipt metadata SQL: %s" query)))))
+
 ;;; Schema Tests
 
 (ert-deftest dorg-test-schema-constant-exists ()
@@ -45,7 +178,112 @@ Skips if dolt is not installed or unsupported."
 
 (ert-deftest dorg-test-schema-version-defined ()
   "Schema version is defined and current."
-  (should (= dorg-schema-version 6)))
+  (should (= dorg-schema-version 8)))
+
+(ert-deftest dorg-test-dzx00-fresh-schema-owns-receipt-storage ()
+  "Fresh core schema declares the complete exactly-once receipt shape.
+
+Receipt storage is versioned core schema rather than operational metadata.  A
+fresh init must therefore receive the table and postimage column from
+`dorg-schema-ddl', before any ordinary apply/replay path runs."
+  (let ((ddl (mapconcat #'identity dorg-schema-ddl "\n")))
+    (should (string-match-p "CREATE TABLE dorg_mutation_log" ddl))
+    (should (string-match-p "postimages_v1[[:space:]]+TEXT" ddl))))
+
+(ert-deftest dorg-test-dzx00-ordinary-receipt-check-is-read-only ()
+  "Missing receipt storage is a typed ordinary refusal with SELECT-only SQL."
+  (let (seen)
+    (cl-letf (((symbol-function 'dorg-sql--lease-exec)
+               (lambda (_lease sql &rest _)
+                 (push sql seen)
+                 nil)))
+      (let ((err (should-error
+                  (dorg-sql--require-mutation-log-schema 'lease)
+                  :type 'dorg-schema-migration-required)))
+        (should (eq 'schema-migration-required
+                    (plist-get (dorg-error-data err) :reason)))))
+    (should (= 2 (length seen)))
+    (should (cl-every (lambda (sql) (string-match-p "\\`SELECT\\_>" sql)) seen))
+    (should-not (cl-some (lambda (sql)
+                           (string-match-p "\\`[[:space:]]*\\(CREATE\\|ALTER\\|DROP\\|INSERT\\|UPDATE\\|DELETE\\)\\_>" sql))
+                         seen))))
+
+(ert-deftest dorg-test-dzx00-receipt-status-handles-client-column-labels ()
+  "Receipt status accepts the uppercase labels emitted by the SQL client.
+
+The query aliases its information-schema fields to the lowercase keys DOrg
+uses.  The uppercase rows retain the exact shape from the failed owned-Dolt
+receipt, so this remains a witness if a client ignores those aliases."
+  (let (seen)
+    (should
+     (eq 'compatible
+         (dorg-sql--mutation-log-schema-status
+          (lambda (sql)
+            (push sql seen)
+            (if (string-match-p "information_schema.tables" sql)
+                '(((TABLE_NAME . "dorg_mutation_log")))
+              '(((COLUMN_NAME . "op_id")
+                 (COLUMN_TYPE . "varchar(255)") (IS_NULLABLE . "NO"))
+                ((COLUMN_NAME . "gen_id")
+                 (COLUMN_TYPE . "varchar(64)") (IS_NULLABLE . "NO"))
+                ((COLUMN_NAME . "intent_digest")
+                 (COLUMN_TYPE . "varchar(64)") (IS_NULLABLE . "NO"))
+                ((COLUMN_NAME . "ts")
+                 (COLUMN_TYPE . "bigint") (IS_NULLABLE . "NO"))
+                ((COLUMN_NAME . "postimages_v1")
+                 (COLUMN_TYPE . "text") (IS_NULLABLE . "YES"))))))))
+    (let ((column-query
+           (cl-find-if (lambda (sql)
+                         (string-match-p "information_schema.columns" sql))
+                       seen)))
+      (should column-query)
+      (should (string-match-p
+               (concat "column_name AS column_name, column_type AS column_type,"
+                       " is_nullable AS is_nullable")
+               column-query)))))
+
+(ert-deftest dorg-test-dzx00-v7-corrupt-receipt-refuses-without-migration-remedy ()
+  "A current-schema store with damaged receipt storage reports integrity, not migration."
+  (let (seen)
+    (cl-letf (((symbol-function 'dorg-sql--lease-exec)
+               (lambda (_lease sql &rest _)
+                 (push sql seen)
+                 (cond ((string-match-p "information_schema.tables" sql) nil)
+                       ((string-match-p "schema_version" sql)
+                        (list (list (cons 'value
+                                          (number-to-string dorg-schema-version)))))))))
+      (let ((err (should-error
+                  (dorg-sql--require-mutation-log-schema 'lease)
+                  :type 'dorg-schema-migration-required)))
+        (should (eq 'receipt-schema-incompatible
+                    (plist-get (dorg-error-data err) :reason)))
+        (should-not (string-match-p "dorg-migrate-schema"
+                                    (error-message-string err)))))
+    (should-not (cl-some (lambda (sql)
+                           (string-match-p "\\`[[:space:]]*\\(CREATE\\|ALTER\\|DROP\\|INSERT\\|UPDATE\\|DELETE\\)\\_>" sql))
+                         seen))))
+
+(ert-deftest dorg-test-dzx00-v6-receipt-resolver-only-upgrades-known-shapes ()
+  "The v6 resolver creates/adds only known receipt shapes and preserves others."
+  (cl-labels
+      ((resolve (tables columns)
+         (cl-letf (((symbol-function 'dorg-repo-migration-query)
+                    (lambda (_dir sql &rest _)
+                      (if (string-match-p "information_schema.tables" sql)
+                          tables
+                        columns))))
+           (dorg-repo--v6-to-v7-receipt-schema "/tmp/dzx00"))))
+    (should (equal (list dorg-schema-mutation-log-ddl) (resolve nil nil)))
+    (should (equal '("ALTER TABLE dorg_mutation_log ADD COLUMN postimages_v1 TEXT NULL")
+                   (resolve '((table_name . "dorg_mutation_log"))
+                            '(((column_name . "op_id") (column_type . "varchar(255)") (is_nullable . "NO"))
+                              ((column_name . "gen_id") (column_type . "varchar(64)") (is_nullable . "NO"))
+                              ((column_name . "intent_digest") (column_type . "varchar(64)") (is_nullable . "NO"))
+                              ((column_name . "ts") (column_type . "bigint") (is_nullable . "NO"))))))
+    (should-error
+     (resolve '((table_name . "dorg_mutation_log"))
+              '(((column_name . "wrong") (column_type . "text") (is_nullable . "YES"))))
+     :type 'dorg-schema-migration-required)))
 
 (ert-deftest dorg-test-dolt-binary-secondary-index-fk-update-keeps-connection-live ()
   "A headings UPDATE through the binary-index FK path keeps the server alive.
@@ -60,7 +298,7 @@ portable witnesses; the client-side timeout/closed-connection text is not."
      dolt-dir
      (concat
       "INSERT INTO headings "
-      "(id, root_id, parent_id, sort_key, level, commented, title, "
+      "(id, root_id, parent_id, sort_key, level_offset, commented, title, "
       "post_blank, items_hash) VALUES "
       "(100, 100, NULL, X'0000', 0, FALSE, NULL, 0, NULL), "
       "(101, 100, 100, X'0001', 1, FALSE, 'before', 0, NULL)"))
@@ -69,18 +307,18 @@ portable witnesses; the client-side timeout/closed-connection text is not."
        dolt-dir
        (concat
         "UPDATE headings SET parent_id = 100, sort_key = X'0001', "
-        "level = 1, todo_keyword = NULL, priority = NULL, "
+        "level_offset = 1, todo_keyword = NULL, priority = NULL, "
         "commented = FALSE, title = 'after', post_blank = 0, "
         "items_hash = '7015d21b5ae3ba277cc23462a9359d76' WHERE id = 101"))
       (should
        (equal (dorg-sql
                dolt-dir
                (concat
-                "SELECT parent_id, HEX(sort_key) AS sort_key, level, title, "
+                "SELECT parent_id, HEX(sort_key) AS sort_key, level_offset, title, "
                 "items_hash FROM headings WHERE id = 101"))
               '(((parent_id . 100)
                  (sort_key . "0001")
-                 (level . 1)
+                 (level_offset . 1)
                  (title . "after")
                  (items_hash . "7015d21b5ae3ba277cc23462a9359d76")))))
       ;; A reconnect would conceal the server dropping the updating session.
@@ -89,8 +327,8 @@ portable witnesses; the client-side timeout/closed-connection text is not."
                      '(((alive . 1))))))))
 
 (ert-deftest dorg-test-release-hygiene-retires-complete-pre-v6-ledger ()
-  "The v6 release candidate contains no pre-v6 migration scaffolding.
-The postimage is coherent: the complete core ledger is empty, every legacy
+  "The v7 release retains only its explicit v6 receipt migration.
+Every legacy
 v4/v5 definition/reference is absent from production source and runtime, and
 the generic explicit migration entry has no retired root-map parameter.  The
 preimage contains every survivor, making this deletion test non-vacuous."
@@ -125,7 +363,9 @@ preimage contains every survivor, making this deletion test non-vacuous."
                        (string-search name (cdr source)))
                      sources)
         (push name survivors)))
-    (when dorg-schema-migrations
+    (unless (equal dorg-schema-migrations
+                   '((6 . dorg-repo--v6-to-v7-receipt-schema)
+                     (7 . dorg-repo--v7-to-v8-level-offset)))
       (push (format "migration-ledger:%S" dorg-schema-migrations) survivors))
     (dolist (symbol '(dorg-schema--conflicts-table
                       dorg-repo--explicit-binding-map
@@ -183,12 +423,17 @@ ensure.  On the current preimage a v5 store follows the live migration ledger,
 so the expected refusal is absent and this test is RED."
   (let ((dorg-schema-auto-migrate t)
         calls)
-    (cl-letf (((symbol-function 'dorg-repo-check-schema-compat)
-               (lambda (_) :needs-migration))
-              ((symbol-function 'dorg-repo--db-schema-version)
-               (lambda (_) 5))
+    (cl-letf (((symbol-function 'dorg-repo--ordinary-read)
+               (lambda (_dir _query &rest args)
+                 (let ((key (car args)))
+                   (cond
+                    ((and key (string-search "schema_version" key))
+                     '(((value . "5"))))
+                    (t nil)))))
               ((symbol-function 'dorg-repo--announce-migration)
                (lambda (&rest _) (push 'announce calls)))
+              ((symbol-function 'dorg-repo--resolve-core-migration-step)
+               (lambda (&rest _) (push 'resolver calls)))
               ((symbol-function 'dorg-repo--commit-schema-step)
                (lambda (&rest _) (push 'commit calls)))
               ((symbol-function 'dorg-repo-ensure-extensions)
@@ -196,13 +441,784 @@ so the expected refusal is absent and this test is RED."
       (let ((err (should-error
                   (dorg-repo-ensure-schema "/pre-v6")
                   :type 'dorg-schema-migration-required)))
-        (should (string-match-p "pre-release schema" (error-message-string err)))
-        (should (string-match-p "no supported upgrade path"
+        (should (string-match-p "core:pre-v6" (error-message-string err)))
+        (should (string-match-p "M-x dorg-migrate-schema"
                                 (error-message-string err)))))
     (should-not calls)))
 
-(ert-deftest dorg-test-ttp2t-schema-v6-hard-renames-file-binding-column ()
-  "Fresh v6 stores encode one table-wide relative binding representation.
+(ert-deftest dorg-test-bx6op-ordinary-core-migration-refuses-before-write ()
+  "Ordinary open refuses an older existing core schema without auto-migrating.
+The old `dorg-schema-auto-migrate' escape hatch must not reach announcement,
+resolver, schema-step, extension ensure, or any write path."
+  (let ((dorg-schema-version 7)
+        (dorg-schema-auto-migrate t)
+        (dorg-schema-migrations '((6 . "ALTER TABLE headings ADD COLUMN bx6op INT")))
+        calls)
+    (cl-letf (((symbol-function 'dorg-repo--db-schema-version) (lambda (_) 6))
+              ((symbol-function 'dorg-repo--ordinary-read)
+               (lambda (_dir query &rest args)
+                 (let ((key (car args)))
+                   (cond
+                    ((and key (string-search "schema_version" key))
+                     '(((value . "6"))))
+                    (t (error "unexpected ordinary read: %s %S" query args))))))
+              ((symbol-function 'dorg-repo--announce-migration)
+               (lambda (&rest _) (push 'announce calls)))
+              ((symbol-function 'dorg-repo--resolve-core-migration-step)
+               (lambda (&rest _) (push 'resolver calls)))
+              ((symbol-function 'dorg-repo--commit-schema-step)
+               (lambda (&rest _) (push 'commit calls)))
+              ((symbol-function 'dorg-repo-ensure-extensions)
+               (lambda (&rest _) (push 'extensions calls))))
+      (let ((err (should-error
+                  (dorg-repo-ensure-schema "/tmp/bx6op-store")
+                  :type 'dorg-schema-migration-required)))
+        (should (string-match-p "M-x dorg-migrate-schema"
+                                (error-message-string err)))
+        (should-not (string-match-p "dorg-schema-auto-migrate"
+                                    (error-message-string err)))
+        (should-not (string-match-p "ext:.*:version"
+                                    (error-message-string err)))))
+    (should-not calls)))
+
+(ert-deftest dorg-test-bx6op-ordinary-absent-extension-refuses-before-install ()
+  "Ordinary open refuses a missing registered extension row without installing it."
+  (let ((calls nil))
+    (dorg-test-with-clean-extensions
+      (dorg-register-extension
+       'demo :schema "CREATE TABLE demo_t (id INT PRIMARY KEY);" :version 1)
+      (cl-letf (((symbol-function 'dorg-repo--ordinary-read)
+                 (lambda (_dir query &rest args)
+                   (let ((key (car args)))
+                     (cond
+                      ((and key (string-search "schema_version" key))
+                       '(((value . "6"))))
+                      ((and key (string-search "ext:demo:version" key))
+                       nil)
+                      (t (error "unexpected ordinary read: %s %S" query args))))))
+                ((symbol-function 'dorg-repo--install-extension)
+                 (lambda (&rest _) (push 'install calls)))
+                ((symbol-function 'dorg-repo--migrate-extension-step)
+                 (lambda (&rest _) (push 'migrate calls))))
+        (let ((err (should-error
+                    (dorg-repo-ensure-schema "/tmp/bx6op-store")
+                    :type 'dorg-schema-migration-required)))
+          (should (string-match-p "demo" (error-message-string err)))
+          (should (string-match-p "absent" (error-message-string err)))
+          (should-not calls))))))
+
+(ert-deftest dorg-test-bx6op-ordinary-transport-error-propagates ()
+  "Ordinary open reports transport failures as transport failures, not schema gaps."
+  (cl-letf (((symbol-function 'dorg-repo--ordinary-read)
+             (lambda (&rest _)
+               (signal 'dorg-sql-transport-error
+                       '("server unavailable")))))
+    (should-error (dorg-repo-ensure-schema "/tmp/bx6op-store")
+                  :type 'dorg-sql-transport-error)))
+
+(ert-deftest dorg-test-bx6op-legacy-extension-ensure-is-retired ()
+  "The old public extension installer is not a second existing-store apply path."
+  (dorg-test-with-clean-extensions
+    (dorg-register-extension
+     'demo :schema "CREATE TABLE demo_t (id INT PRIMARY KEY);" :version 1)
+    (cl-letf (((symbol-function 'dorg-repo--ext-db-version)
+               (lambda (&rest _) nil))
+              ((symbol-function 'dorg-repo--install-extension)
+               (lambda (&rest _)
+                 (ert-fail "retired installer must not install directly")))
+              ((symbol-function 'dorg-repo--migrate-extension-step)
+               (lambda (&rest _)
+                 (ert-fail "retired installer must not migrate directly"))))
+      (let ((err (should-error
+                  (dorg-repo-ensure-extensions "/tmp/bx6op-store")
+                  :type 'dorg-schema-migration-required)))
+        (should (eq 'explicit-migration-required (dorg-error-reason err)))
+        (should (string-match-p "dorg-migrate-schema"
+                                (error-message-string err)))))))
+
+(ert-deftest dorg-test-bx6op-explicit-migration-uses-one-lease-batch-per-step ()
+  "The operator migration path applies each needed step under the real gate.
+This source-only witness pins the leased apply shape: the migration SQL and
+version bump share one `dorg-sql--lease-batch' call with REPORT-ROLLBACK non-nil,
+the batch sees the exact lease acquired by `dorg-mutate-call-with-store-gate',
+and no ordinary commit helper or second commit is reached.  If the public entry
+bypasses the gate while still executing the callback, the batch assertion that
+the lock is held goes RED."
+  (let ((dorg-schema-version 7)
+        (dorg-schema-migrations '((6 . "ALTER TABLE headings ADD COLUMN bx6op INT")))
+        (dorg-sql-transport 'server)
+        (db-version 6)
+        (lease (dorg-sql--make-lease :dolt-dir "/tmp/bx6op-store"))
+        (gate-held nil)
+        (dorg-test-bx6op--receipt-schema-reads nil)
+        demo-installed
+        calls)
+    (dorg-test-with-clean-extensions
+      (dorg-register-extension
+       'demo :schema "CREATE TABLE demo_t (id INT PRIMARY KEY);" :version 1)
+      (cl-letf (((symbol-function 'dorg-sql--acquire-lease)
+                 (lambda (dir)
+                   (push (list :acquire dir) calls)
+                   lease))
+                ((symbol-function 'dorg-sql--release-lease)
+                 (lambda (seen broken)
+                   (push (list :release seen broken) calls)))
+                ((symbol-function 'dorg-sql--mutate-lock-key)
+                 (lambda (seen)
+                   (should (eq seen lease))
+                   (push (list :lock-key seen) calls)
+                   "bx6op-gate-key"))
+                ((symbol-function 'dorg-sql--lease-get-lock)
+                 (lambda (seen key timeout)
+                   (should (eq seen lease))
+                   (should (equal key "bx6op-gate-key"))
+                   (push (list :get-lock seen key timeout) calls)
+                   (setq gate-held t)))
+                ((symbol-function 'dorg-sql--lease-release-lock)
+                 (lambda (seen key)
+                   (should (eq seen lease))
+                   (should (equal key "bx6op-gate-key"))
+                   (should gate-held)
+                   (setq gate-held nil)
+                   (push (list :release-lock seen key) calls)))
+                ((symbol-function 'dorg-repo--working-set-clean-p)
+                 (lambda (&rest _) (push 'ordinary-clean calls) t))
+                ((symbol-function 'dorg-sql--lease-exec)
+                 (lambda (seen query &rest args)
+                   (should (eq seen lease))
+                   (let ((key (car args)))
+                     (cond
+                      ((string-match-p "information_schema" query)
+                       (dorg-test-bx6op--receipt-schema-rows query))
+                      ((string-match-p "dolt_status" query) nil)
+                      ((and key (string-search "schema_version" key))
+                       `(((value . ,(number-to-string db-version)))))
+                      ((and key (string-search "ext:demo:version" key))
+                       (and demo-installed '(((value . "1")))))
+                      (t (error "unexpected leased read: %s %S" query args))))))
+                ((symbol-function 'dorg-sql--lease-batch)
+                 (lambda (seen statements commit-message &optional validate report-rollback)
+                   (should (eq seen lease))
+                   (should gate-held)
+                   (push (list :batch seen statements commit-message validate report-rollback)
+                         calls)
+                   (cond
+                    ((equal commit-message "dorg: migrate schema v6 -> v7")
+                     (setq db-version 7))
+                    ((equal commit-message "dorg: install extension demo v1")
+                     (setq demo-installed t))
+                    (t (ert-fail (format "unexpected commit message: %s"
+                                         commit-message))))
+                   "commit-hash"))
+                ((symbol-function 'dorg-repo--commit-schema-step)
+                 (lambda (&rest _) (push 'ordinary-commit calls)))
+                ((symbol-function 'dorg-commit)
+                 (lambda (&rest _) (push 'second-commit calls))))
+        (dorg-migrate-schema "/tmp/bx6op-store")))
+    (should-not gate-held)
+    (should (equal '(columns tables) dorg-test-bx6op--receipt-schema-reads))
+    (should-not (member 'ordinary-clean calls))
+    (should-not (member 'ordinary-commit calls))
+    (should-not (member 'second-commit calls))
+    (should (= 1 (cl-count-if (lambda (x) (eq (car-safe x) :acquire)) calls)))
+    (should (= 1 (cl-count-if (lambda (x) (eq (car-safe x) :release)) calls)))
+    (should (= 1 (cl-count-if (lambda (x) (eq (car-safe x) :release-lock)) calls)))
+    (let ((batches (nreverse (cl-remove-if-not
+                              (lambda (x) (and (consp x) (eq (car x) :batch)))
+                              calls))))
+      (should (= 2 (length batches)))
+      (let ((core (car batches))
+            (ext (cadr batches)))
+        (should (eq lease (plist-get core :batch)))
+        (should (member "ALTER TABLE headings ADD COLUMN bx6op INT"
+                        (nth 2 core)))
+        (should (cl-some (lambda (sql)
+                           (string-match-p "schema_version" sql))
+                         (nth 2 core)))
+        (should (equal "dorg: migrate schema v6 -> v7" (nth 3 core)))
+        (should (eq t (nth 5 core)))
+        (should (eq lease (plist-get ext :batch)))
+        (should (member "CREATE TABLE demo_t (id INT PRIMARY KEY);"
+                        (nth 2 ext)))
+        (should (cl-some (lambda (sql)
+                           (string-match-p "ext:demo:version" sql))
+                         (nth 2 ext)))
+        (should (equal "dorg: install extension demo v1" (nth 3 ext)))
+        (should (eq t (nth 5 ext)))))))
+
+(ert-deftest dorg-test-bx6op-explicit-migration-releases-gate-after-step-failure ()
+  "A signaled schema step failure releases the real gate once before surfacing."
+  (let ((dorg-schema-version 7)
+        (dorg-schema-migrations '((6 . "ALTER TABLE headings ADD COLUMN bx6op INT")))
+        (dorg-sql-transport 'server)
+        (db-version 6)
+        (lease (dorg-sql--make-lease :dolt-dir "/tmp/bx6op-store"))
+        (gate-held nil)
+        events)
+    (cl-letf (((symbol-function 'dorg-sql--acquire-lease)
+               (lambda (dir) (push (list :acquire dir) events) lease))
+              ((symbol-function 'dorg-sql--release-lease)
+               (lambda (seen broken)
+                 (push (list :release seen broken) events)))
+              ((symbol-function 'dorg-sql--mutate-lock-key)
+               (lambda (seen)
+                 (should (eq seen lease))
+                 "bx6op-gate-key"))
+              ((symbol-function 'dorg-sql--lease-get-lock)
+               (lambda (seen _key _timeout)
+                 (should (eq seen lease))
+                 (setq gate-held t)))
+              ((symbol-function 'dorg-sql--lease-release-lock)
+               (lambda (seen _key)
+                 (should (eq seen lease))
+                 (should gate-held)
+                 (setq gate-held nil)
+                 (push :release-lock events)))
+              ((symbol-function 'dorg-sql--lease-exec)
+               (lambda (seen query &rest args)
+                 (should (eq seen lease))
+                 (let ((key (car args)))
+                   (cond
+                    ((string-match-p "dolt_status" query) nil)
+                    ((and key (string-search "schema_version" key))
+                     `(((value . ,(number-to-string db-version)))))
+                    ((and key (string-search "ext:" key)) nil)
+                    (t nil)))))
+              ((symbol-function 'dorg-sql--lease-batch)
+               (lambda (seen _statements _message &rest _)
+                 (should (eq seen lease))
+                 (should gate-held)
+                 (signal 'dorg-sql-commit-indeterminate '("commit lost")))))
+      (should-error (dorg-migrate-schema "/tmp/bx6op-store")
+                    :type 'dorg-sql-commit-indeterminate))
+    (should-not gate-held)
+    (should (= 1 (cl-count-if (lambda (x) (eq (car-safe x) :acquire)) events)))
+    (should (= 1 (cl-count :release-lock events)))
+    (should (= 1 (cl-count-if (lambda (x) (eq (car-safe x) :release)) events)))))
+
+(ert-deftest dorg-test-bx6op-all-current-migration-skips-clean-check ()
+  "An all-current migration skips dirty-set checks but checks receipt shape.
+Non-vacuous: if the all-current guard is removed, the stubbed dirty
+`dolt_status' row makes the leased clean check signal before this test can
+finish."
+  (let ((dorg-schema-version 6)
+        (dorg-test-bx6op--receipt-schema-reads nil)
+        clean-checks
+        batches)
+    (dorg-test-with-clean-extensions
+      (dorg-register-extension
+       'demo :schema "CREATE TABLE demo_t (id INT PRIMARY KEY);" :version 1)
+      (cl-letf (((symbol-function 'dorg-sql--lease-exec)
+                 (lambda (_lease query &rest args)
+                   (let ((key (car args)))
+                     (cond
+                      ((string-match-p "information_schema" query)
+                       (dorg-test-bx6op--receipt-schema-rows query))
+                      ((string-match-p "dolt_status" query)
+                       (push 'dirty-read clean-checks)
+                       '(((table_name . "demo_t"))))
+                      ((and key (string-search "schema_version" key))
+                       '(((value . "6"))))
+                      ((and key (string-search "ext:demo:version" key))
+                       '(((value . "1"))))
+                      (t (error "unexpected leased read: %s %S" query args))))))
+                ((symbol-function 'dorg-sql--lease-batch)
+                 (lambda (&rest _)
+                   (push 'batch batches)
+                   "commit")))
+        (should-not (dorg-repo--migrate-schema-on-lease
+                     "/tmp/bx6op-store" 'lease))))
+    (should-not clean-checks)
+    (should (equal '(columns tables) dorg-test-bx6op--receipt-schema-reads))
+    (should-not batches)))
+
+(ert-deftest dorg-test-bx6op-migrate-schema-cold-loads-store-gate ()
+  "A fresh public migration entry resolves the real store gate dependency.
+The subprocess requires only `dorg-repo' before calling `dorg-migrate-schema':
+no umbrella `dorg', no suite runner and no preloaded `dorg-mutate'.  It stubs
+only lower lease primitives, so removing the autoload makes the public entry
+fail with `void-function' before the lease-entry sentinel."
+  (let* ((root (file-name-directory (locate-library "dorg-repo")))
+         (emacs (expand-file-name invocation-name invocation-directory))
+         (expr
+          "(progn
+             (require 'cl-lib)
+             (require 'dorg-repo)
+             (when (featurep 'dorg-mutate)
+               (error \"dorg-mutate preloaded before public entry\"))
+             (let ((events nil))
+               (cl-letf (((symbol-function 'dorg-repo--ensure-managed-migration-transport)
+                          (lambda (&rest _) (push 'transport events)))
+                         ((symbol-function 'dorg-sql--acquire-lease)
+                          (lambda (dir) (push (list 'acquire dir) events) 'lease))
+                         ((symbol-function 'dorg-sql--release-lease)
+                          (lambda (lease broken)
+                            (push (list 'release lease broken) events)))
+                         ((symbol-function 'dorg-sql--mutate-lock-key)
+                          (lambda (lease) (push (list 'lock-key lease) events) 'key))
+                         ((symbol-function 'dorg-sql--lease-get-lock)
+                          (lambda (lease key timeout)
+                            (push (list 'get-lock lease key timeout) events)
+                            t))
+                         ((symbol-function 'dorg-sql--lease-release-lock)
+                          (lambda (lease key)
+                            (push (list 'release-lock lease key) events)))
+                         ((symbol-function 'dorg-repo--migrate-schema-on-lease)
+                          (lambda (dir lease)
+                            (push (list 'lease-entry dir lease
+                                        (featurep 'dorg-mutate))
+                                  events)
+                            nil)))
+                 (dorg-migrate-schema \"/tmp/bx6op-store\"))
+               (unless (member '(lease-entry \"/tmp/bx6op-store\" lease t)
+                               events)
+                 (error \"missing lease-entry through loaded gate: %S\"
+                        (nreverse events)))
+               (princ (format \"events=%S\\n\" (nreverse events)))))"))
+    (with-temp-buffer
+      (let ((status
+             (call-process emacs nil (current-buffer) nil
+                           "--batch" "-Q"
+                           "-L" root
+                           "-L" (expand-file-name "lib/mysql" root)
+                           "-L" (expand-file-name "lib/clime" root)
+                           "--eval" expr)))
+        (ert-info ((format "child Emacs output:\n%s" (buffer-string)))
+          (should (= 0 status)))))))
+
+(ert-deftest dorg-test-bx6op-function-resolver-uses-scoped-read-helper ()
+  "A real function-valued resolver keeps the one-arg DOLT-DIR contract and reads
+through the explicit scoped helper on the owned session."
+  (let ((dorg-schema-version 7)
+        (seen-arg nil)
+        (helper-queries nil)
+        sql)
+    (cl-letf (((symbol-function 'dorg-sql--lease-exec)
+               (lambda (lease query &rest args)
+                 (push (list lease query args) helper-queries)
+                 '(((n . 3)))))
+              ((symbol-function 'dorg-dolt-server--canonical-dir)
+               (lambda (dir) (file-name-as-directory (expand-file-name dir)))))
+      (setq sql
+            (dorg-repo--with-migration-resolver-scope
+                "/tmp/bx6op-store" 'lease
+              (dorg-repo--resolve-core-migration-step
+               "/tmp/bx6op-store"
+               (lambda (dolt-dir)
+                 (setq seen-arg dolt-dir)
+                 (let ((rows (dorg-repo-migration-query
+                              dolt-dir
+                              "SELECT COUNT(*) AS n FROM headings WHERE level = %d"
+                              1)))
+                   (format "INSERT INTO audit VALUES (%s)"
+                           (alist-get 'n (car rows)))))))))
+    (should (equal seen-arg "/tmp/bx6op-store"))
+    (should (equal sql '("INSERT INTO audit VALUES (3)")))
+    (should (equal helper-queries
+                   '((lease
+                      "SELECT COUNT(*) AS n FROM headings WHERE level = 1"
+                      nil))))))
+
+(ert-deftest dorg-test-bx6op-resolver-helper-refuses-non-read-sql ()
+  "Resolver-scoped reads refuse writes, transaction control, and multi-statements."
+  (cl-letf (((symbol-function 'dorg-sql--lease-exec)
+             (lambda (&rest _)
+               (ert-fail "unsafe resolver query must not execute")))
+            ((symbol-function 'dorg-dolt-server--canonical-dir)
+             (lambda (dir) (file-name-as-directory (expand-file-name dir)))))
+    (dorg-repo--with-migration-resolver-scope "/tmp/bx6op-store" 'lease
+      (dolist (query '("UPDATE headings SET title = 'x'"
+                       "BEGIN"
+                       "SELECT 1; DELETE FROM headings"))
+        (let ((err (should-error
+                    (dorg-repo-migration-query "/tmp/bx6op-store" query)
+                    :type 'dorg-schema-migration-required)))
+          (should (eq 'resolver-read-unsafe-sql (dorg-error-reason err)))
+          (should (string-match-p "SELECT-only" (error-message-string err))))))))
+
+(ert-deftest dorg-test-bx6op-resolver-helper-refuses-out-of-scope-and-wrong-store ()
+  "The resolver read helper is scoped to the active callback and exact store."
+  (let ((err (should-error
+              (dorg-repo-migration-query "/tmp/bx6op-store" "SELECT 1")
+              :type 'dorg-schema-migration-required)))
+    (should (eq 'resolver-read-outside-scope (dorg-error-reason err)))
+    (should (string-match-p "outside" (error-message-string err))))
+  (cl-letf (((symbol-function 'dorg-dolt-server--canonical-dir)
+             (lambda (dir) (file-name-as-directory (expand-file-name dir)))))
+    (dorg-repo--with-migration-resolver-scope "/tmp/bx6op-store" 'lease
+      (let ((err (should-error
+                  (dorg-repo-migration-query "/tmp/other-store" "SELECT 1")
+                  :type 'dorg-schema-migration-required)))
+        (should (string-match-p "wrong store" (error-message-string err)))))))
+
+(ert-deftest dorg-test-bx6op-resolver-helper-scope-unwinds-on-error ()
+  "Resolver helper authority does not survive a callback error."
+  (cl-letf (((symbol-function 'dorg-dolt-server--canonical-dir)
+             (lambda (dir) (file-name-as-directory (expand-file-name dir)))))
+    (should-error
+     (dorg-repo--with-migration-resolver-scope "/tmp/bx6op-store" 'lease
+       (error "boom"))
+     :type 'error))
+  (let ((err (should-error
+              (dorg-repo-migration-query "/tmp/bx6op-store" "SELECT 1")
+              :type 'dorg-schema-migration-required)))
+    (should (string-match-p "outside" (error-message-string err)))))
+
+(ert-deftest dorg-test-bx6op-legacy-resolver-ordinary-sql-refuses-actionably ()
+  "A resolver that re-enters ordinary same-store SQL while leased gets a
+compatibility refusal naming the scoped helper."
+  (let ((dorg-schema-version 7)
+        (dorg-schema-migrations
+         (list (cons 6 (lambda (dolt-dir)
+                         (dorg-sql dolt-dir "SELECT 1")
+                         "SELECT 1"))))
+        (db-version 6))
+    (cl-letf (((symbol-function 'dorg-mutate-call-with-store-gate)
+               (lambda (_dir fn &rest _) (funcall fn 'lease 'key)))
+              ((symbol-function 'dorg-sql--lease-exec)
+               (lambda (_lease query &rest args)
+                 (let ((key (car args)))
+                   (cond
+                    ((string-match-p "dolt_status" query) nil)
+                    ((and key (string-search "schema_version" key))
+                     `(((value . ,(number-to-string db-version)))))
+                    (t nil)))))
+              ((symbol-function 'dorg-sql)
+               (lambda (&rest _)
+                 (signal 'dorg-sql-lease-busy '("ordinary SQL refused"))))
+              ((symbol-function 'dorg-sql--lease-batch)
+               (lambda (&rest _) (ert-fail "batch must not run"))))
+      (let ((err (should-error
+                  (dorg-migrate-schema "/tmp/bx6op-store")
+                  :type 'dorg-schema-migration-required)))
+        (should (string-match-p "dorg-repo-migration-query"
+                                (error-message-string err)))))))
+
+(ert-deftest dorg-test-bx6op-resolver-chain-sees-prior-committed-step ()
+  "A later data-dependent resolver reads after an earlier migration step lands."
+  (let ((dorg-schema-version 8)
+        (dorg-schema-migrations
+         (list (cons 6 (lambda (dolt-dir)
+                         (let ((rows (dorg-repo-migration-query
+                                      dolt-dir "SELECT marker AS m FROM phase")))
+                           (format "INSERT INTO seen VALUES ('%s')"
+                                   (alist-get 'm (car rows))))))
+               (cons 7 (lambda (dolt-dir)
+                         (let ((rows (dorg-repo-migration-query
+                                      dolt-dir "SELECT marker AS m FROM phase")))
+                           (format "INSERT INTO seen VALUES ('%s')"
+                                   (alist-get 'm (car rows))))))))
+        (db-version 6)
+        (phase "before")
+        (dorg-test-bx6op--receipt-schema-reads nil)
+        resolver-reads
+        batches)
+    (cl-letf (((symbol-function 'dorg-mutate-call-with-store-gate)
+               (lambda (_dir fn &rest _) (funcall fn 'lease 'key)))
+              ((symbol-function 'dorg-sql--lease-exec)
+               (lambda (_lease query &rest args)
+                 (let ((key (car args)))
+                   (cond
+                    ((string-match-p "dolt_status" query) nil)
+                    ((and key (string-search "schema_version" key))
+                     `(((value . ,(number-to-string db-version)))))
+                    ((string-match-p "SELECT marker" query)
+                     (push phase resolver-reads)
+                     `(((m . ,phase))))
+                    ((string-match-p "information_schema" query)
+                     (dorg-test-bx6op--receipt-schema-rows query))
+                    (t nil)))))
+              ((symbol-function 'dorg-sql--lease-batch)
+               (lambda (_lease statements _message &optional _validate report-rollback)
+                 (should (eq t report-rollback))
+                 (push statements batches)
+                 (setq db-version (1+ db-version))
+                 (setq phase "after")
+                 "commit-hash")))
+      (dorg-migrate-schema "/tmp/bx6op-store"))
+    (should (equal (nreverse resolver-reads) '("before" "after")))
+    (should (equal '(columns tables) dorg-test-bx6op--receipt-schema-reads))
+    (should (= 2 (length batches)))))
+
+(ert-deftest dorg-test-bx6op-ordinary-open-never-runs-resolvers ()
+  "Ordinary compatibility refuses without executing migration resolvers."
+  (let ((dorg-schema-version 7)
+        (resolver-calls 0))
+    (let ((dorg-schema-migrations
+           (list (cons 6 (lambda (_dolt-dir)
+                           (cl-incf resolver-calls)
+                           "SELECT 1")))))
+      (cl-letf (((symbol-function 'dorg-repo--ordinary-read)
+                 (lambda (_dir _query &rest args)
+                   (let ((key (car args)))
+                     (cond
+                      ((and key (string-search "schema_version" key))
+                       '(((value . "6"))))
+                      (t nil)))))
+                ((symbol-function 'dorg-repo--commit-schema-step)
+                 (lambda (&rest _) (ert-fail "ordinary open must not write"))))
+        (should-error (dorg-repo-ensure-schema "/tmp/bx6op-store")
+                      :type 'dorg-schema-migration-required)))
+    (should (= 0 resolver-calls))))
+
+(ert-deftest dorg-test-bx6op-explicit-migration-installs-absent-extension ()
+  "Explicit migration may install an absent registered extension on the lease."
+  (let ((batches nil)
+        (dorg-test-bx6op--receipt-schema-reads nil))
+    (dorg-test-with-clean-extensions
+      (dorg-register-extension
+       'demo
+       :schema '("CREATE TABLE demo_t (id INT PRIMARY KEY)")
+       :version 2)
+      (cl-letf (((symbol-function 'dorg-mutate-call-with-store-gate)
+                 (lambda (_dir fn &rest _) (funcall fn 'lease 'key)))
+                ((symbol-function 'dorg-sql--lease-exec)
+                 (lambda (_lease query &rest args)
+                   (let ((key (car args)))
+                     (cond
+                      ((string-match-p "dolt_status" query) nil)
+                      ((and key (string-search "schema_version" key))
+                       `(((value . ,(number-to-string dorg-schema-version)))))
+                      ((and key (string-search "ext:demo:version" key))
+                       nil)
+                      ((string-match-p "information_schema" query)
+                       (dorg-test-bx6op--receipt-schema-rows query))
+                      (t nil)))))
+                ((symbol-function 'dorg-sql--lease-batch)
+                 (lambda (_lease statements message &optional _validate report-rollback)
+                   (push (list statements message report-rollback) batches)
+                   "commit-hash")))
+        (dorg-migrate-schema "/tmp/bx6op-store")))
+    (should (equal '(columns tables) dorg-test-bx6op--receipt-schema-reads))
+    (should (= 1 (length batches)))
+    (let ((batch (car batches)))
+      (should (member "CREATE TABLE demo_t (id INT PRIMARY KEY)" (car batch)))
+      (should (cl-some (lambda (sql)
+                         (string-match-p "ext:demo:version" sql))
+                       (car batch)))
+      (should (equal "dorg: install extension demo v2" (cadr batch)))
+      (should (eq t (nth 2 batch))))))
+
+(ert-deftest dorg-test-bx6op-explicit-newer-refuses-before-write ()
+  "Explicit migration refuses a newer selected component before any DDL batch."
+  (let ((dorg-schema-version 6)
+        batches)
+    (cl-letf (((symbol-function 'dorg-mutate-call-with-store-gate)
+               (lambda (_dir fn &rest _) (funcall fn 'lease 'key)))
+              ((symbol-function 'dorg-sql--lease-exec)
+               (lambda (_lease _query &rest args)
+                 (let ((key (car args)))
+                   (cond
+                    ((and key (string-search "schema_version" key))
+                     '(((value . "7"))))
+                    (t nil)))))
+              ((symbol-function 'dorg-sql--lease-batch)
+               (lambda (&rest _) (push 'batch batches) "commit")))
+      (should-error (dorg-migrate-schema "/tmp/bx6op-store")
+                    :type 'dorg-schema-repo-newer))
+    (should-not batches))
+  (let ((dorg-schema-version 6)
+        migrated)
+    (cl-letf (((symbol-function 'dorg-mutate-call-with-store-gate)
+               (lambda (_dir fn &rest _) (funcall fn 'lease 'key)))
+              ((symbol-function 'dorg-repo--migrate-schema-on-lease)
+               (lambda (_dir _lease) (setq migrated t))))
+      (dorg-migrate-schema "/tmp/bx6op-store"))
+    (should migrated)))
+
+(ert-deftest dorg-test-bx6op-migrate-schema-refuses-cli-seam-before-effects ()
+  "Explicit migration refuses unsupported offline/CLI-pinned requests up front."
+  (let (effects)
+    (cl-letf (((symbol-function 'dorg-mutate-call-with-store-gate)
+               (lambda (&rest _) (push 'gate effects)))
+              ((symbol-function 'dorg-dolt-server--strict-port)
+               (lambda (&rest _) (push 'server effects)))
+              ((symbol-function 'dorg-sql--lease-exec)
+               (lambda (&rest _) (push 'lease-read effects)))
+              ((symbol-function 'dorg-sql--lease-batch)
+               (lambda (&rest _) (push 'batch effects))))
+      (let ((err (should-error
+                  (dorg-sql--with-cli-seam "/tmp/bx6op-store"
+                    (dorg-migrate-schema "/tmp/bx6op-store"))
+                  :type 'dorg-schema-migration-required)))
+        (should (eq 'unsupported-offline-migration (dorg-error-reason err)))
+        (should (string-match-p "managed server" (error-message-string err)))))
+    (should-not effects)))
+
+(ert-deftest dorg-test-bx6op-migrate-schema-server-transport-reaches-gate ()
+  "Supported server transport reaches the existing leased migration gate."
+  (let (events)
+    (cl-letf (((symbol-function 'dorg-mutate-call-with-store-gate)
+               (lambda (_dir fn &rest _)
+                 (push 'gate events)
+                 (funcall fn 'lease 'key)))
+              ((symbol-function 'dorg-repo--migrate-schema-on-lease)
+               (lambda (_dir lease) (push (list 'migrate lease) events))))
+      (let ((dorg-sql-transport 'server))
+        (dorg-migrate-schema "/tmp/bx6op-store")))
+    (should (equal (nreverse events) '(gate (migrate lease))))))
+
+(ert-deftest dorg-test-bx6op-cli-open-caller-refuses-ordinary-migration ()
+  "The CLI open path reaches the ordinary compatibility boundary without writes."
+  (require 'dorg-app)
+  (let* ((root (make-temp-file "dorg-bx6op-cli-" t))
+         (org-file (expand-file-name "task.org" root))
+         (dolt-dir (expand-file-name "dolt" root))
+         calls)
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name ".dolt" dolt-dir) t)
+          (with-temp-file org-file (insert "* Task\n"))
+          (let ((dorg-schema-version 7)
+                (dorg-schema-migrations '((6 . "ALTER TABLE headings ADD COLUMN bx6op INT"))))
+            (cl-letf (((symbol-function 'dorg-repo--ordinary-read)
+                       (lambda (_dir _query &rest args)
+                         (let ((key (car args)))
+                           (cond
+                            ((and key (string-search "schema_version" key))
+                             '(((value . "6"))))
+                            (t nil)))))
+                      ((symbol-function 'dorg-repo--commit-schema-step)
+                       (lambda (&rest _) (push 'commit calls)))
+                      ((symbol-function 'dorg-repo-ensure-extensions)
+                       (lambda (&rest _) (push 'extensions calls)))
+                      ((symbol-function 'dorg-repo-root-id)
+                       (lambda (&rest _) (push 'root calls))))
+              (let ((err (should-error
+                          (dorg-app--open org-file dolt-dir)
+                          :type 'dorg-schema-migration-required)))
+                (should (string-match-p "M-x dorg-migrate-schema"
+                                        (error-message-string err)))))))
+      (when (get-file-buffer org-file)
+        (kill-buffer (get-file-buffer org-file)))
+      (delete-directory root t))
+    (should-not calls)))
+
+(ert-deftest dorg-test-bx6op-rolled-back-step-resets-before-resignal ()
+  "A confirmed transaction rollback is restored only after owned reset succeeds."
+  (let (resets)
+    (cl-letf (((symbol-function 'dorg-sql--lease-batch)
+               (lambda (&rest _)
+                 (signal 'dorg-sql-transaction-rolled-back
+                         '("rolled back" (:rollback-confirmed t)))))
+              ((symbol-function 'dorg-sql--lease-exec)
+               (lambda (_lease query &rest _)
+                 (push query resets)
+                 nil)))
+      (let ((err (should-error
+                  (dorg-repo--apply-schema-step-on-lease
+                   'lease "/tmp/bx6op-store" '("ALTER TABLE t ADD COLUMN c INT")
+                   "dorg: migrate schema v6 -> v7")
+                  :type 'dorg-sql-transaction-rolled-back)))
+        (should (eq t (plist-get (dorg-sql-transaction-rollback-data err)
+                                 :rollback-confirmed)))
+        (should (eq t (plist-get (dorg-sql-transaction-rollback-data err)
+                                 :reset-confirmed)))))
+    (should (equal resets '("CALL DOLT_RESET('--hard')")))))
+
+(ert-deftest dorg-test-bx6op-reset-failure-reports-unresolved-cleanup ()
+  "A failed owned reset reports unresolved cleanup without raw reset payloads."
+  (let (resets)
+    (cl-letf (((symbol-function 'dorg-sql--lease-batch)
+               (lambda (&rest _)
+                 (signal 'dorg-sql-transaction-rolled-back
+                         '("rolled back" (:rollback-confirmed t)))))
+              ((symbol-function 'dorg-sql--lease-exec)
+               (lambda (_lease query &rest _)
+                 (push query resets)
+                 (error "PRIVATE-RESET-PAYLOAD-921"))))
+      (let* ((err (should-error
+                   (dorg-repo--apply-schema-step-on-lease
+                    'lease "/tmp/bx6op-store" '("ALTER TABLE t ADD COLUMN c INT")
+                    "dorg: migrate schema v6 -> v7")
+                   :type 'dorg-sql-transaction-rollback-failed))
+             (message (error-message-string err))
+             (data (dorg-sql-transaction-rollback-data err))
+             (public (format "%S %S" message data)))
+        (should (eq t (plist-get data :rollback-confirmed)))
+        (should (eq nil (plist-get data :reset-confirmed)))
+        (should (eq 'reset-failed (plist-get data :reset-error)))
+        (should-not (string-match-p "PRIVATE-RESET-PAYLOAD-921" public))))
+    (should (equal resets '("CALL DOLT_RESET('--hard')")))))
+
+(ert-deftest dorg-test-bx6op-broken-or-indeterminate-step-never-resets-or-continues ()
+  "Broken lease and indeterminate commit abort without reset, replay or later steps."
+  (dolist (fault '((dorg-sql-lease-broken . "lease broke")
+                   (dorg-sql-commit-indeterminate . "commit indeterminate")))
+    (let ((dorg-schema-version 8)
+          (dorg-schema-migrations '((6 . "STEP 6") (7 . "STEP 7")))
+          (db-version 6)
+          batches
+          resets)
+      (cl-letf (((symbol-function 'dorg-mutate-call-with-store-gate)
+                 (lambda (_dir fn &rest _) (funcall fn 'lease 'key)))
+                ((symbol-function 'dorg-sql--lease-exec)
+                 (lambda (_lease query &rest args)
+                   (cond
+                    ((string-match-p "DOLT_RESET" query)
+                     (push query resets)
+                     nil)
+                    ((string-match-p "dolt_status" query) nil)
+                    ((and (car args) (string-search "schema_version" (car args)))
+                     `(((value . ,(number-to-string db-version)))))
+                    (t nil))))
+                ((symbol-function 'dorg-sql--lease-batch)
+                 (lambda (_lease statements _message &optional _validate report-rollback)
+                   (should (eq t report-rollback))
+                   (push statements batches)
+                   (signal (car fault) (list (cdr fault))))))
+        (should-error (dorg-migrate-schema "/tmp/bx6op-store")
+                      :type (car fault)))
+      (should (= 1 (length batches)))
+      (should (equal (car batches)
+                     '("STEP 6"
+                       "UPDATE dorg_meta SET value = '7' WHERE `key` = 'schema_version'")))
+      (should-not resets))))
+
+(ert-deftest dorg-test-bx6op-explicit-preflight-refuses-missing-step-before-write ()
+  "Whole-selection chain preflight refuses a missing step before any DDL batch."
+  (let ((dorg-schema-version 8)
+        (dorg-schema-migrations '((6 . "STEP 6")))
+        (db-version 6)
+        batches)
+    (cl-letf (((symbol-function 'dorg-mutate-call-with-store-gate)
+               (lambda (_dir fn &rest _) (funcall fn 'lease 'key)))
+              ((symbol-function 'dorg-sql--lease-exec)
+               (lambda (_lease query &rest args)
+                 (cond
+                  ((string-match-p "dolt_status" query) nil)
+                  ((and (car args) (string-search "schema_version" (car args)))
+                   `(((value . ,(number-to-string db-version)))))
+                  (t nil))))
+              ((symbol-function 'dorg-sql--lease-batch)
+               (lambda (&rest _) (push 'batch batches) "commit")))
+      (let ((err (should-error
+                  (dorg-migrate-schema "/tmp/bx6op-store")
+                  :type 'dorg-schema-migration-required)))
+        (should (string-match-p "core:missing-step" (error-message-string err)))))
+    (should-not batches)))
+
+(ert-deftest dorg-test-bx6op-malformed-core-metadata-refuses-before-write ()
+  "Malformed existing core metadata refuses; it is not fresh creation or repair."
+  (let ((writes nil))
+    (cl-letf (((symbol-function 'dorg-repo--ordinary-read)
+               (lambda (_dir _query &rest args)
+                 (cond
+                  ((and (car args) (string-search "schema_version" (car args)))
+                   '(((value . "not-an-integer"))))
+                  (t nil))))
+              ((symbol-function 'dorg-repo--commit-schema-step)
+               (lambda (&rest _) (push 'commit writes)))
+              ((symbol-function 'dorg-repo-ensure-extensions)
+               (lambda (&rest _) (push 'extensions writes))))
+      (let ((err (should-error
+                  (dorg-repo-ensure-schema "/tmp/bx6op-store")
+                  :type 'dorg-schema-migration-required)))
+        (should (string-match-p "core:malformed" (error-message-string err)))))
+    (should-not writes)))
+
+(ert-deftest dorg-test-ttp2t-schema-v7-hard-renames-file-binding-column ()
+  "Fresh v7 stores encode one table-wide relative binding representation.
 The hard `path' -> `relative_path' rename is the fail-closed read fence: no
 per-row kind discriminator or legacy absolute-path column survives."
   (let ((ddl (mapconcat #'identity dorg-schema-ddl "\n")))
@@ -214,7 +1230,9 @@ per-row kind discriminator or legacy absolute-path column survives."
     (should-not (string-search "locator_kind" ddl))
     (should-not (string-search "store-relative-v1" ddl))
     (should-not (string-search "uq_dorg_files_path (path)" ddl))
-    (should (string-search "VALUES ('schema_version', '6')" ddl))))
+    (should (string-search
+             (format "VALUES ('schema_version', '%d')" dorg-schema-version)
+             ddl))))
 
 (ert-deftest dorg-test-ttp2t-relative-binding-round-trips-sibling-layout ()
   "The canonical Downstream tracker sibling layout stores `../beads.org' and round-trips.
@@ -283,6 +1301,110 @@ same canonical local file, not by the mere presence of `..'."
         (should (equal "x/../valid.org"
                        (plist-get (dorg-error-data err) :relative-path)))))))
 
+(ert-deftest dorg-test-7o3q2-omitted-revision-keeps-live-query-and-error ()
+  "Live lookup retains its exact query and ambiguous-binding error kind."
+  (let (queries)
+    (cl-letf (((symbol-function 'dorg-sql)
+               (lambda (_dir query &rest _)
+                 (push query queries)
+                 '(((root_id . 1) (relative_path . "beads.org")
+                    (heading_id . 1) (heading_root_id . 1)
+                    (parent_id . nil) (level_offset . 0))
+                   ((root_id . 2) (relative_path . "beads.org")
+                    (heading_id . 2) (heading_root_id . 2)
+                    (parent_id . nil) (level_offset . 0))))))
+      (let ((err (should-error
+                  (dorg-repo-root-id "/tmp/store" "/tmp/store/beads.org")
+                  :type 'dorg-binding-error)))
+        (should (eq 'ambiguous-locator (dorg-error-reason err)))))
+    (should
+     (equal (car queries)
+            (concat "SELECT f.root_id AS root_id, f.relative_path AS relative_path, "
+                    "h.id AS heading_id, h.root_id AS heading_root_id, "
+                    "h.parent_id AS parent_id, h.level_offset AS level_offset "
+                    "FROM dorg_files f LEFT JOIN headings h ON h.id = f.root_id "
+                    "ORDER BY f.root_id ASC")))))
+
+(ert-deftest dorg-test-7o3q2-pre-offset-revision-refuses-typed ()
+  "A pre-level-offset historical token cannot be read as a mixed schema."
+  (cl-letf (((symbol-function 'dorg-sql)
+             (lambda (&rest _)
+               (error "Unknown column 'h.level_offset' in 'field list"))))
+    (let ((err (should-error
+                (dorg-repo-root-id "/tmp/store" "/tmp/store/beads.org" "H")
+                :type 'dorg-binding-error)))
+      (should (eq 'unsupported-revision-schema (dorg-error-reason err)))
+      (should (equal "H" (plist-get (dorg-error-data err) :revision))))))
+
+(ert-deftest dorg-test-7o3q2-revision-token-refuses-before-live-query ()
+  "A non-string or empty revision cannot silently select the live root."
+  (dolist (revision '("" 42))
+    (let ((called nil))
+      (cl-letf (((symbol-function 'dorg-sql)
+                 (lambda (&rest _)
+                   (setq called t)
+                   (error "revision validation reached SQL"))))
+        (let ((err (should-error
+                    (dorg-repo-root-id "/tmp/store" "/tmp/store/beads.org" revision)
+                    :type 'dorg-binding-error)))
+          (should (eq 'invalid-revision (dorg-error-reason err)))
+          (should-not called))))))
+
+(ert-deftest dorg-test-7o3q2-revision-lookup-cold-loads-sql-suffix ()
+  "A fresh `emacs -Q' needs only `dorg-repo' for historical lookup."
+  (let* ((root (file-name-directory (locate-library "dorg-repo")))
+         (emacs (expand-file-name invocation-name invocation-directory))
+         (expr
+          "(progn
+              (require 'cl-lib)
+              (require 'dorg-repo)
+              (when (featurep 'dorg-ext-read)
+                (error \"dorg-ext-read preloaded\"))
+              (cl-letf (((symbol-function 'dorg-sql)
+                         (lambda (&rest _)
+                           '(((root_id . 1) (relative_path . \"beads.org\")
+                              (heading_id . 1) (heading_root_id . 1)
+                              (parent_id . nil) (level_offset . 0))))))
+                (unless (eql 1 (dorg-repo-root-id \"/tmp/store\" \"/tmp/store/beads.org\" \"H\"))
+                  (error \"historical root lookup failed\"))))"))
+    (should (= 0 (call-process emacs nil nil nil
+                               "--batch" "-Q" "-L" root "--eval" expr)))))
+
+(ert-deftest dorg-test-7o3q2-historical-rebind-is-snapshot-bound ()
+  "A real committed rebind resolves R1 at H1 and R2 at H2/live."
+  (dorg-test-with-dolt
+    (let* ((root (make-temp-file "dorg-7o3q2-rebind-" t))
+           (file (expand-file-name "beads.org" root))
+           (other (expand-file-name "other.org" root)))
+      (unwind-protect
+          (progn
+            (with-temp-file file (insert "* First\n"))
+            (with-temp-file other (insert "* Replacement\n"))
+            (let* ((r1 (dorg-repo-ensure-root dolt-dir file))
+                   (h1 (dorg-head-commit dolt-dir))
+                   (r2 (dorg-id-generate)))
+              (dorg-sql-batch
+               dolt-dir
+               (list
+                (format (concat "INSERT INTO headings "
+                                "(id, root_id, parent_id, sort_key, level_offset, "
+                                "todo_keyword, priority, commented, title) VALUES "
+                                "(%d, %d, NULL, X'01', 0, NULL, NULL, FALSE, NULL)")
+                        r2 r2)
+                (dorg-repo-file-row-statement dolt-dir r2 other)))
+              (dorg-commit dolt-dir "test: seed replacement root")
+              (dorg-sql-batch
+               dolt-dir
+               (list (format "DELETE FROM dorg_files WHERE root_id = %d" r2)
+                     (format "UPDATE dorg_files SET root_id = %d WHERE root_id = %d"
+                             r2 r1)))
+              (dorg-commit dolt-dir "test: replace file root binding")
+              (let ((h2 (dorg-head-commit dolt-dir)))
+                (should (eql r1 (dorg-repo-root-id dolt-dir file h1)))
+                (should (eql r2 (dorg-repo-root-id dolt-dir file h2)))
+                (should (eql r2 (dorg-repo-root-id dolt-dir file))))))
+        (delete-directory root t)))))
+
 (ert-deftest dorg-test-ttp2t-lookup-refuses-non-self-rooted-binding ()
   "A level-zero heading is not a file root unless its root id is itself."
   (dorg-test-with-dolt
@@ -299,7 +1421,7 @@ same canonical local file, not by the mere presence of `..'."
                dolt-dir
                (list
                 (format (concat "INSERT INTO headings "
-                                "(id, root_id, parent_id, sort_key, level, "
+                                "(id, root_id, parent_id, sort_key, level_offset, "
                                 "commented, title, post_blank) VALUES "
                                 "(%d, %d, NULL, X'02', 0, FALSE, NULL, 0)")
                         wrong-root real-root)
@@ -412,7 +1534,7 @@ the second-blank-root failure rather than merely checking an error symbol."
                dolt-dir
                (list
                 (format (concat "INSERT INTO headings "
-                                "(id, root_id, parent_id, sort_key, level, "
+                                "(id, root_id, parent_id, sort_key, level_offset, "
                                 "commented, title, post_blank) VALUES "
                                 "(%d, %d, NULL, X'02', 0, FALSE, NULL, 0)")
                         root-b root-b)
@@ -654,18 +1776,18 @@ artifact stays inside the store; `:cfg-dir' is the store-local `.doltcfg'."
                       hits)))))))))
 
 (ert-deftest dorg-test-h2t9n-standalone-mysql-layout-and-bytes ()
-  "The standalone client has one canonical layout with unchanged bytes."
+  "The standalone client has one canonical layout with reviewed bytes."
   (let* ((root (file-name-directory (locate-library "dorg-dolt")))
          (dir (expand-file-name "lib/mysql" root))
          (retired (expand-file-name (concat "lib/" "clu" "tch") root)))
     (should-not (file-exists-p retired))
     (dolist (entry
              '(("mysql.el" .
-                "42d058c1d8d6463c160402ecba787b8597673e25248a117c9790380e80b14718")
+                "f56b75b236ca5223913dbed8cfd395158fd63b67eec911892ec25f6529d74624")
                ("LICENSE" .
                 "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986")
                ("UPSTREAM.org" .
-                "0bd783947862810eeb975676b9204f5dceb6b170c8711582187ea5c22bd97af0")))
+                "e3164aaff2a120df8bdeb231186c1eded5025a30ae6765ce878f9c5355e59299")))
       (let ((file (expand-file-name (car entry) dir)))
         (should (file-exists-p file))
         (should (equal (cdr entry)
@@ -1132,12 +2254,12 @@ Lisp type error in place of the actionable error."
   "dorg-sql returns parsed results for SELECT queries."
   (dorg-test-with-dolt
     (dorg-sql dolt-dir
-              "INSERT INTO headings (id, root_id, parent_id, sort_key, level, title) VALUES (1, 1, NULL, X'01', 0, NULL)")
+              "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, title) VALUES (1, 1, NULL, X'01', 0, NULL)")
     (dorg-commit dolt-dir "test insert")
-    (let ((result (dorg-sql dolt-dir "SELECT id, level FROM headings WHERE id = 1")))
+    (let ((result (dorg-sql dolt-dir "SELECT id, level_offset FROM headings WHERE id = 1")))
       (should (= (length result) 1))
       (should (= (alist-get 'id (car result)) 1))
-      (should (= (alist-get 'level (car result)) 0)))))
+      (should (= (alist-get 'level_offset (car result)) 0)))))
 
 (ert-deftest dorg-test-sql-error-signals ()
   "dorg-sql signals error on invalid SQL."
@@ -1149,8 +2271,8 @@ Lisp type error in place of the actionable error."
   "dorg-sql supports format arguments."
   (dorg-test-with-dolt
     (dorg-sql dolt-dir
-              "INSERT INTO headings (id, root_id, parent_id, sort_key, level, title) VALUES (1, 1, NULL, X'01', 0, NULL)")
-    (let ((result (dorg-sql dolt-dir "SELECT id FROM headings WHERE level = %d" 0)))
+              "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, title) VALUES (1, 1, NULL, X'01', 0, NULL)")
+    (let ((result (dorg-sql dolt-dir "SELECT id FROM headings WHERE level_offset = %d" 0)))
       (should (= (length result) 1)))))
 
 ;;; Batch SQL Tests
@@ -1159,8 +2281,8 @@ Lisp type error in place of the actionable error."
   "dorg-sql-batch executes multiple statements."
   (dorg-test-with-dolt
     (dorg-sql-batch dolt-dir
-                    (list "INSERT INTO headings (id, root_id, parent_id, sort_key, level, title) VALUES (1, 1, NULL, X'01', 0, NULL)"
-                          "INSERT INTO headings (id, root_id, parent_id, sort_key, level, title) VALUES (2, 1, 1, X'01', 1, 'Heading 1')"))
+                    (list "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, title) VALUES (1, 1, NULL, X'01', 0, NULL)"
+                          "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, title) VALUES (2, 1, 1, X'01', 1, 'Heading 1')"))
     (let ((result (dorg-sql dolt-dir "SELECT COUNT(*) as cnt FROM headings")))
       (should (= (alist-get 'cnt (car result)) 2)))))
 
@@ -1176,7 +2298,7 @@ Lisp type error in place of the actionable error."
   "dorg-commit after writes creates a commit."
   (dorg-test-with-dolt
     (dorg-sql dolt-dir
-              "INSERT INTO headings (id, root_id, parent_id, sort_key, level, title) VALUES (1, 1, NULL, X'01', 0, 'Test')")
+              "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, title) VALUES (1, 1, NULL, X'01', 0, 'Test')")
     (dorg-commit dolt-dir "add heading")
     ;; Verify the data persists after commit
     (let ((result (dorg-sql dolt-dir "SELECT title FROM headings WHERE id = 1")))
@@ -1198,7 +2320,7 @@ Lisp type error in place of the actionable error."
   (dorg-test-with-dolt
     (let ((hash1 (dorg-head-commit dolt-dir)))
       (dorg-sql dolt-dir
-                "INSERT INTO headings (id, root_id, parent_id, sort_key, level, title) VALUES (1, 1, NULL, X'01', 0, 'Test')")
+                "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, title) VALUES (1, 1, NULL, X'01', 0, 'Test')")
       (dorg-commit dolt-dir "add heading")
       (let ((hash2 (dorg-head-commit dolt-dir)))
         (should (stringp hash2))
@@ -1333,13 +2455,13 @@ An earlier object whose string contains stray braces must not confuse
 the scan."
   (let ((output (concat "Processed 50.0% of the file\n"
                         "{\"rows\":[{\"t\":\"earlier {brace} ${X}\"}]}\n"
-                        "{\"rows\":[{\"n\":\"7\"}]}")))
+                        "{\"rows\":[{\"n\":7}]}")))
     (let ((rows (with-temp-buffer
                   (insert output)
                   (dorg-sql--parse-result (current-buffer) 0 "BATCH"))))
       (should (= (length rows) 1))
-      ;; Coercion still applies on the fallback path: "7" -> 7.
-      (should (= (alist-get 'n (car rows)) 7)))))
+      ;; The fallback keeps the writer's JSON number.
+      (should (eql 7 (alist-get 'n (car rows)))))))
 
 (ert-deftest dorg-test-sql-last-json-object-string-escape-aware ()
   "The fallback extractor ignores braces/quotes inside JSON strings.
@@ -1401,7 +2523,7 @@ file/stdin execution prepends \"Processed N%\" progress noise."
             ((symbol-function 'dorg-sql--mysql-available-p) (lambda (&rest _) nil))
             (dorg-sql-cli-arg-max-threshold 1))
     (dorg-test-sql--with-fake-cli
-        "Processed 50.0% of the file\n{\"rows\":[{\"n\":\"7\"}]}" 0
+        "Processed 50.0% of the file\n{\"rows\":[{\"n\":7}]}" 0
       (let ((rows (dorg-sql--with-cli-seam "/tmp/fake-dolt-dir"
                     (dorg-sql "/tmp/fake-dolt-dir" "SELECT 7 AS n"))))
         (should (equal (alist-get 'n (car rows)) 7))))))
@@ -1475,8 +2597,8 @@ a real Dolt repo."
   (dorg-test-with-dolt
     (let ((dorg-sql-cli-arg-max-threshold 1))
       (dorg-sql-batch dolt-dir
-                      (list "INSERT INTO headings (id, root_id, parent_id, sort_key, level, title) VALUES (1, 1, NULL, X'01', 0, NULL)"
-                            "INSERT INTO headings (id, root_id, parent_id, sort_key, level, title) VALUES (2, 1, 1, X'01', 1, 'Heading 1')")
+                      (list "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, title) VALUES (1, 1, NULL, X'01', 0, NULL)"
+                            "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, title) VALUES (2, 1, 1, X'01', 1, 'Heading 1')")
                       "large batch via stdin")
       (let ((rows (dorg-sql dolt-dir "SELECT COUNT(*) AS cnt FROM headings")))
         (should (= (alist-get 'cnt (car rows)) 2))))))
@@ -1503,11 +2625,11 @@ a real Dolt repo."
                 (dorg-sql-quote table)))))
     (> (alist-get 'n (car rows)) 0)))
 
-(ert-deftest dorg-test-schema-v6-fresh-omits-legacy-conflicts ()
-  "Fresh schema v6 has no durable conflict table."
+(ert-deftest dorg-test-schema-v7-fresh-omits-legacy-conflicts ()
+  "Fresh schema (v7 onward) has no durable conflict table."
   (dorg-test-with-dolt
-    (should (= 6 dorg-schema-version))
-    (should (equal "6"
+    (should (= 8 dorg-schema-version))
+    (should (equal "8"
                    (alist-get
                     'value
                     (car (dorg-sql
@@ -1533,13 +2655,13 @@ a real Dolt repo."
     (dorg-commit dolt-dir "bump to future version for test")
     (should-error (dorg-repo-ensure-schema dolt-dir) :type 'error)))
 
-(ert-deftest dorg-test-ensure-schema-core-migration-rolls-back-on-failure ()
-  "A failing core migration resets partial DDL and leaves schema_version unchanged.
+(ert-deftest dorg-test-migrate-schema-core-migration-rolls-back-on-failure ()
+  "A failing explicit core migration resets partial DDL and leaves schema_version unchanged.
 Uses a synthetic let-bound migration from the current version to
 current+1 whose first statement adds a column — implicitly committed into
 the Dolt working set under Dolt's MySQL DDL semantics — and whose second
-statement fails before the `schema_version' bump.  The committed
-schema-step helper must hard-reset that partial DDL and re-signal,
+statement fails before the `schema_version' bump.  The managed migration
+step helper must hard-reset that partial DDL and re-signal,
 leaving the recorded version unchanged and no orphaned column.  Real
 schema constants are not bumped; both are let-bound for the test only."
   (dorg-test-with-dolt
@@ -1552,7 +2674,7 @@ schema constants are not bumped; both are let-bound for the test only."
                               (format
                                "UPDATE dorg_meta SET value = '%d' WHERE `key` = 'schema_version'"
                                (1+ current)))))))
-      (should-error (dorg-repo-ensure-schema dolt-dir) :type 'error)
+      (should-error (dorg-migrate-schema dolt-dir) :type 'error)
       ;; schema_version stayed at the original current — the bump never committed.
       (should (equal (alist-get 'value (car (dorg-sql dolt-dir
                       "SELECT value FROM dorg_meta WHERE `key` = 'schema_version'")))
@@ -1563,8 +2685,8 @@ schema constants are not bumped; both are let-bound for the test only."
       ;; The working set is clean again — nothing left drifting.
       (should (dorg-repo--working-set-clean-p dolt-dir)))))
 
-(ert-deftest dorg-test-ensure-schema-core-migration-rejects-dirty-working-set ()
-  "A pending core migration is rejected when the Dolt working set is dirty.
+(ert-deftest dorg-test-migrate-schema-core-migration-rejects-dirty-working-set ()
+  "An explicit core migration is rejected when the Dolt working set is dirty.
 The clean-working-set preflight must reject before any migration SQL
 runs, preserving the pre-existing uncommitted change and applying no
 synthetic DDL.  Without this guard the failure-path `DOLT_RESET --hard'
@@ -1582,7 +2704,7 @@ for the test only."
       ;; Pre-existing uncommitted working-set change, unrelated to the migration.
       (dorg-sql dolt-dir
                 "INSERT INTO dorg_meta (`key`, value) VALUES ('dj8h_marker', 'pre')")
-      (should-error (dorg-repo-ensure-schema dolt-dir) :type 'error)
+      (should-error (dorg-migrate-schema dolt-dir) :type 'error)
       ;; schema_version unchanged — no migration step ran.
       (should (equal (alist-get 'value (car (dorg-sql dolt-dir
                       "SELECT value FROM dorg_meta WHERE `key` = 'schema_version'")))
@@ -1659,12 +2781,11 @@ path by default — and the check must not mutate the repo."
                     "SELECT value FROM dorg_meta WHERE `key` = 'schema_version'")))
                    (number-to-string (1+ dorg-schema-version))))))
 
-(ert-deftest dorg-test-ensure-schema-gated-when-auto-migrate-nil ()
-  "With `dorg-schema-auto-migrate' nil an older repo is NOT migrated.
-Instead `dorg-schema-migration-required' is signaled and the repo is left
-untouched — the opt-in path that stops a single process from silently
-upgrading a shared repo.  Uses a synthetic let-bound migration so the
-test is independent of real schema internals."
+(ert-deftest dorg-test-ensure-schema-refuses-older-repo-without-write ()
+  "Ordinary schema ensure refuses an older repo without migrating.
+The obsolete `dorg-schema-auto-migrate' variable must not authorize writes.
+Uses a synthetic let-bound migration so the test is independent of real schema
+internals."
   (dorg-test-with-dolt
     (let* ((current dorg-schema-version)
            (dorg-schema-version (1+ current))
@@ -1684,17 +2805,15 @@ test is independent of real schema internals."
                       "SELECT value FROM dorg_meta WHERE `key` = 'schema_version'")))
                      (number-to-string current))))))
 
-(ert-deftest dorg-test-ensure-schema-auto-migrate-announces ()
-  "With `dorg-schema-auto-migrate' t an older repo migrates AND is announced.
-The one-way upgrade must emit a `display-warning' before running so it is
-never silent.  Uses a synthetic let-bound migration."
+(ert-deftest dorg-test-ensure-schema-auto-migrate-obsolete-refuses ()
+  "The obsolete auto-migrate variable does not restore ordinary migration."
   (dorg-test-with-dolt
     (let* ((current dorg-schema-version)
            (dorg-schema-version (1+ current))
            (dorg-schema-migrations
             (list (cons current
                         (list "ALTER TABLE headings ADD COLUMN nf7q_announce INT NULL"
-                              (format
+                               (format
                                "UPDATE dorg_meta SET value = '%d' WHERE `key` = 'schema_version'"
                                (1+ current))))))
            (warnings '()))
@@ -1702,18 +2821,15 @@ never silent.  Uses a synthetic let-bound migration."
                  (lambda (_type message &optional _level &rest _)
                    (push message warnings))))
         (let ((dorg-schema-auto-migrate t))
-          (dorg-repo-ensure-schema dolt-dir)))
-      ;; Migrated up to the synthetic current+1.
+          (should-error (dorg-repo-ensure-schema dolt-dir)
+                        :type 'dorg-schema-migration-required))
+        (should-not warnings))
+      ;; Ordinary ensure did not migrate.
       (should (equal (alist-get 'value (car (dorg-sql dolt-dir
                       "SELECT value FROM dorg_meta WHERE `key` = 'schema_version'")))
-                     (number-to-string (1+ current))))
-      (dorg-sql dolt-dir "SELECT nf7q_announce FROM headings LIMIT 1")
-      ;; Announced before running, naming the one-way lock-out hazard.
-      (should warnings)
-      (should (string-match-p "ONE-WAY" (car warnings)))
-      ;; The public migration warning is path-free by default.
-      (let ((lib (locate-library "dorg-schema")))
-        (when lib (should-not (string-match-p (regexp-quote lib) (car warnings))))))))
+                     (number-to-string current)))
+      (should-error (dorg-sql dolt-dir "SELECT nf7q_announce FROM headings LIMIT 1")
+                    :type 'error))))
 
 (ert-deftest dorg-test-migrate-schema-overrides-gate ()
   "`dorg-migrate-schema' migrates even when `dorg-schema-auto-migrate' is nil.
@@ -1735,57 +2851,66 @@ off yet upgrade deliberately.  Uses a synthetic let-bound migration."
                      (number-to-string (1+ current))))
       (dorg-sql dolt-dir "SELECT nf7q_optin FROM headings LIMIT 1"))))
 
-;;; SQL Type Coercion — value_raw stays text
+;;; SQL result typing — the CLI parser keeps the JSON writer's types
 
-(ert-deftest dorg-test-coerce-types-keyword-value-raw-stays-string ()
-  "`value_raw' is exempt from numeric coercion; non-exempt cols still coerce.
-A keyword item value like a `#+KEY: 7' file keyword must round-trip as
-the string \"7\", not integer 7 — otherwise `dorg-heading-deep-copy'
-\(which `copy-sequence's the value) signals `wrong-type-argument'.
-Regression for value_raw numeric coercion."
-  (let* ((rows (list (list (cons 'value_raw "7")
-                           (cons 'keyword "EMBEAD_LOCK_TIMEOUT")
-                           (cons 'post_blank "3"))))
-         (coerced (car (dorg-sql--coerce-types rows))))
-    ;; value_raw and keyword are exempt — preserved as strings.
-    (should (equal "7" (alist-get 'value_raw coerced)))
-    (should (stringp (alist-get 'value_raw coerced)))
-    (should (equal "EMBEAD_LOCK_TIMEOUT" (alist-get 'keyword coerced)))
-    ;; A non-exempt numeric column is still coerced — proves the test is
-    ;; live (it is the coercion path, not a no-op, that value_raw escapes).
-    (should (eql 3 (alist-get 'post_blank coerced)))))
+(defconst dorg-test-sql--pinned-cli-json
+  (concat
+   "{\"rows\": [{\"binary_hex\":\"007FFF\",\"binary_raw\":\"\\u0000\\ufffd\","
+   "\"decimal_exact\":\"1.250\",\"empty_text\":\"\","
+   "\"newline_text\":\"line\\nbreak\",\"nul_text\":\"a\\u0000b\","
+   "\"signed_max\":9223372036854775807,\"signed_over_2p53\":9007199254740993,"
+   "\"sort_key_hex\":\"697473\",\"tag\":\"007\",\"text_numeric\":\"007\","
+   "\"title\":\"007\",\"unsigned_max\":18446744073709551615,"
+   "\"utf8_text\":\"caf\u00e9 \u2615\",\"value_raw\":\"1.250\","
+   "\"varchar_numeric\":\"-01\"}]}")
+  "One row of raw CLI JSON as the pinned Dolt writer emits it.
+SQL numbers are JSON numbers and text and DECIMAL are JSON strings.  The SQL
+NULL column `null_text' is omitted, and VARBINARY X'007FFF' arrives as
+U+0000 U+FFFD, so a byte-exact reader selects HEX() instead.")
 
-(ert-deftest dorg-test-cli-keyword-value-raw-survives-deep-copy ()
-  "End-to-end contract: a numeric keyword value deep-copies, no crash.
-Chains the exact production path that aborted Dolt commits — CLI result
-coercion (`dorg-sql--coerce-types') feeds `value_raw' into a
-`dorg-keyword-item' value (mirroring `dorg-model-load-headings'), which
-`dorg-heading-deep-copy' (snapshot capture, every commit) `copy-sequence's.
-Without the `value_raw' exemption the value is integer 7 and the deep
-copy signals `wrong-type-argument (sequencep 7)'.
+(ert-deftest dorg-test-sql-parse-result-keeps-pinned-json-types ()
+  "The CLI parser returns exactly the types the pinned JSON writer emitted.
+JSON numbers stay integers past 2^53 and through the unsigned 64-bit maximum;
+JSON strings stay byte-exact however numeric they look, whatever their
+column name.  The writer's own limits stay explicit: NULL is an absent
+member and raw binary is not byte-exact."
+  (let ((row (car (with-temp-buffer
+                    (insert dorg-test-sql--pinned-cli-json)
+                    (dorg-sql--parse-result (current-buffer) 0 "SELECT")))))
+    (should (eql 9007199254740993 (alist-get 'signed_over_2p53 row)))
+    (should (eql 9223372036854775807 (alist-get 'signed_max row)))
+    (should (eql 18446744073709551615 (alist-get 'unsigned_max row)))
+    (dolist (cell '((text_numeric . "007") (varchar_numeric . "-01")
+                    (decimal_exact . "1.250") (title . "007") (tag . "007")
+                    (value_raw . "1.250") (sort_key_hex . "697473")
+                    (binary_hex . "007FFF") (empty_text . "")
+                    (newline_text . "line\nbreak")))
+      (should (equal (cdr cell) (alist-get (car cell) row))))
+    (should (equal (string ?a 0 ?b) (alist-get 'nul_text row)))
+    (should (equal "caf\u00e9 \u2615" (alist-get 'utf8_text row)))
+    (should-not (assq 'null_text row))
+    (should (equal (string 0 #xfffd) (alist-get 'binary_raw row)))))
 
-This is the fast, Dolt-free guard for the result-coercion path that feeds
-model hydration.  Regression for value_raw numeric coercion."
-  (let* ((row (car (dorg-sql--coerce-types
-                    (list (list (cons 'kind "keyword")
-                                (cons 'keyword "EMBEAD_LOCK_TIMEOUT")
-                                (cons 'value_raw "7")
-                                (cons 'post_blank 0))))))
-         ;; Mirror `dorg-model-load-headings' keyword-item construction.
-         (item (dorg-keyword-item
-                :post-blank (or (alist-get 'post_blank row) 0)
-                :keyword (alist-get 'keyword row)
-                :value (or (alist-get 'value_raw row) "")))
-         (heading (make-dorg-heading :id 1 :level 0 :sort-key "\1"
-                                     :items (list item))))
-    ;; The loader stores the value as the string "7", not integer 7.
-    (should (stringp (dorg-keyword-item-value item)))
-    (should (equal "7" (dorg-keyword-item-value item)))
-    ;; The snapshot/commit-path deep copy succeeds and preserves the value.
+(ert-deftest dorg-test-sql-parsed-text-fields-survive-deep-copy ()
+  "Numeric-looking text read through the CLI parser hydrates and deep-copies.
+A title \"007\" and a keyword value \"1.250\" stay strings through
+`dorg-model-from-db-row' and `dorg-heading-deep-copy'; as numbers the deep
+copy would signal `wrong-type-argument'.  The integer id stays an integer."
+  (let* ((row (car (with-temp-buffer
+                     (insert (concat "{\"rows\":[{\"id\":7,\"sort_key\":\"01\","
+                                     "\"level_offset\":0,\"commented\":0,"
+                                     "\"title\":\"007\",\"post_blank\":0,"
+                                     "\"keyword\":\"KEY\",\"value_raw\":\"1.250\"}]}"))
+                     (dorg-sql--parse-result (current-buffer) 0 "SELECT"))))
+         (heading (dorg-model-from-db-row row)))
+    (setf (dorg-heading-items heading)
+          (list (dorg-keyword-item :keyword (alist-get 'keyword row)
+                                   :value (alist-get 'value_raw row))))
+    (should (eql 7 (dorg-heading-id heading)))
     (let ((copy (dorg-heading-deep-copy heading)))
-      (should copy)
-      (should (equal "7" (dorg-keyword-item-value
-                          (car (dorg-heading-items copy))))))))
+      (should (equal "007" (dorg-heading-title copy)))
+      (should (equal "1.250" (dorg-keyword-item-value
+                              (car (dorg-heading-items copy))))))))
 
 ;;; ─── Path-case alias identity ─────────────────────────────────────────
 ;;
@@ -1810,10 +2935,10 @@ physical beads file."
                 dolt-dir "/x/dev/DOrg/.dorg/beads.org")))
     (dorg-sql-batch dolt-dir
       (list
-     "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (100, 100, NULL, X'01', 0, FALSE, NULL, 0)"
-     "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (101, 100, 100, X'02', 1, FALSE, 'Task', 0)"
-     "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (102, 100, 100, X'03', 1, FALSE, 'Task 2', 0)"
-     "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (200, 200, NULL, X'01', 0, FALSE, NULL, 0)"
+     "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (100, 100, NULL, X'01', 0, FALSE, NULL, 0)"
+     "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (101, 100, 100, X'02', 1, FALSE, 'Task', 0)"
+     "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (102, 100, 100, X'03', 1, FALSE, 'Task 2', 0)"
+     "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (200, 200, NULL, X'01', 0, FALSE, NULL, 0)"
        (format "INSERT INTO dorg_files (root_id, relative_path) VALUES (100, %s)"
                (dorg-sql-quote lower))
        (format "INSERT INTO dorg_files (root_id, relative_path) VALUES (200, %s)"
@@ -1865,7 +2990,7 @@ path nor create a second row."
                      dolt-dir "/x/dev/dorg/.dorg/beads.org")))
       (dorg-sql-batch dolt-dir
         (list
-       "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (100, 100, NULL, X'01', 0, FALSE, NULL, 0)"
+       "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (100, 100, NULL, X'01', 0, FALSE, NULL, 0)"
          (format "INSERT INTO dorg_files (root_id, relative_path) VALUES (100, %s)"
                  (dorg-sql-quote relative)))))
     (dorg-commit dolt-dir "seed canonical")
@@ -1889,7 +3014,7 @@ path nor create a second row."
                      dolt-dir "/x/dev/dorg/old.org")))
       (dorg-sql-batch dolt-dir
         (list
-       "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (100, 100, NULL, X'01', 0, FALSE, NULL, 0)"
+       "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (100, 100, NULL, X'01', 0, FALSE, NULL, 0)"
          (format "INSERT INTO dorg_files (root_id, relative_path) VALUES (100, %s)"
                  (dorg-sql-quote relative)))))
     (dorg-commit dolt-dir "seed")
@@ -2017,7 +3142,7 @@ alias emits the alias case and fails the `should-not' (tracked-regression)."
           (if (not (file-name-case-insensitive-p base))
               (ert-skip "filesystem is case-sensitive")
             (let* ((root (make-dorg-heading
-                          :id 1 :parent-id nil :level 0
+                          :id 1 :parent-id nil :level 0 :level-offset 0
                           :sort-key (unibyte-string 1) :title nil :items nil))
                    (tree (let ((h (make-hash-table))) (puthash 1 root h) h))
                    ;; Render with the store dir spelled as an UPPERCASE alias.
@@ -2265,6 +3390,42 @@ normalized sibling-order constraint are public to the mutation layer."
       (should (eq 'deterministic-constraint
                   (plist-get primary-facts :class)))
       (should-not (string-match-p "RAW-" (prin1-to-string heading-facts))))))
+
+(ert-deftest dorg-test-dolt-postimage-parity-classifier-bounds-closed-ids ()
+  "Core parity IDs cross the classifier only as a bounded closed fact."
+  (dolist (ids (list '(42) '(7 11 19) (number-sequence 1 33)))
+    (let* ((err (condition-case caught
+                    (signal 'dorg-sql-postimage-parity
+                            (list "in-transaction readback diverged"
+                                  (list :plane 'core :ids ids)))
+                  (dorg-sql-postimage-parity caught)))
+           (facts (dorg-dolt--classify-db-error err)))
+      (should (eq 'postimage-parity (plist-get facts :class)))
+      (should (eq 'core (plist-get facts :parity-plane)))
+      (should (= (length ids) (plist-get facts :parity-id-count)))
+      (should (equal (cl-subseq ids 0 (min 32 (length ids)))
+                     (plist-get facts :parity-ids)))))
+  (dolist (ids (list nil '(1 1) '(0) '(1 "RAW-SENTINEL") 42 '(1 . 2)))
+    (let* ((err (condition-case caught
+                    (signal 'dorg-sql-postimage-parity
+                            (list "in-transaction readback diverged"
+                                  (list :plane 'core :ids ids)))
+                  (dorg-sql-postimage-parity caught)))
+           (facts (dorg-dolt--classify-db-error err)))
+      (should-not (plist-member facts :parity-ids))
+      (should-not (plist-member facts :parity-id-count)))))
+
+(ert-deftest dorg-test-dolt-postimage-rows-classifier-omits-ids ()
+  "Rows-plane parity remains table-scoped and never exposes identity IDs."
+  (let* ((err (condition-case caught
+                  (signal 'dorg-sql-postimage-parity
+                          (list "in-transaction readback diverged"
+                                (list :plane 'rows :table "private" :ids '(1 2))))
+                (dorg-sql-postimage-parity caught)))
+         (facts (dorg-dolt--classify-db-error err)))
+    (should (eq 'rows (plist-get facts :parity-plane)))
+    (should-not (plist-member facts :parity-ids))
+    (should-not (plist-member facts :parity-id-count))))
 
 (ert-deftest dorg-test-dolt-retry-predicate-delegates-to-classifier ()
   "The older generic retry seam consumes the central classifier, not raw text."
@@ -2543,6 +3704,555 @@ sync module and is NOT part of this contract."
     (should-not (dorg-dolt-tests--qc260-name-hits
                  (mapcar (lambda (p) (concat old-prefix (car p)))
                          (append fns macros vars))))))
+
+;;; ─── Private failure capture ───────────────────────────────────────────────
+;;
+;; A statement-phase database failure inside the typed mutation batch keeps
+;; only closed, sanitized facts in the public receipt.  These tests pin the
+;; diagnostic contract: the batch executor counts the execution ordinal at
+;; its own loop, carries a closed verb/table class drawn from a finite public
+;; set, and, unless the operator turns the capture off, writes the original
+;; condition and the failed SQL to a private file under the store's runtime
+;; overlay after the rollback.  `mysql-query' is stubbed at the same seam as
+;; the rollback-receipt tests above; the suite fixture may hold a server, but
+;; no statement here reaches one.
+
+(defun dorg-dolt-tests--capture-scratch-store ()
+  "Return a fresh scratch store directory shaped like a Dolt dir."
+  (let ((dir (make-temp-file "dorg-capture-store" t)))
+    (make-directory (expand-file-name ".dolt" dir))
+    (file-name-as-directory dir)))
+
+(defun dorg-dolt-tests--capture-files (store)
+  "Return the capture files present under STORE's overlay, if any."
+  (let ((dir (expand-file-name ".dorg/failures" store)))
+    (and (file-directory-p dir)
+         (directory-files dir t "\\`[^.]"))))
+
+(defun dorg-dolt-tests--capture-run (store statements &rest opts)
+  "Run STATEMENTS through the real typed batch executor against STORE.
+The mysql seam signals the raw condition in OPTS `:raw' when it sees the
+statement equal to `:poison' (default \"POISON\"); every other statement
+succeeds.  Returns the `dorg-sql-transaction-rolled-back' receipt data."
+  (let* ((raw (or (plist-get opts :raw) "[1105] RAW-PRIVATE server prose"))
+         (poison (or (plist-get opts :poison) "POISON"))
+         (queries nil))
+    (cl-letf (((symbol-function 'mysql-query)
+               (lambda (_conn sql)
+                 (push sql queries)
+                 (when (equal sql poison)
+                   (signal 'mysql-query-error (list raw)))
+                 nil)))
+      (let* ((dorg-sql--capture-store-dir store)
+             (err (should-error
+                   (dorg-sql--mysql-batch-on-conn
+                    'conn statements "typed" nil t)
+                   :type 'dorg-sql-transaction-rolled-back)))
+        (list :data (dorg-sql-transaction-rollback-data err)
+              :message (error-message-string err)
+              :error err
+              :queries (nreverse queries))))))
+
+(ert-deftest dorg-test-dolt-failure-capture-on-by-default ()
+  "The capture is on unless the operator turns it off.
+The default value is the fact under test; the behavioral witnesses bind the
+variable explicitly so they hold whichever way the default is set."
+  :tags '(dolt iob)
+  (should (eq t (default-value 'dorg-sql-capture-failed-statements)))
+  (should (eq t (custom--standard-value 'dorg-sql-capture-failed-statements))))
+
+(ert-deftest dorg-test-dolt-failure-capture-disabled-by-binding ()
+  "With the capture bound off, a statement failure adds only closed correlation facts.
+No file appears under the store overlay and no prose reaches the receipt."
+  :tags '(dolt iob)
+  (let* ((store (dorg-dolt-tests--capture-scratch-store))
+         (dorg-sql-capture-failed-statements nil)
+         (run (dorg-dolt-tests--capture-run
+               store '("INSERT INTO embead_notes (bead_id) VALUES ('x')"
+                       "POISON")))
+         (data (plist-get run :data))
+         (printed (format "%s %S" (plist-get run :message) data)))
+    (should (eq t (plist-get data :rollback-confirmed)))
+    (should (eq 'statements (plist-get data :transaction-phase)))
+    (should (eq 'database-failure (plist-get data :class)))
+    (should (= 1105 (plist-get data :db-code)))
+    (should (= 2 (plist-get data :statement-index)))
+    (should (equal '(unknown nil) (plist-get data :statement-class)))
+    (should-not (plist-member data :capture-id))
+    (should-not (plist-member data :capture))
+    (should-not (string-match-p "RAW-PRIVATE" printed))
+    (should-not (dorg-dolt-tests--capture-files store))
+    ;; The only SQL after the failure is the same-session ROLLBACK.
+    (should (equal "ROLLBACK" (car (last (plist-get run :queries)))))))
+
+(ert-deftest dorg-test-dolt-failure-capture-writes-private-file ()
+  "With the opt-in, the original condition and SQL land in one private file.
+The file is created 0600 inside a 0700 overlay subdirectory, named by the
+receipt's capture id; the receipt itself still carries no prose or SQL."
+  :tags '(dolt iob)
+  (let* ((store (dorg-dolt-tests--capture-scratch-store))
+         (dorg-sql-capture-failed-statements t)
+         (run (dorg-dolt-tests--capture-run
+               store '("INSERT INTO embead_notes (bead_id) VALUES ('x')"
+                       "POISON")))
+         (data (plist-get run :data))
+         (printed (format "%s %S" (plist-get run :message) data))
+         (files (dorg-dolt-tests--capture-files store)))
+    (should (eq 'written (plist-get data :capture)))
+    (should (stringp (plist-get data :capture-id)))
+    (should (= 1 (length files)))
+    (should (equal (plist-get data :capture-id)
+                   (file-name-base (car files))))
+    (should (= #o700 (logand #o777 (file-modes
+                                    (expand-file-name ".dorg/failures" store)))))
+    (should (= #o600 (logand #o777 (file-modes (car files)))))
+    (let ((captured (with-temp-buffer
+                      (insert-file-contents (car files))
+                      (read (current-buffer)))))
+      (should (string-match-p "RAW-PRIVATE" (plist-get captured :message)))
+      (should (equal "POISON" (plist-get captured :statement)))
+      (should (= 2 (plist-get captured :statement-index)))
+      (should (eq 'statements (plist-get captured :transaction-phase)))
+      (should (= 1105 (plist-get captured :db-code))))
+    (should-not (string-match-p "RAW-PRIVATE" printed))
+    (should-not (string-match-p "POISON" printed))))
+
+(ert-deftest dorg-test-dolt-failure-capture-never-leaks-values ()
+  "Duplicate-value and syntax prose quoting data never reach a public surface.
+Both raw shapes are captured privately when opted in, and absent otherwise."
+  :tags '(dolt iob)
+  (dolist (raw '("[1062] Duplicate entry 'RAW-VALUE-77' for key 'headings.PRIMARY'"
+                 "[1064] You have an error in your SQL syntax near 'VALUES (''RAW-FRAG'')'"))
+    (dolist (opt-in '(nil t))
+      (let* ((store (dorg-dolt-tests--capture-scratch-store))
+             (dorg-sql-capture-failed-statements opt-in)
+             (run (dorg-dolt-tests--capture-run
+                   store '("POISON") :raw raw))
+             (data (plist-get run :data))
+             (printed (format "%s %S" (plist-get run :message) data)))
+        (should-not (string-match-p "RAW-" printed))
+        (should-not (plist-member data :underlying))
+        (if opt-in
+            (should (= 1 (length (dorg-dolt-tests--capture-files store))))
+          (should-not (dorg-dolt-tests--capture-files store)))))))
+
+(ert-deftest dorg-test-dolt-failure-capture-failure-isolated ()
+  "A failing capture never changes the refusal, its facts or the rollback.
+An unwritable overlay yields `:capture failed', no partial file, and a
+receipt otherwise equal to the capture-off run; the prose stays private."
+  :tags '(dolt iob)
+  (let* ((store (dorg-dolt-tests--capture-scratch-store))
+         (overlay (expand-file-name ".dorg" store)))
+    (make-directory overlay)
+    ;; A plain file where the failures directory must go: creation fails.
+    (with-temp-file (expand-file-name "failures" overlay) (insert "blocked"))
+    (let* ((dorg-sql-capture-failed-statements t)
+           (run (dorg-dolt-tests--capture-run store '("POISON")))
+           (data (plist-get run :data))
+           (printed (format "%s %S" (plist-get run :message) data))
+           (off (let ((dorg-sql-capture-failed-statements nil))
+                  (plist-get (dorg-dolt-tests--capture-run store '("POISON"))
+                             :data))))
+      (should (eq 'failed (plist-get data :capture)))
+      (should-not (plist-member data :capture-id))
+      (should-not (string-match-p "RAW-PRIVATE" printed))
+      (should-not (string-match-p "blocked" printed))
+      (should (equal "ROLLBACK" (car (last (plist-get run :queries)))))
+      ;; Decision fields agree with the capture-off receipt.
+      (dolist (key '(:rollback-confirmed :transaction-phase :class :db-code
+                     :statement-index :statement-class))
+        (should (equal (plist-get off key) (plist-get data key)))))))
+
+(ert-deftest dorg-test-dolt-failure-capture-refuses-unsafe-destination ()
+  "A symlinked overlay subdirectory is refused as a capture destination.
+The refusal is reported as a failed capture; nothing is written through the
+link and nothing outside the store is touched."
+  :tags '(dolt iob)
+  (let* ((store (dorg-dolt-tests--capture-scratch-store))
+         (overlay (expand-file-name ".dorg" store))
+         (elsewhere (make-temp-file "dorg-capture-elsewhere" t)))
+    (make-directory overlay)
+    (make-symbolic-link elsewhere (expand-file-name "failures" overlay))
+    (let* ((dorg-sql-capture-failed-statements t)
+           (run (dorg-dolt-tests--capture-run store '("POISON")))
+           (data (plist-get run :data)))
+      (should (eq 'failed (plist-get data :capture)))
+      (should-not (directory-files elsewhere nil "\\`[^.]")))))
+
+(ert-deftest dorg-test-dolt-failure-ordinal-second-of-identical-statements ()
+  "The ordinal is counted at the batch loop, never found by text search.
+Two identical statements where the second fails report index 2 with the
+same statement text, and exactly one ROLLBACK follows."
+  :tags '(dolt iob)
+  (let* ((store (dorg-dolt-tests--capture-scratch-store))
+         (dorg-sql-capture-failed-statements t)
+         (seen 0)
+         (run
+          (cl-letf (((symbol-function 'mysql-query)
+                     (lambda (_conn sql)
+                       (when (equal sql "UPDATE embead_notes SET body = 'same'")
+                         (cl-incf seen)
+                         (when (= seen 2)
+                           (signal 'mysql-query-error
+                                   '("[1105] RAW-PRIVATE second failure"))))
+                       nil)))
+            (let* ((dorg-sql--capture-store-dir store)
+                   (err (should-error
+                         (dorg-sql--mysql-batch-on-conn
+                          'conn
+                          '("UPDATE embead_notes SET body = 'same'"
+                            "UPDATE embead_notes SET body = 'same'")
+                          "typed" nil t)
+                         :type 'dorg-sql-transaction-rolled-back)))
+              (dorg-sql-transaction-rollback-data err))))
+         (files (dorg-dolt-tests--capture-files store)))
+    (should (= 2 (plist-get run :statement-index)))
+    ;; An extension table is outside the finite public set: the class names
+    ;; the verb and `unknown'; the exact statement is only in the capture.
+    (should (equal '(update unknown) (plist-get run :statement-class)))
+    (should (= 1 (length files)))
+    (let ((captured (with-temp-buffer
+                      (insert-file-contents (car files))
+                      (read (current-buffer)))))
+      (should (= 2 (plist-get captured :statement-index)))
+      (should (equal "UPDATE embead_notes SET body = 'same'"
+                     (plist-get captured :statement))))))
+
+(ert-deftest dorg-test-dolt-failure-non-statement-failure-has-no-stale-ordinal ()
+  "A validation-phase failure after the statements succeeded carries no ordinal.
+Unknown is an absent fact: the last successful data statement's index must
+not survive into a later phase's receipt."
+  :tags '(dolt iob)
+  (let* ((store (dorg-dolt-tests--capture-scratch-store))
+         (dorg-sql-capture-failed-statements t)
+         (run
+          (cl-letf (((symbol-function 'mysql-query) (lambda (_conn _sql) nil)))
+            (let* ((dorg-sql--capture-store-dir store)
+                   (err (should-error
+                         (dorg-sql--mysql-batch-on-conn
+                          'conn '("INSERT INTO embead_notes (bead_id) VALUES ('x')")
+                          "typed"
+                          (lambda (_query) (error "RAW-PRIVATE validator says no"))
+                          t)
+                         :type 'dorg-sql-transaction-rolled-back)))
+              (dorg-sql-transaction-rollback-data err)))))
+    (should (eq 'validate (plist-get run :transaction-phase)))
+    (should-not (plist-member run :statement-index))
+    (should-not (plist-member run :statement-class))
+    (should-not (dorg-dolt-tests--capture-files store))))
+
+(ert-deftest dorg-test-dolt-failure-statement-class-is-closed ()
+  "The public statement class is a closed (VERB TABLE) list, never SQL text.
+The table is one of the finite public core names or the symbol `unknown';
+identifiers outside that set, quoted or bare, are never echoed, comments and
+unfamiliar shapes fall to (unknown nil), and every shape encodes as a JSON
+array so the public error envelope can carry it."
+  :tags '(dolt iob)
+  (dolist (case '(("INSERT INTO ext_notes (bead_id) VALUES ('RAW-V')" insert unknown)
+                  ("UPDATE `headings` SET title = 'RAW-V'" update "headings")
+                  ("DELETE FROM heading_items WHERE id = 1" delete "heading_items")
+                  ("UPDATE RAW_SENTINEL_TABLE SET x = 1" update unknown)
+                  ("UPDATE `RAW_SENTINEL_TABLE` SET x = 1" update unknown)
+                  ("DELETE FROM `Headings` WHERE id = 1" delete "headings")
+                  ("CALL DOLT_ADD('.')" unknown nil)
+                  ("INSERT INTO `we`ird` (x) VALUES (1)" unknown nil)
+                  ("/* RAW-COMMENT */ INSERT INTO ext_notes (x) VALUES (1)" unknown nil)))
+    (let ((class (dorg-sql--statement-class (car case))))
+      (should (equal (cdr case) class))
+      (should (= 2 (safe-length class)))
+      (should (stringp (json-encode (list :statement-class class))))
+      (should-not (string-match-p "RAW" (prin1-to-string class)))
+      ;; A public table string is the set's own object, never a substring
+      ;; of the statement.
+      (when (stringp (cadr class))
+        (should (memq (cadr class) dorg-sql--public-table-set))))))
+
+(ert-deftest dorg-test-dolt-failure-capture-classification-stable ()
+  "The opt-in changes no classification: every closed class is unchanged."
+  :tags '(dolt iob)
+  (let ((cases
+         '(("[1213] (40001) Deadlock RAW-1213 while committing" serialization 1213)
+           ("[1105] (HY000) constraint violations from transaction RAW-1105" serialization 1105)
+           ("[1062] (23000) Duplicate entry 'RAW-A' for key 'headings.uq_heading_sibling_order'" sibling-order-duplicate 1062)
+           ("[1062] (23000) Duplicate entry 'RAW-B' for key 'headings.PRIMARY'" deterministic-constraint 1062)
+           ("RAW-UNKNOWN database fault" database-failure nil))))
+    (dolist (opt-in '(nil t))
+      (dolist (case cases)
+        (pcase-let ((`(,raw ,class ,code) case))
+          (let* ((store (dorg-dolt-tests--capture-scratch-store))
+                 (dorg-sql-capture-failed-statements opt-in)
+                 (data (plist-get
+                        (dorg-dolt-tests--capture-run store '("POISON") :raw raw)
+                        :data)))
+            (should (eq class (plist-get data :class)))
+            (should (equal code (plist-get data :db-code)))))))))
+
+(ert-deftest dorg-test-dolt-lease-batch-binds-capture-store ()
+  "The lease seam carries the owning store to the executor; nothing rediscovers it."
+  :tags '(dolt iob)
+  (let* ((dir "/tmp/dorg-capture-lease-store/")
+         (lease (dorg-sql--make-lease :dolt-dir dir :owner (make-symbol "l")))
+         (seen 'unset))
+    (cl-letf (((symbol-function 'dorg-sql--lease-validate) (lambda (_l) nil))
+              ((symbol-function 'dorg-sql--lease-conn) (lambda (_l) 'conn))
+              ((symbol-function 'dorg-sql--mysql-batch-on-conn)
+               (lambda (&rest _) (setq seen dorg-sql--capture-store-dir) nil)))
+      (dorg-sql--lease-batch lease '("SELECT 1") "typed" nil t)
+      (should (equal dir seen)))))
+
+(ert-deftest dorg-test-dolt-failure-public-class-never-echoes-identifiers ()
+  "Through the real batch executor, an unfamiliar table never reaches the public class.
+Bare and backquoted identifiers outside the finite public set become
+`unknown' with the capture on and off; a core table keeps its public name."
+  :tags '(dolt iob)
+  (dolist (opt-in '(nil t))
+    (dolist (case '(("UPDATE RAW_SENTINEL_TABLE SET x = 1" update unknown)
+                    ("UPDATE `RAW_SENTINEL_TABLE` SET x = 1" update unknown)
+                    ("DELETE FROM headings WHERE id = 1" delete "headings")))
+      (let* ((store (dorg-dolt-tests--capture-scratch-store))
+             (dorg-sql-capture-failed-statements opt-in)
+             (run (dorg-dolt-tests--capture-run
+                   store (list "INSERT INTO headings (id) VALUES (1)" (car case))
+                   :poison (car case)))
+             (data (plist-get run :data))
+             (printed (format "%s %S" (plist-get run :message) data)))
+        (should (equal (cdr case) (plist-get data :statement-class)))
+        (should (= 2 (plist-get data :statement-index)))
+        (should-not (string-match-p "sentinel" (downcase printed)))
+        (if opt-in
+            (should (eq 'written (plist-get data :capture)))
+          (should-not (plist-member data :capture)))))))
+
+(ert-deftest dorg-test-dolt-failure-public-refusal-uses-real-receipt ()
+  "The real executor receipt drives the public mutation refusal without leaking.
+The rolled-back receipt produced by the batch loop, not a hand-built one,
+reaches `dorg-mutate--rolled-back-decision'; the refusal carries the closed
+facts and no identifier or prose from the failed statement."
+  :tags '(dolt iob)
+  (require 'dorg-mutate)
+  (let* ((store (dorg-dolt-tests--capture-scratch-store))
+         (dorg-sql-capture-failed-statements t)
+         (poison "UPDATE `RAW_SENTINEL_TABLE` SET x = 1")
+         (run (dorg-dolt-tests--capture-run
+               store (list "INSERT INTO headings (id) VALUES (1)" poison)
+               :poison poison))
+         (plan (list :caller-base "b0" :plan-base "b0"
+                     :root-scope '(1) :identity-scope '((1 1 1))))
+         (err (should-error
+               (dorg-mutate--rolled-back-decision
+                (plist-get run :error) plan "h1" nil nil 0)
+               :type 'dorg-mutate-error))
+         (data (dorg-mutate-error-data err))
+         (printed (format "%s %S" (error-message-string err) data)))
+    (should (eq 'invariant (plist-get data :reason)))
+    (should (eq 'database-failure (plist-get data :detail)))
+    (should (= 2 (plist-get data :statement-index)))
+    (should (equal '(update unknown) (plist-get data :statement-class)))
+    (should (eq 'written (plist-get data :capture)))
+    (should (equal (plist-get data :capture-id)
+                   (file-name-base (car (dorg-dolt-tests--capture-files store)))))
+    (should-not (string-match-p "sentinel" (downcase printed)))
+    (should-not (string-match-p "RAW-PRIVATE" printed))
+    (should-not (plist-member data :underlying))
+    (should-not (plist-member data :message))
+    ;; The public error envelope must encode this refusal, closed facts
+    ;; included: the class is a JSON array, never a dotted pair.
+    (let ((envelope (json-encode
+                     (dorg-envelope-error-json
+                      (dorg-mutate-error-reason err) (cadr err) data))))
+      (should (stringp envelope))
+      (should (string-match-p "\"statement-class\":\\[\"update\",\"unknown\"\\]" envelope))
+      (should-not (string-match-p "sentinel" (downcase envelope))))))
+
+(ert-deftest dorg-test-dolt-failure-capture-refuses-unsafe-existing-modes ()
+  "Existing destination directories with unsafe modes are refused, not repaired.
+A failures directory readable or writable by others, or a group/world-writable
+overlay parent, yields `:capture failed' and no file; an owned readable overlay
+with a private failures directory, and the 0700/0700 pair, are the positive
+controls.  No mode of an existing directory is changed."
+  :tags '(dolt iob)
+  (dolist (case '((#o700 #o755 failed) (#o700 #o777 failed) (#o777 #o700 failed)
+                  (#o755 #o700 written) (#o700 #o700 written)))
+    (pcase-let ((`(,overlay-mode ,dir-mode ,expected) case))
+      (let* ((store (dorg-dolt-tests--capture-scratch-store))
+             (overlay (expand-file-name ".dorg" store))
+             (dir (expand-file-name "failures" overlay)))
+        (make-directory overlay)
+        (make-directory dir)
+        (set-file-modes overlay overlay-mode)
+        (set-file-modes dir dir-mode)
+        (let* ((dorg-sql-capture-failed-statements t)
+               (data (plist-get (dorg-dolt-tests--capture-run store '("POISON"))
+                                :data)))
+          (should (eq expected (plist-get data :capture)))
+          (should (= overlay-mode (logand #o777 (file-modes overlay))))
+          (should (= dir-mode (logand #o777 (file-modes dir))))
+          (if (eq expected 'written)
+              (should (= 1 (length (dorg-dolt-tests--capture-files store))))
+            (should-not (dorg-dolt-tests--capture-files store))))))))
+
+(ert-deftest dorg-test-dolt-failure-capture-refuses-foreign-owner ()
+  "A destination owned by another user is refused through the ownership seam.
+No chown is attempted: the owner query is stubbed to report a foreign uid for
+the failures directory while everything else is owned and 0700; the same
+store with the real owner query is the positive control."
+  :tags '(dolt iob)
+  (let* ((store (dorg-dolt-tests--capture-scratch-store))
+         (overlay (expand-file-name ".dorg" store))
+         (dir (expand-file-name "failures" overlay))
+         (real (symbol-function 'dorg-sql--capture-path-owner-uid)))
+    (with-file-modes #o700 (make-directory overlay))
+    (with-file-modes #o700 (make-directory dir))
+    (cl-letf (((symbol-function 'dorg-sql--capture-path-owner-uid)
+               (lambda (path)
+                 (if (equal (file-name-as-directory path)
+                            (file-name-as-directory dir))
+                     (1+ (user-uid))
+                   (funcall real path)))))
+      (let* ((dorg-sql-capture-failed-statements t)
+             (data (plist-get (dorg-dolt-tests--capture-run store '("POISON"))
+                              :data)))
+        (should (eq 'failed (plist-get data :capture)))
+        (should-not (dorg-dolt-tests--capture-files store))))
+    (let* ((dorg-sql-capture-failed-statements t)
+           (data (plist-get (dorg-dolt-tests--capture-run store '("POISON"))
+                            :data)))
+      (should (eq 'written (plist-get data :capture)))
+      (should (= 1 (length (dorg-dolt-tests--capture-files store)))))))
+
+(ert-deftest dorg-test-dolt-failure-capture-write-failure-cleans-own-file ()
+  "A failure while writing the payload removes only the file this capture created.
+The exclusive file exists when the payload write fails; afterwards the
+failures directory is empty again, the receipt says `:capture failed', the
+rollback facts stand and the failure prose stays private."
+  :tags '(dolt iob)
+  (let* ((store (dorg-dolt-tests--capture-scratch-store))
+         (created nil)
+         (real-write (symbol-function 'write-region)))
+    (cl-letf (((symbol-function 'write-region)
+               (lambda (start end filename &rest rest)
+                 (if (and (stringp filename)
+                          (string-match-p "/\\.dorg/failures/cap-" filename))
+                     (progn (setq created (file-exists-p filename))
+                            (signal 'file-error
+                                    (list "Writing" "RAW-DISK-FULL" filename)))
+                   (apply real-write start end filename rest)))))
+      (let* ((dorg-sql-capture-failed-statements t)
+             (run (dorg-dolt-tests--capture-run store '("POISON")))
+             (data (plist-get run :data))
+             (printed (format "%s %S" (plist-get run :message) data)))
+        (should created)
+        (should (eq 'failed (plist-get data :capture)))
+        (should-not (plist-member data :capture-id))
+        (should-not (dorg-dolt-tests--capture-files store))
+        (should (equal "ROLLBACK" (car (last (plist-get run :queries)))))
+        (should (eq t (plist-get data :rollback-confirmed)))
+        (should-not (string-match-p "RAW-" printed))))))
+
+(ert-deftest dorg-test-dolt-failure-capture-needs-confirmed-rollback ()
+  "Diagnostic file I/O never precedes a confirmed rollback.
+Without confirmation the facts say `:capture skipped' and nothing under the
+store is created or touched; with confirmation the same call writes the
+capture."
+  :tags '(dolt iob)
+  (let* ((store (dorg-dolt-tests--capture-scratch-store))
+         (dorg-sql-capture-failed-statements t)
+         (dorg-sql--capture-store-dir store)
+         (err (list 'mysql-query-error "[1105] RAW-PRIVATE server prose")))
+    (cl-letf (((symbol-function 'make-directory)
+               (lambda (&rest _) (ert-fail "file I/O before a confirmed rollback")))
+              ((symbol-function 'make-temp-file)
+               (lambda (&rest _) (ert-fail "file I/O before a confirmed rollback"))))
+      (let ((facts (dorg-sql--failed-statement-facts
+                    err 'statements "POISON" 1 nil)))
+        (should (eq 'skipped (plist-get facts :capture)))
+        (should-not (plist-member facts :capture-id))
+        (should (= 1 (plist-get facts :statement-index)))))
+    (should-not (file-exists-p (expand-file-name ".dorg" store)))
+    (let ((facts (dorg-sql--failed-statement-facts err 'statements "POISON" 1 t)))
+      (should (eq 'written (plist-get facts :capture)))
+      (should (= 1 (length (dorg-dolt-tests--capture-files store)))))))
+
+(defun dorg-dolt-tests--capture-envelope (err)
+  "Return ERR's public refusal as the parsed JSON error envelope plus its text.
+ERR is a `dorg-mutate-error'; the envelope goes through the real
+`dorg-envelope-error-json' and `json-encode', then `json-parse-string'."
+  (let* ((encoded (json-encode
+                   (dorg-envelope-error-json
+                    (dorg-mutate-error-reason err) (cadr err)
+                    (dorg-mutate-error-data err))))
+         (parsed (json-parse-string encoded :object-type 'alist
+                                    :array-type 'list :null-object nil
+                                    :false-object :json-false)))
+    (list :text encoded :parsed parsed
+          :details (alist-get 'details (alist-get 'error parsed)))))
+
+(ert-deftest dorg-test-dolt-failure-public-envelope-round-trips-closed-facts ()
+  "The real receipt survives refusal, envelope, JSON encoding and parsing intact.
+For a known table, an unknown table and an unknown verb, with the capture on
+and off, the real executor's rolled-back receipt drives
+`dorg-mutate--rolled-back-decision', whose refusal goes through
+`dorg-envelope-error-json' and `json-encode'; parsing the result back yields
+the closed facts as JSON values (the class as an array), and never the
+statement text.  A non-statement failure carries no index and no class."
+  :tags '(dolt iob)
+  (require 'dorg-mutate)
+  (dolist (opt-in '(nil t))
+    (dolist (case '(("DELETE FROM headings WHERE id = 1" ("delete" "headings"))
+                    ("UPDATE `RAW_SENTINEL_TABLE` SET x = 1" ("update" "unknown"))
+                    ("CALL RAW_SENTINEL_PROC(1)" ("unknown" nil))))
+      (let* ((store (dorg-dolt-tests--capture-scratch-store))
+             (dorg-sql-capture-failed-statements opt-in)
+             (poison (car case))
+             (run (dorg-dolt-tests--capture-run
+                   store (list "INSERT INTO headings (id) VALUES (1)" poison)
+                   :poison poison))
+             (plan (list :caller-base "b0" :plan-base "b0"
+                         :root-scope '(1) :identity-scope '((1 1 1))))
+             (err (should-error
+                   (dorg-mutate--rolled-back-decision
+                    (plist-get run :error) plan "h1" nil nil 0)
+                   :type 'dorg-mutate-error))
+             (envelope (dorg-dolt-tests--capture-envelope err))
+             (details (plist-get envelope :details))
+             (text (plist-get envelope :text)))
+        (should (eq :json-false (alist-get 'ok (plist-get envelope :parsed))))
+        (should (equal "database-failure" (alist-get 'detail details)))
+        (should (equal 2 (alist-get 'statement-index details)))
+        (should (equal (cadr case) (alist-get 'statement-class details)))
+        (if opt-in
+            (progn (should (equal "written" (alist-get 'capture details)))
+                   (should (stringp (alist-get 'capture-id details))))
+          (should-not (assq 'capture details)))
+        (should-not (string-match-p "sentinel" (downcase text)))
+        (should-not (string-match-p "RAW-" text)))))
+  ;; A validation-phase failure after the statements: the envelope carries
+  ;; neither an ordinal nor a class, and no validator prose.
+  (let* ((store (dorg-dolt-tests--capture-scratch-store))
+         (dorg-sql-capture-failed-statements t)
+         (receipt
+          (cl-letf (((symbol-function 'mysql-query) (lambda (_conn _sql) nil)))
+            (let ((dorg-sql--capture-store-dir store))
+              (should-error
+               (dorg-sql--mysql-batch-on-conn
+                'conn '("INSERT INTO headings (id) VALUES (1)")
+                "typed"
+                (lambda (_query) (error "RAW-PRIVATE validator says no"))
+                t)
+               :type 'dorg-sql-transaction-rolled-back))))
+         (plan (list :caller-base "b0" :plan-base "b0"
+                     :root-scope '(1) :identity-scope '((1 1 1))))
+         (err (should-error
+               (dorg-mutate--rolled-back-decision receipt plan "h1" nil nil 0)
+               :type 'dorg-mutate-error))
+         (envelope (dorg-dolt-tests--capture-envelope err))
+         (details (plist-get envelope :details)))
+    (should (equal "validate" (alist-get 'transaction-phase details)))
+    (should-not (assq 'statement-index details))
+    (should-not (assq 'statement-class details))
+    (should-not (assq 'capture details))
+    (should-not (string-match-p "RAW-" (plist-get envelope :text)))
+    (should-not (dorg-dolt-tests--capture-files store))))
 
 (provide 'dorg-dolt-tests)
 ;;; dorg-dolt-tests.el ends here

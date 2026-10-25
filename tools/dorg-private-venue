@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Publish DOrg refs and operate its private Actions gate at one verified venue."""
+
+import re
+import subprocess
+import sys
+from urllib.parse import urlsplit
+
+
+PRIVATE_REPO = "cosmicz/DOrg.oc"
+PRIVATE_IDENTITY = ("github.com", "cosmicz", "dorg.oc")
+SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
+CODE_RE = re.compile(r"[a-z0-9]{5}\Z")
+RUN_ID_RE = re.compile(r"[1-9][0-9]*\Z")
+SCP_URL_RE = re.compile(r"git@([^:]+):([^/]+)/([^/]+)\Z")
+
+
+class Refusal(Exception):
+    """An unsafe venue or invocation stopped before a push or dispatch."""
+
+
+def command(*args, check=True):
+    try:
+        result = subprocess.run(args, text=True, capture_output=True)
+    except OSError as error:
+        raise Refusal(f"cannot run {args[0]}: {error}") from error
+    if check and result.returncode:
+        raise Refusal(f"{' '.join(args)} failed ({result.returncode}): {result.stderr.strip()}")
+    return result
+
+
+def identity(url):
+    """Return normalized GitHub host, owner and repository for known URL forms."""
+    scp = SCP_URL_RE.fullmatch(url)
+    if scp:
+        host, owner, repo = scp.groups()
+    else:
+        try:
+            parsed = urlsplit(url)
+            port = parsed.port
+        except ValueError:
+            return None
+        if parsed.scheme not in ("ssh", "https") or parsed.query or parsed.fragment:
+            return None
+        if parsed.username not in (None, "git") or parsed.password:
+            return None
+        if port not in (None, 22 if parsed.scheme == "ssh" else 443):
+            return None
+        host = parsed.hostname
+        parts = parsed.path.lstrip("/").split("/")
+        if len(parts) != 2:
+            return None
+        owner, repo = parts
+    if not host or not owner or not repo.lower().endswith(".git"):
+        return None
+    return (host.casefold(), owner.casefold(), repo[:-4].casefold())
+
+
+def config_values(key):
+    result = command("git", "config", "--get-all", key, check=False)
+    if result.returncode == 1:
+        return []
+    if result.returncode:
+        raise Refusal(f"cannot read {key}: {result.stderr.strip()}")
+    return result.stdout.splitlines()
+
+
+def private_push_remote():
+    """Resolve one remote whose raw and rewritten push URL name the private repo."""
+    remotes = command("git", "remote").stdout.splitlines()
+    matches = []
+    for remote in remotes:
+        raw = config_values(f"remote.{remote}.pushurl") or config_values(f"remote.{remote}.url")
+        effective = command("git", "remote", "get-url", "--push", "--all", remote).stdout.splitlines()
+        if not any(identity(url) == PRIVATE_IDENTITY for url in raw + effective):
+            continue
+        if len(raw) != 1 or len(effective) != 1:
+            raise Refusal(f"remote {remote} has multiple push URLs")
+        if identity(raw[0]) != PRIVATE_IDENTITY or identity(effective[0]) != PRIVATE_IDENTITY:
+            raise Refusal(f"remote {remote} changes private push identity after URL rewrite")
+        mirror = command("git", "config", "--bool", "--get",
+                         f"remote.{remote}.mirror", check=False)
+        if mirror.returncode not in (0, 1):
+            raise Refusal(f"cannot read remote {remote} mirror setting")
+        if mirror.stdout.strip() == "true":
+            raise Refusal(f"remote {remote} is configured to mirror")
+        matches.append((remote, effective[0]))
+    if len(matches) != 1:
+        raise Refusal(f"expected exactly one {PRIVATE_REPO} push remote, found {len(matches)}")
+    return matches[0]
+
+
+def check_sha(sha):
+    if not SHA_RE.fullmatch(sha):
+        raise Refusal("commit must be a full lowercase 40-hex SHA")
+    result = command("git", "cat-file", "-t", sha, check=False)
+    if result.returncode or result.stdout.strip() != "commit":
+        raise Refusal("SHA does not name a local commit")
+
+
+def gate_ref(code, sha):
+    if not CODE_RE.fullmatch(code):
+        raise Refusal("gate code must be five lowercase letters or digits")
+    check_sha(sha)
+    return f"refs/heads/ci/{code}-{sha[:12]}"
+
+
+def push(sha, ref):
+    check_sha(sha)
+    remote, url = private_push_remote()
+    # Git expands insteadOf for ls-remote.  Require a fixed point before using
+    # the same effective push URL to read back; keep the caller's SSH auth.
+    readback_url = command("git", "ls-remote", "--get-url", url).stdout.strip()
+    if readback_url != url:
+        raise Refusal(f"readback URL rewrite changes destination: {readback_url}")
+    print(f"remote={remote}\neffective_url={url}\nsha={sha}\nref={ref}", flush=True)
+    pushed = command("git", "push", "--porcelain", remote, f"{sha}:{ref}", check=False)
+    if pushed.returncode:
+        raise Refusal(f"push failed ({pushed.returncode}): {pushed.stderr.strip()}")
+    observed = [line.split("\t", 1)[0]
+                for line in command("git", "ls-remote", url, ref).stdout.splitlines()
+                if line.endswith(f"\t{ref}")]
+    if observed != [sha]:
+        raise Refusal(f"push readback mismatch: {observed!r}")
+    print(f"readback={sha}")
+
+
+def gh(*args):
+    result = command("gh", *args, "-R", PRIVATE_REPO, check=False)
+    sys.stdout.write(result.stdout)
+    sys.stderr.write(result.stderr)
+    return result.returncode
+
+
+def main(args):
+    if not args:
+        raise Refusal("usage: dorg-private-venue push-gate CODE SHA | push-trunk SHA | dispatch CODE SHA [SELECTOR] | list CODE SHA | view RUN_ID | download RUN_ID DIR")
+    verb, *rest = args
+    if verb == "push-gate" and len(rest) == 2:
+        push(rest[1], gate_ref(rest[0], rest[1]))
+    elif verb == "push-trunk" and len(rest) == 1:
+        push(rest[0], "refs/heads/trunk")
+    elif verb == "dispatch" and len(rest) in (2, 3):
+        ref = gate_ref(rest[0], rest[1]).removeprefix("refs/heads/")
+        selector = rest[2] if len(rest) == 3 else ""
+        return gh("workflow", "run", "ci.yml", "--ref", ref, "-f", f"selector={selector}")
+    elif verb == "list" and len(rest) == 2:
+        ref = gate_ref(rest[0], rest[1]).removeprefix("refs/heads/")
+        return gh("run", "list", "--workflow", "ci.yml", "--branch", ref,
+                  "--event", "workflow_dispatch", "--json",
+                  "databaseId,headSha,status,conclusion,url")
+    elif verb == "view" and len(rest) == 1 and RUN_ID_RE.fullmatch(rest[0]):
+        return gh("run", "view", rest[0], "--json",
+                  "databaseId,headSha,status,conclusion,url")
+    elif verb == "download" and len(rest) == 2 and RUN_ID_RE.fullmatch(rest[0]):
+        return gh("run", "download", rest[0], "-n", "dorg-suite-job", "-D", rest[1])
+    else:
+        raise Refusal("invalid private venue command or arguments")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Refusal as error:
+        print(f"refuse: {error}", file=sys.stderr)
+        sys.exit(2)

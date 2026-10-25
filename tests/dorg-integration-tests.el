@@ -110,8 +110,8 @@ reaped and un-owned workdir on disk for inspection."
                              (dorg-sql
                               dolt-dir
                               (concat
-                               "SELECT level, title FROM headings WHERE root_id = %d "
-                               "ORDER BY CASE WHEN level = 0 THEN 0 ELSE 1 END, sort_key")
+                               "SELECT level_offset, title FROM headings WHERE root_id = %d "
+                               "ORDER BY CASE WHEN level_offset = 0 THEN 0 ELSE 1 END, sort_key")
                               root-id)))
                         (should (= (length headings) 4))
                         (should (equal
@@ -135,7 +135,7 @@ reaped and un-owned workdir on disk for inspection."
                       (let* ((rows-before
                               (dorg-sql
                                dolt-dir
-                               "SELECT id, title FROM headings WHERE root_id = %d AND level > 0 ORDER BY sort_key"
+                               "SELECT id, title FROM headings WHERE root_id = %d AND level_offset > 0 ORDER BY sort_key"
                                root-id))
                              (ids-before
                               (mapcar (lambda (r) (alist-get 'id r)) rows-before))
@@ -151,7 +151,7 @@ reaped and un-owned workdir on disk for inspection."
                         (let* ((rows
                                 (dorg-sql
                                  dolt-dir
-                                 "SELECT id, title FROM headings WHERE root_id = %d AND level > 0 ORDER BY sort_key"
+                                 "SELECT id, title FROM headings WHERE root_id = %d AND level_offset > 0 ORDER BY sort_key"
                                  root-id))
                                (ids-after
                                 (mapcar (lambda (r) (alist-get 'id r)) rows))

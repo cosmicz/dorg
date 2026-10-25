@@ -39,6 +39,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'json)
 (require 'seq)
 (require 'dorg-schema)
 (require 'dorg-dolt-server)
@@ -57,6 +58,7 @@
 (defvar dorg-dolt-fixture--failed-start-lease)
 (defvar dorg-dolt-fixture--conn)
 (defvar dorg-dolt-fixture--store-leases)
+(defvar dorg-test--owned-roots)
 
 ;;; ─── Shared Test Server ────────────────────────────────────────────────
 ;;
@@ -78,6 +80,234 @@
   "Legacy mirror of the fixture's mysql.el connection to the shared server.
 Published by `dorg-test--start-shared-server' from `dorg-dolt-fixture--conn'
 for consumer suites that read it; the fixture owns the live connection.")
+
+(defvar dorg-test--reap-owned-store-trace nil
+  "Non-nil enables JSON decision traces for `dorg-test--reap-owned-store'.")
+
+(defvar dorg-test--reap-owned-store-trace-stubs nil
+  "Alist mapping function symbols to inert trace-marker wrappers.")
+
+(defvar dorg-test--reap-owned-store-trace-current-test nil
+  "Trace-only dynamic fallback for the current ERT test symbol.")
+
+(defun dorg-test--reap-owned-store-trace-enabled-p ()
+  "Return non-nil when owned-store reap decision tracing is enabled."
+  (or dorg-test--reap-owned-store-trace
+      (getenv "DORG_TEST_REAP_OWNED_STORE_TRACE")))
+
+(defun dorg-test--reap-owned-store-mark-stub (symbol fn)
+  "Return an inert wrapper around FN marked as SYMBOL's intended test stub.
+The wrapper must not change FN's return value or side effects; it only gives
+the reap trace an object identity to compare against `symbol-function'."
+  (let ((wrapper (lambda (&rest args) (apply fn args))))
+    (push (cons symbol wrapper) dorg-test--reap-owned-store-trace-stubs)
+    wrapper))
+
+(defun dorg-test--reap-trace-json-value (value)
+  "Return VALUE converted to a conservative JSON-encodable representation."
+  (cond
+   ((or (null value) (eq value t) (numberp value) (stringp value)) value)
+   ((symbolp value) (symbol-name value))
+   ((processp value)
+    `(("type" . "process")
+      ("name" . ,(process-name value))
+      ("live" . ,(process-live-p value))
+      ("pid" . ,(ignore-errors (process-id value)))))
+   (t (prin1-to-string value))))
+
+(defun dorg-test--reap-trace-plist (plist)
+  "Return PLIST as a JSON object alist with safe values."
+  (let (out)
+    (while plist
+      (let ((key (pop plist))
+            (value (pop plist)))
+        (push (cons (if (symbolp key) (symbol-name key) (format "%s" key))
+                    (dorg-test--reap-trace-json-value value))
+              out)))
+    (nreverse out)))
+
+(defun dorg-test--reap-trace-hash-keys (table)
+  "Return TABLE's hash keys as safe JSON values."
+  (let (keys)
+    (when (hash-table-p table)
+      (maphash (lambda (key _value)
+                 (push (dorg-test--reap-trace-json-value key) keys))
+               table))
+    (nreverse keys)))
+
+(defun dorg-test--reap-trace-file-facts (path)
+  "Return JSON facts for PATH existence and truename."
+  `(("path" . ,(dorg-test--reap-trace-json-value path))
+    ("exists" . ,(and (stringp path) (file-exists-p path)))
+    ("truename" . ,(and (stringp path)
+                        (file-exists-p path)
+                        (ignore-errors (file-truename path))))))
+
+(defun dorg-test--reap-trace-function-facts (symbol)
+  "Return stub-effectiveness facts for SYMBOL."
+  (let* ((actual (and (fboundp symbol) (symbol-function symbol)))
+         (expected (cdr (assq symbol dorg-test--reap-owned-store-trace-stubs))))
+    `(("symbol" . ,(symbol-name symbol))
+      ("marked" . ,(and expected t))
+      ("stub_in_effect" . ,(and expected (eq actual expected)))
+      ("symbol_file" . ,(dorg-test--reap-trace-json-value
+                         (ignore-errors (symbol-file symbol))))
+      ("actual" . ,(dorg-test--reap-trace-json-value actual)))))
+
+(defun dorg-test--reap-trace-current-test-symbol ()
+  "Return the current ERT test symbol when available."
+  (let ((test (or dorg-test--reap-owned-store-trace-current-test
+                  (cond
+                   ((boundp 'ert-current-test) (symbol-value 'ert-current-test))
+                   ((boundp 'ert--current-test)
+                    (symbol-value 'ert--current-test))))))
+    (cond
+     ((symbolp test) test)
+     ((and test (fboundp 'ert-test-name))
+      (ignore-errors (ert-test-name test))))))
+
+(defun dorg-test--reap-trace-function-native-facts (label symbol)
+  "Return native-compilation facts for function SYMBOL labelled LABEL."
+  (let* ((fn (and (symbolp symbol) (fboundp symbol) (symbol-function symbol)))
+         (test (and (symbolp symbol)
+                    (fboundp 'ert-get-test)
+                    (ignore-errors (ert-get-test symbol))))
+         (body (and test
+                    (fboundp 'ert-test-body)
+                    (ignore-errors (ert-test-body test)))))
+    `(("label" . ,label)
+      ("symbol" . ,(dorg-test--reap-trace-json-value symbol))
+      ("symbol_file" . ,(dorg-test--reap-trace-json-value
+                         (and (symbolp symbol)
+                              (ignore-errors (symbol-file symbol)))))
+      ("subr_native_elisp" . ,(and (fboundp 'subr-native-elisp-p)
+                                   fn
+                                   (ignore-errors (subr-native-elisp-p fn))))
+      ("ert_body_subr_native_elisp" . ,(and (fboundp 'subr-native-elisp-p)
+                                            body
+                                            (ignore-errors
+                                              (subr-native-elisp-p body)))))))
+
+(defun dorg-test--reap-trace-native-comp-state ()
+  "Return native-compilation state relevant to a reap trace."
+  (let ((caller (dorg-test--reap-trace-current-test-symbol)))
+    `(("native_comp_available" . ,(and (fboundp 'native-comp-available-p)
+                                       (ignore-errors
+                                         (native-comp-available-p))))
+      ("native_comp_jit_compilation" . ,(and (boundp 'native-comp-jit-compilation)
+                                             native-comp-jit-compilation))
+      ("comp_async_compilations" . ,(dorg-test--reap-trace-json-value
+                                     (and (boundp 'comp-async-compilations)
+                                          comp-async-compilations)))
+      ("comp_files_queue" . ,(dorg-test--reap-trace-json-value
+                              (and (boundp 'comp-files-queue)
+                                   comp-files-queue)))
+      ("callee" . ,(dorg-test--reap-trace-function-native-facts
+                    "dorg-test--reap-owned-store"
+                    'dorg-test--reap-owned-store))
+      ("intermediate_callees" .
+       ,(mapcar (lambda (symbol)
+                  (dorg-test--reap-trace-function-native-facts
+                   (symbol-name symbol) symbol))
+                '(dorg-test--confirm-server-gone
+                  dorg-test--registry-identity-match-p
+                  dorg-test--store-server-identities
+                  dorg-test--owned-root-for-path
+                  dorg-test--canonical-path)))
+      ("caller" . ,(dorg-test--reap-trace-function-native-facts
+                    "ert-current-test"
+                    caller)))))
+
+(defun dorg-test--reap-trace-confirm-server-gone (identity)
+  "Trace and perform the same decision as `dorg-test--confirm-server-gone'."
+  (let* ((pid (plist-get identity :pid))
+         (record (list :port (plist-get identity :port)
+                       :dolt-dir (plist-get identity :dolt-dir)))
+         (live 'not-called)
+         (match 'not-called)
+         (killed-live 'not-called)
+         status)
+    (setq status
+          (if (not (integerp pid))
+              'unknown
+            (setq live (dorg-dolt-server--pid-live-p pid))
+            (cond
+             ((null live) 'gone)
+             ((not (eq live t)) 'unknown)
+             ((progn
+                (setq match (dorg-test--registry-identity-match-p pid record))
+                (not match))
+              'unknown)
+             (t (condition-case _err
+                    (progn
+                      (dorg-dolt-server--kill-pid
+                       pid dorg-dolt-server-stop-term-grace)
+                      (setq killed-live (dorg-dolt-server--pid-live-p pid))
+                      (if (null killed-live) 'gone 'still-live))
+                  (error 'error))))))
+    (cons status
+          `(("branch" . "confirm")
+            ("pid_live" . ,(dorg-test--reap-trace-json-value live))
+            ("registry_match" . ,(dorg-test--reap-trace-json-value match))
+            ("post_kill_pid_live" . ,(dorg-test--reap-trace-json-value
+                                      killed-live))
+            ("status_traced" . ,(symbol-name status))))))
+
+(defun dorg-test--reap-trace-facts (dolt-dir canon root ids proc-entry
+                                             identity-decisions status)
+  "Return JSON facts for one `dorg-test--reap-owned-store' decision."
+  (let* ((server-proc dorg-test--server-proc)
+         (proc (car-safe proc-entry)))
+    `(("event" . "dorg-test--reap-owned-store")
+      ("emacs_pid" . ,(emacs-pid))
+      ("emacs_version" . ,emacs-version)
+      ("system_type" . ,(symbol-name system-type))
+      ("ert_current_test" . ,(dorg-test--reap-trace-json-value
+                              (dorg-test--reap-trace-current-test-symbol)))
+      ("dolt_dir_arg" . ,(dorg-test--reap-trace-json-value dolt-dir))
+      ("canon" . ,(dorg-test--reap-trace-json-value canon))
+      ("root" . ,(dorg-test--reap-trace-json-value root))
+      ("owned_roots_keys" . ,(dorg-test--reap-trace-hash-keys
+                              dorg-test--owned-roots))
+      ("root_file" . ,(dorg-test--reap-trace-file-facts root))
+      ("store_file" . ,(dorg-test--reap-trace-file-facts canon))
+      ("temporary_file_directory" . ,(dorg-test--reap-trace-json-value
+                                      temporary-file-directory))
+      ("default_directory" . ,(dorg-test--reap-trace-json-value
+                               default-directory))
+      ("ids" . ,(mapcar #'dorg-test--reap-trace-plist ids))
+      ("proc_entry" . ,(dorg-test--reap-trace-json-value proc-entry))
+      ("proc_entry_key" . ,(and proc-entry canon))
+      ("proc_entry_live" . ,(and (processp proc) (process-live-p proc)))
+      ("dorg_test_server_port" . ,(dorg-test--reap-trace-json-value
+                                   dorg-test--server-port))
+      ("shared_server_pid" . ,(dorg-test--reap-trace-json-value
+                               (dorg-test--shared-server-pid)))
+      ("server_proc_pid" . ,(dorg-test--reap-trace-json-value
+                             (and (processp server-proc)
+                                  (ignore-errors (process-id server-proc)))))
+      ("server_proc_live" . ,(and (processp server-proc)
+                                  (process-live-p server-proc)))
+      ("identity_decisions" . ,(nreverse identity-decisions))
+      ("final_status" . ,(symbol-name status))
+      ("stubs" . ,(mapcar
+                   #'dorg-test--reap-trace-function-facts
+                   '(dorg-dolt-server--canonical-dir
+                     dorg-dolt-server--claim-read
+                     dorg-dolt-server--dolt-server-info
+                     dorg-dolt-server--pid-live-p
+                     dorg-dolt-server--stop
+                     dorg-dolt-server--kill-pid
+                     dorg-dolt-server--claim-delete-file
+                     process-attributes)))
+      ("native_comp" . ,(dorg-test--reap-trace-native-comp-state)))))
+
+(defun dorg-test--reap-trace-emit (facts)
+  "Emit FACTS as one JSON line for owned-store reap tracing."
+  (let ((line (concat "DORG_REAP_OWNED_STORE_TRACE "
+                      (json-encode facts))))
+    (princ line #'external-debugging-output)
+    (terpri #'external-debugging-output)))
 
 ;;; ─── Owned Root / Server Cleanup ──────────────────────────────────────
 
@@ -214,7 +444,7 @@ or a foreign datum on the strength of being a cons."
 (defun dorg-test--registry-recover-server-pid (record)
   "Recover RECORD's server pid from its store's `sql-server.info', or nil.
 Covers the persist-before-start window: ownership is durable BEFORE
-`start-process', so a fatal signal in that window leaves a record without
+the server spawn, so a fatal signal in that window leaves a record without
 `:server-pid'.  The dolt-native `PID:PORT:UUID' file under the recorded
 store is the bounded, normal-context source for the missing pid."
   (let ((store (plist-get record :dolt-dir)))
@@ -260,7 +490,7 @@ argument canonically resolves (`file-truename') to DOLT-DIR.  Returns:
               could not examine might BE the child.  Evidence is inconclusive,
               so the caller must PRESERVE.
 
-This is the ONLY evidence that survives the post-`start-process'/pre-bind/pre-
+This is the ONLY evidence that survives the post-spawn/pre-bind/pre-
 `sql-server.info' window: a just-forked child is process-ALIVE yet port-DEAD and
 has written NO on-disk metadata, so neither `dorg-dolt-server--port-live-p' nor a
 metadata probe can see it.  `tracked-case' persists the ownership record BEFORE the
@@ -640,7 +870,7 @@ construction; a metadata-bearing store with an unreadable pid still yields a
 blocking identity.
 
 PERSIST-BEFORE-SPAWN RECOVERY (tracked-case): the ownership record is written
-BEFORE `start-process', so a fatal signal in that window leaves a `:server-pid'-
+BEFORE the server spawn, so a fatal signal in that window leaves a `:server-pid'-
 absent record whose eligible root has NO on-disk server metadata.  Such a record
 implicates NO server ONLY when it also has no recoverable pid, nothing listening
 on its recorded `:port', AND process-table evidence CONFIRMS no live server under
@@ -648,7 +878,7 @@ its dolt-dir (`dorg-test--live-dolt-process-evidence' returns `none') -- then th
 empty root is reaped and the record consumed, so the shared lane is not
 permanently refused.  On-disk metadata, a LIVE port, a live starting process
 \(`live'), OR an INCONCLUSIVE scan (`unknown') each keeps the record blocking: a
-post-`start-process'/pre-bind child is port-dead but PROCESS-ALIVE and has
+post-spawn/pre-bind child is port-dead but PROCESS-ALIVE and has
 written no metadata, so the process table is the only evidence (reviewer:
 port-dead != process-dead), and a scan that could not complete must never read as
 absence (reviewer re-cert #3: no fail-open).  So confirmed-death safety is never
@@ -704,7 +934,7 @@ into an empty/clear set."
          ;; on-disk server metadata under the dolt-dir, a live listener on the
          ;; recorded port, OR process-table evidence that is not a confirmed
          ;; absence (`live' or `unknown').  The last two cover the post-
-         ;; `start-process' window: a bound orphan is caught by the port; a
+         ;; spawn window: a bound orphan is caught by the port; a
          ;; just-forked child not yet listening with no metadata is PORT-DEAD but
          ;; PROCESS-ALIVE, so only the process table sees it (reviewer: port-dead
          ;; != process-dead).  A scan that could not complete (`unknown') also
@@ -725,7 +955,7 @@ into an empty/clear set."
          ;; metadata, NOTHING listening on its port, AND process-table evidence
          ;; CONFIRMS `none' (no live dolt under it, scan completed clean) — the
          ;; crash landed AFTER the durable write but BEFORE (or with no
-         ;; surviving) `start-process', so no server exists.
+         ;; surviving) spawn, so no server exists.
          ;; Implicate NO server: the identity-intact empty root is reaped and the
          ;; record consumed, so a later shared start is NOT permanently refused
          ;; (the defect reviewer rejected 297209c for).
@@ -1109,15 +1339,21 @@ snapshotted proc entry being proven dead after the stop.  Returns:
 A store not under an owned root is `gone' (not ours).  Confirming by pid — not
 by port going down — refuses to declare a server gone while any recorded pid
 may still be live."
-  (let* ((canon (ignore-errors (dorg-dolt-server--canonical-dir dolt-dir)))
+  (let* ((trace (dorg-test--reap-owned-store-trace-enabled-p))
+         (canon (ignore-errors (dorg-dolt-server--canonical-dir dolt-dir)))
          (root (and canon (dorg-test--owned-root-for-path canon))))
     (if (not root)
-        'gone
+        (prog1 'gone
+          (when trace
+            (dorg-test--reap-trace-emit
+             (dorg-test--reap-trace-facts dolt-dir canon root nil nil nil
+                                          'gone))))
       ;; Snapshot BOTH the on-disk identities AND the in-memory `--procs' entry
       ;; BEFORE any stop/metadata mutation, so a partial/failed `--stop' that
       ;; removes metadata yet leaves a proc live cannot degrade either source.
       (let ((ids (dorg-test--store-server-identities canon))
-            (proc-entry (and canon (gethash canon dorg-dolt-server--procs))))
+            (proc-entry (and canon (gethash canon dorg-dolt-server--procs)))
+            identity-decisions)
         (when (fboundp 'dorg-sql--close-connection)
           (ignore-errors (dorg-sql--close-connection canon)))
         (when proc-entry
@@ -1127,9 +1363,18 @@ may still be live."
           (dolist (id ids)
             (let* ((pid (plist-get id :pid))
                    (port (plist-get id :port))
-                   (s (cond
-                       ((and (integerp pid)
+                 (s (cond
+                      ((and (integerp pid)
                              (dorg-test--shared-server-record-p pid port))
+                       (when trace
+                         (push
+                          `(("identity" . ,(dorg-test--reap-trace-plist id))
+                            ("branch" . "shared-spared")
+                            ("pid_live" . "not-called")
+                            ("registry_match" . "not-called")
+                            ("status_original" . "gone")
+                            ("status_traced" . "not-called"))
+                          identity-decisions))
                         'gone)
                        ;; A nil-pid on-disk identity (metadata FILE present but
                        ;; no readable pid) ALWAYS BLOCKS: it names a DISTINCT
@@ -1140,7 +1385,30 @@ may still be live."
                        ;; when a metadata file actually exists — a metadata-FREE
                        ;; store yields no identity and is governed solely by the
                        ;; proc-entry-dead check below.
-                       ((not (integerp pid)) 'unknown)
+                       ((not (integerp pid))
+                        (when trace
+                          (push
+                           `(("identity" . ,(dorg-test--reap-trace-plist id))
+                             ("branch" . "nil-pid-unknown")
+                             ("pid_live" . "not-called")
+                             ("registry_match" . "not-called")
+                             ("status_original" . "unknown")
+                             ("status_traced" . "not-called"))
+                           identity-decisions))
+                        'unknown)
+                       (trace
+                        (let* ((original
+                                (dorg-test--confirm-server-gone id))
+                               (decision
+                                (dorg-test--reap-trace-confirm-server-gone id)))
+                          (push
+                           (cons (cons "identity"
+                                       (dorg-test--reap-trace-plist id))
+                                 (cons (cons "status_original"
+                                             (symbol-name original))
+                                       (cdr decision)))
+                           identity-decisions)
+                          original))
                        (t (dorg-test--confirm-server-gone id)))))
               (unless (eq s 'gone) (setq status s))))
           ;; The EXACT `--procs' proc snapshotted BEFORE the stop MUST be proven
@@ -1157,6 +1425,10 @@ may still be live."
             (ignore-errors
               (dorg-test--registry-delete
                (dorg-test--registry-store-key canon))))
+          (when trace
+            (dorg-test--reap-trace-emit
+             (dorg-test--reap-trace-facts dolt-dir canon root ids proc-entry
+                                          identity-decisions status)))
           status)))))
 
 (defun dorg-test--reap-owned-root (root &optional unregister)
@@ -1395,33 +1667,37 @@ best-effort because filesystems may reuse device+inode after deletion."
 (defvar dorg-test-diag-dir nil
   "Directory receiving test-only diagnostics, or nil.
 Set by the batch runner from DORG_TEST_DIAG_DIR.  When non-nil the shared
-server's output is tee'd from startup to <dir>/shared-server-<port>.log by a
-process filter (see `dorg-dolt-fixture--diag-attach-sink').  Test/CI
-evidence only; production code never reads this.")
+server writes its output from startup straight into
+<dir>/shared-server-<port>.log (see `dorg-dolt-fixture--shared-log'), which
+survives any failure or termination.  Test/CI evidence only; production code
+never reads this.")
 
-(defun dorg-dolt-fixture--diag-attach-sink (proc port)
-  "When `dorg-test-diag-dir' is set, tee PROC's output to a per-PORT log file.
-Installs a process filter that appends every chunk of the shared server's
-output to <dir>/shared-server-<port>.log before the default filter inserts it
-into the process buffer, so the capture is complete whatever kills the
-buffer later.  Test/CI evidence only; a sink failure never affects the
-server or the tests."
-  (when (and dorg-test-diag-dir (stringp dorg-test-diag-dir) (processp proc))
-    (condition-case err
-        (let ((file (expand-file-name (format "shared-server-%s.log" port)
-                                      dorg-test-diag-dir)))
-          (make-directory dorg-test-diag-dir t)
-          (write-region "" nil file nil 'silent)
-          (set-process-filter
-           proc
-           (lambda (p chunk)
-             (condition-case nil
-                 (write-region chunk nil file 'append 'silent)
-               (error nil))
-             (internal-default-process-filter p chunk)))
-          (message "dorg-test: diag server sink -> %s" file))
-      (error (message "dorg-test: diag server sink failed: %s"
-                      (error-message-string err))))))
+(defun dorg-dolt-fixture--sibling-log (data-dir)
+  "Return the non-diagnostic shared-server log path for DATA-DIR.
+It sits beside the data-dir, not inside it, so the served data root holds
+only Dolt's own files."
+  (concat (directory-file-name data-dir) ".server.log"))
+
+(defun dorg-dolt-fixture--shared-log (data-dir port)
+  "Return the shared server's log path for DATA-DIR and PORT.
+With `dorg-test-diag-dir' set it is <dir>/shared-server-<PORT>.log, written
+directly by the server so the evidence needs no copy and is never deleted;
+otherwise it is the sibling log of DATA-DIR, deleted with the data-dir."
+  (if (and dorg-test-diag-dir (stringp dorg-test-diag-dir))
+      (progn (make-directory dorg-test-diag-dir t)
+             (expand-file-name (format "shared-server-%s.log" port)
+                               dorg-test-diag-dir))
+    (dorg-dolt-fixture--sibling-log data-dir)))
+
+(defun dorg-dolt-fixture--delete-sibling-log (data-dir)
+  "Delete DATA-DIR's non-diagnostic server log when present.
+Called only once the server process is proven dead.  A diagnostic-dir log
+is a different path and is never touched.  A failure signals, so the caller
+records it without skipping its remaining owned-resource cleanup."
+  (when data-dir
+    (let ((log (dorg-dolt-fixture--sibling-log data-dir)))
+      (when (or (file-exists-p log) (file-symlink-p log))
+        (delete-file log)))))
 
 (defvar dorg-dolt-fixture--shared-lease nil
   "The singleton shared-server lease, or nil when none is live.
@@ -1442,9 +1718,9 @@ Used by `dorg-dolt-fixture-store-acquire'/`-store-release' to run
 CREATE/DROP DATABASE against the warm shared server.")
 
 (defvar dorg-dolt-fixture--cold-starts 0
-  "Monotonic count of real shared-server `start-process' spawns.
+  "Monotonic count of real shared-server spawns.
 The measurable before/after cold-start metric this bead is graded on;
-advanced once the spawn's `start-process' returns a real process (the
+advanced once the spawn returns a real process (the
 cold-start cost is then paid), never before it and never on idempotent
 reuse.  A spawn that returns a proc but then fails readiness/connect still
 counts — the process genuinely started — and is unwound.")
@@ -1480,19 +1756,21 @@ exercise the failed-start conn-retention unwind."
 (defun dorg-dolt-fixture--shared-start ()
   "Start the shared server as a first-class DOrg-managed server; return a lease.
 Persist-before-spawn (tracked-case): the durable ownership record lands
-BEFORE `start-process', so no window exists in which a server outlives its
+BEFORE the server spawn, so no window exists in which a server outlives its
 Emacs unrecorded.  On readiness the server is registered in
 `dorg-dolt-server--procs' with its `(proc . port)' so the PUBLIC
 `dorg-dolt-server-list' sees it live and owned (D4).
 
 TRANSACTIONAL: EVERY allocation — the temp data-dir, the durable ownership
-record, the process, its buffer, the `--procs' registration, and the mysql
-connection — is created INSIDE the unwind scope and undone if ANY step
-\(spawn, readiness probe, or mysql connect) fails, leaving no orphan server,
-record, buffer, or directory.  The cold-start metric advances once, and
-ONLY once `start-process' has returned a real process."
+record, the process, its non-diagnostic log, the `--procs' registration, and
+the mysql connection — is created INSIDE the unwind scope and undone if ANY
+step \(spawn, readiness probe, or mysql connect) fails, leaving no orphan
+server, record, log, or directory.  The server spawns through
+`dorg-dolt-server--spawn-logged' exactly as production does: its output
+goes to a file, never to Emacs, so logged errors cannot stall it.  The cold-start metric advances once, and
+ONLY once the spawn has returned a real process."
   (let ((key (dorg-test--registry-shared-key))
-        (data-dir nil) (canon nil) (root-id nil) (port nil) (buf nil)
+        (data-dir nil) (canon nil) (root-id nil) (port nil)
         (proc nil) (conn nil)
         (lease nil) (ok nil) (primary nil) (record-written nil))
     (unwind-protect
@@ -1506,8 +1784,7 @@ ONLY once `start-process' has returned a real process."
                               (make-temp-file "dorg-dolt-fixture-shared-" t))
                     canon (dorg-dolt-server--canonical-dir data-dir)
                     root-id (dorg-test--path-file-identity canon)
-                    port (dorg-dolt-server--free-port)
-                    buf (generate-new-buffer " *dorg-dolt-fixture-shared*"))
+                    port (dorg-dolt-server--free-port))
               ;; The captured root identity is REQUIRED before the durable write
               ;; or the spawn: a nil id would persist an unreapable record, so
               ;; fail closed here (cleanup unwinds the fresh data-dir/buffer).
@@ -1526,17 +1803,18 @@ ONLY once `start-process' has returned a real process."
                                                    :dolt-dir canon
                                                    :root-id root-id))
               (setq record-written t)
-              (setq proc (start-process "dorg-dolt-fixture-shared" buf
-                                        "dolt" "sql-server"
-                                        "--host" "127.0.0.1"
-                                        "--port" (number-to-string port)
-                                        "--data-dir" data-dir))
+              (setq proc (dorg-dolt-server--spawn-logged
+                          "dorg-dolt-fixture-shared"
+                          (list "sql-server"
+                                "--host" "127.0.0.1"
+                                "--port" (number-to-string port)
+                                "--data-dir" data-dir)
+                          (dorg-dolt-fixture--shared-log data-dir port)))
               ;; A real process now exists — the cold-start cost is paid, so the
-              ;; metric advances HERE (never before `start-process').  A
+              ;; metric advances HERE (never before the spawn).  A
               ;; readiness or connect failure below still unwinds the process,
               ;; but the spawn genuinely happened and is counted.
               (when proc (cl-incf dorg-dolt-fixture--cold-starts))
-              (dorg-dolt-fixture--diag-attach-sink proc port)
               (set-process-query-on-exit-flag proc nil)
               ;; Readiness boundary: return only once the server actually
               ;; accepts connections — never deferring the start to first use.
@@ -1550,7 +1828,7 @@ ONLY once `start-process' has returned a real process."
               ;; constructor) so a post-connect failure is injectable in tests.
               (setq lease (dorg-dolt-fixture--build-server-lease
                            :kind 'server :dolt-dir canon :data-dir data-dir
-                           :proc proc :port port :registry-key key :buffer buf
+                           :proc proc :port port :registry-key key :buffer nil
                            :root-id root-id))
               ;; SUCCESS only after the lease exists.
               (setq ok t)
@@ -1598,13 +1876,16 @@ ONLY once `start-process' has returned a real process."
             (setq proc-dead (not (process-live-p proc)))))
           (if (not proc-dead)
               ;; Kill failed / still live: RETAIN runtime (`--procs'), the
-              ;; durable record, the data-dir, AND the process buffer so a
-              ;; later reap can finish — reclaim NOTHING — and report the live
-              ;; process as a cleanup failure.
+              ;; durable record, the data-dir, AND the log so a later reap can
+              ;; finish — reclaim NOTHING — and report the live process as a
+              ;; cleanup failure.
               (push (cons 'proc-still-live proc) cleanup-errors)
-            ;; Proc proven dead — release runtime, then data-dir BEFORE the
-            ;; record, then the buffer.
+            ;; Proc proven dead — release runtime, then the non-diagnostic
+            ;; log and the data-dir BEFORE the record.  A diagnostic-dir log
+            ;; is evidence and stays.
             (when canon (remhash canon dorg-dolt-server--procs))
+            (condition-case e (dorg-dolt-fixture--delete-sibling-log data-dir)
+              ((error quit) (push (cons 'log-delete e) cleanup-errors)))
             (let ((data-dir-ok t))
               (when data-dir
                 (let ((dfn (directory-file-name data-dir)))
@@ -1631,13 +1912,10 @@ ONLY once `start-process' has returned a real process."
               ;; record so the store stays reapable at next start.
               (when (and record-written data-dir-ok)
                 (condition-case e (dorg-test--registry-delete key)
-                  ((error quit) (push (cons 'registry-delete e) cleanup-errors)))))
-            (when (buffer-live-p buf)
-              (condition-case e (kill-buffer buf)
-                ((error quit) (push (cons 'buffer-kill e) cleanup-errors)))))
+                  ((error quit) (push (cons 'registry-delete e) cleanup-errors))))))
           (when cleanup-errors
             ;; ANY retryable leftover after spawn/record allocation — a live
-            ;; proc OR a failed data-dir/record/buffer reclaim — retains a
+            ;; proc OR a failed log/data-dir/record reclaim — retains a
             ;; failed-start SENTINEL (marked `stopped' iff the proc is proven
             ;; dead) so a retry `shared-ensure' FINALIZES this EXACT partial
             ;; before reusing the same durable key or spawning again — never
@@ -1645,7 +1923,7 @@ ONLY once `start-process' has returned a real process."
             (setq dorg-dolt-fixture--failed-start-lease
                   (dorg-dolt-fixture--make-lease
                    :kind 'server :dolt-dir canon :data-dir data-dir
-                   :proc proc :port port :registry-key key :buffer buf
+                   :proc proc :port port :registry-key key :buffer nil
                    :stopped proc-dead :root-id root-id))
             (signal 'dorg-dolt-fixture-cleanup-error
                     (list :primary primary
@@ -1882,7 +2160,14 @@ here WITHOUT re-stopping:
   5. and ONLY once every step above has SUCCEEDED, mark the lease closed and
      clear the singleton."
   (let ((data-dir (dorg-dolt-fixture--lease-data-dir lease))
-        (canon (dorg-dolt-fixture--lease-dolt-dir lease)))
+        (canon (dorg-dolt-fixture--lease-dolt-dir lease))
+        (log-error nil))
+    ;; 0. The non-diagnostic log, the server being dead by precondition.  A
+    ;;    failure is carried, not raised here, so every owned-resource step
+    ;;    below still runs; it is raised before the lease is closed, keeping
+    ;;    the finalize retryable.  A diagnostic-dir log is evidence and stays.
+    (condition-case e (dorg-dolt-fixture--delete-sibling-log data-dir)
+      (error (setq log-error e)))
     ;; 1. Data-dir FIRST.  PRESENCE is `file-exists-p' OR `file-symlink-p' — a
     ;;    dangling symlink, a symlink-to-file, or a non-directory replacement is
     ;;    PRESENT even though `file-directory-p' is nil, and must NOT be treated
@@ -1922,6 +2207,8 @@ here WITHOUT re-stopping:
     (let ((buf (dorg-dolt-fixture--lease-buffer lease)))
       (when (buffer-live-p buf) (kill-buffer buf)))
     ;; 6. Only now, after every cleanup step SUCCEEDED, is the lease closed.
+    (when log-error
+      (signal (car log-error) (cdr log-error)))
     (setf (dorg-dolt-fixture--lease-closed lease) t)
     (when (eq lease dorg-dolt-fixture--shared-lease)
       (setq dorg-dolt-fixture--shared-lease nil))))

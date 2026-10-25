@@ -27,22 +27,31 @@
 (defconst dorg-test-mutate-grammar--production-ids
   '(set-property
     delete-property
-    replace-keywords
-    delete-keywords
+    replace-keyword-all
+    delete-keyword-all
     replace-keyword
     delete-keyword
     insert-keyword
     insert-drawer-line
+    replace-drawer-line-all
+    delete-drawer-line-all
+    replace-drawer-line
+    delete-drawer-line
     set-heading
     set-planning
     insert-text
     replace-text
-    replace-items
+    replace-body-literal
+    delete-text
+    replace-item-all
+    replace-item
+    delete-item
+    insert-item
     move
     delete-heading
     delete-subtree
     insert-heading)
-  "The ratified post-g0vnp public production set.")
+  "The ratified v0.2 public production set.")
 
 (defun dorg-test-mutate-grammar--read (relative)
   "Return the contents of RELATIVE under the repository root."
@@ -61,7 +70,7 @@
     count))
 
 (ert-deftest dorg-test-mutate-grammar-exact-production-set-and-schema ()
-  "The semantic inventory is exactly the ratified 17-production grammar."
+  "The semantic inventory is exactly the ratified v0.2 grammar."
   (let ((ids (mapcar (lambda (production) (plist-get production :id))
                      dorg-mutate-grammar-productions))
         (required '(:id :family :verb :template :example :ir
@@ -77,6 +86,52 @@
         (should (= (length (plist-get production :collection-address))
                    (dorg-mutate-grammar-address-depth production)))))))
 
+(ert-deftest dorg-test-mutate-grammar-inventory-has-one-semantic-owner-per-id ()
+  "Sequence cells project the sequence inventory; base rows own everything else."
+  (let* ((cells (cl-remove-if-not (lambda (cell) (plist-get cell :legal))
+                                  dorg-mutate-sequence-cells))
+         (cell-ids (mapcar (lambda (cell) (plist-get cell :id)) cells))
+         (base-ids (mapcar (lambda (production) (plist-get production :id))
+                            dorg-mutate-grammar--base-productions))
+         (ids (mapcar (lambda (production) (plist-get production :id))
+                      dorg-mutate-grammar-productions)))
+    (should-not (cl-intersection cell-ids base-ids))
+    (should (equal dorg-test-mutate-grammar--production-ids ids))
+    (dolist (id cell-ids)
+      (should (equal (dorg-mutate-grammar--sequence-production
+                      (cl-find id cells :key (lambda (cell) (plist-get cell :id))))
+                     (cl-find id dorg-mutate-grammar-productions
+                              :key (lambda (production) (plist-get production :id))))))))
+
+(ert-deftest dorg-test-mutate-grammar-inventory-builder-rejects-stale-layout ()
+  "The presentation layout cannot silently become a second grammar source."
+  (let ((cells '((:id legal :legal t :noun :text :op insert :family text :verb insert
+                  :template "legal" :example (insert (text) (after-last) "x")
+                  :collection-address [] :cardinality one :missing create
+                  :positions (:after-last) :clearing unsupported :safety (:base when-supplied))
+                 (:id forbidden :legal nil :noun :text :op delete :select (:all))))
+        (base '((:id base :family tree :verb delete :template "base"
+                 :example (delete (heading)) :ir (:op delete :target-kind :heading)
+                 :collection-address [] :cardinality one :missing error :positions (:none)
+                 :clearing destructive :safety (:base when-supplied)))))
+    (should (equal '(legal base)
+                   (mapcar (lambda (production) (plist-get production :id))
+                           (dorg-mutate-grammar--build-productions cells base '(legal base)))))
+    (dolist (layout '((legal legal base) (legal missing base) (legal) (legal forbidden base)))
+      (should-error (dorg-mutate-grammar--build-productions cells base layout)))))
+
+(ert-deftest dorg-test-mutate-grammar-inventory-builder-rejects-overlap ()
+  "A sequence cell cannot shadow a base production under the same ID."
+  (let ((cell '(:id shared :legal t :noun :text :op insert :family text :verb insert
+                :template "cell" :example (insert (text) (after-last) "x")
+                :collection-address [] :cardinality one :missing create
+                :positions (:after-last) :clearing unsupported :safety (:base when-supplied)))
+        (base '(:id shared :family tree :verb delete :template "base"
+                :example (delete (heading)) :ir (:op delete :target-kind :heading)
+                :collection-address [] :cardinality one :missing error :positions (:none)
+                :clearing destructive :safety (:base when-supplied))))
+    (should-error (dorg-mutate-grammar--build-productions (list cell) (list base) '(shared)))))
+
 (ert-deftest dorg-test-mutate-grammar-every-example-normalizes-to-declared-ir ()
   "Every inventory example is accepted by the real normalizer with declared IR."
   (dolist (production dorg-mutate-grammar-productions)
@@ -90,20 +145,23 @@
         (should (eq (plist-get declared :target-kind) (car target)))))))
 
 (ert-deftest dorg-test-9diah-mutate-grammar-insert-positions-match-api ()
-  "The inventory advertises every accepted scoped item insertion position."
+  "The inventory advertises every accepted v0.2 sequence insertion position."
   (dolist (case '((insert-keyword
-                   (on document (insert (keyword "K") POSITION "v")))
-                  (insert-drawer-line
-                   (on (id 100) (insert (drawer-line "AUDIT" (occurrence 1))
+                  (on document (insert (keyword "K") POSITION "v")))
+                 (insert-drawer-line
+                   (on (id 100) (insert (drawer-line "AUDIT")
                                         POSITION "- line")))
                   (insert-text
-                   (on (id 100) (insert (text) POSITION "body")))))
+                   (on (id 100) (insert (text) POSITION "body")))
+                  (insert-item
+                   (on (id 100) (insert (item) POSITION (text "body"))))))
     (pcase-let* ((`(,id ,template) case)
                  (production (cl-find id dorg-mutate-grammar-productions
                                       :key (lambda (p) (plist-get p :id))))
                  (advertised (plist-get production :positions))
                  (accepted nil))
-      (dolist (position '((before-first) (after-last)))
+      (dolist (position '((before-first) (after-last)
+                          (before (occurrence 1)) (after (occurrence 1))))
         (let ((form (cl-subst position 'POSITION template)))
           (when (condition-case nil
                     (progn (dorg-api-normalize form) t)
@@ -281,14 +339,14 @@
   (let* ((candidates (dorg-mutate-grammar-completion-candidates))
          (all (all-completions "" #'dorg-mutate-grammar-completion-table))
          (first (car candidates)))
-    (should (= 17 (length candidates)))
+    (should (= 26 (length candidates)))
     (should (equal candidates all))
     (should (equal t (try-completion first
                                      #'dorg-mutate-grammar-completion-table)))
     (should (equal '(metadata (category . dorg-mutate-production))
                    (funcall #'dorg-mutate-grammar-completion-table
                             "" nil 'metadata)))
-    (should (cl-find-if (lambda (s) (string-match-p "(keywords KEY)" s))
+    (should (cl-find-if (lambda (s) (string-match-p "(keyword KEY (all))" s))
                         candidates))
     (should (cl-find-if
              (lambda (s) (string-match-p "(keyword KEY (occurrence N))" s))

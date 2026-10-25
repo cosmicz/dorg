@@ -1,0 +1,74 @@
+#+title: DOrg Suite Job Image Lock
+
+* Base Image
+
+- parent reference: =debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171=
+- linux/amd64 child manifest digest: =sha256:5ae3c39ebd15e229dcedd5cee596b2497182493d41ff162e824ba13fc1b2b867=
+
+* Emacs
+
+- version: =30.1=
+- source: =https://ftp.gnu.org/gnu/emacs/emacs-30.1.tar.xz=
+- sha256: =6ccac1ae76e6af93c6de1df175e8eb406767c23da3dd2a16aa67e3124a6f138f=
+- build packages: =ca-certificates curl xz-utils tar gzip git lsof build-essential make gcc libc6-dev pkg-config texinfo libgnutls28-dev zlib1g-dev libxml2-dev libncurses-dev=
+- configure features: =--without-x --without-sound --without-pop --without-mailutils --without-dbus --without-gsettings --without-selinux --without-xwidgets --without-native-compilation --with-gnutls --with-zlib --with-xml2=
+- required runtime probe: =(fboundp 'gnutls-available-p)=
+- native compilation: disabled explicitly with =--without-native-compilation=; probe requires =native-comp=nil= and =libgccjit-dev= is intentionally absent.
+- Debian bookworm emacs Build-Depends cross-check: source package =emacs_1:28.2+1-15+deb12u4= declares build dependencies including =ca-certificates=, =git=, =libgnutls28-dev=, =libncurses5-dev=, =libxml2-dev=, =texinfo=, and =zlib1g-dev=; the dorg image retains the matching selected-feature set (=ca-certificates git libgnutls28-dev libncurses-dev libxml2-dev texinfo zlib1g-dev=) plus the base compile tools (=build-essential make gcc libc6-dev=), =pkg-config= for the explicit GnuTLS/zlib/xml2 probes, and transfer/unpack tools (=curl xz-utils tar gzip=). Debian dependencies for disabled features are intentionally omitted from this non-X, non-native build path: X/GTK/image/sound/dbus/gsettings/selinux/systemd/native-comp/mail/package-maintainer tooling such as =libgccjit-12-dev=, =libacl1-dev=, =libasound2-dev=, =libcairo-dev=, =libdbus-1-dev=, =libgtk-3-dev=, =imagemagick=, =quilt=, =sharutils=, and =bsd-mailx | mailx=. Source: =https://sources.debian.org/data/main/e/emacs/1:28.2+1-15+deb12u4/debian/control=.
+
+* Local image build
+
+The image requires both locked Emacs inputs.  A local build must derive them
+from this lock and pass both build arguments; the Dockerfile intentionally has
+no version or archive-hash default:
+
+#+begin_src sh
+emacs_version=$(sed -n 's/^- version: =\(.*\)=$/\1/p' .github/dorg-suite-job/image-lock.org | head -n1)
+emacs_sha256=$(sed -n 's/^- sha256: =\([0-9a-f]*\)=$/\1/p' .github/dorg-suite-job/image-lock.org | head -n1)
+docker build --build-arg EMACS_VERSION="$emacs_version" \\
+  --build-arg EMACS_SHA256="$emacs_sha256" \\
+  -f .github/dorg-suite-job/Dockerfile .
+#+end_src
+
+* Dolt
+
+- version: =1.86.4=
+- source: =https://github.com/dolthub/dolt/releases/download/v1.86.4/dolt-linux-amd64.tar.gz=
+- sha256: =88bdca99086bbac7f2414af2756c962d20a8d9b6463861dc2cf35111f13b6dea=
+- install target: =/usr/local/bin/dolt=
+- build identity: =dolt version= after =metrics.disabled=true= and =versioncheck.disabled=true= are written and read back in the image-build =HOME=.
+- runtime identity: the entrypoint writes and reads back both settings in its fresh job-private =HOME= before any Dolt invocation. Both values are retained in =manifest.txt=, and each version probe has its own raw output in =probe/=.
+- network behavior: the two settings disable anonymous usage uploads and the version out-of-date lookup, respectively. The suite container's Docker network policy is tracked separately in the private issue tracker.
+
+* Git
+
+- version: =2.49.0=
+- source: =https://www.kernel.org/pub/software/scm/git/git-2.49.0.tar.xz=
+- sha256: =618190cf590b7e9f6c11f91f23b1d267cd98c3ab33b850416d8758f8b5a85628=
+- checksum source: =https://www.kernel.org/pub/software/scm/git/sha256sums.asc=
+- additional build packages: =libcurl4-gnutls-dev libexpat1-dev libssl-dev gettext=
+- install prefix: =/usr/local=; =NO_TCLTK=YesPlease= omits the GUI tools.
+- runtime probe: =git --version= must report =git version 2.49.0=; the
+  observed version is retained in =probe/versions.txt= and =manifest.txt=.
+- rationale: the maintenance fixture contract uses the tested 2.49 behavior.
+  Bookworm's distribution Git remains available at =/usr/bin/git=, but
+  =/usr/local/bin/git= is the job's pinned default. The preflight refuses a
+  PATH that selects the distribution version.
+
+* Source packet admission
+
+The image includes Debian =python3= for the standard-library archive,
+JSON and hash reader in =tools/dorg-suite-job-source.py=. It installs after the
+pinned toolchain layers. No Python package registry or third-party module is
+used. The image digest identifies the actual runtime package build.
+
+The optional source packet is a tar of =manifest.json= and flat regular Git
+bundles. Admission verifies every bundle hash and size, exact commit/tree,
+and the complete recursive gitlink set before the ordinary make commands.
+The archive is never extracted onto source paths. No submodule URL is fetched.
+
+* Process and terminal tools
+
+- packages: =tmux procps=, unpinned Debian bookworm apt packages, installed after Python.
+- consumer: Meld remote suite.
+- probes: =tmux -V=, =ps --version=, and =pgrep --version=; actual values are retained in the job evidence.

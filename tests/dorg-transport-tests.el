@@ -27,6 +27,45 @@
 
 (defvar dorg-test--dolt-available)      ; defined in dorg-dolt-tests.el
 
+;;; ─── Vendored wire packet contract ─────────────────────────────────────
+
+(ert-deftest dorg-test-transport-packets-use-one-write-per-fragment ()
+  "Each wire fragment is one complete write, including empty terminators.
+Separate header/payload writes can incur a TCP delayed-ACK round trip per
+command.  Assert bytes and write counts rather than a wall-clock threshold."
+  (require 'mysql)
+  (dolist (size '(0 3 16777215 16777216))
+    (let* ((payload (make-string size 97))
+           (conn (make-mysql-conn :sequence-id 255))
+           (expected-lengths (if (< size #xffffff)
+                                 (list size)
+                               (list #xffffff (- size #xffffff))))
+           writes)
+      (cl-letf (((symbol-function 'mysql--live-process) (lambda (_) 'wire))
+                ((symbol-function 'mysql--send-string)
+                 (lambda (proc bytes)
+                   (should (eq 'wire proc))
+                   (push bytes writes))))
+        (mysql--send-packet conn payload))
+      (setq writes (nreverse writes))
+      (should (= (length writes) (length expected-lengths)))
+      (let ((sequence 255)
+            (offset 0))
+        (cl-mapc
+         (lambda (packet size)
+           (should (= (+ 4 size) (length packet)))
+           (should (equal (substring packet 0 4)
+                          (unibyte-string (logand size 255)
+                                          (logand (ash size -8) 255)
+                                          (logand (ash size -16) 255)
+                                          sequence)))
+           (should (equal (substring packet 4)
+                          (substring payload offset (+ offset size))))
+           (cl-incf offset size)
+           (setq sequence (logand (1+ sequence) 255)))
+         writes expected-lengths)
+        (should (= sequence (mysql-conn-sequence-id conn)))))))
+
 ;;; ─── Helpers ────────────────────────────────────────────────────────────
 
 (defvar dorg-test-transport--store-root nil
@@ -73,6 +112,307 @@ The store-relative `<store>/.dorg/' overlays land under an isolated
                 :name "dorg-test-live" :host "127.0.0.1"
                 :service 0 :server t :family 'ipv4)))
     (cons proc (process-contact proc :service))))
+
+;;; ─── Wrong-store claim discovery ───────────────────────────────────────
+
+(defconst dorg-test-transport--crlf-wire
+  (encode-coding-string "line\r\nbreak \u00fc\r\n" 'utf-8-unix)
+  "Exact UTF-8 wire bytes of a text value holding CRLF and a multibyte char.")
+
+(ert-deftest dorg-test-transport-text-row-decoder-preserves-crlf ()
+  "The text-protocol row decoder keeps CR LF: wire bytes decode without any
+end-of-line conversion, so a stored CRLF value reads back as CRLF."
+  (let ((column (list :type mysql-type-var-string :character-set 33 :flags 0)))
+    (should (equal "line\r\nbreak \u00fc\r\n"
+                   (mysql--parse-typed-value dorg-test-transport--crlf-wire
+                                             mysql-type-var-string column)))
+    (should (equal "line\r\nbreak \u00fc\r\n"
+                   (mysql--parse-value dorg-test-transport--crlf-wire column)))
+    (should (equal "a\rb\nc"
+                   (mysql--parse-typed-value "a\rb\nc" mysql-type-blob
+                                             (list :type mysql-type-blob
+                                                   :character-set 33 :flags 0))))))
+
+(ert-deftest dorg-test-transport-binary-row-decoder-preserves-crlf ()
+  "The prepared/binary-protocol string decoder keeps CR LF as well."
+  (should (equal "line\r\nbreak \u00fc\r\n"
+                 (mysql--binary-text-value
+                  dorg-test-transport--crlf-wire
+                  (list :type mysql-type-var-string :character-set 33 :flags 0)))))
+
+(ert-deftest dorg-test-transport-row-decoders-leave-binary-and-custom-raw ()
+  "Controls: binary-charset or BINARY-flag columns and custom type parsers still
+receive the exact undecoded wire bytes in both protocols."
+  (dolist (column (list (list :type mysql-type-var-string
+                              :character-set mysql--binary-character-set :flags 0)
+                        (list :type mysql-type-blob :character-set 33
+                              :flags mysql--column-flag-binary)))
+    (should (equal dorg-test-transport--crlf-wire
+                   (mysql--parse-typed-value dorg-test-transport--crlf-wire
+                                             (plist-get column :type) column)))
+    (should-not (multibyte-string-p
+                 (mysql--parse-typed-value dorg-test-transport--crlf-wire
+                                           (plist-get column :type) column)))
+    (should (equal dorg-test-transport--crlf-wire
+                   (mysql--binary-text-value dorg-test-transport--crlf-wire column))))
+  (let ((mysql-type-parsers (list (cons mysql-type-var-string #'identity))))
+    (should (equal dorg-test-transport--crlf-wire
+                   (mysql--parse-typed-value
+                    dorg-test-transport--crlf-wire mysql-type-var-string
+                    (list :type mysql-type-var-string :character-set 33 :flags 0))))))
+
+(ert-deftest dorg-test-transport-copied-overlay-refuses-before-attach ()
+  "A copied DOrg overlay never selects the other store endpoint.
+The positive controls use the owner store and a symlink alias of that exact
+store.  The negative control uses two same-basename synthetic stores and a
+claim copied from OWNER into COPY.  Every attach/classification sentinel must
+remain untouched on both first and repeated COPY discovery."
+  (dorg-test-transport--with-runtime
+    (let* ((owner (dorg-test-transport--repo "owner/.dorg/dorg"))
+           (copy (dorg-test-transport--repo "copy/.dorg/dorg"))
+           (alias (expand-file-name "owner-alias" dorg-test-transport--store-root))
+           (owner-canon nil)
+           (copy-canon nil)
+           (port 43101)
+           (contacts 0)
+           (network-calls 0))
+      (make-directory owner t)
+      (make-directory copy t)
+      (make-symbolic-link owner alias)
+      (setq owner-canon (dorg-dolt-server--canonical-dir owner)
+            copy-canon (dorg-dolt-server--canonical-dir copy))
+      (let ((claim (list (cons :dolt-dir owner-canon)
+                         (cons :host (system-name))
+                         (cons :owner-pid 31337)
+                         (cons :server-pid 31337)
+                         (cons :owner-kind 'daemon)
+                         (cons :port port)
+                         (cons :protocol dorg-dolt-server-claim-protocol))))
+        (cl-letf (((symbol-function 'dorg-dolt-server-port) (lambda (&rest _) nil))
+                  ((symbol-function 'dorg-dolt-server--claim-read)
+                   (lambda (dir)
+                     (when (member (dorg-dolt-server--canonical-dir dir)
+                                   (list owner-canon copy-canon))
+                       claim)))
+                  ((symbol-function 'dorg-dolt-server--dolt-server-info) (lambda (&rest _) nil))
+                  ((symbol-function 'process-attributes)
+                   (lambda (_pid)
+                     `((comm . "dolt")
+                       (args . ,(format "dolt sql-server --port %d --data-dir %s"
+                                        port owner-canon)))))
+                  ((symbol-function 'dorg-dolt-server--claim-classify)
+                   (lambda (&rest _) (cl-incf contacts) 'live))
+                  ((symbol-function 'dorg-dolt-server--claim-compatible-p) (lambda (&rest _) t))
+                  ((symbol-function 'dorg-dolt-server--attach-live)
+                   (lambda (&rest _) (cl-incf contacts) port))
+                  ((symbol-function 'make-network-process)
+                   (lambda (&rest _)
+                     (cl-incf network-calls)
+                     (error "copied claim reached the network primitive"))))
+          ;; Owner and its canonical alias remain eligible.
+          (should (= (dorg-dolt-server--strict-port owner) port))
+          (clrhash dorg-dolt-server--attached-ports)
+          (should (= (dorg-dolt-server--strict-port alias) port))
+          (should (= contacts 4))
+          (setq contacts 0)
+          ;; A copied claim must not reach either discovery/attach endpoint,
+          ;; including through the attached-port fast path on a repeat call.
+          (dotimes (_ 2)
+            (should-error (dorg-dolt-server--strict-port copy)
+                          :type 'dorg-sql-transport-error)
+            (should (= contacts 0))
+            (should (= network-calls 0))))))))
+
+(ert-deftest dorg-test-transport-copied-native-info-refuses-before-attach ()
+  "Copied native server metadata never selects its foreign process endpoint.
+Unlike the overlay case, synthesized native claims set their :dolt-dir from
+the requested path, so only the live process advertised data directory can
+distinguish the same-basename copy before attach."
+  (dorg-test-transport--with-runtime
+    (let* ((owner (dorg-test-transport--repo "owner/.dorg/dorg"))
+           (copy (dorg-test-transport--repo "copy/.dorg/dorg"))
+           (owner-canon nil)
+           (copy-canon nil)
+           (port 43102)
+           (contacts 0)
+           (network-calls 0))
+      (make-directory owner t)
+      (make-directory copy t)
+      (setq owner-canon (dorg-dolt-server--canonical-dir owner)
+            copy-canon (dorg-dolt-server--canonical-dir copy))
+      (cl-letf (((symbol-function 'dorg-dolt-server-port) (lambda (&rest _) nil))
+                ((symbol-function 'dorg-dolt-server--claim-read) (lambda (&rest _) nil))
+                ((symbol-function 'dorg-dolt-server--dolt-server-info)
+                 (lambda (dir)
+                   (when (equal (dorg-dolt-server--canonical-dir dir) copy-canon)
+                     (list :pid 31338 :port port :uuid "copied-native"))))
+                ;; This is the live foreign process evidence a copied
+                ;; sql-server.info cannot forge for the requested copy.
+                ((symbol-function 'process-attributes)
+                 (lambda (_pid)
+                   `((comm . "dolt")
+                     (args . ,(format "dolt sql-server --port %d --data-dir %s"
+                                      port owner-canon)))))
+                ((symbol-function 'dorg-dolt-server--claim-classify)
+                 (lambda (&rest _) (cl-incf contacts) 'live))
+                ((symbol-function 'dorg-dolt-server--claim-compatible-p) (lambda (&rest _) t))
+                ((symbol-function 'dorg-dolt-server--attach-live)
+                 (lambda (&rest _) (cl-incf contacts) port))
+                ((symbol-function 'make-network-process)
+                 (lambda (&rest _)
+                   (cl-incf network-calls)
+                   (error "copied native metadata reached the network primitive"))))
+        (dotimes (_ 2)
+          (should-error (dorg-dolt-server--strict-port copy)
+                        :type 'dorg-sql-transport-error)
+          (should (= contacts 0))
+          (should (= network-calls 0)))))))
+
+(ert-deftest dorg-test-transport-claim-evidence-accepts-real-spaced-data-dir ()
+  "An unmocked live process with a spaced explicit data directory is proven.
+The helper is a local shell symlink named dolt; it is not Dolt and does not
+open a store or a network connection.  This exercises the host's real
+process-attributes argv formatting, including spaces in --data-dir."
+  (dorg-test-transport--with-runtime
+    (let* ((root (dorg-test-transport--repo "store with space/.dorg/dorg"))
+           (binary (expand-file-name "dolt" dorg-test-transport--store-root))
+           (shell (or (executable-find "sh") "/bin/sh"))
+           proc)
+      (make-directory root t)
+      (make-symbolic-link shell binary)
+      (unwind-protect
+          (progn
+            (setq proc (make-process
+                        :name "dorg-test-dolt-evidence"
+                        :command (list binary "-c" "while :; do sleep 20; done"
+                                       "sql-server" "--data-dir" root)
+                        :noquery t))
+            (accept-process-output proc 0.05)
+            (should (process-live-p proc))
+            (should (eq (dorg-dolt-server--claim-store-evidence
+                         root
+                         (list (cons :server-pid (process-id proc))))
+                        'proven)))
+        (when (process-live-p proc)
+          (delete-process proc))))))
+
+(ert-deftest dorg-test-transport-claim-evidence-decodes-linux-argv ()
+  "Linux process attributes escape whitespace and literal backslashes.
+A space followed by -- inside the directory is data, not another option."
+  (let ((system-type 'gnu/linux))
+    (dolist (path '("/tmp/store with space/" "/tmp/store --name/"
+                    "/tmp/store\\name/" "/tmp/store\tname/"))
+      (let ((encoded (replace-regexp-in-string
+                      "[[:space:]\\\\]" (lambda (match) (concat "\\" match))
+                      path t t)))
+        (dolist (separator '(" " "="))
+          (cl-letf (((symbol-function 'process-attributes)
+                     (lambda (_)
+                       `((comm . "dolt")
+                         (args . ,(concat "dolt sql-server --data-dir" separator
+                                          encoded " --port 12345"))))))
+            (should (eq 'proven
+                        (dorg-dolt-server--claim-store-evidence
+                         path '((:server-pid . 12345)))))
+            (should (eq 'contradictory
+                        (dorg-dolt-server--claim-store-evidence
+                         "/tmp/different-store/" '((:server-pid . 12345)))))))))))
+
+(ert-deftest dorg-test-transport-dead-pid-evidence-keeps-restart-lifecycle ()
+  "A dead server PID remains absent evidence and reaches restart recovery."
+  (dorg-test-transport--with-runtime
+    (let* ((store (dorg-test-transport--repo "raw/.dorg/dorg"))
+           (claim (list (cons :server-pid 31339) (cons :port 43103)))
+           (classified 0)
+           (broken 0)
+           (started 0))
+      (make-directory store t)
+      (cl-letf (((symbol-function 'dorg-dolt-server-port) (lambda (&rest _) nil))
+                ((symbol-function 'dorg-dolt-server--effective-claim)
+                 (lambda (&rest _) claim))
+                ((symbol-function 'process-attributes)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'dorg-dolt-server--claim-classify)
+                 (lambda (&rest _) (cl-incf classified) 'dead))
+                ((symbol-function 'dorg-dolt-server--break-claim)
+                 (lambda (&rest _) (cl-incf broken)))
+                ((symbol-function 'dorg-dolt-server--start-unsafe)
+                 (lambda (&rest _) (cl-incf started) 43104)))
+        (should (= (dorg-dolt-server--ensure-strict store) 43104))
+        (should (= classified 1))
+        (should (= broken 1))
+        (should (= started 1))))))
+
+(ert-deftest dorg-test-transport-raw-dolt-without-flags-still-attaches ()
+  "Raw dolt sql-server lacks evidence but remains attachable by lifecycle."
+  (dorg-test-transport--with-runtime
+    (let* ((store (dorg-test-transport--repo "raw/.dorg/dorg"))
+           (claim (list (cons :server-pid 31342) (cons :port 43107)))
+           (attached 0))
+      (make-directory store t)
+      (cl-letf (((symbol-function 'dorg-dolt-server-port) (lambda (&rest _) nil))
+                ((symbol-function 'dorg-dolt-server--effective-claim)
+                 (lambda (&rest _) claim))
+                ((symbol-function 'process-attributes)
+                 (lambda (&rest _) '((comm . "dolt") (args . "dolt sql-server"))))
+                ((symbol-function 'dorg-dolt-server--claim-classify)
+                 (lambda (&rest _) 'live))
+                ((symbol-function 'dorg-dolt-server--claim-compatible-p)
+                 (lambda (&rest _) t))
+                ((symbol-function 'dorg-dolt-server--attach-live)
+                 (lambda (&rest _) (cl-incf attached) 43107)))
+        (should (= (dorg-dolt-server--strict-port store) 43107))
+        (should (= attached 1))))))
+
+(ert-deftest dorg-test-transport-nil-server-pid-still-attaches ()
+  "A normal refresh with no server PID remains absent evidence, not refusal."
+  (dorg-test-transport--with-runtime
+    (let* ((store (dorg-test-transport--repo "owner/.dorg/dorg"))
+           (claim (list (cons :port 43108)))
+           (attached 0))
+      (make-directory store t)
+      (cl-letf (((symbol-function 'dorg-dolt-server-port) (lambda (&rest _) nil))
+                ((symbol-function 'dorg-dolt-server--effective-claim)
+                 (lambda (&rest _) claim))
+                ((symbol-function 'process-attributes)
+                 (lambda (&rest _)
+                   (error "nil server-pid must not query process attributes")))
+                ((symbol-function 'dorg-dolt-server--claim-classify)
+                 (lambda (&rest _) 'live))
+                ((symbol-function 'dorg-dolt-server--claim-compatible-p)
+                 (lambda (&rest _) t))
+                ((symbol-function 'dorg-dolt-server--attach-live)
+                 (lambda (&rest _) (cl-incf attached) 43108)))
+        (should (= (dorg-dolt-server--strict-port store) 43108))
+        (should (= attached 1))))))
+
+(ert-deftest dorg-test-transport-effective-claim-keeps-contradiction-readable ()
+  "A copied-claim contradiction is inspectable until an attach is selected."
+  (dorg-test-transport--with-runtime
+    (let* ((store (dorg-test-transport--repo "copy/.dorg/dorg"))
+           (foreign (dorg-test-transport--repo "owner/.dorg/dorg"))
+           (claim (list (cons :server-pid 31340) (cons :port 43105))))
+      (make-directory store t)
+      (make-directory foreign t)
+      (cl-letf (((symbol-function 'dorg-dolt-server--claim-read)
+                 (lambda (&rest _) claim))
+                ((symbol-function 'dorg-dolt-server--dolt-server-info) (lambda (&rest _) nil))
+                ((symbol-function 'process-attributes)
+                 (lambda (&rest _)
+                   '((comm . "dolt")
+                     (args . "dolt sql-server --data-dir /definitely/foreign")))))
+        (should (eq (dorg-dolt-server--effective-claim store) claim))))))
+
+(ert-deftest dorg-test-transport-publish-refresh-preserves-server-pid ()
+  "Refreshing an owner claim without a PID retains its live server identity."
+  (dorg-test-transport--with-runtime
+    (let ((store (dorg-test-transport--repo "owner/.dorg/dorg")))
+      (make-directory store t)
+      (dorg-dolt-server--publish-claim store 43106 31341)
+      (dorg-dolt-server--publish-claim store 43106)
+      (should (= (alist-get :server-pid
+                            (dorg-dolt-server--claim-read store))
+                 31341)))))
 
 ;;; ─── Transport Selector Taxonomy ────────────────────────────────────────
 
@@ -659,7 +999,7 @@ default is disabled."
             (unwind-protect
                 (progn
                   (dorg-sql-batch dolt-dir
-                                  (list "INSERT INTO headings (id, root_id, parent_id, sort_key, level, title) VALUES (1, 1, NULL, X'01', 0, 'Root')")
+                                  (list "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, title) VALUES (1, 1, NULL, X'01', 0, 'Root')")
                                   "strict insert")
                   (let ((rows (dorg-sql dolt-dir "SELECT id, title FROM headings WHERE id = 1")))
                     (should (= (length rows) 1))
@@ -1073,30 +1413,6 @@ pin must keep the ROLLBACK on `(cli)'."
            (dorg-sql-batch (dorg-test-transport--repo "fake") (list "INSERT INTO t VALUES (1)") "msg")))
         (should (equal rollback-transport '(cli)))))))
 
-(ert-deftest dorg-test-transport-schema-reset-same-transport ()
-  "`dorg-repo--commit-schema-step' failure `DOLT_RESET' uses the same
-transport the batch selected.  Non-vacuous: the global is flipped to a
-policy that would otherwise signal after the step begins; the pin keeps
-RESET on `(cli)'."
-  (dorg-test-transport--with-runtime
-    (let ((reset-transport 'unset)
-          (dorg-sql-transport 'server))
-      (cl-letf (((symbol-function 'dorg-sql--mysql-available-p) (lambda (&rest _) t))
-                ((symbol-function 'dorg-dolt-server-port) (lambda (&rest _) 3307))
-                ((symbol-function 'dorg-repo--ensure-clean-working-set)
-                 (lambda (&rest _) t))
-                ((symbol-function 'dorg-sql-batch)
-                 (lambda (&rest _) (setq dorg-sql-transport 'bogus) (error "boom")))
-                ((symbol-function 'dorg-sql)
-                 (lambda (dir q &rest _)
-                   (when (string-match-p "DOLT_RESET" q)
-                     (setq reset-transport (dorg-sql--resolve-transport dir)))
-                   nil)))
-        (dorg-sql--with-cli-seam (dorg-test-transport--repo "fake")
-          (should-error
-           (dorg-repo--commit-schema-step (dorg-test-transport--repo "fake") (list "ALTER TABLE t ADD c INT") "msg")))
-        (should (equal reset-transport '(cli)))))))
-
 (ert-deftest dorg-test-transport-init-starts-bootstrap-server ()
   "Fresh `dorg-init' starts a managed server before post-init SQL.
 The schema batch and initial `dorg-commit' must then resolve the normal
@@ -1118,6 +1434,8 @@ assertions."
           (cl-letf (((symbol-function 'dorg-dolt--ensure-available) (lambda (&rest _) t))
                     ((symbol-function 'dorg-sql--mysql-available-p) (lambda (&rest _) t))
                     ((symbol-function 'call-process) (lambda (&rest _) 0))
+                    ((symbol-function 'dorg-repo--new-store-id)
+                     (lambda () "0123456789abcdef0123456789abcdef"))
                     ((symbol-function 'dorg-registered-extensions) (lambda (&rest _) nil))
                     ((symbol-function 'dorg-dolt-server--start-bootstrap)
                      (lambda (_dir) (cl-incf bootstrap-calls) 55001))
@@ -1185,6 +1503,8 @@ tear down the live server on success."
           (cl-letf (((symbol-function 'dorg-dolt--ensure-available) (lambda (&rest _) t))
                     ((symbol-function 'dorg-sql--mysql-available-p) (lambda (&rest _) t))
                     ((symbol-function 'call-process) (lambda (&rest _) 0))
+                    ((symbol-function 'dorg-repo--new-store-id)
+                     (lambda () "0123456789abcdef0123456789abcdef"))
                     ((symbol-function 'dorg-registered-extensions) (lambda (&rest _) nil))
                     ((symbol-function 'dorg-dolt-server--start-bootstrap)
                      (lambda (_dir) (cl-incf bootstrap-calls) 55003))

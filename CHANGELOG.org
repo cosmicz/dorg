@@ -1,5 +1,119 @@
 #+title: DOrg Changelog
 
+* 0.2.0 (2026-10-25)
+
+DOrg 0.2.0 extends typed editing, indexed retrieval and persisted clocks while
+keeping plain Org and Dolt ownership boundaries explicit.  Existing Dolt
+stores and mutation consumers need the migrations below before adoption.
+
+** Installation and compatibility
+
+- =make install= publishes a self-contained runtime and launcher under
+  =~/.local/share/dorg= and =~/bin= by default.  Dependencies and compiled files live
+  in the installed tree; the development checkout can move independently.
+- =install.sh= now keeps its source checkout at =~/.local/src/dorg= by default.
+  An older source checkout at =~/.local/share/dorg= blocks the new runtime:
+  move that checkout to =~/.local/src/dorg= yourself, or set =PREFIX= or
+  =DORG_HOME= to another runtime location.  An older =make install= runtime
+  at =~/share/dorg= remains in place; update any Emacs =load-path= entry to
+  =~/.local/share/dorg= and remove the old tree by hand when ready.
+- The package header declares GNU Emacs 28.1 as a nominal dependency minimum;
+  release qualification uses Emacs 30.2 on macOS; Linux CI targets 30.1.
+  Dolt-backed operations require Dolt 1.86.4 or newer.  Plain Org needs no
+  Dolt binary.
+- The current schema is 8.  Explicit migrations take schema 6 through 7
+  (durable mutation receipts) to 8 (parent-relative heading levels).
+  Ordinary access refuses incompatible stores without upgrading them.
+  Historical reads decode the schema recorded at their own commit.
+- Store identity is created on initialization; existing stores use explicit
+  =dorg dolt identify DIR=.  A deliberate =--fork= records the previous ID.
+  Identification refuses a dirty Dolt working set.
+
+** Plain-Org editing and mutation safety
+
+- The plain executor now supports heading title, TODO, priority, tags and
+  COMMENT edits; SCHEDULED, DEADLINE and CLOSED changes; and bounded heading
+  capture through the shared mutation grammar.  Untouched source spans remain
+  byte-preserved.  Support and refusals are exposed by dry-run.
+- Saved local plain-Org applies acquire a per-file writer lock, recheck the
+  source and publish atomically.  This serializes participating DOrg writers;
+  stock Emacs saves and other programs do not participate.  Lock waits are
+  bounded and =dorg lock inspect= reports the gate without changing it.  An
+  apply refuses if it cannot assert that its saved-file gate is still held.
+- Plain operation IDs are echoed, not durably enforced.  Dolt operations retain
+  transactional commits and durable operation receipts.  Retired receipt
+  postimage blobs are no longer written/read; in-transaction validation stays.
+- A closed metadata registry routes owner-specific intent through the public
+  execution door.  Generic =DORG_= property/keyword writes refuse, including
+  constructor and bulk replacement paths.  Import validates registered owned
+  families through their owners.
+
+** Queries and indexed retrieval
+
+- Terminal =select= projects named scalar columns, including declared
+  extension fields.  Snapshot results bind rows, source, revision and extension
+  context in one invocation; the CLI retains that provenance in JSON.
+- String predicates have explicit sensitive/insensitive modes.  =contains-any=
+  expresses a literal disjunction without repeating the field expression;
+  bounded title scans avoid hydrating unrelated bodies.
+- Opt-in Dolt BM25 indexes heading titles and directly owned text, with
+  sensitive/insensitive profiles and bounded top-K results.  Descendants,
+  planning, drawers and metadata are excluded.  Installing the extension and
+  building a root index are explicit operations; plain/model sources refuse
+  ranked search.  Ordinary edits maintain changed documents and term/corpus
+  counters by deltas rather than rebuilding the root.
+- Existing stores can be bound read-only without initialization or migration;
+  ephemeral Dolt registrations allow query callers to avoid visiting files.
+
+** Persisted clocks
+
+- Managed clocks provide start, stop, switch, correction, cancellation and
+  explicit adoption through immutable intents.  The authority is a named Dolt
+  scope; tasks may be in identified Dolt stores or plain files.
+- UTC instants plus an explicit IANA zone are canonical.  Legacy CLOCK lines
+  are adopted with source/byte evidence; ambiguous times and duplicate lines
+  refuse.  Reads do not create identity or clock activity.
+- The optional Emacs adapter intercepts clock actions before local CLOCK edits
+  and reconciles local indicators from the authority.  Dirty buffers and
+  foreign locks defer actions; an unknown reply preserves the exact intent.
+  Stock Org clock hooks/idle resolution remain separate.
+
+** Derived data and operations
+
+- Exact-revision extension rebuilds support owner partitions and declared
+  parent scopes.  Whole-store audits distinguish orphaned, ambiguous and
+  unreadable derived rows; an explicit policy-upgrade plan/apply/inverse path
+  preserves the recorded before/after rows.
+- Core/postimage and extension planning use bounded reads and batched writes
+  where their contracts permit them.  No global command-latency bound is
+  promised; cold import and whole-root rendering still scale with the tree.
+- Managed server identity and diagnostics are hardened, and server output goes
+  to a log file rather than blocking an Emacs pipe.  CLI/HTTP invocation
+  history records metadata only, excluding arguments and document content.
+- Public JSON renders explicit null values as JSON null.  Query and mutation
+  share an exact-form reader that refuses trailing forms and reader evaluation.
+
+** Mutation addressing migration
+
+The sequence mutation grammar uses one singular-noun addressing algebra.  The
+four retired 0.1.0 spellings below are hard errors: DOrg does not translate,
+warn, or provide a compatibility mode.  Each diagnostic names the exact
+replacement.
+
+| 0.1.0 spelling | 0.2 spelling |
+|----------------+--------------|
+| =(replace (keywords K) V...)= | =(replace (keyword K (all)) V...)= |
+| =(delete (keywords K))= | =(delete (keyword K (all)))= |
+| =(insert (drawer-line NAME (occurrence 1)) POS L)= | =(insert (drawer-line NAME) POS L)= |
+| =(replace (items) I...)= | =(replace (item (all)) I...)= |
+| =(replace/delete (keyword K (occurrence N)) ...)= | unchanged |
+| =(insert (keyword K) POS V)= | unchanged |
+| =(insert (text) POS T)= | unchanged |
+| =(replace (text (occurrence N)) T)= | unchanged |
+
+Replacing =(keyword K (all))= now writes its replacement run at the first
+matching keyword's former index, instead of appending it at the host end.
+
 * 0.1.0
 
 DOrg 0.1.0 establishes the DB-as-truth architecture: Dolt-backed
@@ -40,6 +154,9 @@ mutation APIs.  Plain-org files keep ordinary Emacs editing.
   extension-built closure state.
 - Extension index rebuilds are deterministic from an exact committed revision
   after projector definitions change.
+- Exact-revision rebuild now requires explicit identity policy and supports a
+  validated one-edge parent scope for derived child tables; it refuses
+  ambiguous cross-root parent keys rather than broadening a repair.
 - Batch insertion preserves declared order when targeting heading-after
   anchors across the API and command-line interface.
 - Subtree moves persist the updated heading level for every moved descendant,
@@ -86,4 +203,5 @@ mutation APIs.  Plain-org files keep ordinary Emacs editing.
 
 * Released versions
 
-None.
+- [[https://github.com/cosmicz/dorg/releases/tag/v0.2.0][0.2.0]] — typed plain editing, indexed retrieval, managed clocks and explicit schema upgrades.
+- [[https://github.com/cosmicz/dorg/releases/tag/v0.1.0][0.1.0]] — first public release.

@@ -121,10 +121,10 @@ effective dispatch identity (`plain-org' or `dolt').  TRANSPORT is the
 session's `dorg-sql-transport' policy (Dolt only).  SERVER-ROLE is nil,
 `owner' (this session started the strict server), or `attach' (it reused
 a foreign/pre-existing owner).  SERVER-PORT is the strict-server port when
-applicable.  CACHE maps a query key to its raw (marker-carrying) result
-list.  TOKEN is the freshness plist captured at the last refresh.
-OWNS-BUFFER records whether open created BUFFER (and so close should kill
-it).  CLOSED is non-nil once the session is closed."
+applicable.  CACHE maps a query key to raw rows plus registrations captured
+by their invocation's field plan.  TOKEN is the freshness plist captured at
+the last refresh.  OWNS-BUFFER records whether open created BUFFER (and so
+close should kill it).  CLOSED is non-nil once the session is closed."
   source registration buffer backend-type
   transport server-role server-port
   cache token owns-buffer
@@ -291,11 +291,13 @@ unconditionally.  Returns SESSION."
 (defun dorg-session--project-result (result)
   "Project one `dorg-ql' RESULT plist to its host-safe shape.
 Drops the live `:marker' (and any non-readable object it would carry),
-keeping the read/print-safe `:heading-id', `:title', and `:properties'.
-RESULT keys other than these are dropped."
-  (list :heading-id (plist-get result :heading-id)
-        :title      (plist-get result :title)
-        :properties (plist-get result :properties)))
+keeping heading fields or the explicitly selected `:values'."
+  (if (plist-member result :values)
+      (list :heading-id (plist-get result :heading-id)
+            :values (copy-tree (plist-get result :values)))
+    (list :heading-id (plist-get result :heading-id)
+          :title      (plist-get result :title)
+          :properties (plist-get result :properties))))
 
 (defun dorg-session-project (session value &rest options)
   "Return a host-safe projection of VALUE for SESSION.
@@ -330,19 +332,30 @@ projection itself is backend-independent."
 
 ;;; ─── Query ────────────────────────────────────────────────────────────
 
-(defun dorg-session--query-key (query)
-  "Return a stable cache key for QUERY.
-A fresh copy so a caller mutating its query form cannot corrupt the
-cache; compared with `equal' by the hash table."
-  (copy-tree query))
+(defun dorg-session--query-key (ast context-digest)
+  "Return a stable cache key for normalized AST and CONTEXT-DIGEST.
+Using the canonical AST makes omitted and explicit sensitive modes share an
+entry while preserving the distinct `:case insensitive' leaf.  A fresh copy
+keeps a caller from corrupting the equal-compared hash-table key."
+  (list (copy-tree ast) context-digest))
 
-(defun dorg-session--run-query (session query)
+(defun dorg-session--same-extension-identities-p (left right)
+  "Return non-nil when LEFT and RIGHT name the same registrations by `eq'.
+These are session-local cache guards, not portable context or transport
+identity.  Re-registering an extension replaces its registry object even at
+the same version, while an unchanged warm invocation keeps that object."
+  (and (= (length left) (length right))
+       (cl-every (lambda (a b)
+                   (and (eq (car a) (car b)) (eq (cdr a) (cdr b))))
+                 left right)))
+
+(defun dorg-session--run-query (session query prepared)
   "Execute QUERY against SESSION's warm buffer, returning raw results.
 Binds `dorg-sql-transport' to the session's policy so a strict-server
 Dolt session routes through its server and never falls back to CLI."
   (let ((dorg-sql-transport (or (dorg-session-transport session)
                                 dorg-sql-transport)))
-    (dorg-ql-select query (dorg-session-buffer session))))
+    (dorg-ql-select query (dorg-session-buffer session) prepared)))
 
 (defun dorg-session-query (session query &rest options)
   "Run dorg-ql QUERY through SESSION and return host-safe results.
@@ -364,13 +377,31 @@ surface as `dorg-ql-error' from the underlying adapter."
   (dorg-session--check-open session)
   ;; Never serve stale: refresh-if-stale before consulting the cache.
   (dorg-session-refresh session)
-  (let* ((cache (dorg-session-cache session))
-         (key (dorg-session--query-key query))
-         (raw (if (let ((probe (gethash key cache 'miss)))
-                    (not (eq probe 'miss)))
-                  (gethash key cache)
-                (let ((results (dorg-session--run-query session query)))
-                  (puthash key results cache)
+  (let* ((source (dorg-session-buffer session))
+         (invocation
+          (dorg-ql--make-invocation
+           source (and (eq (dorg-session-backend-type session) 'dolt)
+                       (let ((head (plist-get (dorg-session-token session) :head)))
+                         ;; An unreadable freshness token deliberately fails
+                         ;; closed; it is not a SQL revision capability.
+                         (and (stringp head) head)))))
+         (prepared (dorg-ql--prepare-query query source invocation))
+         (cache (dorg-session-cache session))
+         (key (dorg-session--query-key (plist-get prepared :ast)
+                                       (plist-get prepared :context-digest)))
+         (identities (plist-get prepared :extension-identities))
+         (entry (gethash key cache 'miss))
+         (raw (if (and (not (eq entry 'miss))
+                       (dorg-session--same-extension-identities-p
+                        identities (plist-get entry :extension-identities)))
+                  (plist-get entry :rows)
+                (let ((results (dorg-session--run-query session query prepared)))
+                  ;; Identities come from PREPARED, before context/evaluator
+                  ;; callbacks.  A post-execution registry read could label
+                  ;; these old rows with a registration installed during them.
+                  (puthash key (list :extension-identities identities
+                                     :rows results)
+                           cache)
                   results))))
     (setf (dorg-session-last-used-at session) (current-time))
     (if (plist-get options :raw)

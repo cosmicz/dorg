@@ -15,8 +15,9 @@
 ;;           convenience forms);
 ;;   mutate — apply explicit typed mutations;
 ;;   import — administrative full-document bootstrap/recovery ingest;
-;;   dolt — manage DOrg-managed Dolt sql-servers (list/status, start/
-;;            ensure, stop, stop-all) with owner-safe semantics.
+;;   lock inspect — read-only local saved-file owner diagnostics;
+;;   dolt — manage Dolt sql-servers and explicit store identity with
+;;            owner-safe lifecycle semantics.
 ;;
 ;; Load-path / build honesty
 ;; -------------------------
@@ -41,6 +42,7 @@
 ;;     surface: `dorg-dolt-server-list', `dorg-dolt-start', `dorg-dolt-stop',
 ;;     and `dorg-dolt-stop-all'.  Listing is read-only; stop is
 ;;     owner-safe; explicit starts are manual lifecycle operations.
+;;   - Store identification goes through `dorg-api-identify-store'.
 ;;   - Backend resolution follows the registration order: explicit
 ;;     stored binding > `#+DORG_DOLT_DIR:' keyword > transient
 ;;     plain-org.  Query/edit commands that need a concrete store use
@@ -90,11 +92,6 @@
 ;; does not flag the `setq' that tunes the org-element cache as a free variable.
 (defvar org-element-cache-persistent)
 
-;; KEEP (external): lread.c's dynamic reader-evaluation switch.  Declaring it
-;; prevents the byte compiler from turning the security binding into an unused
-;; lexical variable; `dorg-app--read-exact-form' must bind the real reader flag.
-(defvar read-eval)
-
 (defun dorg-app--serve-start-command-p ()
   "Return non-nil when argv names the long-lived `serve start' command.
 Detects the command *positionally* rather than against a hand-maintained
@@ -142,6 +139,8 @@ into reading a value token as a command.  Boolean --json and any other
 (require 'dorg-envelope)
 (require 'json)
 (require 'subr-x)
+
+(declare-function dorg-load-extension "dorg-ext" (name))
 
 ;; `clime-serve' is an OPTIONAL Clime module, loaded lazily by the
 ;; `serve start' handler — declare its entry points so this file
@@ -212,7 +211,7 @@ fault (HTTP 500).  Caught and routed by `dorg-app--with-json-error'."
 
 (defun dorg-app--read-exact-form (text command)
   "Read exactly one Lisp form from TEXT for COMMAND.
-Reader evaluation is disabled.  One form followed only by whitespace is
+Emacs rejects reader evaluation syntax.  One form followed only by whitespace is
 accepted; atoms and nil are returned for the command's domain validator.
 Signals `dorg-app-error' with reason `invalid-form' and stable detail
 `empty-input', `malformed-syntax', or `trailing-input'."
@@ -222,8 +221,7 @@ Signals `dorg-app-error' with reason `invalid-form' and stable detail
      (list :command command :detail 'empty-input) t))
   (let ((parsed
          (condition-case nil
-             (let ((read-eval nil))
-               (read-from-string text))
+             (read-from-string text)
            (error nil))))
     (unless parsed
       (dorg-app--command-error
@@ -279,21 +277,15 @@ maps to HTTP 400 with the shared JSON error envelope instead of
 
 ;;; ─── Pure helpers (no I/O) ─────────────────────────────────────────────
 
-(defun dorg-app--hit (result)
-  "Return the public JSON object plist for a `dorg-ql' RESULT plist.
-Shape is (:heading-id N :title S :properties ALIST); the
-live `:marker' is omitted because it is not serializable."
-  (list :heading-id (plist-get result :heading-id)
-        :title (or (plist-get result :title) "")
-        :properties (plist-get result :properties)))
-
 (defun dorg-app--text (result)
   "Return the text line \"<id>\\t<title>\" for a `dorg-ql' RESULT plist.
 The id renders as the em dash when nil, matching the results-buffer
 convention in `dorg-command'."
-  (format "%s\t%s"
-          (or (plist-get result :heading-id) "—")
-          (or (plist-get result :title) "")))
+  (if (plist-member result :values)
+      (dorg-ql-result-text result)
+    (format "%s\t%s"
+            (or (plist-get result :heading-id) "—")
+            (or (plist-get result :title) ""))))
 
 (defun dorg-app--error-envelope-json (error-or-msg)
   "Return the JSON error envelope for ERROR-OR-MSG.
@@ -366,13 +358,15 @@ Typed query failures map once to `dorg-app-error'; the shared router emits
 one CLI JSON envelope or one HTTP 400 envelope with reason and details."
   (dorg-app--with-json-error
     (condition-case err
-        (let ((hits (dorg-command-run-query query buffer)))
-          (if (eq (clime-out-format) 'json)
-              (let ((results (vconcat (mapcar #'dorg-app--hit hits))))
-                (list :command 'query :results results :count (length results)))
-            (dolist (hit hits)
-              (clime-out nil :text (dorg-app--text hit)))
-            nil))
+        (if (eq (clime-out-format) 'json)
+            ;; The envelope and rows must come from one invocation: running the
+            ;; command facade first could observe a different HEAD or workflow
+            ;; context than the snapshot reported to the caller.
+            (dorg-ql-snapshot-public
+             (dorg-ql-select-snapshot query buffer))
+          (dolist (hit (dorg-command-run-query query buffer))
+            (clime-out nil :text (dorg-app--text hit)))
+          nil)
       (dorg-ql-error
        (dorg-app--command-error (dorg-error-reason err)
                                 (cadr err)
@@ -509,7 +503,7 @@ Carries the serializable subset of the inventory plist; the embedded
 process/connection objects are not included."
   (let (out)
     (dolist (k '(:dolt-dir :port :role :status :policy :protocol
-                 :owner-pid :server-pid :host :created-at :last-used))
+                 :owner-pid :server-pid :host :created-at :last-used :generation))
       (setq out (append out (list k (plist-get entry k)))))
     out))
 
@@ -1050,7 +1044,7 @@ claim blocks replacement until explicit recovery."
   :version dorg-version
   :env-prefix "DORG"
   :on-invocation #'dorg-app--log-invocation
-  :help "Query, mutate, administratively import, and serve dorg-backed org trees."
+  :help "Query, mutate, inspect locks, administratively import, and serve dorg-backed org trees."
   :examples '(("dorg query '(tag \"work\")' -f tasks.org" . "Headings tagged :work:")
               ("dorg property CATEGORY red -f tasks.org --json" . "Property match as JSON")
               ("dorg mutate '(on (id 100) (set (property \"STATUS\") \"done\"))' --apply -f tasks.org" . "Apply a mutation")
@@ -1133,9 +1127,12 @@ claim blocks replacement until explicit recovery."
                 ("dorg query '(pipe (where (deadline (this-week))) (traverse children))' -f tasks.org" . "Composable v2 pipeline (plain-org or Dolt)"))
     (clime-arg sexp
       :help "A single dorg-ql form — atomic alias or composable v2 (read as one Lisp expression)")
+    (clime-opt extension ("--extension")
+      :help "Load installed extension NAME through its standalone dorg entry point")
     (clime-handler (ctx)
-      (clime-let ctx (file dolt-dir sexp)
+      (clime-let ctx (file dolt-dir sexp extension)
         (dorg-app--with-json-error
+          (when extension (dorg-load-extension extension))
           (dorg-app--emit-query (dorg-app--read-exact-form sexp 'query)
                                 (dorg-app--open file dolt-dir))))))
 
@@ -1191,9 +1188,11 @@ claim blocks replacement until explicit recovery."
     (clime-opt allow-broad ("--allow-broad") :type 'boolean
       :help "Permit an apply over more than the broad-write threshold")
     (clime-opt base ("--base") :help "Base revision/commit token (staleness check)")
+    (clime-opt lock-timeout ("--lock-timeout")
+      :help "Maximum seconds to wait for a saved plain-Org file lock")
     (clime-handler (ctx)
       (clime-let ctx (file dolt-dir root-id sexp dry-run apply mode expect-targets
-                       allow-broad base)
+                       allow-broad base lock-timeout)
         (dorg-app--with-json-error
           (dorg-app--client-error-as-usage
             (let* ((form (dorg-app--read-exact-form sexp 'mutate))
@@ -1208,6 +1207,13 @@ claim blocks replacement until explicit recovery."
                             ;; A file-backed apply persists inside its sole API
                             ;; execution.  No post-API save/sync/writeback path.
                             (when (and (eq m 'apply) buf) (list :save t))
+                            (when lock-timeout
+                              (list :lock-timeout
+                                    (if (string-match-p
+                                         "\\`[0-9]+\\(?:\\.[0-9]+\\)?\\'"
+                                         lock-timeout)
+                                        (string-to-number lock-timeout)
+                                      lock-timeout)))
                             (unless (eq expect 'none)
                               (list :expected-targets expect))))
                    (resp (condition-case err
@@ -1221,6 +1227,21 @@ claim blocks replacement until explicit recovery."
                                                      (dorg-api-error-data err)
                                                      t)))))
               (dorg-app--emit-mutate resp)))))))
+
+  ;; Explicit read-only operator inspection.  Unlike public contention errors,
+  ;; this command intentionally includes owner host, PID and acquisition time.
+  (clime-group lock
+    :help "Inspect a local saved plain-Org writer gate."
+    (clime-command inspect
+      :help "Read the writer lock for one canonical Org file."
+      (clime-arg path :coerce #'expand-file-name
+        :help "Local Org file whose writer lock should be inspected")
+      (clime-handler (ctx)
+        (clime-let ctx (path)
+          (let ((report (dorg-file-lock-inspect (dorg-file-lock-path path))))
+            (clime-out-text (format "%S" report))
+            (when (eq (clime-out-format) 'json)
+              (list :command 'lock-inspect :report report)))))))
 
   ;; ── doctor (Dolt DB consistency diagnose/repair) ─────────────────────
 
@@ -1328,6 +1349,33 @@ header (NOT a standard Authorization: Bearer header)."
                     :dolt-dir target
                     :port port
                     :started t))))))
+
+    (clime-command identify
+      :help "Set a missing Dolt store identity; --fork replaces and records one."
+      :examples '(("dorg dolt identify /repo/dolt" . "Identify an existing store")
+                  ("dorg dolt identify /repo/dolt --fork" . "Fork its identity"))
+      (clime-arg dir :optional
+        :help "Dolt directory (else --dolt-dir, else --file's bound repo)")
+      (clime-opt fork ("--fork") :type 'boolean
+        :help "Replace the current store ID and record its previous value")
+      (clime-handler (ctx)
+        (clime-let ctx (file dolt-dir dir fork)
+          (dorg-app--client-error-as-usage
+            (let* ((target (dorg-app--dolt-target dir file dolt-dir))
+                   (receipt (dorg-api-identify-store target :fork fork)))
+              (clime-out-text
+               (format "store %s identified as %s%s"
+                       target (plist-get receipt :store-id)
+                       (if (plist-get receipt :previous-id)
+                           (format " (prior %s)"
+                                   (plist-get receipt :previous-id))
+                         "")))
+              (when (eq (clime-out-format) 'json)
+                (list :command 'dolt-identify :dolt-dir target
+                      :store-id (plist-get receipt :store-id)
+                      :previous-id (plist-get receipt :previous-id)
+                      :fork (if (plist-get receipt :fork) t :json-false)
+                      :commit (plist-get receipt :commit))))))))
 
     (clime-command stop
       :help "Owner-safe stop/detach of this Emacs's sql-server for a Dolt dir."

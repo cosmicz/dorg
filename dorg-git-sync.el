@@ -35,6 +35,7 @@
 (require 'cl-lib)
 (eval-when-compile (require 'subr-x))
 (require 'dorg-git)
+(require 'dorg-git-maintenance)
 (require 'dorg-keywords)
 (require 'dorg-registry)
 
@@ -705,6 +706,19 @@ CONFIG's root is not in a git repository (no error signaled)."
               ;; Refresh the committed result's warnings with the push note.
               (setf (dorg-git-sync-result-warnings result)
                     (reverse dorg-git-sync--warnings)))))
+        ;; THE COMMITTER DISPATCHES.  This facade just landed a sync-branch
+        ;; commit, so it launches maintenance itself: a standalone DOrg
+        ;; caller never reaches a consumer, so a consumer-side trigger alone
+        ;; would never fire for it.  The dispatch is given the SHA this
+        ;; result already carries and never rereads the branch, which can
+        ;; move or vanish before the worker starts.  It cannot signal and is
+        ;; not waited on, so maintenance can never change this outcome.
+        (when (and (eq (dorg-git-sync-result-status result) :committed)
+                   (eq (dorg-git-sync-config-mode config) :sync-branch))
+          (dorg-git-maintenance-dispatch
+           repo-dir (dorg-git--common-dir repo-dir)
+           (dorg-git-sync-result-branch result)
+           (dorg-git-sync-result-commit result)))
         result))))
 
 (cl-defun dorg-git-sync (config)

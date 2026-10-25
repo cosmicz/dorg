@@ -23,9 +23,12 @@
 (require 'cl-lib)
 (require 'eieio)
 (require 'org-src)                      ; org-{,un}escape-code-in-string
+(require 'dorg-error)
+(require 'dorg-backend)                  ; root-preamble keyword constants
 (require 'dorg-id)                      ; `dorg-id-property'
 (require 'dorg-sortkey)
 (require 'dorg-timestamp)
+
 
 ;;; ─── Verbatim Block Comma-Escape ──────────────────────────────────────
 ;;
@@ -149,12 +152,16 @@ the model) so it is never reduced to a bare structural close."
 - ID: snowflake BIGINT (from DORG_ID or freshly allocated).
 - PARENT-ID: parent heading id, or nil for root.
 - SORT-KEY: unibyte string position among siblings (VARBINARY).
-- LEVEL: org heading level (0 for synthetic root).
+- LEVEL: EFFECTIVE absolute Org level (0 for the synthetic root).  It is
+  derived from ancestry by `dorg-model-derive-levels' and is never a
+  persisted authority; nil means the ancestry was not available.
+- LEVEL-OFFSET: the persisted local fact, the level relative to the parent
+  \(0 for the synthetic root, a positive integer for every real heading).
 - TODO, PRIORITY, COMMENTED, TITLE, POST-BLANK: heading attributes.
 - TAGS: list of tag strings in order.
 - ITEMS: list of `dorg-heading-item' EIEIO objects.
 - ITEMS-HASH: MD5 hex string of structured item content, or nil."
-  id parent-id sort-key level
+  id parent-id sort-key level level-offset
   todo priority commented title post-blank
   tags
   items
@@ -176,7 +183,264 @@ row is excluded, and nil sort keys sort as empty strings."
             (string< (or (dorg-heading-sort-key a) "")
                      (or (dorg-heading-sort-key b) ""))))))
 
-;;; Item EIEIO Hierarchy
+;;; Effective Levels
+;;
+;; A heading persists only its LEVEL-OFFSET, its level relative to its parent.
+;; The effective absolute Org level is a path sum over the ancestry, so it can
+;; only be derived where the whole ancestor chain is present at one snapshot.
+;; `dorg-model-derive-levels' is the one derivation point: it never
+;; fabricates a level for a heading whose chain is incomplete, and it is
+;; re-run after any ancestry change rather than patched in place by
+;; arithmetic, so a stale derived level cannot survive a reparent.
+
+(define-error 'dorg-model-incomplete-ancestry
+  "Heading effective level needs ancestry that is not loaded")
+
+(define-error 'dorg-model-invalid-offset
+  "Heading level offset is not a positive integer")
+
+(defun dorg-model-offset-level (base offset)
+  "Return the effective level of a heading with OFFSET under a parent at BASE.
+This is the one derivation rule: BASE must be a known integer level and
+OFFSET a positive integer, else the answer is nil (unknown), never a
+fabricated number."
+  (and (integerp base) (integerp offset) (> offset 0) (+ base offset)))
+
+(defun dorg-model--root-shape-p (heading)
+  "Return non-nil when HEADING has the synthetic root's shape.
+It has no parent, and its stored offset is 0; a model that carries no
+offset at all (levels only) must instead have level 0.  A named root of any
+other shape is malformed, and nothing is derived beneath it."
+  (and (null (dorg-heading-parent-id heading))
+       (if (dorg-heading-level-offset heading)
+           (eql 0 (dorg-heading-level-offset heading))
+         (eql 0 (dorg-heading-level heading)))))
+
+(defun dorg-model-derive-levels (headings root-id)
+  "Set every heading's effective LEVEL in HEADINGS from level offsets.
+HEADINGS is an id -> `dorg-heading' hash table and ROOT-ID the synthetic
+root, whose level is 0 only when its row has the root's shape (no parent,
+offset 0; see `dorg-model--root-shape-p').  A heading reachable from a
+well-formed ROOT-ID through loaded parents with positive offsets gets its
+parent's level plus its own offset.  Every other heading (a malformed named
+root, a missing ancestor, a non-positive or absent offset, or a cycle) gets
+level nil, never a fabricated 0 or its bare offset.  Returns HEADINGS."
+  (let ((memo (make-hash-table :test 'eql))
+        (visiting (make-hash-table :test 'eql)))
+    (cl-labels
+        ((level-of (id)
+           (pcase (gethash id memo 'unset)
+             ('unset
+              (let ((value
+                     (let ((h (gethash id headings)))
+                       (cond
+                        ((null h) nil)
+                        ((eql id root-id)
+                         (and (dorg-model--root-shape-p h) 0))
+                        ((gethash id visiting) nil)
+                        (t
+                         (puthash id t visiting)
+                         (let ((parent (dorg-heading-parent-id h)))
+                           (and parent
+                                (dorg-model-offset-level
+                                 (level-of parent)
+                                 (dorg-heading-level-offset h)))))))))
+                (puthash id value memo)
+                value))
+             (value value))))
+      (maphash (lambda (id h) (setf (dorg-heading-level h) (level-of id)))
+               headings))
+    headings))
+
+(defun dorg-model-derive-closure (heading base children-fn)
+  "Re-derive effective levels of HEADING's subtree top-down; return it.
+BASE is the effective level of HEADING's parent, nil when unknown.
+CHILDREN-FN maps a heading to its direct child headings.  Each level comes
+from `dorg-model-offset-level', the rule `dorg-model-derive-levels' uses, so
+a candidate closure (a mutation's moved subtree, whose ancestry above
+HEADING is not reloaded) derives exactly as a whole-tree load would.  It
+fails closed: a heading in the closure whose offset is not a positive
+integer signals `dorg-model-invalid-offset' instead of leaving a level the
+rest of the closure would build on.  Returns the closure headings in visit
+order; a heading already visited is not walked again."
+  (let ((seen (make-hash-table :test 'eql))
+        out)
+    (cl-labels ((walk (h parent-level)
+                  (unless (gethash (dorg-heading-id h) seen)
+                    (puthash (dorg-heading-id h) t seen)
+                    (let ((offset (dorg-heading-level-offset h)))
+                      (unless (and (integerp offset) (> offset 0))
+                        (signal 'dorg-model-invalid-offset
+                                (list (dorg-heading-id h) offset)))
+                      (let ((level (dorg-model-offset-level parent-level offset)))
+                        (setf (dorg-heading-level h) level)
+                        (push h out)
+                        (dolist (child (funcall children-fn h))
+                          (walk child level)))))))
+      (walk heading base))
+    (nreverse out)))
+
+(defun dorg-model-root-p (heading)
+  "Return non-nil when HEADING is a synthetic document root.
+A root has no parent and sits at level 0: its offset is 0, or, on a model
+that still carries only levels, its level is 0.  This never depends on a
+derived level alone, so an orphan whose ancestry is unknown is not a root."
+  (and (null (dorg-heading-parent-id heading))
+       (or (eql 0 (dorg-heading-level-offset heading))
+           (eql 0 (dorg-heading-level heading)))))
+
+(defun dorg-model-effective-level (heading)
+  "Return HEADING's derived effective level, or signal when it is unknown.
+Signals `dorg-model-incomplete-ancestry' instead of answering nil, so a
+consumer that needs a level can never read a missing one as a number."
+  (or (dorg-heading-level heading)
+      (signal 'dorg-model-incomplete-ancestry
+              (list (dorg-heading-id heading)))))
+
+(defun dorg-model-placement-representable-p (offset pred-offset succ-offset)
+  "Return non-nil when OFFSET can sit between sibling PRED-OFFSET and SUCC-OFFSET.
+Org re-parents a later sibling that is deeper than an earlier one, so
+direct-sibling offsets must be non-increasing in render order.  Placing a
+heading into a fan that is already valid keeps it valid exactly when
+PRED-OFFSET >= OFFSET >= SUCC-OFFSET; a nil neighbour is unconstrained."
+  (and (or (null pred-offset) (>= pred-offset offset))
+       (or (null succ-offset) (>= offset succ-offset))))
+
+(defun dorg-model-sibling-fan-representable-p (headings parent-id)
+  "Return non-nil when PARENT-ID's children in HEADINGS are representable.
+The direct children's offsets must be non-increasing in sort-key order."
+  (let ((offsets (mapcar #'dorg-heading-level-offset
+                         (dorg-model-children-of parent-id headings)))
+        (ok t))
+    (while (and ok (cdr offsets))
+      (setq ok (>= (car offsets) (cadr offsets))
+            offsets (cdr offsets)))
+    ok))
+
+(defconst dorg-model-window-room (ash 1 32)
+  "Minimum coordinate room per key that a rebalanced window must leave.
+Correctness needs only the spacing `dorg-sortkey-spread' enforces; this larger
+margin decides how far `dorg-model-plan-window' expands, so that a rebalanced
+region absorbs many later placements before it is touched again.")
+
+(defun dorg-model-plan-gap (left right count &optional occupied)
+  "Return COUNT fresh keys strictly between neighbour keys LEFT and RIGHT.
+LEFT and RIGHT are the adjacent siblings' current keys, either nil at an open
+end.  Head and tail placement steps at constant width; interior placement
+spreads inside the open interval, which holds no other live key when LEFT and
+RIGHT are truly adjacent.  OCCUPIED is a hash set of keys no result may equal:
+keys this batch vacated but the store still holds until it commits.  Signals
+`dorg-sortkey-exhausted' when the gap has no room, which the caller answers
+with `dorg-model-plan-window'."
+  (cl-flet ((free (key step)
+              (while (and occupied (gethash key occupied))
+                (setq key (funcall step key)))
+              key))
+    (cond
+     ((zerop count) nil)
+     ((null right)
+      (let ((key (free (if left
+                           (dorg-sortkey-step-after left)
+                         (dorg-sortkey-first-key))
+                       #'dorg-sortkey-step-after))
+            keys)
+        (dotimes (_ count (nreverse keys))
+          (push key keys)
+          (setq key (free (dorg-sortkey-step-after key) #'dorg-sortkey-step-after)))))
+     ((null left)
+      (let ((key (free (dorg-sortkey-step-before right) #'dorg-sortkey-step-before))
+            keys)
+        (dotimes (_ count keys)
+          (push key keys)
+          (setq key (free (dorg-sortkey-step-before key) #'dorg-sortkey-step-before)))))
+     (t (let ((bounds (dorg-sortkey-bounds left right)))
+          (dorg-sortkey-spread count (car bounds) (cdr bounds) occupied))))))
+
+(defun dorg-model-plan-window (facts index count &optional occupied
+                                     left-bound right-bound)
+  "Place COUNT keys after INDEX in FACTS, rekeying the smallest window that fits.
+FACTS is a vector of (ID . KEY) pairs in sibling order, contiguous for one
+parent.  INDEX is the position of the left neighbour, or -1 to place before
+the first entry.  OCCUPIED is a hash set of keys no result may equal (keys
+this batch vacated under the parent while the store still holds them).
+LEFT-BOUND and RIGHT-BOUND are the unchanged keys just outside FACTS, nil at
+a true fan end; a window that would have to grow past FACTS signals instead,
+and the caller decides what wider slice to offer.
+
+An empty window is the plain gap between the true neighbours and allocates
+exactly as `dorg-model-plan-gap' does.  When that gap has no room the window
+grows one row at a time, alternating sides, until the interval between the
+keys just outside it leaves `dorg-model-window-room' per key; the window rows
+and the new keys are then spread evenly across that interval.  The set of
+keys the spread must avoid grows with the window and is never rebuilt, so the
+work is linear in the final window.  Returns (:keys NEW-KEYS :rekeys ((ID .
+KEY) ...)), REKEYS listing only rows whose key changes.
+
+Every key lies strictly between the outside keys, so it equals no key outside
+the window; `dorg-sortkey-spread' keeps it distinct from every old key inside
+the window and from OCCUPIED; assignment is monotone on the final sequence, so
+sibling order is preserved.  Signals `dorg-sortkey-exhausted' only when the
+whole group cannot fit at the fixed width."
+  (let* ((n (length facts))
+         (i (1+ index))
+         (j index)
+         (inside (make-hash-table :test 'equal))
+         (pending (and occupied
+                       (let (keys)
+                         (maphash (lambda (key _) (push key keys)) occupied)
+                         keys)))
+         plan)
+    (while (not plan)
+      (let* ((left (if (> i 0) (cdr (aref facts (1- i))) left-bound))
+             (right (if (< j (1- n)) (cdr (aref facts (1+ j))) right-bound))
+             (bounds (dorg-sortkey-bounds left right))
+             (lo (car bounds))
+             (hi (cdr bounds))
+             (need (+ (- j i -1) count)))
+        ;; Vacated keys enter the avoid-set once their coordinate falls inside
+        ;; the (only ever widening) interval; window rows entered as they were
+        ;; absorbed below.
+        (setq pending
+              (cl-remove-if (lambda (key)
+                              (when (<= lo (dorg-sortkey-int16 key) hi)
+                                (puthash key t inside)
+                                t))
+                            pending))
+        (if (= i (1+ j))
+            ;; Empty window: the plain gap between the true neighbours.
+            (condition-case nil
+                (setq plan (list :keys (dorg-model-plan-gap left right count inside)
+                                 :rekeys nil))
+              (dorg-sortkey-exhausted nil))
+          (let ((cap (1+ (- hi lo))))
+            (when (and (> cap 0)
+                       (>= (/ cap (1+ need))
+                           (max dorg-model-window-room
+                                (+ 2 (hash-table-count inside)))))
+              (let ((keys (dorg-sortkey-spread need lo hi inside))
+                    rekeys new)
+                (cl-loop for k from i to index
+                         do (let ((cell (aref facts k)) (key (pop keys)))
+                              (unless (equal (cdr cell) key)
+                                (push (cons (car cell) key) rekeys))))
+                (dotimes (_ count) (push (pop keys) new))
+                (cl-loop for k from (1+ index) to j
+                         do (let ((cell (aref facts k)) (key (pop keys)))
+                              (unless (equal (cdr cell) key)
+                                (push (cons (car cell) key) rekeys))))
+                (setq plan (list :keys (nreverse new) :rekeys (nreverse rekeys)))))))
+        (unless plan
+          (let ((can-left (> i 0))
+                (can-right (< j (1- n))))
+            (cond
+             ((and can-left (or (not can-right) (<= (- index i -1) (- j index))))
+              (setq i (1- i))
+              (puthash (cdr (aref facts i)) t inside))
+             (can-right
+              (setq j (1+ j))
+              (puthash (cdr (aref facts j)) t inside))
+             (t (signal 'dorg-sortkey-exhausted (list n count))))))))
+    plan))
 
 (defclass dorg-heading-item ()
   ((post-blank :initarg :post-blank :initform 0 :accessor dorg-item-post-blank)
@@ -260,13 +524,17 @@ Format must be stable across sessions — changing it invalidates all hashes.")
 (defun dorg-model-from-db-row (row &optional tags)
   "Convert a DB ROW alist to a `dorg-heading' struct.
 ROW is an alist with keys: id, parent_id, sort_key (hex string),
-level, todo_keyword, priority, commented (0/1), title, post_blank,
-items_hash.  TAGS is an optional list of tag strings."
+level_offset, todo_keyword, priority, commented (0/1), title, post_blank,
+items_hash.  TAGS is an optional list of tag strings.  The persisted fact is
+level_offset.  A row also carrying `level' supplies an effective level that a
+loader already derived from the ancestry (never a stored column); without it
+the effective level is left for `dorg-model-derive-levels'."
   (make-dorg-heading
    :id (alist-get 'id row)
    :parent-id (dorg-model--json-nil (alist-get 'parent_id row))
    :sort-key (dorg-sortkey-from-hex (alist-get 'sort_key row))
-   :level (alist-get 'level row)
+   :level (dorg-model--json-nil (alist-get 'level row))
+   :level-offset (dorg-model--json-nil (alist-get 'level_offset row))
    :todo (dorg-model--json-nil (alist-get 'todo_keyword row))
    :priority (dorg-model--json-nil (alist-get 'priority row))
    :commented (not (memq (alist-get 'commented row) '(nil 0 :null :false)))
@@ -328,6 +596,119 @@ Use case-insensitively, e.g.:
                    (upcase dorg-protected-keyword-prefix)
                    "")))
     (cons (concat escaped "%") (string esc))))
+
+;;; ─── Canonical owned metadata families ─────────────────────────────────
+
+;; This is deliberately a closed constant rather than a registration API.
+;; Families are persisted Org data, so a process-local extension point would
+;; make the same store mean different things in different Emacsen.
+(define-error 'dorg-owned-metadata-registry-error
+  "DOrg owned-metadata registry is invalid" 'dorg-error)
+
+(defconst dorg-owned-metadata-families
+  '(("DORG_CLOCK_" dorg-clock-metadata-owner 1 dorg-clock))
+  "Closed registry of canonical metadata families.
+Each entry is (PREFIX OWNER VERSION FEATURE).  PREFIX is the canonical upper-case
+PROPERTIES key prefix, OWNER is resolved lazily by the typed participant, and
+VERSION belongs to that participant's codec.  Generic callers never receive
+an owner capability from this table.")
+
+(defconst dorg-window-keyword
+  (concat dorg-protected-keyword-prefix "WINDOW")
+  "Root-preamble keyword carrying the durable partial-window marker.
+The marker remains system metadata; this named spelling lets registry guards
+refer to it without creating a second raw DORG_WINDOW source literal.")
+
+(defconst dorg-owned-metadata--system-names
+  (list dorg-id-property dorg-hash-keyword dorg-window-keyword
+        dorg-dolt-dir-keyword)
+  "Existing DOrg system names which an owned-family prefix must not cover.")
+
+(defun dorg-owned-metadata--validate-families (families)
+  "Signal for an invalid closed owned-metadata FAMILIES table.
+This pure validator exists so the literal registry is testable without a
+mutable registration seam."
+  (let ((seen nil))
+    (dolist (entry families)
+      (pcase-let ((`(,prefix ,owner ,version . ,rest) entry))
+        (unless (and (stringp prefix) (symbolp owner) (integerp version)
+                     (consp rest) (null (cdr rest))
+                     (symbolp (car rest))
+                     (string-prefix-p dorg-protected-keyword-prefix prefix)
+                     (string-suffix-p "_" prefix)
+                     (equal prefix (upcase prefix)))
+          (signal 'dorg-owned-metadata-registry-error
+                  (list "invalid owned metadata family"
+                        (list :reason 'invalid-family :entry entry))))
+        (when (or (member prefix seen)
+                  (cl-some (lambda (other)
+                             (or (string-prefix-p prefix other)
+                                 (string-prefix-p other prefix)))
+                           seen)
+                  (cl-some (lambda (name) (string-prefix-p prefix name))
+                           dorg-owned-metadata--system-names))
+          (signal 'dorg-owned-metadata-registry-error
+                  (list "overlapping or system-covering owned metadata family"
+                        (list :reason 'overlapping-family :entry entry))))
+        (push prefix seen)))
+  families))
+
+(dorg-owned-metadata--validate-families dorg-owned-metadata-families)
+
+(defun dorg-owned-metadata-family (name)
+  "Return NAME's registered owned-metadata family entry, or nil.
+Recognition is case-insensitive because Org property keys are
+case-insensitive.  The caller still owns canonical-spelling validation."
+  (when (stringp name)
+    (let ((canonical (upcase name)))
+      (cl-find-if (lambda (entry)
+                    (string-prefix-p (car entry) canonical))
+                  dorg-owned-metadata-families))))
+
+(defun dorg-owned-metadata-participants (family)
+  "Resolve FAMILY's declared owner after loading its registry feature.
+Return nil when the family or owner is unavailable.  The caller owns error
+normalization and validates the participant methods it needs."
+  (when-let ((entry (dorg-owned-metadata-family family)))
+    (when-let ((feature (nth 3 entry)))
+      (require feature))
+    (let ((owner (nth 1 entry)))
+      (when (and owner (fboundp owner))
+        (funcall owner)))))
+
+(defun dorg-owned-metadata-key-p (name)
+  "Return non-nil when NAME belongs to a registered owned family."
+  (and (dorg-owned-metadata-family name) t))
+
+(defun dorg-owned-metadata-canonical-key-p (name)
+  "Return non-nil when NAME is a canonical registered family property key.
+
+Family recognition is deliberately case-insensitive for refusal, while stored
+family keys are upper-case, non-accumulating Org property names.  In
+particular, a `KEY+' accumulation spelling is never canonical metadata."
+  (when-let ((family (dorg-owned-metadata-family name)))
+    (and (equal name (upcase name))
+         (string-prefix-p (car family) name)
+         (not (string-suffix-p "+" name)))))
+
+(defun dorg-owned-metadata-normalize-owner-signal (family participant err)
+  "Return a redacted diagnostic for ERR from FAMILY's PARTICIPANT.
+Only a declared `dorg-owner-refusal' reason crosses the owner boundary.
+DETAILS and condition objects never enter the returned plist."
+  (let* ((typed (eq (car-safe err) 'dorg-owner-refusal))
+         (data (cdr-safe err))
+         (same-family (and typed (equal family (nth 0 data))))
+         (reason (and same-family (nth 1 data)))
+         (declared (and (symbolp reason)
+                        (memq reason (plist-get participant :reasons))))
+         (message (if (and typed (stringp (nth 2 data)))
+                      (nth 2 data)
+                    (error-message-string err))))
+    (list :detail 'owner-refused
+          :owner-message message
+          :owner-reason (cond (declared reason)
+                              (typed 'undeclared)
+                              (t nil)))))
 
 ;;; Items Hash
 
@@ -700,6 +1081,7 @@ any field of the copy cannot reach back into the original."
    :sort-key (when (dorg-heading-sort-key heading)
                (copy-sequence (dorg-heading-sort-key heading)))
    :level (dorg-heading-level heading)
+   :level-offset (dorg-heading-level-offset heading)
    :todo (when (dorg-heading-todo heading)
            (copy-sequence (dorg-heading-todo heading)))
    :priority (when (dorg-heading-priority heading)
@@ -769,6 +1151,60 @@ a generic raw-lines drawer named PROPERTIES is rendered verbatim.")
                 (mapconcat #'identity lines "\n")
                 (if lines "\n" "")
                 ":END:")))))
+
+(defun dorg-model--body-view-item (item)
+  "Return ITEM's exact canonical body-view serialization.
+Text uses its stored model value directly: this view is the common mutation
+surface, not an Org source renderer, so verbatim-body escaping must not alter
+what a caller matched.  Structured items use their established model renderer.
+Every item contributes one terminal LF when absent and its exact post-blank
+run."
+  (let ((text (if (cl-typep item 'dorg-text-item)
+                  (dorg-text-item-text item)
+                (dorg-model--render-item item))))
+    (concat text
+            (if (string-suffix-p "\n" text) "" "\n")
+            (make-string (or (dorg-item-post-blank item) 0) ?\n))))
+
+(defun dorg-model-body-view (heading)
+  "Return HEADING's canonical own-body view for literal body operations.
+
+The view excludes leading planning and only the immediate local PROPERTIES
+drawer.  A later PROPERTIES drawer is an ordinary body item.  Children are not
+part of a heading's item list and therefore cannot enter this view.  This is a
+model representation shared by plain and Dolt operations; it is not a faithful
+plain-Org source renderer."
+  (let ((items (copy-sequence (dorg-heading-items heading))))
+    (while (and items (cl-typep (car items) 'dorg-planning-item))
+      (setq items (cdr items)))
+    (when (and items
+               (cl-typep (car items) 'dorg-drawer-item)
+               (equal "PROPERTIES" (dorg-drawer-item-name (car items))))
+      (setq items (cdr items)))
+    (mapconcat #'dorg-model--body-view-item items "")))
+
+(defun dorg-model-body-view-literal-match (view literal)
+  "Count overlapping LITERAL starts in canonical body VIEW, capped at two.
+Return a plist with `:count' and, for an exactly-one match, its half-open
+`:begin'/`:end' character range.  The caller owns public diagnostics; this
+pure primitive deliberately exposes neither source bytes nor a regex surface."
+  (unless (and (stringp literal) (not (string-empty-p literal)))
+    (error "body literal must be a nonempty string"))
+  (let ((case-fold-search nil)
+        (start 0)
+        (count 0)
+        first)
+    (while (and (< start (length view))
+                (< count 2)
+                (string-match (regexp-quote literal) view start))
+      (let ((begin (match-beginning 0)))
+        (unless first (setq first begin))
+        (setq count (1+ count))
+        ;; One-character advance intentionally counts overlapping starts.
+        (setq start (1+ begin))))
+    (append (list :count count)
+            (when (= count 1)
+              (list :begin first :end (+ first (length literal)))))))
 
 ;;; Heading Property Snapshot
 
@@ -861,7 +1297,7 @@ drawer (see `dorg-model--insert-heading-section')."
   (let ((by-parent (make-hash-table :test 'eql))
         (root nil))
     (dolist (h headings)
-      (if (= (dorg-heading-level h) 0)
+      (if (dorg-model-root-p h)
           (setq root h)
         (let ((pid (dorg-heading-parent-id h)))
           (puthash pid (append (gethash pid by-parent) (list h))
@@ -945,8 +1381,7 @@ PROPERTIES drawer appearing later in the body is treated as domain content
 and never receives an injected identity.  Does not emit post-blank or
 recurse into children."
   (let* ((hid (dorg-heading-id heading))
-         (level (dorg-heading-level heading))
-         (is-root (= level 0))
+         (is-root (dorg-model-root-p heading))
          (items (dorg-heading-items heading))
          (local-drawer (and (not is-root)
                             (dorg-model--local-identity-drawer items))))
@@ -979,7 +1414,7 @@ recurse into children."
 
 (defun dorg-model--insert-post-blank (heading out)
   "Insert HEADING's post-blank newlines into buffer OUT."
-  (unless (= (dorg-heading-level heading) 0)
+  (unless (dorg-model-root-p heading)
     (let ((pb (or (dorg-heading-post-blank heading) 0)))
       (when (> pb 0)
         (with-current-buffer out
@@ -1095,43 +1530,54 @@ Incompatible kind or name changes become delete+insert for that item."
     (equal (dorg-drawer-item-name old) (dorg-drawer-item-name new)))
    (t nil)))
 
-(defun dorg-model--plan-items-assign-keys (new match)
+(defun dorg-model--plan-items-assign-keys (new match old)
   "Build ordered item ops with final sort keys.
 NEW is the filtered list of parsed items; MATCH is a vector mapping each
-new index to its reused OLD item (or nil for an insert).  A matched item
-becomes `:keep' when `dorg-model--item-semantic-equal-p' holds (no detail
-rewrite needed), or `:update' when its content changed (id still reused).
+new index to its reused OLD item (or nil for an insert); OLD is the complete
+filtered DB item list.  A matched item becomes `:keep' when
+`dorg-model--item-semantic-equal-p' holds (no detail rewrite needed), or
+`:update' when its content changed (id still reused).
 
 Reused items keep their DB sort keys while their relative order stays
-monotonic; inserts get midpoint keys between reused neighbors.  When the
-reused order is non-monotonic (an item reorder) or nothing is reused, all
-items get fresh strictly-ordered sequential keys.  Returns the
-:keep/:update/:insert ops in new document order."
+monotonic; inserts get fresh keys in the gap between their reused
+neighbours.  When the reused order is non-monotonic (a reorder), nothing is
+reused, or a gap has no room, every item gets a fresh key spread across the
+domain.  A fresh key never equals any key in OLD, so at no point during
+lowering can two rows hold the same key and no temporary keys are needed.
+Returns the :keep/:update/:insert ops in new document order."
   (let* ((nlen (length new))
+         (old-keys (make-hash-table :test 'equal))
          (reused-keys (cl-loop for i from 0 below nlen
                                for o = (aref match i)
                                when o collect (dorg-item-sort-key o)))
          (monotonic (and (cl-notany #'null reused-keys)
                          (dorg-sortkey-ordered-p reused-keys)))
          (final (make-vector nlen nil)))
-    (if (or (null reused-keys) (not monotonic))
-        ;; No reuse, or a reorder: fresh ordered keys for every item.
-        (let ((w (dorg-sortkey-width-for-count nlen)))
-          (cl-loop for i from 0 below nlen do
-                   (aset final i (dorg-sortkey-from-integer (1+ i) w))))
-      ;; Monotonic reuse: reused items keep DB keys, inserts get midpoints.
-      (let ((prev nil))
-        (cl-loop for i from 0 below nlen
-                 for o = (aref match i) do
-                 (if o
-                     (progn (aset final i (dorg-item-sort-key o))
-                            (setq prev (dorg-item-sort-key o)))
-                   (let* ((next (cl-loop for j from (1+ i) below nlen
-                                         for oj = (aref match j)
-                                         when oj return (dorg-item-sort-key oj)))
-                          (mid (dorg-sortkey-midpoint prev next)))
-                     (aset final i mid)
-                     (setq prev mid))))))
+    (dolist (o old)
+      (when (dorg-item-sort-key o)
+        (puthash (dorg-item-sort-key o) t old-keys)))
+    (cl-flet ((fill-all ()
+                (let ((keys (dorg-sortkey-spread
+                             nlen 1 dorg-sortkey-boundary-max old-keys)))
+                  (dotimes (i nlen)
+                    (aset final i (pop keys))))))
+      (if (or (null reused-keys) (not monotonic))
+          (fill-all)
+        ;; Monotonic reuse: reused items keep DB keys, inserts get gap keys.
+        (condition-case nil
+            (let ((prev nil))
+              (cl-loop for i from 0 below nlen
+                       for o = (aref match i) do
+                       (if o
+                           (progn (aset final i (dorg-item-sort-key o))
+                                  (setq prev (dorg-item-sort-key o)))
+                         (let* ((next (cl-loop for j from (1+ i) below nlen
+                                               for oj = (aref match j)
+                                               when oj return (dorg-item-sort-key oj)))
+                                (key (car (dorg-model-plan-gap prev next 1 old-keys))))
+                           (aset final i key)
+                           (setq prev key)))))
+          (dorg-sortkey-exhausted (fill-all)))))
     (cl-loop for n in new
              for i from 0
              for o = (aref match i)
@@ -1140,7 +1586,6 @@ items get fresh strictly-ordered sequential keys.  Returns the
                       ((null o) (list :insert n k))
                       ((dorg-model--item-semantic-equal-p o n) (list :keep o n k))
                       (t (list :update o n k))))))
-
 (defun dorg-model-plan-items (old-items new-items)
   "Plan item ops reconciling OLD-ITEMS (DB-bound) to NEW-ITEMS (parsed).
 OLD-ITEMS carry `dorg-item-id'/`dorg-item-sort-key'; NEW-ITEMS leave them
@@ -1188,7 +1633,7 @@ unpaired new items are inserted."
                    (aset match i o)
                    (puthash o t used)))))
     ;; Phase 3 — sort keys + ops, then deletes for unused old items.
-    (append (dorg-model--plan-items-assign-keys new match)
+    (append (dorg-model--plan-items-assign-keys new match old)
             (cl-loop for o in old
                      unless (gethash o used)
                      collect (list :delete o)))))

@@ -155,7 +155,7 @@ The inversion means the branch never reaches directly into the transport:
 it funcalls the registered loader with (DIR ROOT-ID) and returns its value.
 Binding a spy proves the dispatch is invoked via the seam."
   (let* ((seen nil)
-         (sentinel (make-dorg-heading :id 7 :level 0 :title "root"))
+         (sentinel (make-dorg-heading :id 7 :level 0 :level-offset 0 :title "root"))
          (dorg-root--dolt-loader
           (lambda (dir id) (setq seen (list dir id)) sentinel)))
     (should (eq sentinel

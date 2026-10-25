@@ -30,7 +30,7 @@
 
 (defconst dorg-test-infra--insert
   (concat "INSERT INTO headings"
-          " (id, root_id, parent_id, sort_key, level, commented, title, post_blank)"
+          " (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank)"
           " VALUES (%d, %d, NULL, X'01', 0, FALSE, '%s', 0)")
   "Template INSERT of a single level-0 root heading with a title.")
 
@@ -1041,7 +1041,7 @@ live full-suite fixture's proc/data-dir."
                      (lambda (&rest _) t))
                     ((symbol-function 'dorg-dolt-server--free-port)
                      (lambda () 3999))
-                    ((symbol-function 'start-process)
+                    ((symbol-function 'dorg-dolt-server--spawn-logged)
                      (lambda (&rest _)
                        (setq record-at-spawn
                              (let (hit)
@@ -1383,7 +1383,7 @@ the record and delete the root despite the live child."
                      (lambda () '(90001)))
                     ((symbol-function 'process-attributes)
                      ;; A live `dolt sql-server' launched with this data-dir --
-                     ;; the exact argv `start-process' passes (fixture.el:~1288).
+                     ;; the argv the fixture spawn passes.
                      (lambda (pid)
                        (when (= pid 90001)
                          `((comm . "dolt")
@@ -1989,6 +1989,8 @@ deletes the root.  A port going down is NOT accepted as confirmation while the
 pid may remain live.  Non-vacuous against a reap that declares `gone' from
 port-down alone."
   (let* ((dorg-test--owned-roots (make-hash-table :test 'equal))
+         (dorg-test--server-proc nil)
+         (dorg-test--server-port nil)
          (root (dorg-test--canonical-path "/tmp/dorg-test-reapstore/" t))
          (store (concat root "s/"))
          (store-canon (dorg-test--canonical-path store t))
@@ -2076,6 +2078,8 @@ pid that is not matched/killed leaves a non-`gone' status, so the root is never
 deleted over it.  Non-vacuous against a reap that reads only the claim and,
 finding none, declares the store `gone' over a live server."
   (let* ((dorg-test--owned-roots (make-hash-table :test 'equal))
+         (dorg-test--server-proc nil)
+         (dorg-test--server-port nil)
          (root (dorg-test--canonical-path "/tmp/dorg-test-infoonly/" t))
          (store (concat root "s/"))
          (kills nil))
@@ -2158,6 +2162,8 @@ that reads the identity AFTER the stop (seeing nothing) and returns gone over a
 live server."
   (let* ((dorg-test--owned-roots (make-hash-table :test 'equal))
          (dorg-dolt-server--procs (make-hash-table :test 'equal))
+         (dorg-test--server-proc nil)
+         (dorg-test--server-port nil)
          (root (dorg-test--canonical-path "/tmp/dorg-test-snap/" t))
          (store (concat root "s/"))
          (store-canon (dorg-test--canonical-path store t))
@@ -2193,28 +2199,149 @@ requires ALL gone: the live native process blocks, so the claim/root are
 PRESERVED.  Non-vacuous against a reap that confirms only the (dead) overlay
 and deletes metadata over the live native process."
   (let* ((dorg-test--owned-roots (make-hash-table :test 'equal))
+         (dorg-test--server-proc nil)
+         (dorg-test--server-port nil)
+         ;; The Actions probe must carry the decision row without enabling the
+         ;; side-effectful trace oracle for unrelated real cleanup paths.
+         (dorg-test--reap-owned-store-trace t)
+         (dorg-test--reap-owned-store-trace-stubs nil)
+         (dorg-test--reap-owned-store-trace-current-test
+          'dorg-test-reap-owned-store-claim-native-disagreement-preserves)
          (root (dorg-test--canonical-path "/tmp/dorg-test-disagree/" t))
          (store (concat root "s/"))
          (claim-deleted nil) (kills nil))
     (puthash root t dorg-test--owned-roots)
     (cl-letf (((symbol-function 'dorg-dolt-server--canonical-dir)
-               (lambda (d) (dorg-test--canonical-path d t)))
+               (dorg-test--reap-owned-store-mark-stub
+                'dorg-dolt-server--canonical-dir
+                (lambda (d) (dorg-test--canonical-path d t))))
               ((symbol-function 'dorg-sql--close-connection) (lambda (&rest _) nil))
               ((symbol-function 'dorg-dolt-server--claim-read)
-               (lambda (&rest _) '((:server-pid . 100) (:port . 4000))))
+               (dorg-test--reap-owned-store-mark-stub
+                'dorg-dolt-server--claim-read
+                (lambda (&rest _) '((:server-pid . 100) (:port . 4000)))))
               ((symbol-function 'dorg-dolt-server--dolt-server-info)
-               (lambda (&rest _) '(:pid 200 :port 4001)))
+               (dorg-test--reap-owned-store-mark-stub
+                'dorg-dolt-server--dolt-server-info
+                (lambda (&rest _) '(:pid 200 :port 4001))))
               ((symbol-function 'dorg-dolt-server--pid-live-p)
-               (lambda (pid) (and (eql pid 200) t)))     ; 100 dead, 200 live
+               (dorg-test--reap-owned-store-mark-stub
+                'dorg-dolt-server--pid-live-p
+                (lambda (pid) (and (eql pid 200) t)))) ; 100 dead, 200 live
               ((symbol-function 'process-attributes)
-               (lambda (_p) '((comm . "unrelated") (args . "unrelated"))))
+               (dorg-test--reap-owned-store-mark-stub
+                'process-attributes
+                (lambda (_p) '((comm . "unrelated") (args . "unrelated")))))
               ((symbol-function 'dorg-dolt-server--kill-pid)
-               (lambda (pid &optional _g) (push pid kills) t))
+               (dorg-test--reap-owned-store-mark-stub
+                'dorg-dolt-server--kill-pid
+                (lambda (pid &optional _g) (push pid kills) t)))
               ((symbol-function 'dorg-dolt-server--claim-delete-file)
-               (lambda (&rest _) (setq claim-deleted t))))
+               (dorg-test--reap-owned-store-mark-stub
+                'dorg-dolt-server--claim-delete-file
+                (lambda (&rest _) (setq claim-deleted t)))))
       (let ((status (dorg-test--reap-owned-store store)))
         (should-not (eq status 'gone))
         (should-not claim-deleted)))))
+
+(defmacro dorg-test-infra--with-fake-shared-pid (pid var &rest body)
+  "Run BODY with VAR bound to a live non-Dolt process whose pid reads as PID."
+  (declare (indent 2) (debug (form symbolp body)))
+  `(let ((,var (start-process "dorg-test-fake-shared" nil "sleep" "30")))
+     (unwind-protect
+         (cl-letf (((symbol-function 'process-id) (lambda (_p) ,pid)))
+           ,@body)
+       (ignore-errors (delete-process ,var)))))
+
+(defun dorg-test-infra--run-ert-body (test)
+  "Run TEST's ERT body directly under the caller's dynamic bindings."
+  (funcall (ert-test-body (ert-get-test test))))
+
+(ert-deftest dorg-test-reap-owned-store-claim-native-disagreement-isolated-from-shared-port ()
+  "The real disagreement test survives injected shared-server port collision.
+Mutation control: removing the test's inner shared-server nil bindings makes the
+original `(should-not (eq status 'gone))' assertion fail as `(eq gone gone)'."
+  (let ((dorg-test--server-port 4001))
+    (dorg-test-infra--run-ert-body
+     'dorg-test-reap-owned-store-claim-native-disagreement-preserves)))
+
+(ert-deftest dorg-test-reap-owned-store-claim-native-disagreement-isolated-from-shared-pid ()
+  "The real disagreement test survives injected shared-server pid collision."
+  (dorg-test-infra--with-fake-shared-pid 200 fake
+    (let ((dorg-test--server-proc fake))
+      (dorg-test-infra--run-ert-body
+       'dorg-test-reap-owned-store-claim-native-disagreement-preserves))))
+
+(ert-deftest dorg-test-reap-owned-store-claim-native-disagreement-noncolliding-shared-control ()
+  "The real disagreement test still preserves under non-colliding shared state."
+  (dorg-test-infra--with-fake-shared-pid 201 fake
+    (let ((dorg-test--server-proc fake)
+          (dorg-test--server-port 4002))
+      (dorg-test-infra--run-ert-body
+       'dorg-test-reap-owned-store-claim-native-disagreement-preserves))))
+
+(ert-deftest dorg-test-reap-owned-store-snapshot-identity-isolated-from-shared-port ()
+  "The snapshot-before-stop sibling survives injected shared-server port collision."
+  (let ((dorg-test--server-port 4040))
+    (dorg-test-infra--run-ert-body
+     'dorg-test-reap-owned-store-snapshots-identity-before-stop)))
+
+(ert-deftest dorg-test-reap-owned-store-snapshot-identity-isolated-from-shared-pid ()
+  "The snapshot-before-stop sibling survives injected shared-server pid collision."
+  (dorg-test-infra--with-fake-shared-pid 6161 fake
+    (let ((dorg-test--server-proc fake))
+      (dorg-test-infra--run-ert-body
+       'dorg-test-reap-owned-store-snapshots-identity-before-stop))))
+
+(ert-deftest dorg-test-reap-owned-store-snapshot-identity-noncolliding-shared-control ()
+  "The snapshot-before-stop sibling still preserves under non-colliding shared state."
+  (dorg-test-infra--with-fake-shared-pid 6162 fake
+    (let ((dorg-test--server-proc fake)
+          (dorg-test--server-port 4041))
+      (dorg-test-infra--run-ert-body
+       'dorg-test-reap-owned-store-snapshots-identity-before-stop))))
+
+(ert-deftest dorg-test-reap-owned-store-unconfirmed-kill-isolated-from-shared-port ()
+  "The unconfirmed-kill synthetic test survives injected shared-server port collision."
+  (let ((dorg-test--server-port 7070))
+    (dorg-test-infra--run-ert-body
+     'dorg-test-reap-owned-store-preserves-on-unconfirmed-kill)))
+
+(ert-deftest dorg-test-reap-owned-store-unconfirmed-kill-isolated-from-shared-pid ()
+  "The unconfirmed-kill synthetic test survives injected shared-server pid collision."
+  (dorg-test-infra--with-fake-shared-pid 8181 fake
+    (let ((dorg-test--server-proc fake))
+      (dorg-test-infra--run-ert-body
+       'dorg-test-reap-owned-store-preserves-on-unconfirmed-kill))))
+
+(ert-deftest dorg-test-reap-owned-store-unconfirmed-kill-noncolliding-shared-control ()
+  "The unconfirmed-kill synthetic test still preserves under non-colliding shared state."
+  (dorg-test-infra--with-fake-shared-pid 8182 fake
+    (let ((dorg-test--server-proc fake)
+          (dorg-test--server-port 7071))
+      (dorg-test-infra--run-ert-body
+       'dorg-test-reap-owned-store-preserves-on-unconfirmed-kill))))
+
+(ert-deftest dorg-test-reap-owned-store-info-only-isolated-from-shared-port ()
+  "The info-only synthetic test survives injected shared-server port collision."
+  (let ((dorg-test--server-port 5050))
+    (dorg-test-infra--run-ert-body
+     'dorg-test-reap-owned-store-info-only-blocks-over-live-pid)))
+
+(ert-deftest dorg-test-reap-owned-store-info-only-isolated-from-shared-pid ()
+  "The info-only synthetic test survives injected shared-server pid collision."
+  (dorg-test-infra--with-fake-shared-pid 9191 fake
+    (let ((dorg-test--server-proc fake))
+      (dorg-test-infra--run-ert-body
+       'dorg-test-reap-owned-store-info-only-blocks-over-live-pid))))
+
+(ert-deftest dorg-test-reap-owned-store-info-only-noncolliding-shared-control ()
+  "The info-only synthetic test still preserves under non-colliding shared state."
+  (dorg-test-infra--with-fake-shared-pid 9192 fake
+    (let ((dorg-test--server-proc fake)
+          (dorg-test--server-port 5051))
+      (dorg-test-infra--run-ert-body
+       'dorg-test-reap-owned-store-info-only-blocks-over-live-pid))))
 
 ;; OC 03:34 (A): raw overlay read + coalesce a provisional (nil-pid) overlay
 ;; into the native identity on a shared port; distinct ports stay separate.
@@ -3253,7 +3380,7 @@ its dynamic extent."
                    ((symbol-function 'dorg-test--registry-write) (lambda (&rest _) nil))
                    ((symbol-function 'dorg-test--registry-delete) (lambda (&rest _) nil))
                    ((symbol-function 'dorg-dolt-server--free-port) (lambda () 3999))
-                   ((symbol-function 'start-process)
+                   ((symbol-function 'dorg-dolt-server--spawn-logged)
                     (lambda (&rest _) 'dorg-test-fixture--fake-proc))
                    ((symbol-function 'process-id) (lambda (&rest _) 4242))
                    ((symbol-function 'process-live-p)
@@ -3353,7 +3480,7 @@ re-write is needed).  RED before IMPL (void-function)."
     (let ((writes 0) (spawns 0) order)
       (cl-letf (((symbol-function 'dorg-test--registry-write)
                  (lambda (&rest _) (cl-incf writes) (push 'write order) nil))
-                ((symbol-function 'start-process)
+                ((symbol-function 'dorg-dolt-server--spawn-logged)
                  (lambda (&rest _)
                    (cl-incf spawns) (push 'spawn order)
                    'dorg-test-fixture--fake-proc)))
@@ -3373,7 +3500,7 @@ runs exactly once and the SAME lease object is returned.  This is the
   (should (fboundp 'dorg-dolt-fixture-shared-ensure))
   (dorg-test-fixture--with-spawn-mocked
     (let ((spawns 0))
-      (cl-letf (((symbol-function 'start-process)
+      (cl-letf (((symbol-function 'dorg-dolt-server--spawn-logged)
                  (lambda (&rest _) (cl-incf spawns) 'dorg-test-fixture--fake-proc)))
         (let ((lease1 (funcall 'dorg-dolt-fixture-shared-ensure))
               (lease2 (funcall 'dorg-dolt-fixture-shared-ensure)))
@@ -3573,7 +3700,7 @@ happens; an idempotent second ensure does NOT bump it.  RED before IMPL."
   (dorg-test-fixture--with-spawn-mocked
     (let ((cold0 (plist-get (funcall 'dorg-dolt-fixture-inventory) :cold-starts))
           (spawns 0))
-      (cl-letf (((symbol-function 'start-process)
+      (cl-letf (((symbol-function 'dorg-dolt-server--spawn-logged)
                  (lambda (&rest _) (cl-incf spawns) 'dorg-test-fixture--fake-proc)))
         (let ((lease (funcall 'dorg-dolt-fixture-shared-ensure)))
           (unwind-protect
@@ -3729,6 +3856,8 @@ ignored).  RED now (the helper still owns lifecycle); GREEN once IMPL
 migrates it all into the opaque fixture module."
   (let ((forbidden '(;; direct spawn
                      start-process
+                     make-process
+                     dorg-dolt-server--spawn-logged
                      call-process
                      ;; PID-metadata scan
                      process-attributes
@@ -3788,7 +3917,7 @@ no unwind after the durable-record write)."
   ;;     registration, singleton/connection nil.
   (dorg-test-fixture--with-spawn-mocked
     (let ((deletes 0))
-      (cl-letf (((symbol-function 'start-process)
+      (cl-letf (((symbol-function 'dorg-dolt-server--spawn-logged)
                  (lambda (&rest _) (error "spec: spawn failed")))
                 ((symbol-function 'dorg-test--registry-delete)
                  (lambda (&rest _) (cl-incf deletes) nil)))
@@ -4086,7 +4215,7 @@ only condition that authorises recovery — distinct from the live-but-unlisted
 inconsistency, which must fail closed."
   (dorg-test-fixture--with-spawn-mocked
     (let ((spawns 0))
-      (cl-letf (((symbol-function 'start-process)
+      (cl-letf (((symbol-function 'dorg-dolt-server--spawn-logged)
                  (lambda (&rest _) (cl-incf spawns) 'dorg-test-fixture--fake-proc)))
         (let ((lease1 (funcall 'dorg-dolt-fixture-shared-ensure)))
           (should (= 1 spawns))
@@ -4529,7 +4658,7 @@ Non-vacuous against a recovery that reclaims the data-dir but leaves the
 store leases (and count) dangling."
   (dorg-test-fixture--with-spawn-mocked
     (let ((spawns 0))
-      (cl-letf (((symbol-function 'start-process)
+      (cl-letf (((symbol-function 'dorg-dolt-server--spawn-logged)
                  (lambda (&rest _) (cl-incf spawns) 'dorg-test-fixture--fake-proc)))
         (funcall 'dorg-dolt-fixture-shared-ensure)
         (funcall 'dorg-dolt-fixture-store-acquire)
@@ -4611,7 +4740,7 @@ against a recovery whose failure is swallowed before a fresh spawn overwrites
 the singleton."
   (dorg-test-fixture--with-spawn-mocked
     (let ((spawns 0) (fail-dir t))
-      (cl-letf (((symbol-function 'start-process)
+      (cl-letf (((symbol-function 'dorg-dolt-server--spawn-logged)
                  (lambda (&rest _) (cl-incf spawns) 'dorg-test-fixture--fake-proc))
                 ((symbol-function 'delete-directory)
                  (lambda (&rest _)
@@ -4643,7 +4772,7 @@ and NO second spawn occurs.  Non-vacuous against a reuse gate that treats
 live process, orphaning it, and/or spawn a duplicate)."
   (dorg-test-fixture--with-spawn-mocked
     (let ((spawns 0))
-      (cl-letf (((symbol-function 'start-process)
+      (cl-letf (((symbol-function 'dorg-dolt-server--spawn-logged)
                  (lambda (&rest _) (cl-incf spawns) 'dorg-test-fixture--fake-proc)))
         (let ((lease1 (funcall 'dorg-dolt-fixture-shared-ensure)))
           (should (= 1 spawns))
@@ -4699,7 +4828,7 @@ Non-vacuous against a retry that sees singleton=nil and spawns a duplicate over
 the still-live original."
   (dorg-test-fixture--with-spawn-mocked
     (let ((spawns 0) (proc-alive t) (connect-fail t))
-      (cl-letf (((symbol-function 'start-process)
+      (cl-letf (((symbol-function 'dorg-dolt-server--spawn-logged)
                  (lambda (&rest _) (cl-incf spawns) 'dorg-test-fixture--fake-proc))
                 ((symbol-function 'mysql-connect)
                  (lambda (&rest _) (if connect-fail (error "spec: connect failed")
@@ -4736,7 +4865,7 @@ old dir.  Non-vacuous against an abort that sets the sentinel only for a live
 proc (a retry would reuse shared-<pid> and overwrite the record)."
   (dorg-test-fixture--with-spawn-mocked
     (let ((spawns 0) (fail-dir t))
-      (cl-letf (((symbol-function 'start-process)
+      (cl-letf (((symbol-function 'dorg-dolt-server--spawn-logged)
                  (lambda (&rest _) (cl-incf spawns) 'dorg-test-fixture--fake-proc))
                 ((symbol-function 'dorg-dolt-server--wait-ready)
                  (lambda (&rest _) (if fail-dir (error "spec: readiness failed") t)))
@@ -4760,17 +4889,66 @@ proc (a retry would reuse shared-<pid> and overwrite the record)."
                 (should (eq lease dorg-dolt-fixture--shared-lease)))
             (ignore-errors (funcall 'dorg-dolt-fixture-close lease))))))))
 
-;; OC 03:47 (1): finalize kills the owned process buffer (no leak).
-(ert-deftest dorg-test-fixture-close-kills-owned-process-buffer ()
-  "Closing a shared-server lease KILLS its owned process buffer after the stop
-is confirmed — the buffer is not leaked.  Non-vacuous against a finalize that
-reclaims the data-dir/record/procs but leaves the process buffer alive."
+;; The shared server's log is a file the server writes itself, never an
+;; Emacs process buffer.  A diag-dir log is evidence and survives every exit;
+;; a sibling log is removed with the data-dir.
+
+(defun dorg-test-fixture--logging-spawn (sink)
+  "Return a mocked spawn that writes simulated Dolt output to its log.
+It records (LOGFILE . DATA-DIR) through SINK, a one-argument function."
+  (lambda (_name args logfile)
+    (write-region "spec: dolt sql-server startup output\n" nil logfile nil 'silent)
+    (funcall sink (cons logfile (file-name-as-directory
+                                 (cadr (member "--data-dir" args)))))
+    'dorg-test-fixture--fake-proc))
+
+(ert-deftest dorg-test-dolt-fixture-failed-start-keeps-diag-log ()
+  "A failed start keeps the server's log in the diagnostic directory.
+The server writes <diag>/shared-server-<port>.log itself, so the evidence
+needs no copy and survives the unwind that removes the data-dir."
   (dorg-test-fixture--with-spawn-mocked
-    (let ((lease (funcall 'dorg-dolt-fixture-shared-ensure)))
-      (let ((buf (dorg-dolt-fixture--lease-buffer lease)))
-        (should (buffer-live-p buf))
-        (funcall 'dorg-dolt-fixture-close lease)
-        (should-not (buffer-live-p buf))))))
+    (let* ((diag (make-temp-file "dorg-fixture-diag-" t))
+           (dorg-test-diag-dir diag)
+           (seen nil))
+      (unwind-protect
+          (cl-letf (((symbol-function 'dorg-dolt-server--spawn-logged)
+                     (dorg-test-fixture--logging-spawn (lambda (x) (setq seen x))))
+                    ((symbol-function 'dorg-dolt-server--wait-ready)
+                     (lambda (&rest _) (error "spec: readiness failed")))
+                    ((symbol-function 'process-live-p) (lambda (&rest _) nil)))
+            (should-error (funcall 'dorg-dolt-fixture-shared-ensure))
+            (should (equal (car seen) (expand-file-name "shared-server-3999.log" diag)))
+            (should (string-match-p "startup output"
+                                    (with-temp-buffer
+                                      (insert-file-contents (car seen))
+                                      (buffer-string))))
+            (should-not (file-exists-p (cdr seen)))
+            (should-not (file-exists-p (dorg-dolt-fixture--sibling-log (cdr seen)))))
+        (delete-directory diag t)))))
+
+(ert-deftest dorg-test-dolt-fixture-no-diag-leaves-no-stray-log ()
+  "Without a diagnostic dir, neither a failed start nor a close leaves a log.
+The sibling log beside the data-dir goes after the process is dead and
+before the data-dir, on the failure unwind and on a normal close alike.
+The lease owns no process buffer."
+  (dorg-test-fixture--with-spawn-mocked
+    (let ((dorg-test-diag-dir nil) (seen nil) (fail t))
+      (cl-letf (((symbol-function 'dorg-dolt-server--spawn-logged)
+                 (dorg-test-fixture--logging-spawn (lambda (x) (setq seen x))))
+                ((symbol-function 'dorg-dolt-server--wait-ready)
+                 (lambda (&rest _) (if fail (error "spec: readiness failed") t))))
+        (cl-letf (((symbol-function 'process-live-p) (lambda (&rest _) nil)))
+          (should-error (funcall 'dorg-dolt-fixture-shared-ensure)))
+        (should (equal (car seen) (dorg-dolt-fixture--sibling-log (cdr seen))))
+        (should-not (file-exists-p (car seen)))
+        (should-not (file-exists-p (cdr seen)))
+        (setq fail nil seen nil)
+        (let ((lease (funcall 'dorg-dolt-fixture-shared-ensure)))
+          (should-not (dorg-dolt-fixture--lease-buffer lease))
+          (should (file-exists-p (car seen)))
+          (funcall 'dorg-dolt-fixture-close lease)
+          (should-not (file-exists-p (car seen)))
+          (should-not (file-exists-p (cdr seen))))))))
 
 ;; OC 03:47 (2): store-release removes by the stored key, never re-canonicalizes.
 (ert-deftest dorg-test-fixture-store-release-removes-by-stored-key ()

@@ -1,0 +1,719 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+usage: tools/dorg-suite-job-local --image IMAGE [--commit FULL_40_HEX_SHA] [--source-packet FILE --tree FULL_TREE_SHA] [--launcher local|actions] [--artifacts DIR] [--selector REGEXP] [--raw-server-evidence-repeat 1..50] [--positive-control-residue]
+EOF
+}
+
+image=
+commit=
+launcher=local
+artifacts=
+selector=
+raw_server_evidence_repeat=
+positive_control=false
+source_packet=
+tree=
+while (($#)); do
+  case "$1" in
+    --image)
+      image="${2:-}"
+      shift 2
+      ;;
+    --commit)
+      commit="${2:-}"
+      shift 2
+      ;;
+    --source-packet)
+      source_packet="${2:-}"
+      shift 2
+      ;;
+    --tree)
+      tree="${2:-}"
+      shift 2
+      ;;
+    --launcher)
+      launcher="${2:-}"
+      shift 2
+      ;;
+    --artifacts)
+      artifacts="${2:-}"
+      shift 2
+      ;;
+    --selector)
+      selector="${2:-}"
+      shift 2
+      ;;
+    --raw-server-evidence-repeat)
+      raw_server_evidence_repeat="${2:-}"
+      shift 2
+      ;;
+    --positive-control-residue)
+      positive_control=true
+      shift
+      ;;
+    *)
+      usage
+      exit 64
+      ;;
+  esac
+done
+
+if [[ -n "$raw_server_evidence_repeat" ]]; then
+  [[ "$raw_server_evidence_repeat" =~ ^([1-9]|[1-4][0-9]|50)$ ]] || {
+    echo "refuse: --raw-server-evidence-repeat must be an integer in 1..50" >&2
+    exit 64
+  }
+  [[ "$selector" == '^dorg-test-evidence-real-kernel-raw-server-shape$' ]] || {
+    echo "refuse: --raw-server-evidence-repeat requires the exact raw-server selector" >&2
+    exit 64
+  }
+fi
+
+[[ -n "$image" ]] || { usage; exit 64; }
+if [[ -n "$source_packet" ]]; then
+  [[ -f "$source_packet" && "$tree" =~ ^[0-9a-f]{40}$ && -n "$commit" ]] || {
+    echo "refuse: packet requires a file and explicit full commit/tree" >&2
+    exit 65
+  }
+elif [[ -z "$commit" ]]; then
+  commit="$(git rev-parse HEAD)"
+fi
+if [[ -n "$tree" && -z "$source_packet" ]]; then
+  echo "refuse: --tree requires --source-packet" >&2
+  exit 65
+fi
+[[ "$commit" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "refuse: --commit did not yield a full SHA: $commit" >&2
+  exit 65
+}
+workspace_commit="$(git rev-parse HEAD)"
+[[ "$workspace_commit" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "refuse: git rev-parse HEAD did not yield a full SHA: $workspace_commit" >&2
+  exit 65
+}
+[[ -n "$source_packet" || "$workspace_commit" == "$commit" ]] || {
+  echo "refuse: workspace HEAD $workspace_commit does not match requested $commit" >&2
+  exit 66
+}
+case "$launcher" in
+  local|actions) ;;
+  *)
+    echo "refuse: --launcher must be local or actions: $launcher" >&2
+    exit 64
+    ;;
+esac
+
+# The suite uses loopback fixtures only. Image construction fetches pinned
+# inputs before this container starts; no suite command has an egress grant.
+network_mode=none
+if [[ -n "${DORG_SUITE_JOB_NETWORK_MODE+x}" &&
+      "$DORG_SUITE_JOB_NETWORK_MODE" != "$network_mode" ]]; then
+  echo "refuse: caller network mode differs from fixed $network_mode policy" >&2
+  exit 64
+fi
+
+# Catchable cancellation needs a bounded Docker control plane on the host;
+# refuse before writing anything.
+timeout --version 2>/dev/null | grep -q 'GNU coreutils' || {
+  echo 'refuse: GNU timeout is required for bounded container cleanup' >&2
+  exit 69
+}
+
+if [[ -z "$artifacts" ]]; then
+  artifacts="${TMPDIR:-/tmp}/dorg-suite-job-artifacts-${commit}-$(date -u +%Y%m%dT%H%M%SZ)"
+fi
+mkdir -p "$artifacts/host-census"
+
+# Custody: a run-private cidfile and a unique run label.  Cleanup touches
+# only a container whose full ID is in that cidfile AND whose label matches;
+# a missing or unverifiable identity is recorded, never guessed.
+custody="$(mktemp -d "$artifacts/host-census/custody.XXXXXX")"
+cidfile="$custody/container.cid"
+run_label="${custody##*/}-$$"
+pipeline_pid=
+launching=false
+launch_pending=
+launch_pending_status=0
+host_interruption=
+host_original_status=0
+cleanup_deadline=0
+
+docker_control() {
+  local seconds=15
+  if (( cleanup_deadline > 0 )); then
+    seconds=$((cleanup_deadline - SECONDS))
+    (( seconds > 0 )) || return 124
+  fi
+  timeout -k .2 "$seconds" docker "$@"
+}
+
+census() {
+  local out="$1"
+  {
+    local output
+    local command_status
+    echo "[docker-containers]"
+    command_status=0
+    output="$(docker_control ps -aq 2>&1)" || command_status=$?
+    if [[ "$command_status" -eq 0 ]]; then
+      [[ -z "$output" ]] || printf '%s\n' "$output"
+    else
+      echo "unknown exit=$command_status command=docker ps -aq"
+    fi
+    echo "[docker-volumes]"
+    command_status=0
+    output="$(docker_control volume ls -q 2>&1)" || command_status=$?
+    if [[ "$command_status" -eq 0 ]]; then
+      [[ -z "$output" ]] || printf '%s\n' "$output"
+    else
+      echo "unknown exit=$command_status command=docker volume ls -q"
+    fi
+    echo "[job-temp-roots]"
+    find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'dorg-suite-job.*' -print 2>/dev/null || true
+    echo "[artifact-ownership]"
+    if [[ -d "$artifacts" ]]; then
+      while IFS= read -r -d '' path; do
+        stat -c '%u:%g %n' "$path" 2>/dev/null ||
+          stat -f '%u:%g %N' "$path" 2>/dev/null ||
+          true
+      done < <(find "$artifacts" -maxdepth 2 -print0)
+    fi
+  } >"$out"
+}
+
+section_entries() {
+  local file="$1"
+  local section="$2"
+  awk -v section="[$section]" '
+    $0 == section { in_section = 1; next }
+    /^\[/ { in_section = 0 }
+    in_section && length($0) { print }
+  ' "$file"
+}
+
+new_section_entries() {
+  local section="$1"
+  comm -13 \
+    <(section_entries "$artifacts/host-census/before.txt" "$section" | sort -u) \
+    <(section_entries "$artifacts/host-census/after.txt" "$section" | sort -u)
+}
+
+join_csv() {
+  local IFS=,
+  echo "$*"
+}
+
+record_host_census_outcome() {
+  local host_census="$1"
+  local classes="$2"
+  local host_census_status="$3"
+  local bundle_status="$4"
+  local container_status="$5"
+  local receipt_present=false
+  local receipt_overall=
+  local receipt_overall_raw=
+  local receipt_classification=
+  local step_compile=
+  local step_lint=
+  local step_test=
+  local manifest_completeness=
+  local ert_summary_state=absent
+  local ert_unexpected=
+  local evidence_completeness
+  local evidence_missing
+  local verdict_facts
+  local overall
+  local classification
+  local receipt_wall_time=false
+  # The verdict is derived from three fact lists and nothing else.  A pass is
+  # asserted only when all three are empty; there is no fallthrough branch,
+  # so a fact this launcher does not read can never produce a pass.
+  #   missing      evidence absent or unreadable        -> incomplete, exit 2
+  #   contradicted evidence present but incoherent      -> incomplete, exit 2
+  #   failed       coherent evidence of a failure       -> fail, that status
+  local missing=()
+  local contradicted=()
+  local failed=()
+
+  [[ -z "$host_interruption" ]] || missing+=("host-interruption:$host_interruption")
+
+  read_receipt_field() {
+    grep -E "^$1=" "$artifacts/exit.status" 2>/dev/null | tail -n 1 |
+      cut -d= -f2- || true
+  }
+
+  # --- evidence facts: every required artifact, present and well-formed ---
+  if [[ -f "$artifacts/exit.status" ]]; then
+    receipt_present=true
+    receipt_overall="$(read_receipt_field overall)"
+    receipt_classification="$(read_receipt_field classification)"
+    step_compile="$(read_receipt_field compile)"
+    step_lint="$(read_receipt_field lint)"
+    step_test="$(read_receipt_field test)"
+  else
+    missing+=("exit.status")
+  fi
+  [[ -f "$artifacts/manifest.txt" ]] || missing+=("manifest.txt")
+  [[ -f "$artifacts/raw.log" ]] || missing+=("raw.log")
+  if [[ -f "$artifacts/manifest.txt" ]]; then
+    manifest_completeness="$(grep -E '^artifact_completeness=' \
+      "$artifacts/manifest.txt" 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
+    [[ "$manifest_completeness" == "complete" ]] ||
+      missing+=("manifest.txt:artifact_completeness")
+  fi
+  if [[ -f "$artifacts/ert-summary.txt" ]]; then
+    if grep -Eq '^Ran [0-9]+ tests?, .* unexpected' "$artifacts/ert-summary.txt" \
+        2>/dev/null; then
+      ert_summary_state=present
+      ert_unexpected="$(grep -Eo '[0-9]+ unexpected' "$artifacts/ert-summary.txt" |
+        tail -n 1 | cut -d' ' -f1)"
+    else
+      ert_summary_state=malformed
+    fi
+  fi
+
+  if [[ "$receipt_present" == true ]]; then
+    if [[ -z "$receipt_overall" ]]; then
+      receipt_overall=2
+      missing+=("exit.status:overall")
+    elif [[ ! "$receipt_overall" =~ ^[0-9]+$ ]]; then
+      receipt_overall_raw="$receipt_overall"
+      receipt_overall=2
+      receipt_classification=incomplete
+      missing+=("exit.status:overall")
+    fi
+    case "$receipt_classification" in
+      pass|fail|wall-time|incomplete) ;;
+      *)
+        # An absent or empty classification is a missing required fact and
+        # is never inferred from overall; "unknown" or any other token is
+        # not a classification either.  The raw value (possibly empty) is
+        # retained in the export and the verdict cannot pass.
+        missing+=("exit.status:classification")
+        ;;
+    esac
+    # The container's own verdict is a fact like any other: a receipt that
+    # classifies itself incomplete is incomplete evidence, whatever the
+    # process exit and every other fact say.
+    [[ "$receipt_classification" != incomplete ]] ||
+      missing+=("exit.status:classification")
+    local step
+    local value
+    for step in compile lint test; do
+      eval "value=\"\$step_$step\""
+      [[ "$value" =~ ^([0-9]+|skipped)$ ]] || missing+=("exit.status:$step")
+    done
+    # The ERT summary is the evidence of the test step: required whenever
+    # the test step ran, whatever the receipt claims.
+    if [[ "$step_test" =~ ^[0-9]+$ && "$receipt_classification" != wall-time ]]; then
+      if [[ "$ert_summary_state" == absent ]]; then
+        missing+=("ert-summary.txt")
+      elif [[ "$ert_summary_state" == malformed ]]; then
+        missing+=("ert-summary.txt:summary")
+      fi
+    fi
+  else
+    receipt_overall=2
+    receipt_classification=incomplete
+    [[ "$ert_summary_state" == absent ]] && missing+=("ert-summary.txt")
+  fi
+
+  # --- coherence facts: independent evidence must agree with itself ---
+  # Evaluated only over evidence that is present; absent evidence is already
+  # recorded above.  A container that declares its own outcome incomplete is
+  # taken at its word and not judged for coherence.
+  if [[ "$receipt_present" == true && ${#missing[@]} -eq 0 &&
+        "$receipt_classification" != incomplete ]]; then
+    local claims_pass=false
+    local steps_pass=false
+    [[ "$receipt_overall" == "0" && "$receipt_classification" == pass ]] &&
+      claims_pass=true
+    [[ "$step_compile" == "0" && "$step_lint" == "0" && "$step_test" == "0" ]] &&
+      steps_pass=true
+    if [[ "$receipt_classification" == pass && "$receipt_overall" != "0" ]] ||
+       [[ "$receipt_classification" == fail && "$receipt_overall" == "0" ]] ||
+       [[ "$receipt_classification" == wall-time &&
+          ! "$receipt_overall" =~ ^(124|137)$ ]]; then
+      contradicted+=("exit.status:classification")
+    fi
+    if [[ "$claims_pass" == true && "$steps_pass" == false ]]; then
+      [[ "$step_compile" == "0" ]] || contradicted+=("exit.status:compile")
+      [[ "$step_lint" == "0" ]] || contradicted+=("exit.status:lint")
+      [[ "$step_test" == "0" ]] || contradicted+=("exit.status:test")
+    elif [[ "$claims_pass" == false && "$steps_pass" == true &&
+            "$receipt_classification" == fail && "$receipt_overall" != "0" ]]; then
+      contradicted+=("exit.status:overall")
+    fi
+    if [[ "$step_test" =~ ^[0-9]+$ && "$ert_summary_state" == present ]]; then
+      if [[ "$step_test" == "0" && "$ert_unexpected" != "0" ]] ||
+         [[ "$step_test" != "0" && "$ert_unexpected" == "0" ]]; then
+        contradicted+=("ert-summary.txt:unexpected")
+      fi
+    fi
+  fi
+
+  if [[ "$receipt_classification" == wall-time &&
+        "$receipt_overall" =~ ^(124|137)$ &&
+        "$container_status" == "$receipt_overall" ]]; then
+    case "$receipt_overall:$step_compile:$step_lint:$step_test" in
+      (124:124:skipped:skipped|137:137:skipped:skipped|\
+       124:0:124:skipped|137:0:137:skipped|\
+       124:0:0:124|137:0:0:137)
+        receipt_wall_time=true
+        ;;
+    esac
+  fi
+
+  # --- outcome facts: every process and the receipt itself succeeded ---
+  [[ "$bundle_status" == "0" ]] || failed+=("bundle_status=$bundle_status")
+  [[ "$container_status" == "0" || "$receipt_wall_time" == true ]] ||
+    failed+=("container_status=$container_status")
+  if [[ "$receipt_present" == true && "$receipt_classification" == fail ]]; then
+    failed+=("receipt_overall=$receipt_overall")
+  fi
+  [[ "$host_census" == pass ]] || failed+=("host_census=$host_census")
+
+  evidence_missing="$(join_csv "${missing[@]}" "${contradicted[@]}")"
+  if [[ -n "$evidence_missing" ]]; then
+    evidence_completeness=incomplete
+  else
+    evidence_completeness=complete
+  fi
+  verdict_facts="$(join_csv "${missing[@]}" "${contradicted[@]}" "${failed[@]}")"
+
+  # --- the verdict, derived: pass only with nothing unsatisfied ---
+  if [[ "$receipt_wall_time" == true && ${#missing[@]} -eq 0 &&
+        ${#contradicted[@]} -eq 0 && ${#failed[@]} -eq 0 ]]; then
+    overall="$receipt_overall"
+    classification=wall-time
+  elif [[ ${#missing[@]} -eq 0 && ${#contradicted[@]} -eq 0 &&
+        ${#failed[@]} -eq 0 ]]; then
+    overall=0
+    classification=pass
+  elif [[ ${#missing[@]} -gt 0 || ${#contradicted[@]} -gt 0 ||
+          "$receipt_classification" == incomplete ]]; then
+    overall=2
+    if [[ "$receipt_classification" == incomplete &&
+          "$receipt_overall" =~ ^[0-9]+$ && "$receipt_overall" != "0" ]]; then
+      overall="$receipt_overall"
+    fi
+    classification=incomplete
+  else
+    classification=fail
+    if [[ "$bundle_status" != "0" ]]; then
+      overall="$bundle_status"
+    elif [[ "$container_status" != "0" ]]; then
+      overall="$container_status"
+    elif [[ "$receipt_classification" == fail && "$receipt_overall" != "0" ]]; then
+      overall="$receipt_overall"
+    else
+      overall="$host_census_status"
+    fi
+    [[ "$overall" =~ ^[0-9]+$ && "$overall" != "0" ]] || overall=1
+  fi
+  if [[ -n "$host_interruption" ]]; then
+    overall="$host_original_status"
+    [[ "$overall" != 0 ]] || overall=2
+  fi
+
+  {
+    echo "host_census=$host_census"
+    echo "host_census_status=$host_census_status"
+    echo "host_census_residue_classes=$classes"
+  } >"$artifacts/host-census/result.txt"
+
+  if [[ -f "$artifacts/exit.status" ]]; then
+    grep -Ev '^(overall|classification|bundle_status|container_status|runtime_status|receipt_present|receipt_overall|receipt_overall_raw|receipt_classification|container_overall|container_overall_raw|container_classification|evidence_completeness|evidence_missing|verdict_facts|host_census|host_census_status|host_census_residue_classes)=' \
+      "$artifacts/exit.status" >"$artifacts/exit.status.tmp" || true
+  else
+    : >"$artifacts/exit.status.tmp"
+  fi
+  {
+    echo "bundle_status=$bundle_status"
+    echo "container_status=$container_status"
+    echo "runtime_status=$container_status"
+    echo "receipt_present=$receipt_present"
+    if [[ -n "$receipt_overall_raw" ]]; then
+      echo "receipt_overall_raw=$receipt_overall_raw"
+      echo "container_overall_raw=$receipt_overall_raw"
+    fi
+    echo "receipt_overall=$receipt_overall"
+    echo "receipt_classification=$receipt_classification"
+    echo "container_overall=$receipt_overall"
+    echo "container_classification=$receipt_classification"
+    echo "evidence_completeness=$evidence_completeness"
+    echo "evidence_missing=$evidence_missing"
+    echo "verdict_facts=$verdict_facts"
+    echo "host_census=$host_census"
+    echo "host_census_status=$host_census_status"
+    echo "host_census_residue_classes=$classes"
+    echo "host_interruption=$host_interruption"
+    echo "host_original_status=$host_original_status"
+    echo "overall=$overall"
+    echo "classification=$classification"
+  } >>"$artifacts/exit.status.tmp"
+  mv "$artifacts/exit.status.tmp" "$artifacts/exit.status"
+
+  {
+    echo "bundle_status=$bundle_status"
+    echo "container_status=$container_status"
+    echo "runtime_status=$container_status"
+    echo "receipt_present=$receipt_present"
+    echo "receipt_overall=$receipt_overall"
+    echo "receipt_classification=$receipt_classification"
+    echo "evidence_completeness=$evidence_completeness"
+    echo "evidence_missing=$evidence_missing"
+    echo "verdict_facts=$verdict_facts"
+    echo "host_census=$host_census"
+    echo "host_census_status=$host_census_status"
+    echo "host_census_residue_classes=$classes"
+  } >>"$artifacts/manifest.txt"
+
+  status="$overall"
+}
+
+evaluate_host_census() {
+  local bundle_status="$1"
+  local container_status="$2"
+  local expected_uid
+  expected_uid="$(id -u)"
+  local host_status
+  local host_status_code
+  local owner
+  local path
+  local uid
+  local classes=()
+
+  if section_entries "$artifacts/host-census/after.txt" docker-containers |
+      grep -q '^unknown exit='; then
+    classes+=(docker-container-unknown)
+  fi
+  if section_entries "$artifacts/host-census/after.txt" docker-volumes |
+      grep -q '^unknown exit='; then
+    classes+=(docker-volume-unknown)
+  fi
+  if [[ -n "$(new_section_entries docker-containers)" ]]; then
+    classes+=(docker-container)
+  fi
+  if [[ -n "$(new_section_entries docker-volumes)" ]]; then
+    classes+=(docker-volume)
+  fi
+  if [[ -n "$(new_section_entries job-temp-roots)" ]]; then
+    classes+=(job-temp-root)
+  fi
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    owner="${line%% *}"
+    path="${line#* }"
+    uid="${owner%%:*}"
+    if [[ "$uid" != "$expected_uid" || ( -d "$path" && ! -w "$path" ) ]]; then
+      classes+=(artifact-ownership)
+      break
+    fi
+  done < <(section_entries "$artifacts/host-census/after.txt" artifact-ownership)
+
+  classes="$(join_csv "${classes[@]}")"
+  if [[ -n "$classes" ]]; then
+    host_status=fail
+    host_status_code=1
+  else
+    host_status=pass
+    host_status_code=0
+  fi
+  record_host_census_outcome "$host_status" "$classes" "$host_status_code" "$bundle_status" "$container_status"
+}
+
+# Runs on every exit except the committed normal one, which disarms it first:
+# any exit reaching it is an interruption (a caught signal or an abnormal
+# shell exit) whose custody this handler discharges.
+# shellcheck disable=SC2317  # invoked only through the EXIT trap
+finish_interrupted() {
+  local original_status=$?
+  # A second signal must not interrupt custody discharge.  SIGKILL is outside
+  # this contract and remains the external job owner's responsibility.
+  trap '' INT TERM HUP
+  trap - EXIT
+  set +e
+  host_original_status="$original_status"
+  host_interruption="${host_interruption:-abnormal-exit}"
+  cleanup_deadline=$((SECONDS + 7))
+  if [[ -n "$pipeline_pid" ]]; then
+    # First end this launcher's own job group (exporter and Docker client),
+    # never the caller's group or a process-name census.  With the client
+    # gone no container can be created after the identity check below.
+    kill -TERM -- "-$pipeline_pid" 2>/dev/null
+    sleep .05
+    kill -KILL -- "-$pipeline_pid" 2>/dev/null
+    wait "$pipeline_pid" 2>/dev/null
+  fi
+  local cid='' identity='' inspect_status=0 stop_status=0 remove_status=0
+  local identity_state=missing
+  if [[ -f "$cidfile" ]]; then
+    cid="$(<"$cidfile")"
+    identity_state=invalid
+    if [[ "$cid" =~ ^[0-9a-f]{64}$ ]]; then
+      identity="$(docker_control inspect --format \
+        '{{.Id}} {{index .Config.Labels "dorg-suite-job.run"}}' "$cid")"
+      inspect_status=$?
+      identity_state=unverified
+      if [[ "$inspect_status" == 0 && "$identity" == "$cid $run_label" ]]; then
+        identity_state=owned
+        docker_control kill --signal TERM "$cid"
+        stop_status=$?
+        sleep .2
+        docker_control rm -f "$cid"
+        remove_status=$?
+      fi
+    fi
+  fi
+  {
+    echo "host_interruption=$host_interruption"
+    echo "host_original_status=$host_original_status"
+    echo "identity=$identity_state"
+    echo "inspect_status=$inspect_status"
+    echo "stop_status=$stop_status"
+    echo "remove_status=$remove_status"
+    echo "pipeline_pid=$pipeline_pid"
+  } >"$artifacts/host-census/cleanup.txt"
+  # Preserve the original container receipt, including earlier nonzero steps.
+  # If the normal path already rewrote the receipt and manifest with its own
+  # verdict, restore the container's originals so the verdict is re-derived
+  # from the container's evidence, not from the launcher's earlier verdict.
+  if [[ -f "$custody/container-exit.status" ]]; then
+    cp "$custody/container-exit.status" "$artifacts/exit.status"
+  elif [[ -f "$artifacts/exit.status" ]]; then
+    cp "$artifacts/exit.status" "$custody/container-exit.status"
+  fi
+  [[ ! -f "$custody/container-manifest.txt" ]] ||
+    cp "$custody/container-manifest.txt" "$artifacts/manifest.txt"
+  [[ -z "${positive_control_path:-}" ]] || rmdir "$positive_control_path" 2>/dev/null
+  census "$artifacts/host-census/after.txt"
+  local bundle_status=2 container_status=2
+  [[ ! -f "$custody/pipeline.status" ]] ||
+    read -r bundle_status container_status <"$custody/pipeline.status"
+  evaluate_host_census "$bundle_status" "$container_status"
+  exit "$status"
+}
+
+# While the background job is being started its process group is not yet
+# recorded, so a signal then is held as pending and raised as soon as the
+# group is known; otherwise it exits into finish_interrupted at once.
+# shellcheck disable=SC2317  # invoked only through the signal traps
+on_signal() {
+  if [[ "$launching" == true ]]; then
+    if [[ -z "$launch_pending" ]]; then
+      launch_pending="$1"
+      launch_pending_status="$2"
+    fi
+    return 0
+  fi
+  host_interruption="$1"
+  exit "$2"
+}
+
+trap finish_interrupted EXIT
+trap 'on_signal INT 130' INT
+trap 'on_signal TERM 143' TERM
+trap 'on_signal HUP 129' HUP
+
+census "$artifacts/host-census/before.txt"
+
+if [[ "$positive_control" == true ]]; then
+  positive_control_path="$(mktemp -d "${TMPDIR:-/tmp}/dorg-suite-job.positive-control.XXXXXX")"
+fi
+
+run_args=(run --source-bundle - --commit "$commit" --artifacts /artifacts)
+if [[ -n "$source_packet" ]]; then
+  run_args=(run --source-packet - --commit "$commit" --tree "$tree" --artifacts /artifacts)
+fi
+if [[ -n "$selector" ]]; then
+  run_args+=(--selector "$selector")
+fi
+docker_env_args=()
+if [[ -n "$raw_server_evidence_repeat" ]]; then
+  docker_env_args+=( -e "DORG_RAW_SERVER_EVIDENCE_REPEAT=$raw_server_evidence_repeat" )
+fi
+
+export_source() {
+  if [[ -n "$source_packet" ]]; then
+    cat "$source_packet"
+  else
+    git bundle create - HEAD
+  fi
+}
+
+# A foreground pipeline defers Bash traps until Docker exits. A background
+# job plus wait is interruptible; its private group also owns the exporter.
+set -m
+launching=true
+(
+set +e
+export_source |
+  docker run --rm --init --network "$network_mode" --user "$(id -u):$(id -g)" -i \
+    --cidfile "$cidfile" --label "dorg-suite-job.run=$run_label" \
+    -e DORG_SUITE_JOB_LAUNCHER="$launcher" \
+    -e DORG_SUITE_JOB_EVENT_NAME \
+    -e DORG_SUITE_JOB_REF \
+    -e DORG_SUITE_JOB_HEAD_REF \
+    -e DORG_SUITE_JOB_GITHUB_REPOSITORY \
+    -e DORG_SUITE_JOB_GITHUB_SERVER_URL \
+    -e DORG_SUITE_JOB_NETWORK_MODE="$network_mode" \
+    -e DORG_SUITE_JOB_WORKSPACE_SHA="$workspace_commit" \
+    -e DORG_SUITE_JOB_IMAGE_ID \
+    -e DORG_SUITE_JOB_IMAGE_DIGEST \
+    -e DORG_SUITE_JOB_IMAGE_METADATA \
+    -e DORG_SUITE_JOB_IMAGE_CACHE_INFERRED \
+    -e DORG_SUITE_JOB_IMAGE_CACHE_INFERENCE_THRESHOLD_SECONDS \
+    -e DORG_SUITE_JOB_IMAGE_BUILD_SECONDS \
+    "${docker_env_args[@]+${docker_env_args[@]}}" \
+    -v "$artifacts:/artifacts" \
+    "$image" "${run_args[@]}"
+pipe_status=("${PIPESTATUS[@]}")
+printf '%s %s\n' "${pipe_status[0]}" "${pipe_status[1]}" >"$custody/pipeline.status.tmp"
+mv "$custody/pipeline.status.tmp" "$custody/pipeline.status"
+exit 0
+) &
+pipeline_pid=$!
+launching=false
+if [[ -n "$launch_pending" ]]; then
+  host_interruption="$launch_pending"
+  exit "$launch_pending_status"
+fi
+wait "$pipeline_pid"
+read -r bundle_status container_status <"$custody/pipeline.status"
+if [[ "$bundle_status" -ne 0 ]]; then
+  status="$bundle_status"
+else
+  status="$container_status"
+fi
+
+census "$artifacts/host-census/after.txt"
+diff -u "$artifacts/host-census/before.txt" "$artifacts/host-census/after.txt" \
+  >"$artifacts/host-census/diff.txt" || true
+# Keep the container's own receipt and manifest; evaluation rewrites both.
+[[ ! -f "$artifacts/exit.status" ]] ||
+  cp "$artifacts/exit.status" "$custody/container-exit.status"
+[[ ! -f "$artifacts/manifest.txt" ]] ||
+  cp "$artifacts/manifest.txt" "$custody/container-manifest.txt"
+evaluate_host_census "$bundle_status" "$container_status"
+
+if [[ "$positive_control" == true ]]; then
+  if grep -q "$(basename "$positive_control_path")" "$artifacts/host-census/after.txt"; then
+    echo "positive-control=detected" >"$artifacts/host-census/positive-control.txt"
+    rmdir "$positive_control_path" 2>/dev/null || true
+    status=1
+  else
+    echo "positive-control=missed" >"$artifacts/host-census/positive-control.txt"
+    rmdir "$positive_control_path" 2>/dev/null || true
+    status=2
+  fi
+fi
+
+# Commit: the outcome is fully written.  From here no catchable signal may
+# turn it into an interruption, and the EXIT handler must not run.
+trap '' INT TERM HUP
+trap - EXIT
+exit "$status"

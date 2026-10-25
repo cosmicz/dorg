@@ -1,49 +1,157 @@
 name: CI
 
 on:
+  workflow_dispatch:
+    inputs:
+      selector:
+        description: 'Optional ERT regexp for a diagnostic run (not release certification); empty runs the full suite'
+        required: false
+        type: string
+        default: ''
+      raw_server_evidence_repeat:
+        description: 'Diagnostic repeat count 1..50; requires the exact raw-server selector'
+        required: false
+        type: string
+        default: ''
+  # Pushes to trunk do not start this workflow.  trunk is the private
+  # cosmicz/DOrg.oc branch, whose Actions minutes are rationed, and each
+  # landing is certified before it is pushed: a dispatched gate run on the
+  # candidate tree, then a check at landing that the trunk tree is identical
+  # to it.  The public repository runs this job only on main pushes; private
+  # pull requests and explicit dispatches remain eligible.
   push:
-    branches: [main, trunk]
+    branches: [main]
   pull_request:
     branches: [main, trunk]
 
 jobs:
   test:
+    # Public release: main pushes only; PRs, forks and dispatches refuse; no secrets, and artifacts are public.
+    if: ${{ (github.repository == 'cosmicz/DOrg.oc' && github.server_url == 'https://github.com') || (github.repository == 'cosmicz/dorg' && github.server_url == 'https://github.com' && github.event_name == 'push' && github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        emacs-version: ['30.1']
-      fail-fast: false
-
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-
-      - uses: purcell/setup-emacs@master
         with:
-          version: ${{ matrix.emacs-version }}
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
-      # The suite needs a real Dolt.  Stock v1.86.1 panics in isNoopUpdate on
-      # the headings UPDATE (VARBINARY index + foreign key; upstream PR 10906,
-      # released in v1.86.4).  Pin that release asset and verify its digest
-      # (GitHub release-asset digest, confirmed by hashing the download on
-      # 2026-09-09).  The DOLT_MIN floor moves in a separate production change.
-      - name: Install Dolt 1.86.4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Read suite job image lock
+        id: image-lock
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP"
-          curl -sSL -o dolt.tgz https://github.com/dolthub/dolt/releases/download/v1.86.4/dolt-linux-amd64.tar.gz
-          echo "88bdca99086bbac7f2414af2756c962d20a8d9b6463861dc2cf35111f13b6dea  dolt.tgz" | sha256sum -c -
-          tar xzf dolt.tgz
-          sudo install -m 0755 dolt-linux-amd64/bin/dolt /usr/local/bin/dolt
-          rm -rf dolt.tgz dolt-linux-amd64
-          dolt version
-          dolt config --global --add user.name "dorg-ci"
-          dolt config --global --add user.email "dorg-ci@example.invalid"
+          lock=.github/dorg-suite-job/image-lock.org
+          emacs_version="$(awk '
+            $0 == "* Emacs" { in_emacs = 1; next }
+            /^\* / { in_emacs = 0 }
+            in_emacs && /^- version: =[^=]+=$/ {
+              value = $0; sub(/^- version: =/, "", value); sub(/=$/, "", value); print value
+            }
+          ' "$lock")"
+          emacs_sha256="$(awk '
+            $0 == "* Emacs" { in_emacs = 1; next }
+            /^\* / { in_emacs = 0 }
+            in_emacs && /^- sha256: =[0-9a-f]{64}=$/ {
+              value = $0; sub(/^- sha256: =/, "", value); sub(/=$/, "", value); print value
+            }
+          ' "$lock")"
+          [[ "$emacs_version" =~ ^[0-9]+\.[0-9]+$ ]] || exit 2
+          [[ "$emacs_sha256" =~ ^[0-9a-f]{64}$ ]] || exit 2
+          echo "emacs_version=$emacs_version" >> "$GITHUB_OUTPUT"
+          echo "emacs_sha256=$emacs_sha256" >> "$GITHUB_OUTPUT"
 
-      - name: Byte-compile
-        run: make compile
+      - name: Prepare suite job artifacts
+        run: |
+          set -euo pipefail
+          artifacts="$RUNNER_TEMP/dorg-suite-job-artifacts"
+          echo "DORG_SUITE_JOB_ARTIFACTS=$artifacts" >> "$GITHUB_ENV"
+          mkdir -p "$artifacts"
+          {
+            echo "overall=not-run"
+            echo "classification=incomplete"
+            echo "stage=before-image-build"
+          } > "$artifacts/exit.status"
 
-      - name: Lint
-        run: make lint
+      - name: Start suite job image timer
+        id: image-build-start
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
 
-      - name: Test
-        run: make test
+      - name: Build suite job image
+        id: build-suite-job-image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .github/dorg-suite-job/Dockerfile
+          tags: dorg-suite-job:ci
+          load: true
+          push: false
+          build-args: |
+            EMACS_VERSION=${{ steps.image-lock.outputs.emacs_version }}
+            EMACS_SHA256=${{ steps.image-lock.outputs.emacs_sha256 }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Record suite job image build
+        id: image-build-finish
+        run: |
+          set -euo pipefail
+          started="${{ steps.image-build-start.outputs.epoch }}"
+          ended="$(date +%s)"
+          seconds=$((ended - started))
+          cache_threshold_seconds=600
+          if (( seconds <= 600 )); then
+            cache_inferred=hit
+          else
+            cache_inferred=miss
+          fi
+          {
+            echo "seconds=$seconds"
+            echo "cache-inferred=$cache_inferred"
+            echo "cache-threshold-seconds=$cache_threshold_seconds"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run suite job
+        timeout-minutes: 30
+        env:
+          DORG_SUITE_JOB_SELECTOR: ${{ inputs.selector || '' }}
+          DORG_SUITE_JOB_RAW_SERVER_EVIDENCE_REPEAT: ${{ inputs.raw_server_evidence_repeat || '' }}
+          DORG_SUITE_JOB_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          DORG_SUITE_JOB_EVENT_NAME: ${{ github.event_name }}
+          DORG_SUITE_JOB_REF: ${{ github.ref }}
+          DORG_SUITE_JOB_HEAD_REF: ${{ github.head_ref }}
+          DORG_SUITE_JOB_GITHUB_REPOSITORY: ${{ github.repository }}
+          DORG_SUITE_JOB_GITHUB_SERVER_URL: ${{ github.server_url }}
+          DORG_SUITE_JOB_IMAGE_ID: ${{ steps.build-suite-job-image.outputs.imageid }}
+          DORG_SUITE_JOB_IMAGE_DIGEST: ${{ steps.build-suite-job-image.outputs.digest }}
+          DORG_SUITE_JOB_IMAGE_METADATA: ${{ steps.build-suite-job-image.outputs.metadata || steps.build-suite-job-image.outputs['metadata-json'] }}
+          DORG_SUITE_JOB_IMAGE_CACHE_INFERRED: ${{ steps.image-build-finish.outputs.cache-inferred }}
+          DORG_SUITE_JOB_IMAGE_CACHE_INFERENCE_THRESHOLD_SECONDS: ${{ steps.image-build-finish.outputs.cache-threshold-seconds }}
+          DORG_SUITE_JOB_IMAGE_BUILD_SECONDS: ${{ steps.image-build-finish.outputs.seconds }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ -n "$DORG_SUITE_JOB_SELECTOR" ]]; then
+            args+=(--selector "$DORG_SUITE_JOB_SELECTOR")
+          fi
+          if [[ -n "$DORG_SUITE_JOB_RAW_SERVER_EVIDENCE_REPEAT" ]]; then
+            args+=(--raw-server-evidence-repeat "$DORG_SUITE_JOB_RAW_SERVER_EVIDENCE_REPEAT")
+          fi
+          set +e
+          tools/dorg-suite-job-local \
+            --image dorg-suite-job:ci \
+            --commit "$DORG_SUITE_JOB_COMMIT" \
+            --launcher actions \
+            --artifacts "$DORG_SUITE_JOB_ARTIFACTS" \
+            "${args[@]}"
+          status="$?"
+          set -e
+          exit "$status"
+
+      - name: Upload suite job artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dorg-suite-job
+          path: ${{ env.DORG_SUITE_JOB_ARTIFACTS }}

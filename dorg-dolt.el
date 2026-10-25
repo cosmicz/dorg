@@ -28,6 +28,7 @@
 (require 'cl-lib)
 (require 'dorg-model)
 (require 'dorg-sortkey)
+(require 'dorg-backend)
 ;; SQL literal quoting is a dependency-free leaf; hard-requiring it keeps the
 ;; public `dorg-sql-quote' / `dorg-sql-escape-string' resolvable after
 ;; `(require \\='dorg-dolt)' even though their home file moved.
@@ -49,6 +50,8 @@
 (declare-function mysql-query "mysql" (conn query))
 (declare-function mysql-result-rows "mysql" (result))
 (declare-function mysql-result-columns "mysql" (result))
+(declare-function dorg-registration-backend "dorg-registry" (registration))
+(declare-function dorg--preamble-keyword-alist "dorg-registry" (keys &optional buffer))
 
 ;;; ─── Error Types ─────────────────────────────────────────────────────
 
@@ -70,6 +73,10 @@
 
 (define-error 'dorg-sql-lease-broken
   "DOrg lease session broke; aborted fail-closed" 'dorg-sql-transport-error)
+
+(define-error 'dorg-sql-lease-generation-drift
+  "DOrg store generation changed while a lease was held; write refused"
+  'dorg-sql-lease-broken)
 
 (define-error 'dorg-sql-commit-indeterminate
   "DOrg Dolt commit outcome is indeterminate"
@@ -98,13 +105,16 @@
 ;; with zero durable writes.  Data shape: (MESSAGE PLIST) where PLIST carries
 ;; only closed facts (`:plane' core|rows, optional `:ids' / `:table').
 (define-error 'dorg-sql-postimage-parity
-  "DOrg committed state diverged from the validated candidate" 'error)
+  "DOrg in-transaction readback diverged from the validated candidate" 'error)
 
 (define-error 'dorg-sql-transaction-read-port-error
   "DOrg transaction read port refused a request" 'error)
 
 (defconst dorg-sql-transaction-read-port-max-ids 1024
   "Maximum heading id count accepted by the internal transaction read port.")
+
+(defconst dorg-sql-transaction-read-port-max-checks 256
+  "Maximum check count of one batched extension count read.")
 
 (defun dorg-sql-commit-indeterminate-data (err)
   "Return the sanitized fact plist carried by commit-indeterminate ERR.
@@ -127,6 +137,24 @@ before failure."
     (let ((data (caddr err)))
       (and (listp data) data))))
 
+(defconst dorg-dolt--postimage-parity-id-limit 32
+  "Maximum mismatch IDs exposed in a sanitized parity diagnostic.")
+
+(defun dorg-dolt--postimage-parity-id-facts (facts)
+  "Return bounded closed core mismatch facts from parity FACTS, or nil.
+Only a proper, nonempty, duplicate-free list of positive integer IDs is a
+diagnostic identity fact.  Invalid input is omitted rather than repaired."
+  (let ((ids (and (listp facts) (plist-get facts :ids))))
+    (when (and (eq (plist-get facts :plane) 'core)
+               (listp ids) ids
+               (condition-case nil (>= (length ids) 1)
+                 (wrong-type-argument nil))
+               (cl-every (lambda (id) (and (integerp id) (> id 0))) ids)
+               (= (length ids) (length (delete-dups (copy-sequence ids)))))
+      (list :parity-ids (cl-subseq ids 0 (min (length ids)
+                                               dorg-dolt--postimage-parity-id-limit))
+            :parity-id-count (length ids)))))
+
 (defun dorg-dolt--classify-db-error (err &optional failed-statement)
   "Return closed, sanitized database-failure facts for ERR and FAILED-STATEMENT.
 This is the sole conversion point from raw MySQL condition text to facts used
@@ -146,15 +174,17 @@ The closed classes are `serialization', `sibling-order-duplicate',
 `database-failure'.
 A typed `dorg-sql-postimage-parity' signal (tracked-regression) is classified
 by its condition type BEFORE any message-text inspection — it is a DOrg
-verdict, not a database condition — and only its closed `:plane' fact
-crosses the boundary."
+verdict, not a database condition.  Its core plane may carry a bounded,
+validated mismatch-ID list and full count; rows-plane and invalid IDs carry no
+identity facts."
   (cond
    ((eq (car-safe err) 'dorg-sql-postimage-parity)
     (let ((facts (car (last err))))
       (append (list :class 'postimage-parity)
               (when-let ((plane (and (listp facts)
                                      (plist-get facts :plane))))
-                (list :parity-plane plane)))))
+                (list :parity-plane plane))
+              (dorg-dolt--postimage-parity-id-facts facts))))
    ((eq (car-safe err) 'dorg-mutate-error)
     (let ((facts (caddr err)))
       (append (list :class 'mutation-validator)
@@ -503,6 +533,7 @@ absolute (callers pass `file-truename' output)."
   port        ; the TCP port it was opened against
   identity    ; (:db DB :uuid UUID): store db-name + `sql-server.info' instance
               ; UUID (or nil UUID) captured at open — the store+instance identity
+  generation  ; read-only directory/native/source fingerprint captured at open
   validated)  ; non-nil once first-use identity validation has passed
 
 ;; KEEP (mutable-state): persistent mysql connection pool, puthash-mutated across calls.
@@ -598,6 +629,157 @@ raises `mysql-timeout' within this window instead of blocking forever."
   :type 'number
   :group 'dorg)
 
+;;; ─── Private capture of failed batch statements ────────────────────────────
+;;
+;; The sanitized rollback receipt keeps only closed facts, by design: the
+;; classifier never lets raw server prose, SQL text or row values cross into
+;; the public refusal.  That boundary also discards the one thing an operator
+;; needs to diagnose an unexplained `database-failure': the original
+;; condition and the exact statement that failed.  The capture below records
+;; those privately, unless the operator turns the capture off, into a file
+;; under the store's own runtime overlay; the public receipt gains only
+;; closed correlation facts (execution ordinal, verb/table class, capture id).
+
+(defcustom dorg-sql-capture-failed-statements t
+  "When non-nil, record the original condition of a failed batch statement.
+On by default (operator decision, 2026-09-12); bind or set it to nil to turn
+the capture off.  When set, every statement-phase database failure inside a
+typed mutation batch writes ONE private file under the owning store's
+runtime overlay, `<store>/.dorg/failures/<capture-id>.eld', containing the
+raw server message, the exact failed SQL statement, its execution ordinal
+and the closed transaction facts.
+
+SENSITIVE CONTENTS: the raw message and SQL may quote row values, bead
+text and identifiers.  The file is created exclusively with mode 0600
+inside a 0700 directory and is never copied into the public receipt, the
+error message, stdout or the tracker; the receipt names only the capture
+id.  Capture happens after the same-session ROLLBACK and never changes the
+refusal, its classification, retry decisions or database effects; a
+capture that cannot be written is reported as `:capture failed' and
+leaves no partial file.  Old capture files are never removed
+automatically."
+  :type 'boolean
+  :group 'dorg)
+
+(defvar dorg-sql--capture-store-dir nil
+  "The owning store of the batch currently executing on a leased session.
+Bound by `dorg-sql--lease-batch' from the lease's exact store identity so a
+failure can be captured without rediscovering a store through the working
+directory or opening another connection.  Nil outside a leased batch, in
+which case no capture is attempted.")
+
+(defconst dorg-sql--public-table-set
+  '("dorg_files" "dorg_meta" "dorg_mutation_log" "drawer_items" "drawer_lines"
+    "heading_items" "heading_tags" "headings" "keyword_items" "planning_items"
+    "property_entries" "text_items")
+  "The explicit finite set of core table names a public statement class may name.
+A failed statement's table is reported by one of these literal strings or as
+the symbol `unknown'; nothing is ever copied out of the SQL text itself, so an
+arbitrary identifier (extension tables included) cannot cross the privacy
+boundary through the class.  The raw statement stays in the private capture.")
+
+(defun dorg-sql--statement-class (sql)
+  "Return the closed (VERB TABLE) class of SQL, or (unknown nil).
+VERB is one of the symbols `insert', `update' or `delete'.  TABLE is the
+member of `dorg-sql--public-table-set' that the statement names (that set's
+own string, never a substring of SQL), or the symbol `unknown' for any other
+identifier, quoted or not.  Other verbs, leading comments and odd shapes are
+\(unknown nil).  The class is a proper two-element list so the public error
+envelope can encode it as a JSON array.  No fragment of the statement is ever
+returned."
+  (let ((case-fold-search t)
+        (identifier "\\(?:`\\([A-Za-z_][A-Za-z0-9_]*\\)`\\|\\([A-Za-z_][A-Za-z0-9_]*\\)\\)"))
+    (if (and (stringp sql)
+             (string-match
+              (concat "\\`[[:space:]]*"
+                      "\\(?:\\(insert\\)[[:space:]]+into\\|\\(update\\)\\|\\(delete\\)[[:space:]]+from\\)"
+                      "[[:space:]]+" identifier
+                      "\\(?:[[:space:](]\\|\\'\\)")
+              sql))
+        (let* ((verb (cond ((match-beginning 1) 'insert)
+                           ((match-beginning 2) 'update)
+                           (t 'delete)))
+               (named (downcase (or (match-string 4 sql) (match-string 5 sql))))
+               (public (car (member named dorg-sql--public-table-set))))
+          (list verb (or public 'unknown)))
+      (list 'unknown nil))))
+
+(defun dorg-sql--capture-path-owner-uid (path)
+  "Return the numeric owner uid of PATH without following a final symlink.
+A seam for the custody checks below; nil when PATH has no attributes."
+  (file-attribute-user-id (file-attributes path 'integer)))
+
+(defun dorg-sql--capture-dir-custody-ok-p (dir forbidden-bits)
+  "Return non-nil when the existing directory DIR is safe to write under.
+DIR must be a real directory (not a symlink), owned by this process's user,
+with none of FORBIDDEN-BITS set in its permission bits: `#o022' rejects a
+group- or world-writable parent, `#o077' demands a private directory.
+Nothing is created or changed; an unsafe DIR is simply refused."
+  (and (file-directory-p dir)
+       (not (file-symlink-p dir))
+       (eql (dorg-sql--capture-path-owner-uid dir) (user-uid))
+       (zerop (logand forbidden-bits (or (file-modes dir) #o777)))))
+
+(defun dorg-sql--capture-failed-statement (store err statement index phase code)
+  "Privately record ERR and STATEMENT under STORE's runtime overlay.
+INDEX is the execution ordinal, PHASE the closed transaction phase and
+CODE the numeric database code, if any.  Returns the capture id (the file's
+base name) on success, or nil on ANY failure, after removing only a file
+this invocation itself created.
+
+Custody of the destination is checked before anything is created or
+written: `<store>/.dorg' must be an owned real directory that is not group-
+or world-writable, `<store>/.dorg/failures' an owned real directory with no
+group or other bits (either is created 0700 only when missing), and the
+exclusively created 0600 capture file must still be an owned plain file
+when the payload is written.  Anything else is refused without adjusting
+the modes of any existing tree.  Must be called only after the same-session
+ROLLBACK has completed; it issues no SQL and touches nothing outside
+`<store>/.dorg/failures/'."
+  (let ((file nil))
+    (condition-case nil
+        (let* ((store (file-name-as-directory (expand-file-name store)))
+               (overlay (expand-file-name ".dorg" store))
+               (dir (expand-file-name "failures" overlay)))
+          (unless (file-directory-p store) (error "no store"))
+          (when (file-symlink-p overlay) (error "overlay is a link"))
+          (unless (file-exists-p overlay)
+            (with-file-modes #o700 (make-directory overlay)))
+          (unless (dorg-sql--capture-dir-custody-ok-p overlay #o022)
+            (error "overlay custody"))
+          (when (file-symlink-p dir) (error "capture dir is a link"))
+          (unless (file-exists-p dir)
+            (with-file-modes #o700 (make-directory dir)))
+          (unless (dorg-sql--capture-dir-custody-ok-p dir #o077)
+            (error "capture dir custody"))
+          ;; Exclusive 0600 creation before any payload is written, then the
+          ;; created name is re-checked as an owned plain file before use.
+          (setq file (with-file-modes #o600
+                       (make-temp-file (expand-file-name "cap-" dir) nil ".eld")))
+          (unless (and (file-regular-p file)
+                       (not (file-symlink-p file))
+                       (eql (dorg-sql--capture-path-owner-uid file) (user-uid))
+                       (= #o600 (logand #o777 (or (file-modes file) 0))))
+            (error "capture file custody"))
+          (with-temp-buffer
+            (prin1 (list :captured-at (format-time-string "%FT%T%z")
+                         :transaction-phase phase
+                         :db-code code
+                         :statement-index index
+                         :statement statement
+                         :message (condition-case nil
+                                      (error-message-string err)
+                                    (error "")))
+                   (current-buffer))
+            (insert "\n")
+            (let ((coding-system-for-write 'utf-8-unix))
+              (write-region (point-min) (point-max) file nil 'silent)))
+          (file-name-base file))
+      (error
+       (when (and file (file-exists-p file))
+         (ignore-errors (delete-file file)))
+       nil))))
+
 (defun dorg-sql--probe-healthy-p (port timeout)
   "Return t if a sql-server on PORT answers `SELECT 1' within TIMEOUT.
 Opens a short-lived, no-database mysql.el connection bounded by TIMEOUT
@@ -638,6 +820,45 @@ connection and evicts the matching attached-port hint for its exact port."
   (ignore-errors (mysql-disconnect (dorg-sql--conn-entry-conn entry)))
   (dorg-dolt-server--evict-attached-port key (dorg-sql--conn-entry-port entry)))
 
+(defun dorg-sql--directory-identity (dolt-dir)
+  "Return DOLT-DIR's serializable device/inode identity, or nil.
+This is intentionally a local filesystem read: a pathname may be reused after
+a store replacement, while its directory identity distinguishes generations."
+  (condition-case nil
+      (let ((attrs (file-attributes (dorg-dolt-server--canonical-dir dolt-dir))))
+        (list :device (file-attribute-device-number attrs)
+              :inode (file-attribute-inode-number attrs)))
+    (error nil)))
+
+(defun dorg-sql--bound-source-hash (dolt-dir)
+  "Return DOLT-DIR's live bound Org buffer `DORG_HASH', else nil.
+Never visits a file or performs SQL: only an already-loaded explicitly bound
+buffer contributes its genuine root-preamble keyword."
+  (when (boundp 'dorg--registry)
+    (let ((canon (dorg-dolt-server--canonical-dir dolt-dir)))
+      (cl-loop for (file . registration) in dorg--registry
+               for backend = (dorg-registration-backend registration)
+               for registered-dir = (dorg-backend-dolt-dir backend)
+               for buffer = (and registered-dir
+                                 (or (get-file-buffer file)
+                                     (find-buffer-visiting file)))
+               when (and buffer
+                         (equal canon
+                                (dorg-dolt-server--canonical-dir registered-dir)))
+               return (cdr (assoc dorg-hash-keyword
+                                  (dorg--preamble-keyword-alist
+                                   (list dorg-hash-keyword) buffer)))))))
+
+(defun dorg-sql--generation-fingerprint (dolt-dir)
+  "Return DOLT-DIR's read-only cache generation fingerprint.
+The members are the canonical directory identity, native sql-server PID:port,
+and the bound source buffer's `DORG_HASH'.  This deliberately excludes HEAD:
+ordinary reads must not issue product SQL merely to validate a warm entry."
+  (let ((info (dorg-dolt-server--dolt-server-info dolt-dir)))
+    (list :directory (dorg-sql--directory-identity dolt-dir)
+          :native (list :pid (plist-get info :pid) :port (plist-get info :port))
+          :source-hash (dorg-sql--bound-source-hash dolt-dir))))
+
 (defun dorg-sql--connect-entry (dolt-dir port)
   "Open a fresh `dorg-sql--conn-entry' to PORT for DOLT-DIR.
 Captures the `sql-server.info' instance UUID (or nil for a server that
@@ -656,7 +877,8 @@ endpoint is unreachable."
      :port port
      :identity (list :db db
                      :uuid (plist-get (dorg-dolt-server--dolt-server-info dolt-dir)
-                                      :uuid)))))
+                                      :uuid))
+     :generation (dorg-sql--generation-fingerprint dolt-dir))))
 
 (defun dorg-sql--entry-identity-valid-p (entry dolt-dir)
   "Return non-nil if ENTRY's captured identity (db-name + UUID) still matches.
@@ -688,12 +910,24 @@ success).  A dead ping or a POSITIVE identity mismatch returns nil.  Shared by t
 ordinary hot path (`dorg-sql--get-connection') and the lease reserved-checkout so
 BOTH acquire a VALIDATED Model-A session and neither can lease/reuse a
 stale-identity connection.  Does NOT evict or disconnect — the caller decides."
-  (and (dorg-sql--entry-ping-ok-p entry)
+  (let ((generation (dorg-sql--generation-fingerprint dolt-dir)))
+    (and (dorg-sql--entry-ping-ok-p entry)
+       ;; C1/C2: validate this cheap, local generation on EVERY warm read.
+       ;; A cached connection cannot outlive a directory swap, native endpoint
+       ;; rotation, or re-materialized source buffer.
+       (or (equal (dorg-sql--conn-entry-generation entry) generation)
+           ;; An entry created before this field existed can be resident after
+           ;; an in-session reload.  Stamp it once from the same read-only
+           ;; snapshot; all later warm reads compare the complete fingerprint.
+           (and (null (dorg-sql--conn-entry-generation entry))
+                (progn
+                  (setf (dorg-sql--conn-entry-generation entry) generation)
+                  t)))
        (or (dorg-sql--conn-entry-validated entry)
            (when (dorg-sql--entry-identity-valid-p entry dolt-dir)
              (setf (dorg-sql--conn-entry-validated entry) t)
              t))
-       entry))
+       entry)))
 
 (defun dorg-sql--open-entry (key dolt-dir port)
   "Internal (unguarded) endpoint-ownership open: connect to PORT, cache, return.
@@ -806,12 +1040,44 @@ already known dead, matching the lease guard law."
   (or (dorg-sql--transport-condition-p err)
       (dorg-sql--conn-process-dead-p conn)))
 
+(defun dorg-sql--failed-statement-facts (err transaction-phase failed-statement
+                                             statement-index rollback-confirmed)
+  "Return closed correlation facts for a failed data statement, plus capture.
+Empty when there is no FAILED-STATEMENT (the failure was not a data
+statement: validation, staging or commit).  Otherwise names the execution
+ordinal and the closed verb/table class, and — under
+`dorg-sql-capture-failed-statements' inside a leased batch — records the
+original condition privately, reporting `:capture written' with its id or
+`:capture failed'.  ROLLBACK-CONFIRMED must be t: diagnostic file I/O never
+precedes the same-session ROLLBACK, and an unconfirmed rollback yields
+`:capture skipped' with no file access at all.  Never carries prose or SQL."
+  (when failed-statement
+    (append
+     (list :statement-index statement-index
+           :statement-class (dorg-sql--statement-class failed-statement))
+     (when (and dorg-sql-capture-failed-statements dorg-sql--capture-store-dir)
+       (if (not (eq t rollback-confirmed))
+           (list :capture 'skipped)
+         (let ((id (dorg-sql--capture-failed-statement
+                    dorg-sql--capture-store-dir err failed-statement
+                    statement-index transaction-phase
+                    (plist-get (dorg-dolt--classify-db-error err failed-statement)
+                               :db-code))))
+           (if id
+               (list :capture 'written :capture-id id)
+             (list :capture 'failed))))))))
+
 (defun dorg-sql--raise-batch-rollback-result
-    (conn err transaction-phase failed-statement report-rollback)
+    (conn err transaction-phase failed-statement report-rollback
+          &optional statement-index)
   "Roll back ERR on CONN and signal its definite transaction result.
-TRANSACTION-PHASE and FAILED-STATEMENT are closed attempt facts.
+TRANSACTION-PHASE and FAILED-STATEMENT are closed attempt facts;
+STATEMENT-INDEX is the execution ordinal counted by the batch loop for
+FAILED-STATEMENT (nil when the failure was not a data statement).
 REPORT-ROLLBACK selects the sanitized typed receipt used by mutation; ordinary
-callers retain the original error family.  This function never returns."
+callers retain the original error family.  The private capture runs only
+after the ROLLBACK completed and never alters the signalled outcome.  This
+function never returns."
   (let ((rollback-failure
          (condition-case rb
              (progn (mysql-query conn "ROLLBACK") nil)
@@ -837,17 +1103,21 @@ callers retain the original error family.  This function never returns."
              (append
               (list :rollback-confirmed t
                     :transaction-phase transaction-phase)
-              (dorg-dolt--classify-db-error err failed-statement)))))
+              (dorg-dolt--classify-db-error err failed-statement)
+              ;; The ROLLBACK above completed: the capture may touch files.
+              (dorg-sql--failed-statement-facts
+               err transaction-phase failed-statement statement-index t)))))
      (t (signal (car err) (cdr err))))))
 
 (defun dorg-sql--handle-batch-failure
     (conn err transaction-phase transaction-open commit-hash
-          failed-statement report-rollback)
+          failed-statement report-rollback &optional statement-index)
   "Classify and signal one commit-bearing batch failure.
 CONN and ERR identify the failed operation; TRANSACTION-PHASE and
 TRANSACTION-OPEN record the state machine.  COMMIT-HASH is non-nil only after a
-returned Dolt commit response.  FAILED-STATEMENT and REPORT-ROLLBACK feed only
-the definite rollback path.  This function never returns."
+returned Dolt commit response.  FAILED-STATEMENT, STATEMENT-INDEX and
+REPORT-ROLLBACK feed only the definite rollback path.  This function never
+returns."
   (cond
    ;; A returned hash proves DOLT_COMMIT landed.  A transport-class failure
    ;; while its request is in flight proves only ambiguity, including when the
@@ -868,7 +1138,8 @@ the definite rollback path.  This function never returns."
    ((not transaction-open) (signal (car err) (cdr err)))
    (t
     (dorg-sql--raise-batch-rollback-result
-     conn err transaction-phase failed-statement report-rollback))))
+     conn err transaction-phase failed-statement report-rollback
+     statement-index))))
 
 (defconst dorg-sql--transaction-read-port-core-tables
   '("headings" "heading_tags" "heading_items" "property_entries"
@@ -980,6 +1251,88 @@ the definite rollback path.  This function never returns."
        :table table))
     table))
 
+(defun dorg-sql--transaction-read-port-count-from (request allowed-tables)
+  "Return the validated `FROM TABLE [WHERE PRED]' of a count REQUEST.
+REQUEST carries `:table' and `:where'.  The per-check count and every
+subquery of a batched count are built from this one clause, so both read
+exactly the same rows."
+  (let ((table (dorg-sql--transaction-read-port-extension-table
+                request allowed-tables))
+        (pred (dorg-sql--transaction-read-port-predicate-sql
+               (plist-get request :where))))
+    (if pred
+        (format "FROM %s WHERE %s" table pred)
+      (format "FROM %s" table))))
+
+(defun dorg-sql--transaction-read-port-natural-count (n &rest facts)
+  "Return count N when it is a native nonnegative integer, else refuse.
+FACTS are added to the refusal."
+  ;; COUNT(*) decodes to a native integer; anything else is a broken
+  ;; read, never a zero and never a number recovered from its spelling.
+  (unless (natnump n)
+    (apply #'dorg-sql--transaction-read-port-raise
+           'bad-count "extension count result is not a nonnegative integer"
+           :count n facts))
+  n)
+
+(defun dorg-sql--transaction-read-port-batch-from (request allowed-tables)
+  "Return the validated FROM clauses of batched count REQUEST, in order.
+`:checks' must be a proper list of 1 to
+`dorg-sql-transaction-read-port-max-checks' pairs (TABLE . WHERE).  Every
+check is validated before the caller sends any SQL; a refusal names the
+check's position."
+  (let ((checks (plist-get request :checks)))
+    (unless (and (consp checks) (proper-list-p checks)
+                 (<= (length checks) dorg-sql-transaction-read-port-max-checks))
+      (dorg-sql--transaction-read-port-raise
+       'bad-checks "batched count request has an empty, improper or oversized check list"
+       :count (and (proper-list-p checks) (length checks))))
+    (cl-loop
+     for check in checks
+     for position from 0
+     collect
+     (progn
+       (unless (consp check)
+         (dorg-sql--transaction-read-port-raise
+          'bad-checks "batched count check is not a (TABLE . WHERE) pair"
+          :position position))
+       ;; The predicate is traversed below, so its shape is settled first: a
+       ;; proper, finite list of cells (or nil), never an improper or cyclic
+       ;; one that would escape as an untyped error or never return.
+       (let ((where (cdr check)))
+         (unless (or (null where)
+                     (and (proper-list-p where) (cl-every #'consp where)))
+           (dorg-sql--transaction-read-port-raise
+            'bad-predicate "batched count check predicate is not a column alist"
+            :position position)))
+       (condition-case err
+           (dorg-sql--transaction-read-port-count-from
+            (list :table (car check) :where (cdr check)) allowed-tables)
+         (dorg-sql-transaction-read-port-error
+          (signal (car err)
+                  (list (nth 1 err)
+                        (append (nth 2 err) (list :position position))))))))))
+
+(defun dorg-sql--transaction-read-port-batch-counts (rows count)
+  "Return COUNT natural numbers read by alias from the one row in ROWS.
+The row must hold exactly the aliases n0 ... n(COUNT-1); any other shape is a
+typed refusal."
+  (let ((row (car rows)))
+    (unless (and (= 1 (length rows))
+                 (= count (length row))
+                 (equal (sort (mapcar #'car row)
+                              (lambda (a b) (string< (symbol-name a) (symbol-name b))))
+                        (sort (cl-loop for i below count
+                                       collect (intern (format "n%d" i)))
+                              (lambda (a b) (string< (symbol-name a) (symbol-name b))))))
+      (dorg-sql--transaction-read-port-raise
+       'bad-count "batched count result is not one row of the requested aliases"
+       :rows (length rows) :columns (mapcar #'car row)))
+    (cl-loop for i below count
+             collect (dorg-sql--transaction-read-port-natural-count
+                      (cdr (assq (intern (format "n%d" i)) row))
+                      :position i))))
+
 (defun dorg-sql--transaction-read-port-dispatch (conn request allowed-tables)
   "Execute one closed transaction-local read REQUEST on CONN."
   (unless (and (listp request) (not (stringp request)))
@@ -998,34 +1351,31 @@ the definite rollback path.  This function never returns."
             (root-id (dorg-sql--transaction-read-port-root-id request))
             (id-list (mapconcat #'number-to-string ids ","))
             (root-filter (if root-id (format " AND root_id = %d" root-id) "")))
-       (dorg-sql--coerce-types
-        (dorg-sql--mysql-exec
-         (format
-          (concat "SELECT id, parent_id, HEX(sort_key) AS sort_key,"
-                  " level, todo_keyword, priority, commented, title,"
-                  " post_blank, items_hash FROM headings"
-                  " WHERE id IN (%s)%s")
-          id-list root-filter)
-         conn))))
+       (dorg-sql--mysql-exec
+        (format
+         (concat "SELECT id, parent_id, HEX(sort_key) AS sort_key,"
+                 " level_offset, todo_keyword, priority, commented, title,"
+                 " post_blank, items_hash FROM headings"
+                 " WHERE id IN (%s)%s")
+         id-list root-filter)
+        conn)))
     ('core-heading-tags
      (dorg-sql--transaction-read-port-check-keys request '(:version :op :ids))
      (let* ((ids (dorg-sql--transaction-read-port-ids request))
             (id-list (mapconcat #'number-to-string ids ",")))
-       (dorg-sql--coerce-types
-        (dorg-sql--mysql-exec
-         (format
-          (concat "SELECT heading_id, tag FROM heading_tags"
-                  " WHERE heading_id IN (%s) ORDER BY heading_id, ordinal")
-          id-list)
-         conn))))
+       (dorg-sql--mysql-exec
+        (format
+         (concat "SELECT heading_id, tag FROM heading_tags"
+                 " WHERE heading_id IN (%s) ORDER BY heading_id, ordinal")
+         id-list)
+        conn)))
     ('core-heading-ids
      (dorg-sql--transaction-read-port-check-keys request '(:version :op :ids))
      (let* ((ids (dorg-sql--transaction-read-port-ids request))
             (id-list (mapconcat #'number-to-string ids ",")))
-       (dorg-sql--coerce-types
-        (dorg-sql--mysql-exec
-         (format "SELECT id FROM headings WHERE id IN (%s)" id-list)
-         conn))))
+       (dorg-sql--mysql-exec
+        (format "SELECT id FROM headings WHERE id IN (%s)" id-list)
+        conn)))
     ('owner-model
      (dorg-sql--transaction-read-port-check-keys
       request '(:version :op :root-id :ids))
@@ -1034,26 +1384,39 @@ the definite rollback path.  This function never returns."
        (unless root-id
          (dorg-sql--transaction-read-port-raise
           'bad-root "owner model read requires a root id"))
+       ;; The owner image feeds only offset-carrying canonical tuples, so it
+       ;; reads the persisted offsets and derives no effective level.
        (dorg-model-load-headings
         nil root-id ids nil nil
-        (lambda (sql)
-          (dorg-sql--coerce-types (dorg-sql--mysql-exec sql conn))))))
+        (lambda (sql) (dorg-sql--mysql-exec sql conn))
+        'offsets)))
     ('extension-row-count
      (dorg-sql--transaction-read-port-check-keys
       request '(:version :op :table :where))
-     (let* ((table (dorg-sql--transaction-read-port-extension-table
+     (let* ((from (dorg-sql--transaction-read-port-count-from
+                   request allowed-tables))
+            (rows (dorg-sql--mysql-exec
+                   (concat "SELECT COUNT(*) AS n " from) conn)))
+       (dorg-sql--transaction-read-port-natural-count
+        (alist-get 'n (car rows)) :table (plist-get request :table))))
+    ('extension-row-counts
+     ;; One statement answers many checks: each subquery is exactly the
+     ;; per-check count above, so the batch reads the same rows on the same
+     ;; connection and snapshot.  Every check is validated first.
+     (dorg-sql--transaction-read-port-check-keys
+      request '(:version :op :checks))
+     (let* ((froms (dorg-sql--transaction-read-port-batch-from
                     request allowed-tables))
-            (pred (dorg-sql--transaction-read-port-predicate-sql
-                   (plist-get request :where)))
-            (rows (dorg-sql--coerce-types
-                   (dorg-sql--mysql-exec
-                    (if pred
-                        (format "SELECT COUNT(*) AS n FROM %s WHERE %s"
-                                table pred)
-                      (format "SELECT COUNT(*) AS n FROM %s" table))
-                    conn)))
-            (n (alist-get 'n (car rows))))
-       (if (stringp n) (string-to-number n) (or n 0))))
+            (rows (dorg-sql--mysql-exec
+                   (concat "SELECT "
+                           (mapconcat #'identity
+                                      (cl-loop for from in froms
+                                               for i from 0
+                                               collect (format "(SELECT COUNT(*) %s) AS n%d"
+                                                               from i))
+                                      ", "))
+                   conn)))
+       (dorg-sql--transaction-read-port-batch-counts rows (length froms))))
     (_
      (dorg-sql--transaction-read-port-raise
       'bad-op "transaction read request operation is unsupported"
@@ -1131,6 +1494,11 @@ commit message or Dolt reports nothing to commit."
                             dorg-dolt-user-email))
             commit-hash
             failed-statement
+            ;; Execution ordinal of the statement in flight, counted here at
+            ;; the loop (never recovered from text later): cleared together
+            ;; with `failed-statement' after each success so no later phase
+            ;; inherits a stale index.
+            statement-index
             (transaction-phase 'pre-statement)
             transaction-open)
         ;; Manual BEGIN/COMMIT instead of with-mysql-transaction so we
@@ -1141,10 +1509,14 @@ commit message or Dolt reports nothing to commit."
               (mysql-query conn "BEGIN")
               (setq transaction-open t
                     transaction-phase 'statements)
-              (dolist (stmt statements)
-                (setq failed-statement stmt)
-                (mysql-query conn stmt)
-                (setq failed-statement nil))
+              (let ((ordinal 0))
+                (dolist (stmt statements)
+                  (setq ordinal (1+ ordinal)
+                        failed-statement stmt
+                        statement-index ordinal)
+                  (mysql-query conn stmt)
+                  (setq failed-statement nil
+                        statement-index nil)))
               (setq transaction-phase 'validate)
               (when validate-function
                 (let ((query-function
@@ -1191,7 +1563,8 @@ commit message or Dolt reports nothing to commit."
           (error
            (dorg-sql--handle-batch-failure
             conn err transaction-phase transaction-open commit-hash
-            failed-statement report-rollback))))
+            failed-statement report-rollback
+            (and failed-statement statement-index)))))
     (dolist (stmt statements)
       (mysql-query conn stmt))
     nil))
@@ -1210,7 +1583,7 @@ commit message or Dolt reports nothing to commit."
 ;; as the owner.  The `owner' slot is a diagnostic tag only.
 (cl-defstruct (dorg-sql--lease (:constructor dorg-sql--make-lease)
                                (:copier nil))
-  dolt-dir port conn
+  dolt-dir port conn generation
   (phase :reserved)   ; :reserved -> :active -> :released
   owner)              ; diagnostic uninterned symbol
 
@@ -1245,12 +1618,53 @@ A wrong/absent/stale/copied lease signals `dorg-sql-lease-ownership-error'."
               (list (format "dorg: lease for %s is not the active owner"
                             (dorg-sql--lease-dolt-dir lease)))))))
 
+(defun dorg-sql--lease-assert-current-generation (lease)
+  "Refuse LEASE if its store generation changed before its next SQL operation.
+The lease is connection-affine: it cannot reconnect a mutation planned against
+its original generation onto a replacement store.  Comparing the same local C1
+fingerprint used by warm reads before every leased operation therefore fails
+closed before any product SQL is sent to the replacement generation."
+  (let ((actual (dorg-sql--generation-fingerprint
+                 (dorg-sql--lease-dolt-dir lease))))
+    ;; A lease created by the previous struct layout can remain active during
+    ;; an in-session reload.  Like a legacy warm entry, capture its first
+    ;; observed generation once; subsequent operations compare it strictly.
+    (if (null (dorg-sql--lease-generation lease))
+        (setf (dorg-sql--lease-generation lease) actual)
+      (unless (equal (dorg-sql--lease-generation lease) actual)
+        (signal 'dorg-sql-lease-generation-drift
+                (list (format "dorg: store generation changed while lease was held: %s"
+                              (dorg-sql--lease-dolt-dir lease))
+                      :expected (dorg-sql--lease-generation lease)
+                      :actual actual))))))
+
+(defconst dorg-sql--lease-broken-cause-classes
+  '(mysql-timeout mysql-connection-error mysql-protocol-error
+    dead-connection other)
+  "Closed cause vocabulary carried by `dorg-sql-lease-broken'.")
+
+(defun dorg-sql--lease-broken-cause-class (lease err)
+  "Return the closed transport cause for ERR raised on LEASE.
+Classification uses only the condition symbol and connection liveness; error
+messages, SQL text, paths, and server payloads are never inspected."
+  (pcase (car-safe err)
+    ('mysql-timeout 'mysql-timeout)
+    ('mysql-connection-error 'mysql-connection-error)
+    ('mysql-protocol-error 'mysql-protocol-error)
+    ('error (if (dorg-sql--lease-conn-live-p lease)
+                'other
+              'dead-connection))
+    (_ 'other)))
+
 (defun dorg-sql--raise-lease-broken (lease err)
-  "Signal `dorg-sql-lease-broken' for LEASE citing the underlying ERR."
+  "Signal `dorg-sql-lease-broken' for LEASE citing the underlying ERR.
+The condition data also carries closed diagnostic symbols.  Its first datum
+remains the historical human-readable message."
   (signal 'dorg-sql-lease-broken
           (list (format "dorg: lease session for %s broke mid-operation: %s"
                         (dorg-sql--lease-dolt-dir lease)
-                        (error-message-string err)))))
+                        (error-message-string err))
+                :cause-class (dorg-sql--lease-broken-cause-class lease err))))
 
 (defun dorg-sql--lease-conn-live-p (lease)
   "Return non-nil if LEASE's connection process is still live.
@@ -1296,6 +1710,7 @@ connection — no transport resolution, strict-port, `dorg-sql--get-connection',
 or implicit state.  A transport-level failure aborts fail-closed with
 `dorg-sql-lease-broken' (no reconnect, no replay)."
   (dorg-sql--lease-validate lease)
+  (dorg-sql--lease-assert-current-generation lease)
   (let ((formatted (if args (apply #'format query args) query)))
     (dorg-sql--with-broken-guard lease
       (dorg-sql--mysql-exec formatted (dorg-sql--lease-conn lease)))))
@@ -1310,10 +1725,14 @@ REPORT-ROLLBACK is the private opt-in documented by
 `dorg-sql--mysql-batch-on-conn'.  Returns the exact hash reported by
 DOLT_COMMIT, or nil when no commit was created."
   (dorg-sql--lease-validate lease)
-  (dorg-sql--with-broken-guard lease
-    (dorg-sql--mysql-batch-on-conn (dorg-sql--lease-conn lease)
-                                   statements commit-message
-                                   validate-function report-rollback)))
+  (dorg-sql--lease-assert-current-generation lease)
+  ;; The lease is the established store identity: carry it to the executor
+  ;; so a private failure capture never rediscovers a store on its own.
+  (let ((dorg-sql--capture-store-dir (dorg-sql--lease-dolt-dir lease)))
+    (dorg-sql--with-broken-guard lease
+      (dorg-sql--mysql-batch-on-conn (dorg-sql--lease-conn lease)
+                                     statements commit-message
+                                     validate-function report-rollback))))
 
 (defun dorg-sql--reserved-checkout (canon dolt-dir lease)
   "Check out a VALIDATED endpoint-ownership session for the reserved LEASE.
@@ -1347,6 +1766,7 @@ caller can reach the leased session.  Fills LEASE's conn/port and flips it
                 fresh)))))
     (setf (dorg-sql--lease-port lease) (dorg-sql--conn-entry-port entry)
           (dorg-sql--lease-conn lease) (dorg-sql--conn-entry-conn entry)
+          (dorg-sql--lease-generation lease) (dorg-sql--conn-entry-generation entry)
           (dorg-sql--lease-phase lease) :active)
     lease))
 
@@ -1539,89 +1959,103 @@ requires 0/NULL to be an error, not a silent success."
 ;; `to_gen_id' — never by ambiguous commit-date ordering, never a circular
 ;; self-hash.
 
-(defconst dorg-sql--mutation-log-ddl
-  "CREATE TABLE IF NOT EXISTS dorg_mutation_log (
-  op_id          VARCHAR(255) PRIMARY KEY,
-  gen_id         VARCHAR(64) NOT NULL UNIQUE,
-  intent_digest  VARCHAR(64) NOT NULL,
-  ts             BIGINT NOT NULL
-)"
-  "Idempotent DDL for the exactly-once evidence table (tracked-regression).
-`gen_id NOT NULL UNIQUE' is load-bearing: it is the per-generation discriminator
-the `dolt_diff' creation-commit recovery keys on.")
+(defun dorg-sql--mutation-log-schema-row-field (row field)
+  "Read FIELD from ROW under the aliased or uppercase client label."
+  (or (alist-get field row)
+      (alist-get (intern (upcase (symbol-name field))) row)))
 
-(defun dorg-sql--ensure-mutation-log (lease)
-  "Ensure `dorg_mutation_log' exists in LEASE's store working set.
-Idempotent `CREATE TABLE IF NOT EXISTS' on the leased session so a subsequent
-preflight SELECT is safe on a store that has never been mutated.  Runs in the
-working set only — the table is persisted by the next DOLT_COMMIT, never by a
-standalone DDL commit, so it does not advance HEAD on its own."
-  (dorg-sql--lease-exec lease dorg-sql--mutation-log-ddl))
+(defun dorg-sql--mutation-log-schema-status (query)
+  "Return receipt schema status using read-only QUERY.
 
-(defun dorg-sql--ensure-mutation-log-postimages (lease)
-  "Ensure the additive `postimages_v1' TEXT column exists (tracked-regression).
-Column-existence probe + additive ALTER on the operational evidence table —
-NO dorg_meta schema-version bump: like the table's own on-demand CREATE, this
-is retention-prunable evidence plumbing outside the frozen public-0.1
-persisted format.  Runs in the working set only (Dolt DDL cannot roll back),
-so it is called OUTSIDE the committing transaction and persisted by the next
-DOLT_COMMIT.  Caller must have run `dorg-sql--ensure-mutation-log' first."
-  (unless (dorg-sql--lease-exec
-           lease
-           (concat "SELECT column_name FROM information_schema.columns"
-                   " WHERE table_schema = DATABASE()"
-                   " AND table_name = 'dorg_mutation_log'"
-                   " AND column_name = 'postimages_v1'"))
-    (dorg-sql--lease-exec
-     lease "ALTER TABLE dorg_mutation_log ADD COLUMN postimages_v1 TEXT")))
+QUERY is a function accepting one SQL string and returning rows as alists.
+The result is `compatible', `missing-table', `legacy-missing-postimages', or
+`(incompatible . DETAIL)'.  This deliberately validates the complete column
+shape rather than treating a matching core version as proof of receipt health."
+  (let ((tables (funcall query
+                         (concat "SELECT table_name FROM information_schema.tables"
+                                 " WHERE table_schema = DATABASE()"
+                                 " AND table_name = 'dorg_mutation_log'"))))
+    (if (null tables)
+        'missing-table
+      (let* ((rows (funcall query
+                            (concat "SELECT column_name AS column_name,"
+                                    " column_type AS column_type,"
+                                    " is_nullable AS is_nullable"
+                                    " FROM information_schema.columns"
+                                    " WHERE table_schema = DATABASE()"
+                                    " AND table_name = 'dorg_mutation_log'"
+                                    " ORDER BY ordinal_position")))
+             (actual (mapcar
+              (lambda (row)
+                        (list (downcase
+                               (format "%s" (dorg-sql--mutation-log-schema-row-field
+                                             row 'column_name)))
+                              (downcase
+                               (format "%s" (dorg-sql--mutation-log-schema-row-field
+                                             row 'column_type)))
+                              (downcase
+                               (format "%s" (dorg-sql--mutation-log-schema-row-field
+                                             row 'is_nullable)))))
+                      rows))
+             (legacy '(("op_id" "varchar(255)" "no")
+                       ("gen_id" "varchar(64)" "no")
+                       ("intent_digest" "varchar(64)" "no")
+                       ("ts" "bigint" "no")))
+             (current (append legacy '(("postimages_v1" "text" "yes")))))
+        (cond ((equal actual current) 'compatible)
+              ((equal actual legacy) 'legacy-missing-postimages)
+              (t (cons 'incompatible actual)))))))
 
-(defun dorg-sql--mutation-log-insert-sql (op-id gen-id intent-digest ts
-                                                &optional postimages)
+(defun dorg-sql--require-mutation-log-schema (lease)
+  "Refuse ordinary receipt access unless LEASE has the current receipt shape.
+
+This check is read-only.  Fresh init and `dorg-migrate-schema' own CREATE/ALTER
+through the versioned core schema; ordinary apply and replay never repair a
+store's working set."
+  (let* ((query (lambda (sql) (dorg-sql--lease-exec lease sql)))
+         (status (dorg-sql--mutation-log-schema-status query)))
+    (unless (eq status 'compatible)
+      (let* ((version-rows
+              (funcall query
+                       "SELECT value FROM dorg_meta WHERE `key` = 'schema_version'"))
+             (version (and version-rows (alist-get 'value (car version-rows))))
+             (current (equal (format "%s" version)
+                             (number-to-string dorg-schema-version))))
+        (signal 'dorg-schema-migration-required
+                (list
+                 (if current
+                     (format "dorg: schema v%s has incompatible mutation receipt storage %S; repair the store before retrying"
+                             version status)
+                   (format (concat "dorg: mutation receipt schema is %S; run M-x "
+                                   "dorg-migrate-schema for the selected store")
+                           status))
+                 (list :reason (if current 'receipt-schema-incompatible
+                                 'schema-migration-required)
+                       :component 'receipt :schema-version version
+                       :receipt-status status)))))))
+
+(defun dorg-sql--mutation-log-insert-sql (op-id gen-id intent-digest ts)
   "Return the INSERT statement recording evidence (OP-ID GEN-ID INTENT-DIGEST TS).
 Appended to the committing batch so the evidence row lands ATOMICALLY with the
-mutation's data in one Dolt commit.  POSTIMAGES, when non-nil, is the
-serialized versioned postimage receipt payload (tracked-regression) stored in the
-additive `postimages_v1' column; the caller must have ensured the column via
-`dorg-sql--ensure-mutation-log-postimages'.  The digests inside it are
-computed pre-transaction from the candidate canonical and are ENTITLED by the
-postimage validator's readback assert — an aborted transaction rolls this row
-back, so no unentitled digest survives."
-  (if postimages
-      (format (concat "INSERT INTO dorg_mutation_log"
-                      " (op_id, gen_id, intent_digest, ts, postimages_v1)"
-                      " VALUES (%s, %s, %s, %d, %s)")
-              (dorg-sql-quote op-id) (dorg-sql-quote gen-id)
-              (dorg-sql-quote intent-digest) ts (dorg-sql-quote postimages))
-    (format (concat "INSERT INTO dorg_mutation_log (op_id, gen_id, intent_digest, ts)"
-                    " VALUES (%s, %s, %s, %d)")
-            (dorg-sql-quote op-id) (dorg-sql-quote gen-id)
-            (dorg-sql-quote intent-digest) ts)))
+mutation's data in one Dolt commit.  The retained nullable legacy payload
+column is omitted.  The caller must have checked receipt compatibility via
+`dorg-sql--require-mutation-log-schema'."
+  (format (concat "INSERT INTO dorg_mutation_log (op_id, gen_id, intent_digest, ts)"
+                  " VALUES (%s, %s, %s, %d)")
+          (dorg-sql-quote op-id) (dorg-sql-quote gen-id)
+          (dorg-sql-quote intent-digest) ts))
 
 (defun dorg-sql--mutation-log-lookup (lease op-id)
   "Return `(GEN-ID . INTENT-DIGEST)' for OP-ID in LEASE's store, or nil if absent.
 The gate-first idempotency preflight.  Reads the CURRENT-STATE row on the leased
 session; nil means no live evidence (not committed, or pruned past the retention
-window).  Caller must have run `dorg-sql--ensure-mutation-log' first."
+window).  Caller must have checked receipt compatibility first."
   (let ((rows (dorg-sql--lease-exec
                lease "SELECT gen_id, intent_digest FROM dorg_mutation_log WHERE op_id = %s"
                (dorg-sql-quote op-id))))
     (when rows
       (cons (alist-get 'gen_id (car rows))
             (alist-get 'intent_digest (car rows))))))
-
-(defun dorg-sql--mutation-log-postimages (lease op-id)
-  "Return OP-ID's stored serialized postimage payload, or nil (tracked-regression).
-nil means a LEGACY row: evidence committed before postimage receipts
-existed (or a store whose column was just added), which cannot satisfy an
-evidence-requesting replay.  Caller must have ensured the column via
-`dorg-sql--ensure-mutation-log-postimages' first."
-  (let ((rows (dorg-sql--lease-exec
-               lease
-               "SELECT postimages_v1 FROM dorg_mutation_log WHERE op_id = %s"
-               (dorg-sql-quote op-id))))
-    (when rows
-      (let ((v (alist-get 'postimages_v1 (car rows))))
-        (and (stringp v) (> (length v) 0) v)))))
 
 (defun dorg-sql--mutation-log-recover-commit (lease gen-id)
   "Return the creation commit hash for evidence generation GEN-ID in LEASE's store.
@@ -2215,8 +2649,10 @@ lease guard."
 
 (defun dorg-sql--parse-result (buf exit-code query &optional _server-p)
   "Parse dolt output in BUF after EXIT-CODE for QUERY.
-Type coercion is always applied (both CLI and server modes can
-return integers as strings)."
+Row values keep the types the Dolt JSON writer gave them: SQL numbers are
+JSON numbers, and text and DECIMAL are JSON strings, so nothing is converted
+by its spelling.  A SQL NULL column is an absent member, and raw binary is
+not byte-exact in JSON, so byte readers select HEX()."
   (with-current-buffer buf
     (if (/= exit-code 0)
         (error "dolt sql failed (exit %d): %s\nQuery: %s"
@@ -2252,13 +2688,7 @@ return integers as strings)."
                                  (list (format "Failed to parse dolt output: %s\nRaw output: %s"
                                                (error-message-string err)
                                                output))))))))
-            (let ((rows (and (consp parsed) (alist-get 'rows parsed))))
-              ;; Always coerce: CLI mode can return BIGINT as strings
-              ;; (JSON precision avoidance), server mode returns
-              ;; everything as strings (MySQL wire protocol).
-              (if rows
-                  (dorg-sql--coerce-types rows)
-                rows))))))))
+            (and (consp parsed) (alist-get 'rows parsed))))))))
 
 (defun dorg-sql--parse-json-or-nil (str)
   "Parse STR as JSON, returning the value or nil if STR is not valid JSON.
@@ -2316,49 +2746,6 @@ parse error on the raw output."
     (if (and last-start last-end)
         (substring str last-start (1+ last-end))
       str)))
-
-(defconst dorg-sql--no-coerce-columns '(sort_key sk item_sort_key value value_raw
-                                        text_raw line_raw raw_line
-                                        keyword prop_key prop_value
-                                        path tag hash)
-  "Column names exempt from server-mode type coercion.
-HEX() output (sort_key, sk, item_sort_key) and text content columns must
-stay as strings to preserve hex encoding and free-form values.
-`value_raw' is the `keyword_items' value column (selected under that
-alias by `dorg-model-load-headings'); it is free-form text such as a
-`#+KEY: 7' file keyword.  Coercing it to a number would make
-`dorg-keyword-item' values non-strings, so the string ops downstream
-\(`copy-sequence' in `dorg-heading-deep-copy') signal
-`wrong-type-argument'.  Its sibling raw columns above are exempt for the
-same reason.")
-
-(defun dorg-sql--coerce-types (rows)
-  "Coerce string values in ROWS to numbers where appropriate.
-Dolt client mode (via sql-server) returns all values as strings
-due to MySQL wire protocol.  This converts integer strings to
-integers and float strings to floats.
-
-Columns listed in `dorg-sql--no-coerce-columns' are exempt —
-their values are always left as strings."
-  (mapcar
-   (lambda (row)
-     (mapcar
-      (lambda (cell)
-        (let ((col (car cell))
-              (val (cdr cell)))
-          (cons col
-                (if (and (stringp val)
-                         (not (memq col dorg-sql--no-coerce-columns)))
-                    (cond
-                     ((string-match-p "\\`-?[0-9]+\\'" val)
-                      (string-to-number val))
-                     ((string-match-p "\\`-?[0-9]*\\.[0-9]+\\'" val)
-                      (string-to-number val))
-                     (t val))
-                  val))))
-      row))
-   rows))
-
 
 (defun dorg-sql-batch (dolt-dir statements &optional commit-message)
   "Execute multiple SQL STATEMENTS in DOLT-DIR in a single call.

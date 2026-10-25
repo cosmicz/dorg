@@ -19,8 +19,8 @@
 ;;   - the direct `(require 'dorg-*)' block in `dorg.el'
 ;;   - the `(require 'dorg-*-tests)' list in `tests/dorg-tests-runner.el'
 ;;   - the documented module/test maps in `DEVELOPMENT.org'
-;;   - the ERT selector policy (`dorg-test-*' required, `dorg-perf-*' the
-;;     one documented benchmark exception outside default `make test')
+;;   - the ERT selector policy (`dorg-test-*' and `dorg-perf-*' are both
+;;     covered by the exhaustive `make test-full' target)
 ;;
 ;; Each check fails with an actionable message naming the missing
 ;; symbol/file AND the map/list to update.  Adding a module or test
@@ -107,23 +107,31 @@ such as the runner, helpers, and stress harness are excluded by design."
     (nreverse (delete-dups out))))
 
 (defun dorg-test-project--doc-example-block (heading)
-  "Return body lines of the first #+begin_example block after org HEADING.
+  "Return body lines of the first #+begin_example block under Org HEADING.
 HEADING is matched as an Org headline in DEVELOPMENT.org."
   (with-temp-buffer
     (insert-file-contents
      (expand-file-name "DEVELOPMENT.org" dorg-test-project--root))
     (goto-char (point-min))
-    (unless (re-search-forward
-             (concat "^\\*+ +" (regexp-quote heading) "[ \t]*$") nil t)
-      (error "DEVELOPMENT.org: heading %S not found" heading))
-    (unless (re-search-forward "^[ \t]*#\\+begin_example[ \t]*$" nil t)
-      (error "DEVELOPMENT.org: no #+begin_example after %S" heading))
-    (let ((start (line-beginning-position 2)))
-      (unless (re-search-forward "^[ \t]*#\\+end_example[ \t]*$" nil t)
-        (error "DEVELOPMENT.org: unterminated example block after %S" heading))
-      (split-string
-       (buffer-substring-no-properties start (line-beginning-position))
-       "\n" t))))
+    (let ((case-fold-search t))
+      (unless (re-search-forward
+               (concat "^\\(\\*+\\) +" (regexp-quote heading) "[ \t]*$") nil t)
+        (error "DEVELOPMENT.org: heading %S not found" heading))
+      (let* ((level (length (match-string 1)))
+             (limit (save-excursion
+                      (if (re-search-forward
+                           (format "^\\*\\{1,%d\\}[ \t]" level) nil t)
+                          (match-beginning 0)
+                        (point-max)))))
+        (unless (re-search-forward
+                 "^[ \t]*#\\+begin_example\\(?:[ \t]+.*\\)?$" limit t)
+          (error "DEVELOPMENT.org: no #+begin_example after %S" heading))
+        (let ((start (line-beginning-position 2)))
+          (unless (re-search-forward "^[ \t]*#\\+end_example[ \t]*$" limit t)
+            (error "DEVELOPMENT.org: unterminated example block after %S" heading))
+          (split-string
+           (buffer-substring-no-properties start (line-beginning-position))
+           "\n" t))))))
 
 (defun dorg-test-project--documented-el-symbols (heading)
   "Return symbols for every `dorg*.el' token in HEADING's example block."
@@ -134,6 +142,69 @@ HEADING is matched as an Org headline in DEVELOPMENT.org."
           (push (intern (match-string 1 line)) out)
           (setq start (match-end 0)))))
     (delete-dups (nreverse out))))
+
+(defun dorg-test-project--with-doc-fixture (text body)
+  "Write TEXT as a temporary DEVELOPMENT.org, then call BODY in its root."
+  (let ((dorg-test-project--root (make-temp-file "dorg-project-doc-map-" t)))
+    (unwind-protect
+        (progn
+          (with-temp-file (expand-file-name "DEVELOPMENT.org"
+                                            dorg-test-project--root)
+            (insert text))
+          (funcall body))
+      (delete-directory dorg-test-project--root t))))
+
+(ert-deftest dorg-test-project-doc-example-labelled-opener ()
+  "A language-labelled Org example block supplies the documented map."
+  (dorg-test-project--with-doc-fixture
+   "* Modules\n#+BEGIN_EXAMPLE text -n\ndorg-example-module.el\n#+END_EXAMPLE\n"
+   (lambda ()
+     (should (equal '("dorg-example-module.el")
+                    (dorg-test-project--doc-example-block "Modules"))))))
+
+(ert-deftest dorg-test-project-doc-example-bare-opener ()
+  "The original bare Org example opener remains valid."
+  (dorg-test-project--with-doc-fixture
+   "* Modules\n#+begin_example\ndorg-example-module.el\n#+end_example\n"
+   (lambda ()
+     (should (equal '("dorg-example-module.el")
+                    (dorg-test-project--doc-example-block "Modules"))))))
+
+(ert-deftest dorg-test-project-doc-example-absent-in-section ()
+  "A later heading's block cannot satisfy a missing Modules block."
+  (dorg-test-project--with-doc-fixture
+   "* Modules\nNo block here.\n* Tests\n#+begin_example\ndorg-example-module.el\n#+end_example\n"
+   (lambda ()
+     (should (equal '(error "DEVELOPMENT.org: no #+begin_example after \"Modules\"")
+                    (should-error (dorg-test-project--doc-example-block "Modules")))))))
+
+(ert-deftest dorg-test-project-doc-example-rejects-lookalikes ()
+  "Similar Org block names do not count as an example opener."
+  (dolist (opener '("#+begin_examples" "#+begin_example_x"))
+    (dorg-test-project--with-doc-fixture
+     (format "* Modules\n%s\ndorg-example-module.el\n#+end_example\n" opener)
+     (lambda ()
+       (should (equal '(error "DEVELOPMENT.org: no #+begin_example after \"Modules\"")
+                      (should-error (dorg-test-project--doc-example-block "Modules"))))))))
+
+(ert-deftest dorg-test-project-doc-example-rejects-unterminated-block ()
+  "A block with no terminator in its section is malformed."
+  (dorg-test-project--with-doc-fixture
+   "* Modules\n#+begin_example\ndorg-example-module.el\n* Tests\n#+end_example\n"
+   (lambda ()
+     (should (equal '(error "DEVELOPMENT.org: unterminated example block after \"Modules\"")
+                    (should-error (dorg-test-project--doc-example-block "Modules")))))))
+
+(ert-deftest dorg-test-project-doc-example-missing-module-still-fails ()
+  "A parsed block cannot hide an undocumented root module."
+  (dorg-test-project--with-doc-fixture
+   "* Modules\n#+begin_example text\ndorg-example-module.el\n#+end_example\n"
+   (lambda ()
+     (with-temp-file (expand-file-name "dorg-extra-module.el" dorg-test-project--root)
+       (insert ";;; fixture\n"))
+     (should-error
+      (funcall (ert-test-body (ert-get-test 'dorg-test-project-modules-documented)))
+      :type 'ert-test-failed))))
 
 (defun dorg-test-project--fmt (syms)
   "Format SYMS as a comma-separated name list."
@@ -299,7 +370,7 @@ hand-maintained list silently allowed."
          (no-file (cl-set-difference reqs files)))
     (when unrequired
       (ert-fail
-       (format "Test files not required by dorg-tests-runner.el: %s. Add (require '...) so they run in `make test'."
+       (format "Test files not required by dorg-tests-runner.el: %s. Add (require '...) so `make test-full' can select them."
                (dorg-test-project--fmt unrequired))))
     (when no-file
       (ert-fail
@@ -349,7 +420,8 @@ hand-maintained list silently allowed."
     "dorg-ext-read-context-root-id"
     "dorg-registered-backend"
     "dorg-registered-dolt-dir"
-    "dorg-bind-dolt")
+    "dorg-bind-dolt"
+    "dorg-bind-existing-dolt")
   "Public symbols that must be rows in docs/api-census.org.
 This is the pre-internalization caller-census guard for the risky API
 families named by tracked-case.")
@@ -435,10 +507,9 @@ fail if the durable table omits the known cross-repo coupling classes."
 
 (ert-deftest dorg-test-project-ert-selector-policy ()
   "Every ERT test is named `dorg-test-*' or `dorg-perf-*'.
-`dorg-test-*' is the required default-suite namespace (SEL ?= ^dorg-test-);
-`dorg-perf-*' is the one documented benchmark exception, excluded from
-default `make test' and run via `make perf'.  Any other prefix would be
-silently dropped from the default suite."
+The exhaustive `make test-full' gate covers both namespaces.  `make test'
+is a bounded representative, while `make perf' remains a focused benchmark
+target.  Any other prefix would be silently dropped from the full suite."
   (let (offenders)
     (dolist (file (directory-files dorg-test-project--tests-dir t "\\.el\\'"))
       (let ((text (dorg-test-project--file-contents file))
@@ -454,15 +525,14 @@ silently dropped from the default suite."
        (format "ert-deftest names outside the dorg-test-*/dorg-perf-* policy: %s. Rename to dorg-test-* (or dorg-perf-* for benchmarks)."
                (mapconcat #'identity (nreverse offenders) ", "))))))
 
-;;; ─── Test gate partition (fast / medium / full) ───────────────────────
+;;; ─── Test gate partition (fast / medium / representative / full) ──────
 ;;
-;; `dorg-test-gates.el' splits the suite into a quick Dolt-free FAST gate
-;; and a Dolt/integration MEDIUM gate, with FULL `make test' unchanged as
-;; the acceptance gate.  These guards prove the gates cannot silently
-;; replace or shrink full coverage: the partition is exhaustive + disjoint,
-;; each gate is a proper non-empty subset, the FAST allowlist is statically
-;; Dolt-free, and the Makefile keeps `test' == `^dorg-test-' while ADDING
-;; (not replacing) the fast/medium targets.
+;; `dorg-test-gates.el' splits the regular `dorg-test-*' suite into a quick
+;; Dolt-free FAST gate and a Dolt/integration MEDIUM gate.  The default
+;; REPRESENTATIVE gate combines FAST with a small, named integration-file
+;; allowlist; TEST-FULL is the exhaustive acceptance gate and also covers
+;; `dorg-perf-*'.  These guards prove the convenience gates cannot silently
+;; replace or shrink full coverage.
 
 (defun dorg-test-project--makefile-text ()
   "Return the repository Makefile contents as a string."
@@ -475,7 +545,7 @@ Computed from the ACTUAL gate selector forms the Make targets run, so a
 classification or selector bug that dropped or double-counted tests turns
 this red — the core guarantee that the gates never silently lose coverage."
   (let* ((all (mapcar #'ert-test-name
-                      (ert-select-tests (dorg-test-gate-selector 'full) t)))
+                      (ert-select-tests dorg-test-gate-regular-selector t)))
          (fast (mapcar #'ert-test-name
                        (ert-select-tests (dorg-test-gate-selector 'fast) t)))
          (medium (mapcar #'ert-test-name
@@ -489,11 +559,70 @@ this red — the core guarantee that the gates never silently lose coverage."
     (should-not extra)                  ; no phantom outside full
     (should (= (length all) (+ (length fast) (length medium))))))
 
+(defun dorg-test-project--owned-ert-tests ()
+  "Return ERT tests whose defining file is in this project's tests directory.
+This uses `symbol-file' rather than a test-name prefix so macro-generated
+tests remain covered and a future project-owned test cannot be omitted by a
+namespace-only selector."
+  (let ((tests-dir (file-truename dorg-test-project--tests-dir)))
+    (seq-filter
+     (lambda (test)
+       (let ((file (symbol-file (ert-test-name test) 'ert--test)))
+         (and file
+              (file-in-directory-p (file-truename file) tests-dir))))
+     (ert-select-tests t t))))
+
+(ert-deftest dorg-test-project-gate-full-covers-project-test-inventory ()
+  "The full gate selects every registered project-owned ERT test.
+The assertion is inventory-based, not prefix-based: all ERT definitions in
+`tests/' — including macro-generated tests and `dorg-perf-*' benchmarks —
+must be selected by the exact FULL selector."
+  (let ((owned (sort (mapcar (lambda (test) (symbol-name (ert-test-name test)))
+                             (dorg-test-project--owned-ert-tests))
+                     #'string-lessp))
+        (full (sort (mapcar (lambda (test) (symbol-name (ert-test-name test)))
+                            (ert-select-tests
+                             (dorg-test-gate-selector 'full) t))
+                    #'string-lessp)))
+    (should (equal owned full))))
+
+(ert-deftest dorg-test-project-gate-representative-is-strict-full-subset ()
+  "The default representative gate is non-empty, bounded, and covered by full."
+  (let* ((representative
+          (mapcar #'ert-test-name
+                  (ert-select-tests (dorg-test-gate-selector 'representative) t)))
+         (fast (mapcar #'ert-test-name
+                       (ert-select-tests (dorg-test-gate-selector 'fast) t)))
+         (full (mapcar #'ert-test-name
+                       (ert-select-tests (dorg-test-gate-selector 'full) t)))
+         (uncovered (cl-set-difference representative full))
+         (missing-fast (cl-set-difference fast representative)))
+    (should representative)
+    (should-not uncovered)
+    (should-not missing-fast)
+    (should (< (length representative) (length full)))))
+
+(ert-deftest dorg-test-project-gate-representative-files-exist-and-define-tests ()
+  "Every named representative integration file exists and contributes tests.
+The default's integration component is a finite file allowlist.  A rename or
+stale entry must turn this red instead of silently shrinking the default."
+  (dolist (base dorg-test-gate-representative-dolt-files)
+    (let ((file (expand-file-name (concat base ".el")
+                                  dorg-test-project--tests-dir)))
+      (should (file-exists-p file))
+      (should
+       (ert-select-tests
+        `(and ,dorg-test-gate-regular-selector
+              (satisfies
+               ,(lambda (test)
+                  (equal (dorg-test-gate--test-file-base test) base))))
+        t)))))
+
 (ert-deftest dorg-test-project-gate-proper-non-empty-subsets ()
   "Neither FAST nor MEDIUM is empty or equal to the full suite.
 A gate that matched nothing (useless) or everything (a silent alias of the
 full acceptance suite) would defeat the point; pin both bounds."
-  (let ((all (length (ert-select-tests (dorg-test-gate-selector 'full) t)))
+  (let ((all (length (ert-select-tests dorg-test-gate-regular-selector t)))
         (fast (length (ert-select-tests (dorg-test-gate-selector 'fast) t)))
         (medium (length (ert-select-tests (dorg-test-gate-selector 'medium) t))))
     (should (> fast 0))
@@ -561,24 +690,44 @@ degenerate split; these concrete anchors prevent that."
     (should (dorg-test-gate-fast-p pure))
     (should-not (dorg-test-gate-fast-p dolt))))
 
-(ert-deftest dorg-test-project-gate-make-targets-preserve-full-suite ()
-  "Makefile keeps `test' == full `^dorg-test-' and ADDS fast/medium targets.
-Proves the new gates are additive conveniences, not a silent replacement of
-the acceptance suite: `make test' must still default its selector to
-`^dorg-test-', and dedicated `test-fast'/`test-medium' targets must exist
-and route through the gate runner."
+(ert-deftest dorg-test-project-gate-make-targets-preserve-coverage ()
+  "Makefile defaults to representative and keeps a separately exhaustive full.
+Focused `make test SELECT=...' calls remain arbitrary selectors.  The full
+target must run the FULL gate and enable the existing benchmark fixtures;
+FAST and MEDIUM retain their current gate routes."
   (let ((mk (dorg-test-project--makefile-text)))
-    ;; Full acceptance selector unchanged (`SEL ?= ^dorg-test-').
-    (should (string-match-p "^SEL[ \t]*\\?=[ \t]*\\^dorg-test-" mk))
-    ;; Both new targets are declared.
+    (should (string-match-p "^test:" mk))
+    (should (string-match-p "dorg-run-tests-batch-default-or-selector" mk))
+    (should (string-match-p "^test-full:" mk))
+    (should (string-match-p
+             "^DEFAULT_TEST_ENV[ \t]*=[ \t]*env -u DORG_BENCH"
+             mk))
+    (should (string-match-p
+             "^FOCUSED_TEST_ENV[ \t]*=[ \t]*DORG_TEST_VERBOSE"
+             mk))
+    (should (string-match-p
+             "^TEST_FULL_ENV[ \t]*=[ \t]*DORG_BENCH=1"
+             mk))
+    (should (string-match-p "DORG_BENCH=1" mk))
+    (should (string-match-p "Capability-dependent ERT skips remain reported" mk))
+    (should (string-match-p "dorg-run-tests-batch-gate \\\"full\\\"" mk))
+    (should (string-match-p "test-fast.*no sql-server" mk))
+    (should (string-match-p "test-medium.*starts shared sql-server" mk))
+    (should (string-match-p "test-full.*starts shared sql-server" mk))
+    ;; Existing narrow gates remain declared and gate-routed.
     (should (string-match-p "^test-fast:" mk))
     (should (string-match-p "^test-medium:" mk))
-    ;; And they run the gate entry point, not an arbitrary selector.
     (should (string-match-p "dorg-run-tests-batch-gate \"fast\"" mk))
     (should (string-match-p "dorg-run-tests-batch-gate \"medium\"" mk))
-    ;; .PHONY lists them so they never collide with a file of the same name.
+    ;; .PHONY lists each target so it cannot collide with a file of that name.
+    (should (string-match-p "test-full" mk))
     (should (string-match-p "test-fast" mk))
-    (should (string-match-p "test-medium" mk))))
+    (should (string-match-p "test-medium" mk))
+    (should (string-match-p
+             "shared server not started (fast gate)"
+             (dorg-test-project--file-contents
+              (expand-file-name "dorg-tests-runner.el"
+                                dorg-test-project--tests-dir))))))
 
 ;;; ─── Install story: targets + public-tree scrub ───────────────────────
 ;; End-user install surface: `make install' / `make install-deps' and a hosted
@@ -598,8 +747,9 @@ install story)."
 
 (ert-deftest dorg-test-project-install-sh-static-contract ()
   "install.sh pins its public `curl | bash' contract by static inspection:
-it parses under `bash -n', uses strict mode, invokes `make install', finishes
-with the `dorg doctor --install' verification, and honors the documented
+it parses under `bash -n', uses strict mode, invokes `make install' (whose
+staged `dorg doctor --install' is the installation verification, so the script
+never re-runs doctor on the published launcher), and honors the documented
 configurable inputs."
   (let ((path (expand-file-name "install.sh" dorg-test-project--root)))
     (should (file-exists-p path))
@@ -609,8 +759,90 @@ configurable inputs."
       (should (string-match-p "set -euo pipefail" text))
       (should (string-match-p "make .*install" text))
       (should (string-match-p "doctor --install" text))
-      (dolist (var '("DORG_REPO" "DORG_REF" "DORG_DIR" "BINDIR"))
-        (should (string-match-p var text))))))
+      (should-not (string-match-p "BINDIR/dorg\"? doctor" text))
+      (dolist (var '("DORG_REPO" "DORG_REF" "DORG_DIR" "BINDIR" "PREFIX"))
+        (should (string-match-p var text)))
+      ;; The launcher defaults to ~/bin like `make install', and the
+      ;; script forwards both layout roots to it.
+      (should (string-match-p (regexp-quote "BINDIR=\"${BINDIR:-$HOME/bin}\"") text))
+      (should (string-match-p "make .*install .*PREFIX=" text))
+      (should (string-match-p "make .*install .*BINDIR=" text)))))
+
+;;; ─── Relocated install: static contract ───────────────────────────────
+;; `make install' copies an explicit runtime inventory into an installation
+;; tree and compiles it there (behaviour: tests/dorg-install-tests.el).
+
+(defconst dorg-test-project--install-excluded-modules
+  '("dorg-app.el" "dorg-test-job.el")
+  "Root `dorg*.el' files the install never copies as modules.
+`dorg-app.el' ships as the body of the committed wrapper; `dorg-test-job.el'
+is test-only.")
+
+(defun dorg-test-project--install-runtime-modules (makefile-text)
+  "Return the `DORG_RUNTIME_MODULES' entries parsed from MAKEFILE-TEXT."
+  (with-temp-buffer
+    (insert makefile-text)
+    (goto-char (point-min))
+    (when (re-search-forward "^DORG_RUNTIME_MODULES[ \t]*:?=" nil t)
+      (let ((start (point)))
+        ;; The value runs through every backslash-continued line.
+        (while (progn (end-of-line)
+                      (and (eq (char-before) ?\\) (not (eobp))))
+          (forward-line 1))
+        (split-string (replace-regexp-in-string
+                       "\\\\$" "" (buffer-substring-no-properties start (point)))
+                      "[ \t\n\\\\]+" t)))))
+
+(defun dorg-test-project--install-inventory-problems (listed actual)
+  "Return a description of LISTED modules that differ from ACTUAL, or nil."
+  (let ((missing (cl-set-difference actual listed :test #'equal))
+        (extra (cl-set-difference listed actual :test #'equal))
+        (dups (cl-remove-duplicates
+               (cl-remove-if (lambda (m) (= 1 (cl-count m listed :test #'equal)))
+                             listed)
+               :test #'equal)))
+    (when (or missing extra dups)
+      (format "DORG_RUNTIME_MODULES in Makefile: missing %S, extra %S, duplicated %S"
+              missing extra dups))))
+
+(ert-deftest dorg-test-project-install-runtime-inventory-is-exact ()
+  "The Makefile's install inventory is every root `dorg*.el' module except
+the wrapper body and the test-only module.  The negative controls prove the
+predicate rejects a dropped module and an admitted test-only file."
+  (let* ((listed (dorg-test-project--install-runtime-modules
+                  (dorg-test-project--makefile-text)))
+         (actual (cl-set-difference
+                  (directory-files dorg-test-project--root nil "\\`dorg.*\\.el\\'")
+                  dorg-test-project--install-excluded-modules :test #'equal)))
+    (should (> (length actual) 40))
+    (should-not (dorg-test-project--install-inventory-problems listed actual))
+    (ert-info ("negative control: a dropped module is reported")
+      (should (dorg-test-project--install-inventory-problems (cdr listed) actual)))
+    (ert-info ("negative control: an admitted test-only module is reported")
+      (should (dorg-test-project--install-inventory-problems
+               (cons "dorg-test-job.el" listed) actual)))))
+
+(ert-deftest dorg-test-project-install-target-has-no-checkout-compile ()
+  "`install' does not byte-compile the checkout: no `compile' or
+`install-deps' prerequisite, so the source tree gains no `.elc'."
+  (let ((mk (dorg-test-project--makefile-text)))
+    (should (string-match "^install:\\(.*\\)$" mk))
+    (let ((prereqs (split-string (match-string 1 mk) "[ \t]+" t)))
+      (should-not (member "compile" prereqs))
+      (should-not (member "install-deps" prereqs)))))
+
+(ert-deftest dorg-test-project-wrapper-body-matches-app ()
+  "The committed wrapper is the two Clime header lines plus `dorg-app.el' verbatim.
+`make install' refuses a stale wrapper with the same comparison."
+  (let* ((wrapper (dorg-test-project--file-contents
+                   (expand-file-name "bin/dorg" dorg-test-project--root)))
+         (app (dorg-test-project--file-contents
+               (expand-file-name "dorg-app.el" dorg-test-project--root)))
+         (newline (string-search "\n" wrapper)))
+    (should newline)
+    (should (string-prefix-p "#!/bin/sh\n" wrapper))
+    (should (equal app (substring wrapper (1+ (string-search "\n" wrapper
+                                                              (1+ newline))))))))
 
 (ert-deftest dorg-test-project-install-surface-scrub-clean ()
   "The install surface passes the shared public-export scrub predicate."
@@ -1004,25 +1236,26 @@ disabled scanner.  Actual preimage offenders make the transformation RED."
       (should-not violations))))
 
 (ert-deftest dorg-test-project-public-scrub-rules-have-safe-boundaries ()
-  "The shared scrub rules distinguish internal names from public identifiers.
-Tracker brands use alphanumeric-or-underscore boundaries, preserving the B3
-EMBEAD_* isolation contract.  Bare slugs have the exact one-segment tracker-id
-shape; legitimate public tokens require a documented exact-token allowlist."
+  "The shared scrub rules separate private coordination tokens from public text.
+Tracker references, seat identities, home-directory paths and the internal
+codename are forbidden.  The names of DOrg's sibling tools are public product
+names and must not be classified (operator decision, 2026-10-05), so the two
+former brand classes are absent and their directory forms pass.  Bare slugs have
+the exact one-segment tracker-id shape; legitimate public tokens require a
+documented exact-token allowlist."
   (let ((known-symbols (dorg-test-project--known-dorg-token-table)))
     (dorg-test-project--load-public-scrub-source)
     (should (consp dorg-public-scrub-rules))
-    (dolist (class '("tracker reference" "tracker brand"
-                     "coordination brand" "agent identity" "private path"
+    (dolist (class '("tracker reference" "agent identity" "private path"
                      "internal codename" "bare tracker slug"))
       (should (assoc class dorg-public-scrub-rules)))
+    (dolist (class '("tracker brand" "coordination brand"))
+      (ert-info ((format "retired scrub class still present: %s" class))
+        (should-not (assoc class dorg-public-scrub-rules))))
     (dolist (control
              `(("tracker reference" . ,(concat "see b" "d:dorg-" "ab12"))
-               ("tracker brand" . ,(concat "run em" "bd status"))
-               ("tracker brand" . ,(concat "em" "bead-dir"))
-               ("tracker brand" . ,(concat ".em" "bead/"))
-               ("coordination brand" . ,(concat "Me" "lD handoff"))
                ("agent identity" . ,(concat "nav-" "ab12"))
-               ("private path" . ,(concat "/Us" "ers/example/.me" "ld/lane"))
+               ("private path" . ,(concat "/Us" "ers/example/lane"))
                ("internal codename" . ,(concat "Amb" "ient workload"))
                ("bare tracker slug" . ,(concat "dorg-" "ab12"))
                ("bare tracker slug" . ,(concat "dorg-" "ab12.foo3"))))
@@ -1031,7 +1264,12 @@ shape; legitimate public tokens require a documented exact-token allowlist."
                         (dorg-public-scrub-classify-string
                          (cdr control) known-symbols)))))
     (dolist (control
-             `(("B3 environment name" . ,(concat "EM" "BEAD_DIR"))
+             `(("B3 environment name" . "EMBEAD_DIR")
+               ("tracker tool command" . "run embd status")
+               ("tracker tool identifier" . "embead-dir")
+               ("tracker data directory" . ".embead/")
+               ("coordination tool name" . "MelD handoff")
+               ("coordination data directory" . ".meld/")
                ("multi-segment DOrg name" . ,(concat "dorg-" "test-run"))
                ("too-short slug" . ,(concat "dorg-" "ab"))
                ("too-long slug" . ,(concat "dorg-" "abcdef"))
@@ -1055,6 +1293,27 @@ shape; legitimate public tokens require a documented exact-token allowlist."
         (ert-info ((format "allowlisted token still classified: %s" (car entry)))
           (should-not (dorg-public-scrub-classify-string
                        (car entry) (make-hash-table :test #'equal))))))))
+
+(ert-deftest dorg-test-project-gitignore-passes-public-scrub ()
+  "Every line of the repository .gitignore passes the shared scrub.
+The ignore entries for the tracker and coordination directories are spelled
+literally; naming an ignored directory is public information, so the file
+needs no per-file exemption in the release gate."
+  (let* ((known-symbols (dorg-test-project--known-dorg-token-table))
+         (path (expand-file-name ".gitignore" dorg-test-project--root))
+         (lines (progn
+                  (should (file-readable-p path))
+                  (with-temp-buffer
+                    (insert-file-contents path)
+                    (split-string (buffer-string) "\n"))))
+         violations)
+    (dorg-test-project--load-public-scrub-source)
+    (should (member ".embead/" lines))
+    (should (member ".meld/" lines))
+    (dolist (line lines)
+      (when-let ((classes (dorg-public-scrub-classify-string line known-symbols)))
+        (push (cons line classes) violations)))
+    (should-not violations)))
 
 (ert-deftest dorg-test-project-public-release-gate-reports-net-positive-accounting ()
   "A growing candidate is valid when its accounting is exact.
@@ -1505,6 +1764,384 @@ network, tagging, commit, checkout, branch, or ref-update command."
                          "git[ 	]+update-ref\\b"
                          "gh[ 	]+release\\b"))
       (should-not (string-match-p forbidden text)))))
+
+;;; ─── Installed-root Make guard ─────────────────────────────────────────
+
+(defconst dorg-test-project--installed-root-marker ".installed-root"
+  "Per-worktree marker that protects an active installed checkout.")
+
+(defconst dorg-test-project--installed-root-guarded-goals
+  '("test" "tests" "test-full" "test-fast" "test-medium" "test-derived" "perf"
+    "bench" "lint" "clean-elc" "clean")
+  "Make entry goals that must refuse in a marked installed root.")
+
+(defconst dorg-test-project--installed-root-allowed-goals
+  '("all" "compile" "install" "install-deps" "mutate-grammar" "help"
+    "test-clean-scratch")
+  "Make entry goals whose current prerequisite closure may not reach a guard.")
+
+(defun dorg-test-project--make-rule-prerequisites (text)
+  "Parse TEXT's simple Make target/prerequisite graph into a hash table.
+The DOrg Makefile deliberately uses one target per non-pattern rule; the
+parser rejects recipes and variable assignments rather than pretending they
+are graph edges.  This static reader is the closure control for the real
+candidate Makefile, not a second target list maintained by the test."
+  (let ((rules (make-hash-table :test 'equal)))
+    (dolist (line (split-string text "\n"))
+      (when (string-match
+             "^\\([[:alnum:]_.-]+\\):\\(?:[ \t]+\\(.*\\)\\)?$" line)
+        (puthash (match-string 1 line)
+                 (split-string (or (match-string 2 line) "") "[ \t]+" t)
+                 rules)))
+    rules))
+
+(defun dorg-test-project--make-prerequisite-closure (rules goal &optional seen)
+  "Return GOAL's transitive prerequisite closure in RULES.
+SEEN is the recursive cycle guard; it keeps a future accidental Make cycle
+from turning this static safety control into a nonterminating test."
+  (unless (member goal seen)
+    (let ((seen (cons goal seen)) out)
+      (dolist (prerequisite (gethash goal rules))
+        (push prerequisite out)
+        (setq out (nconc out (dorg-test-project--make-prerequisite-closure
+                              rules prerequisite seen))))
+      (delete-dups out))))
+
+(defun dorg-test-project--make-call (dir &rest goals)
+  "Run Make in owned fixture DIR with GOALS and return (STATUS . OUTPUT)."
+  (with-temp-buffer
+    (let ((default-directory dir))
+      (cons (apply #'call-process "make" nil t nil "--no-print-directory" goals)
+            (buffer-string)))))
+
+(defun dorg-test-project--installed-root-fixture (root marker-kind)
+  "Populate ROOT with the candidate Makefile and MARKER-KIND entry.
+MARKER-KIND is one of `file', `directory', `symlink' or `dangling-symlink'.
+The copied Makefile is byte-for-byte the candidate under test; guarded
+invocations must stop during parsing, before any of its absent build inputs
+could be mistaken for the reason the command failed."
+  (copy-file (expand-file-name "Makefile" dorg-test-project--root)
+             (expand-file-name "Makefile" root))
+  (let ((marker (expand-file-name dorg-test-project--installed-root-marker root)))
+    (pcase marker-kind
+      ('file (with-temp-file marker (insert "marker\n")))
+      ('directory (make-directory marker))
+      ('symlink (let ((target (expand-file-name "marker-target" root)))
+                  (with-temp-file target (insert "target\n"))
+                  (make-symbolic-link target marker)))
+      ('dangling-symlink
+       (make-symbolic-link (expand-file-name "does-not-exist" root) marker)))
+    marker))
+
+(defun dorg-test-project--marker-observation (marker)
+  "Return a non-following observation of MARKER for mutation assertions."
+  (list :link (file-symlink-p marker)
+        :exists (file-exists-p marker)
+        :directory (file-directory-p marker)
+        :bytes (and (file-regular-p marker)
+                    (dorg-test-project--file-contents marker))))
+
+(defun dorg-test-project--installed-root-without-preflight (makefile)
+  "Return MAKEFILE with the parse-time marked-root refusal deleted.
+This is an in-memory RED witness only: the fixture writes it to an owned
+temporary root, never to the candidate."
+  (replace-regexp-in-string
+   "^\\$(error dorg: REFUSE guarded target.*\n" "" makefile))
+
+(ert-deftest dorg-test-project-installed-root-refuses-every-guarded-goal ()
+  "File, directory and both symlink marker forms refuse before Make effects."
+  (dolist (kind '(file directory symlink dangling-symlink))
+    (let ((root (make-temp-file "dorg-installed-root-" t)))
+      (unwind-protect
+          (let* ((marker (dorg-test-project--installed-root-fixture root kind))
+                 (before (dorg-test-project--marker-observation marker))
+                 (elc (expand-file-name "sentinel.elc" root))
+                 (bin (expand-file-name "bin/sentinel" root)))
+            (make-directory (file-name-directory bin) t)
+            (with-temp-file elc (insert "elc-sentinel"))
+            (with-temp-file bin (insert "bin-sentinel"))
+            (dolist (goal dorg-test-project--installed-root-guarded-goals)
+              (pcase-let ((`(,status . ,output)
+                           (dorg-test-project--make-call root goal)))
+                (ert-info ((format "%s marker, target %s: %s" kind goal output))
+                  (should-not (zerop status))
+                  (should (string-match-p "REFUSE guarded target" output))
+                  (should (string-match-p (regexp-quote goal) output))
+                  (should (equal before
+                                 (dorg-test-project--marker-observation marker)))
+                  (should (equal "elc-sentinel"
+                                 (dorg-test-project--file-contents elc)))
+                  (should (equal "bin-sentinel"
+                                 (dorg-test-project--file-contents bin)))))))
+        (delete-directory root t)))))
+
+(ert-deftest dorg-test-project-installed-root-guarded-closure-is-static ()
+  "Allowed Make goals cannot acquire a destructive guarded prerequisite.
+The RED mutation adds `clean-elc' to `install', demonstrating why inspecting
+only the requested top-level goal would be insufficient."
+  (let* ((makefile (dorg-test-project--makefile-text))
+         (ignore-lines (split-string
+                        (dorg-test-project--file-contents
+                         (expand-file-name ".gitignore" dorg-test-project--root))
+                        "\n" t))
+         (rules (dorg-test-project--make-rule-prerequisites makefile)))
+    (should (member dorg-test-project--installed-root-marker ignore-lines))
+    (should (string-match-p "test -e.*test -L" makefile))
+    (dolist (goal dorg-test-project--installed-root-allowed-goals)
+      (let ((closure (dorg-test-project--make-prerequisite-closure rules goal)))
+        (should-not (cl-intersection closure
+                                     dorg-test-project--installed-root-guarded-goals
+                                     :test #'equal))))
+    ;; The current file has no recursive Make at all.  If one is later added,
+    ;; a guarded target cannot be hidden behind an allowed goal's recipe.
+    (should-not
+     (string-match-p
+      (concat "\\$(MAKE).*\\<"
+              (regexp-opt dorg-test-project--installed-root-guarded-goals t)
+              "\\>")
+      makefile))
+    (let* ((mutant (replace-regexp-in-string "^install:" "install: clean-elc"
+                                              makefile))
+           (mutant-rules (dorg-test-project--make-rule-prerequisites mutant)))
+      (should (member "clean-elc"
+                      (dorg-test-project--make-prerequisite-closure
+                       mutant-rules "install"))))))
+
+(ert-deftest dorg-test-project-installed-root-preflight-mutants-are-observable ()
+  "Missing or delayed preflight visibly permits protected cleanup.
+These two RED witnesses keep the parse-time placement requirement concrete:
+removing the error lets `clean-elc' delete a sentinel, while moving refusal
+behind that prerequisite deletes it before reporting the delayed refusal."
+  (let ((makefile (dorg-test-project--makefile-text)))
+    ;; Missing preflight: guarded cleanup succeeds and destroys the sentinel.
+    (let ((root (make-temp-file "dorg-installed-root-no-preflight-" t)))
+      (unwind-protect
+          (let* ((marker (dorg-test-project--installed-root-fixture root 'file))
+                 (sentinel (expand-file-name "protected.elc" root)))
+            (with-temp-file (expand-file-name "Makefile" root)
+              (insert (dorg-test-project--installed-root-without-preflight makefile)))
+            (with-temp-file sentinel (insert "must-survive\n"))
+            (pcase-let ((`(,status . ,_output)
+                         (dorg-test-project--make-call root "clean-elc")))
+              (should (zerop status))
+              (should (file-exists-p marker))
+              (should-not (file-exists-p sentinel))))
+        (delete-directory root t)))
+    ;; Delayed preflight: the command refuses, but only after clean-elc has
+    ;; already removed the sentinel, proving that a recipe-time guard is late.
+    (let ((root (make-temp-file "dorg-installed-root-delayed-preflight-" t)))
+      (unwind-protect
+          (let* ((marker (dorg-test-project--installed-root-fixture root 'file))
+                 (sentinel (expand-file-name "protected.elc" root))
+                 (mutant
+                  (replace-regexp-in-string
+                   "^test: clean-elc$"
+                   "test: clean-elc\n\t@echo 'REFUSE delayed preflight' >&2; exit 2"
+                   (dorg-test-project--installed-root-without-preflight makefile))))
+            (with-temp-file (expand-file-name "Makefile" root)
+              (insert mutant))
+            (with-temp-file sentinel (insert "must-survive\n"))
+            (pcase-let ((`(,status . ,output)
+                         (dorg-test-project--make-call root "test")))
+              (should-not (zerop status))
+              (should (string-match-p "REFUSE delayed preflight" output))
+              (should (file-exists-p marker))
+              (should-not (file-exists-p sentinel))))
+        (delete-directory root t)))))
+
+(defun dorg-test-project--installed-root-compile-stubs (root)
+  "Add the minimal recorder-backed inputs for Make's real `compile' recipe.
+Return (EMACS RECORDER).  The Makefile remains the candidate's actual bytes;
+only its external compiler command is replaced, because these rows prove
+ordering and marker effects rather than Emacs byte compilation."
+  (let ((tools (expand-file-name "tools" root))
+        (emacs (expand-file-name "fake-emacs" root))
+        (recorder (expand-file-name "compile-recorder" root)))
+    (make-directory tools t)
+    (with-temp-file (expand-file-name "fixture.el" root)
+      (insert "(provide 'fixture)\n"))
+    (with-temp-file (expand-file-name "dorg-public-scrub.el" tools)
+      (insert "(provide 'dorg-public-scrub)\n"))
+    (with-temp-file emacs
+      (insert "#!/bin/sh\nprintf 'compile\\n' >> \"$DORG_INSTALLED_ROOT_RECORDER\"\n"
+              "exit \"${DORG_INSTALLED_ROOT_COMPILE_STATUS:-0}\"\n"))
+    (set-file-modes emacs #o700)
+    (list emacs recorder)))
+
+(ert-deftest dorg-test-project-installed-root-lifecycle-and-mixed-preflight ()
+  "Compile is allowed; install-root marks after success and mixed goals refuse.
+The fake compiler is an explicit recorder, so a guard accidentally placed
+behind a compile/clean prerequisite becomes a direct failure rather than a
+mere command-status coincidence."
+  (let ((root (make-temp-file "dorg-installed-root-lifecycle-" t)))
+    (unwind-protect
+        (let* ((marker (dorg-test-project--installed-root-fixture root 'file))
+               (before (dorg-test-project--marker-observation marker))
+               (stubs (dorg-test-project--installed-root-compile-stubs root))
+               (emacs (car stubs))
+               (recorder (cadr stubs))
+               (process-environment
+                (cons (concat "DORG_INSTALLED_ROOT_RECORDER=" recorder)
+                      process-environment)))
+          ;; Explicit compilation and the default all target remain possible
+          ;; inside an active checkout and leave the marker untouched.
+          (dolist (goal '("compile" "all"))
+            (pcase-let ((`(,status . ,output)
+                         (dorg-test-project--make-call root goal
+                                                        (concat "EMACS=" emacs))))
+              (ert-info ((format "%s: %s" goal output))
+                (should (zerop status))
+                (should (equal before
+                               (dorg-test-project--marker-observation marker))))))
+          ;; The mixed-goal preflight happens before compile can record or
+          ;; install-root can create/alter a marker.
+          (let ((mixed-root (make-temp-file "dorg-installed-root-mixed-" t)))
+            (unwind-protect
+                (let* ((unused-marker
+                        (expand-file-name dorg-test-project--installed-root-marker
+                                          mixed-root))
+                       (mixed-stubs
+                        (progn
+                          (dorg-test-project--installed-root-fixture mixed-root 'file)
+                          ;; The fixture helper intentionally marks; remove it
+                          ;; to exercise the *unmarked* mixed-goal rule.
+                          (delete-file unused-marker)
+                          (dorg-test-project--installed-root-compile-stubs mixed-root)))
+                       (mixed-recorder (cadr mixed-stubs))
+                       (process-environment
+                        (cons (concat "DORG_INSTALLED_ROOT_RECORDER=" mixed-recorder)
+                              process-environment)))
+                  (pcase-let ((`(,status . ,output)
+                               (dorg-test-project--make-call
+                                mixed-root "-j4" "install-root" "clean"
+                                (concat "EMACS=" (car mixed-stubs)))))
+                    (should-not (zerop status))
+                    (should (string-match-p "REFUSE install-root combined" output))
+                    (should-not (file-exists-p unused-marker))
+                    (should-not (file-exists-p mixed-recorder))))
+              (delete-directory mixed-root t))))
+      (delete-directory root t))))
+
+(ert-deftest dorg-test-project-installed-root-is-per-worktree ()
+  "A primary marker does not turn a separate linked worktree into an install.
+The marker is intentionally untracked and root-local.  This control creates a
+real Git linked worktree, puts the marker only in the primary checkout, then
+proves that `clean-elc' can remove bytecode in the linked checkout.  Thus a
+global or repository-common marker lookup cannot accidentally make ordinary
+lane worktrees unusable."
+  (let* ((root (make-temp-file "dorg-installed-root-primary-" t))
+         ;; `git -C ROOT worktree add' interprets relative destinations from
+         ;; ROOT, while ERT's temporary default-directory is this checkout.
+         ;; Make the independent worktree location explicit.
+         (linked (make-temp-name
+                  (expand-file-name "dorg-installed-root-linked-"
+                                    temporary-file-directory)))
+         (marker (expand-file-name dorg-test-project--installed-root-marker root))
+         (primary-elc (expand-file-name "primary-sentinel.elc" root))
+         (linked-elc (expand-file-name "linked-sentinel.elc" linked)))
+    (unwind-protect
+        (progn
+          (copy-file (expand-file-name "Makefile" dorg-test-project--root)
+                     (expand-file-name "Makefile" root))
+          (with-temp-file (expand-file-name "fixture.el" root)
+            (insert "(provide 'fixture)\n"))
+          (dorg-test-project--command-output "git" "init" "-q" root)
+          (dorg-test-project--git root "config" "user.email" "dorg-test@example.invalid")
+          (dorg-test-project--git root "config" "user.name" "DOrg project test")
+          (dorg-test-project--git root "add" "Makefile" "fixture.el")
+          (dorg-test-project--git root "commit" "-qm" "fixture")
+          ;; An ordinary, unmarked primary checkout retains normal cleanup.
+          (with-temp-file primary-elc (insert "primary-bytecode\n"))
+          (pcase-let ((`(,status . ,output)
+                       (dorg-test-project--make-call root "clean-elc")))
+            (ert-info (output)
+              (should (zerop status))
+              (should-not (file-exists-p primary-elc))))
+          (with-temp-file marker (insert "primary-marker\n"))
+          ;; A shared-Git-config implementation would observe this value from
+          ;; the linked worktree.  The marker contract is strictly local.
+          (dorg-test-project--git root "config" "dorg.installed-root" "true")
+          (dorg-test-project--git root "worktree" "add" "--detach" linked "HEAD")
+          (with-temp-file linked-elc (insert "linked-bytecode\n"))
+          (pcase-let ((`(,status . ,output)
+                       (dorg-test-project--make-call linked "clean-elc")))
+            (ert-info (output)
+              (should (zerop status))
+              (should-not (file-exists-p linked-elc))
+              (should (equal "primary-marker\n"
+                             (dorg-test-project--file-contents marker)))
+              (should-not (file-exists-p
+                           (expand-file-name dorg-test-project--installed-root-marker
+                                             linked)))))
+          (dorg-test-project--git root "worktree" "remove" "--force" linked)
+          (setq linked nil))
+      (when (and linked (file-directory-p linked))
+        (ignore-errors (dorg-test-project--git root "worktree" "remove" "--force" linked)))
+      (delete-directory root t))))
+
+(ert-deftest dorg-test-project-installed-root-packet-and-ci-stay-unmarked ()
+  "The packet control and CI workflow keep installed-root state local.
+The Python control uses an untracked marker fixture and proves bundle
+reconstruction excludes it.  This source row additionally refuses a CI-side
+marker exception or an unconnected packet control."
+  (let ((packet-control
+         (dorg-test-project--file-contents
+          (expand-file-name "tests/test_suite_source_packet.py"
+                            dorg-test-project--root)))
+        (ci (dorg-test-project--file-contents
+             (expand-file-name ".github/workflows/ci.yml"
+                               dorg-test-project--root))))
+    (should (string-match-p "test_untracked_installed_marker_never_enters_packet"
+                            packet-control))
+    (should (string-match-p "actions/checkout@v4" ci))
+    (should-not (string-match-p
+                 (regexp-quote dorg-test-project--installed-root-marker) ci))))
+
+(ert-deftest dorg-test-project-install-root-marks-only-after-compile ()
+  "install-root marks after successful compile and preserves failure state."
+  (let ((root (make-temp-file "dorg-install-root-ordering-" t)))
+    (unwind-protect
+        (let* ((marker (dorg-test-project--installed-root-fixture root 'file))
+               (stubs (dorg-test-project--installed-root-compile-stubs root))
+               (emacs (car stubs))
+               (recorder (cadr stubs)))
+          ;; First, exercise the success edge from an explicitly unmarked root.
+          (delete-file marker)
+          (let ((process-environment
+                 (cons (concat "DORG_INSTALLED_ROOT_RECORDER=" recorder)
+                       process-environment)))
+            (pcase-let ((`(,status . ,output)
+                         (dorg-test-project--make-call root "install-root"
+                                                        (concat "EMACS=" emacs))))
+              (ert-info (output)
+                (should (zerop status))
+                (should (file-regular-p marker))
+                (should (string-match-p "Marked installed root" output))
+                (should (file-exists-p recorder)))))
+          ;; A failure before the install-root recipe cannot create a marker.
+          (delete-file marker)
+          (let ((process-environment
+                 (cons "DORG_INSTALLED_ROOT_COMPILE_STATUS=1"
+                       (cons (concat "DORG_INSTALLED_ROOT_RECORDER=" recorder)
+                             process-environment))))
+            (pcase-let ((`(,status . ,_output)
+                         (dorg-test-project--make-call root "install-root"
+                                                        (concat "EMACS=" emacs))))
+              (should-not (zerop status))
+              (should-not (file-exists-p marker))))
+          ;; Nor may a failed compile remove or overwrite an existing marker.
+          (with-temp-file marker (insert "keep-me\n"))
+          (let ((process-environment
+                 (cons "DORG_INSTALLED_ROOT_COMPILE_STATUS=1"
+                       (cons (concat "DORG_INSTALLED_ROOT_RECORDER=" recorder)
+                             process-environment))))
+            (pcase-let ((`(,status . ,_output)
+                         (dorg-test-project--make-call root "install-root"
+                                                        (concat "EMACS=" emacs))))
+              (should-not (zerop status))
+              (should (equal "keep-me\n"
+                             (dorg-test-project--file-contents marker))))))
+      (delete-directory root t))))
 
 (provide 'dorg-project-tests)
 ;;; dorg-project-tests.el ends here

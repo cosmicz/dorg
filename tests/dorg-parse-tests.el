@@ -404,16 +404,16 @@ today (parse succeeds, minting a heading whose id is the float 1.5)."
 (ert-deftest dorg-test-parse-import-headings ()
   "Import creates queryable headings in Dolt."
   (dorg-test-with-import "#+TITLE: Test\n* First\n** Nested\n* Second\n"
-    (let ((result (dorg-sql dolt-dir "SELECT id, level, title FROM headings ORDER BY id")))
-      ;; root(0) + First(1) + Nested(2) + Second(1)
+    (let ((result (dorg-sql dolt-dir "SELECT id, level_offset, title FROM headings ORDER BY id")))
+      ;; Stored offsets: root 0, First 1, Nested 1 (level 2 under First), Second 1
       (should (= (length result) 4))
-      (should (= (alist-get 'level (nth 0 result)) 0))
+      (should (= (alist-get 'level_offset (nth 0 result)) 0))
       (should (equal (alist-get 'title (nth 1 result)) "First"))
-      (should (= (alist-get 'level (nth 1 result)) 1))
+      (should (= (alist-get 'level_offset (nth 1 result)) 1))
       (should (equal (alist-get 'title (nth 2 result)) "Nested"))
-      (should (= (alist-get 'level (nth 2 result)) 2))
+      (should (= (alist-get 'level_offset (nth 2 result)) 1))
       (should (equal (alist-get 'title (nth 3 result)) "Second"))
-      (should (= (alist-get 'level (nth 3 result)) 1)))))
+      (should (= (alist-get 'level_offset (nth 3 result)) 1)))))
 
 (ert-deftest dorg-test-parse-import-keywords ()
   "Import stores file keywords queryable via SQL."
@@ -981,16 +981,16 @@ re-parse the rendered org: the sibling beads must survive.  This is the
 end-to-end verbatim round-trip in miniature; fails before the
 region bound (the siblings are swallowed when the lone begin bridges to
 the later end)."
-  (let* ((root (make-dorg-heading :id 1 :level 0 :title nil))
+  (let* ((root (make-dorg-heading :id 1 :level 0 :level-offset 0 :title nil))
          (a (make-dorg-heading
-             :id 100 :parent-id 1 :level 1 :title "Bead A"
+             :id 100 :parent-id 1 :level 1 :level-offset 1 :title "Bead A"
              :sort-key (dorg-sortkey-from-integer 1 2)
              :items (list (dorg-text-item
                            :text "#+begin_example\n*** Sample\nsample body"))))
-         (b (make-dorg-heading :id 200 :parent-id 1 :level 1 :title "Bead B"
+         (b (make-dorg-heading :id 200 :parent-id 1 :level 1 :level-offset 1 :title "Bead B"
                                :sort-key (dorg-sortkey-from-integer 2 2)))
          (c (make-dorg-heading
-             :id 300 :parent-id 1 :level 1 :title "Bead C"
+             :id 300 :parent-id 1 :level 1 :level-offset 1 :title "Bead C"
              :sort-key (dorg-sortkey-from-integer 3 2)
              :items (list (dorg-text-item :text "#+end_example\ntail"))))
          (text (dorg-model-render-tree (list root a b c))))
@@ -1111,7 +1111,7 @@ so both the no-phantom and the byte-identity assertions fail (vacuity
 guard: deleting either the escape or the unescape flips this red)."
   (let* ((body "#+begin_example\n*** Sample heading\nsample body line\n#+end_example\n")
          (h (make-dorg-heading
-             :id 100 :parent-id nil :level 1 :title "Real bead"
+             :id 100 :parent-id nil :level 1 :level-offset 1 :title "Real bead"
              :items (list (dorg-text-item :text body))))
          (s1 (dorg-model-render-heading-section h)))
     ;; Render escaped the column-0 heading line.
@@ -1133,7 +1133,7 @@ Escape and unescape are paired, so the model always holds unescaped
 content and render emits the same bytes each cycle (no `,,*')."
   (let* ((body "#+begin_example\n*** Sample\n#+end_example\n")
          (h (make-dorg-heading
-             :id 100 :parent-id nil :level 1 :title "Bead"
+             :id 100 :parent-id nil :level 1 :level-offset 1 :title "Bead"
              :items (list (dorg-text-item :text body))))
          (s1 (dorg-model-render-heading-section h)))
     (should-not (string-match-p ",,\\*" s1))
@@ -1347,9 +1347,9 @@ it is stripped before comparing the 7275-byte / SHA-256 witness."
 Defense-in-depth: if malformed source ever slips duplicate ids past the
 parser, the error names the offending id instead of deferring to an
 opaque downstream Dolt primary-key abort."
-  (let* ((root (make-dorg-heading :id 1000 :level 0 :title nil))
-         (h1 (make-dorg-heading :id 5 :level 1 :title "A"))
-         (h2 (make-dorg-heading :id 5 :level 1 :title "B"))
+  (let* ((root (make-dorg-heading :id 1000 :level 0 :level-offset 0 :title nil))
+         (h1 (make-dorg-heading :id 5 :level 1 :level-offset 1 :title "A"))
+         (h2 (make-dorg-heading :id 5 :level 1 :level-offset 1 :title "B"))
          (result (make-dorg-parse-result
                   :root-id 1000
                   :headings (list root h1 h2)
@@ -1385,7 +1385,7 @@ miniature.  Skips when dolt is unavailable."
 #+end_example
 "
     (let ((rows (dorg-sql dolt-dir
-                          "SELECT title FROM headings ORDER BY level, title")))
+                          "SELECT title FROM headings ORDER BY level_offset, title")))
       ;; root (NULL title) + Real bead = 2 rows; phantoms excluded.
       (should (= (length rows) 2))
       (should (cl-some (lambda (r) (equal (alist-get 'title r) "Real bead")) rows))

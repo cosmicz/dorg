@@ -17,8 +17,10 @@
 ;;     :version 2
 ;;     :migrations '((1 . myapp-dorg--migration-1-to-2)))
 ;;
-;; Extensions are applied after the core schema in `dorg-init', and
-;; their version is tracked in `dorg_meta' as `ext:<name>:version'.
+;; Extensions are applied after the core schema in `dorg-init'.  Existing
+;; stores install or upgrade registered extensions only through the explicit
+;; operator migration entry, `dorg-migrate-schema'.  Extension versions are
+;; tracked in `dorg_meta' as `ext:<name>:version'.
 ;;
 ;; Schema evolution is a first-class migration contract, not silent
 ;; drift.  Each `:migrations' entry is keyed by a from-version integer
@@ -27,8 +29,7 @@
 ;; function steps may inspect the repo but must not commit or touch
 ;; `dorg_meta' — dorg owns the version bump.  Dorg never infers schema
 ;; diffs and never downgrades; a missing migration step is an actionable
-;; error, with manual SQL available only as an operator escape hatch (see
-;; `dorg-repo-ensure-extensions').
+;; error before any write.
 
 ;;; Code:
 
@@ -50,7 +51,13 @@ exactly FROM-VERSION -> FROM-VERSION+1.  STEP is SQL (string or list of
 strings) or a function of one argument (the dolt-dir) returning SQL.
 
 CAPABILITIES is a list of mutation/read source kinds (e.g. `dolt') the
-extension's participants support; nil defaults to `(dolt)'.
+extension's participants support; nil defaults to `(dolt)'.  PROJECT-SCOPE is
+`bounded' (the default) or `whole-root': the latter is an explicit opt-in for
+a projector whose deterministic aggregate requires every canonical heading in
+the root, and causes DOrg to materialize a complete candidate image before
+calling it.  An aggregate expressible as sums or xors (document frequencies,
+corpus totals) is instead declared with `:accumulate' read tables and stays
+bounded; see `dorg-ext-fold-accumulators'.
 PROJECT and VALIDATE are the index-projector callbacks (see
 `dorg-ext-collect-index-projection').  Each is a pure function of a single
 `dorg-ext-index-context' argument.  PROJECT returns a list of TYPED ROW DELTAS —
@@ -77,11 +84,17 @@ nil for no opinion).  It classifies whether a heading whose buffer-derived
 star nesting would record it at a different lineage than its stored one is a
 legitimate move or a corrupt promotion — knowledge only an extension that
 OWNS the heading has (see `dorg-ext-classify-placement').  Defaults nil,
-leaving generic DOrg with no opinion on any level-1 heading."
+leaving generic DOrg with no opinion on any level-1 heading.
+
+PRODUCER-RESOLVER is an optional policy-upgrade callback.  It resolves a
+DOrg-owned request for a content-addressed producer into the installed
+projector, immutable implementation/dependency identities, and canonical
+policy input.  Ordinary mutation and root rebuild never consult it."
   name schema version migrations
-  capabilities project validate
+  capabilities project project-scope validate
   read-tables hydrate
-  placement-invariant)
+  fields query-context
+  placement-invariant producer-resolver)
 
 ;; The old `dorg-ext-mutation-context' read model and its `:extension-inputs'
 ;; caller-payload seam are RETIRED (tracked-regression).  Extension participants are
@@ -266,25 +279,34 @@ A nil HEADINGS yields an empty map."
 
 (defun dorg-ext--index-lineage-changed-p (before after)
   "Return non-nil when AFTER's lineage differs from BEFORE's.
-Lineage is parent id, sibling sort key, and level — the placement facts that
-distinguish a move from an in-place content change."
+Lineage is parent id, sibling sort key, and level offset: the persisted
+placement facts that distinguish a move from an in-place content change.  A
+derived effective level is not a persisted fact, so its change alone is not
+a lineage change; a descendant whose ancestry moved is reported through the
+explicit MOVED set of `dorg-ext--index-classify' instead."
   (not (and (eql (dorg-heading-parent-id before) (dorg-heading-parent-id after))
             (equal (dorg-heading-sort-key before) (dorg-heading-sort-key after))
-            (eql (dorg-heading-level before) (dorg-heading-level after)))))
+            (eql (dorg-heading-level-offset before)
+                 (dorg-heading-level-offset after)))))
 
-(defun dorg-ext--index-classify (orig ps-headings created changed deleted)
+(defun dorg-ext--index-classify (orig ps-headings created changed deleted
+                                      &optional moved)
   "Partition candidate images into create/change/move/delete index entries.
 ORIG and PS-HEADINGS are S0 and candidate id -> `dorg-heading' hashes.
-CREATED/CHANGED/DELETED are touched-id accumulators.  Net membership decides the
-disjoint partition: a heading present only in the candidate is a create, one
-present only in S0 is a delete, and one present in both and touched is a move or
-change.  Returns (:created ES :changed ES :moved ES :deleted ES), each sorted by
-id."
+CREATED/CHANGED/DELETED are touched-id accumulators, and MOVED lists ids whose
+ancestry changed even where their persisted tuple did not.  Net membership
+decides the disjoint partition, each id in exactly one: present only in the
+candidate is a create, and present only in S0 is a delete.  Present in both,
+a MOVED id is a move; otherwise a touched id is a move when its lineage
+changed and a change when it did not.  Returns (:created ES :changed ES
+:moved ES :deleted ES), each sorted by id."
   (let ((touched (make-hash-table :test 'eql))
+        (moved-set (make-hash-table :test 'eql))
         (creates nil) (changes nil) (moves nil) (deletes nil)
         (by-id (lambda (a b) (< (dorg-ext-index-entry-id a)
                                 (dorg-ext-index-entry-id b)))))
-    (dolist (id (append created changed deleted)) (puthash id t touched))
+    (dolist (id (append created changed deleted moved)) (puthash id t touched))
+    (dolist (id moved) (puthash id t moved-set))
     (when ps-headings
       (maphash
        (lambda (id after)
@@ -295,7 +317,8 @@ id."
                     :kind 'create :id id :after (dorg-heading-deep-copy after))
                    creates))
             ((gethash id touched)
-             (if (dorg-ext--index-lineage-changed-p before after)
+             (if (or (gethash id moved-set)
+                     (dorg-ext--index-lineage-changed-p before after))
                  (push (dorg-ext-index-entry-create
                         :kind 'move :id id
                         :before (dorg-heading-deep-copy before)
@@ -321,11 +344,13 @@ id."
           :deleted (sort deletes by-id))))
 
 (defun dorg-ext--index-heading-canonical (h)
-  "Return a COMPLETE canonical tuple of `dorg-heading' H's persisted state."
+  "Return a COMPLETE canonical tuple of `dorg-heading' H's persisted state.
+The level fact is the persisted offset, never the derived effective level:
+readback images are built from id slices that cannot derive it."
   (list (dorg-heading-id h)
         (dorg-heading-parent-id h)
         (dorg-heading-sort-key h)
-        (dorg-heading-level h)
+        (dorg-heading-level-offset h)
         (dorg-heading-todo h)
         (dorg-heading-priority h)
         (dorg-heading-commented h)
@@ -432,13 +457,15 @@ CANDIDATE-POSTIMAGE.  For a backend that does not materialize a candidate tree
 \(plain-org, which preserves core semantics without a durable shadow index) both
 are nil; the Dolt backend supplies real images.
 
-SCOPE: ordinary mutation and import images span exactly the transaction's BOUNDED
+SCOPE: ordinary mutation and import images span the transaction's BOUNDED
 WORKING SCOPE — the same id slice the core simulation loaded (root row, direct
-targets, anchors, current parents, and affected-parent sibling fans), not the
-whole root.  This is the canonical view an index projector derives from: every
-heading the mutation could have read or written is present, so
-removals/additions within scope are complete; headings outside the loaded scope
-are unchanged and are not materialized.  `dorg-ext-rebuild-index' is a distinct
+targets, anchors, current parents, and affected-parent sibling fans), unless an
+eligible registered projector explicitly declares `:project-scope whole-root'.
+That explicit aggregate opt-in causes DOrg to materialize the whole root before
+simulation; projectors still receive no store-read capability.  In either case,
+every heading the mutation could have read or written is present and headings
+outside a bounded scope are unchanged and not materialized.
+`dorg-ext-rebuild-index' is a distinct
 administrative, exact-revision operation: it supplies an empty base image and a
 complete requested-root candidate image, with every entry classified `created'.
 It does not fabricate mutation patches or relax this bounded-context contract.
@@ -478,10 +505,22 @@ Recursively copies cons cells, vectors, and strings, so no consumer can `aset' a
 string leaf or `setcar'/`aset' a shared cell to poison the stored context, a later
 reader, or the source object.  Symbols, numbers, and other immutable atoms are
 returned as-is.  Used for the typed patch IR, whose leaves include mutable title
-and sort-key strings that `copy-tree' would share."
+and sort-key strings that `copy-tree' would share.  Cons spines are iterative so
+batch width does not consume Lisp depth."
   (cond
    ((consp value)
-    (cons (dorg-ext--deep-copy (car value)) (dorg-ext--deep-copy (cdr value))))
+    ;; Reject unsupported circular spines without formatting their payload.
+    (condition-case nil
+        (unless (cl-list-length value) (signal 'circular-list nil))
+      (wrong-type-argument nil))
+    (let* ((head (cons nil nil))
+           (tail head))
+      (while (consp value)
+        (setcdr tail (cons (dorg-ext--deep-copy (car value)) nil))
+        (setq tail (cdr tail)
+              value (cdr value)))
+      (setcdr tail (dorg-ext--deep-copy value))
+      (cdr head)))
    ((stringp value) (copy-sequence value))
    ((vectorp value)
     (let ((v (copy-sequence value)))
@@ -490,7 +529,7 @@ and sort-key strings that `copy-tree' would share."
    (t value)))
 
 (cl-defun dorg-ext-index-context-create
-    (&key source-kind root-id from-root-id to-root-id dolt-dir file
+    (&key source-kind root-id from-root-id to-root-id dolt-dir file owner-request
           base-commit candidate-id patches created changed moved deleted
           base-image candidate-postimage owner-partitions)
   "Construct an immutable `dorg-ext-index-context'.
@@ -512,6 +551,7 @@ the source patches, or a later read."
                    :base-commit (and base-commit (copy-sequence base-commit))
                    :candidate-id (and candidate-id (copy-sequence candidate-id))
                    :patches (dorg-ext--deep-copy patches)
+                   :owner-request (dorg-ext--deep-copy owner-request)
                    :created created :changed changed
                    :moved moved :deleted deleted
                    :base-image base-image
@@ -560,6 +600,11 @@ Copy-on-read via `dorg-ext--deep-copy': the result shares neither spine nor a
 mutable string/vector leaf with the stored batch, so a consumer cannot corrupt
 what a later consumer reads (tracked-regression host-safe immutability)."
   (dorg-ext--deep-copy (dorg-ext--index-context-field context :patches)))
+
+(defun dorg-ext-index-context-owner-request (context)
+  "Return a detached immutable owner request for CONTEXT, when present.
+This is planning data, never a capability and never a public mutation form."
+  (dorg-ext--deep-copy (dorg-ext--index-context-field context :owner-request)))
 
 (defun dorg-ext-index-context-created (context)
   "Return a fresh copy of CONTEXT's `create' `dorg-ext-index-entry' list.
@@ -616,9 +661,198 @@ starting with a letter.  This prevents SQL injection when the name
 is interpolated into metadata keys.")
 
 (defconst dorg-ext--registration-keys
-  '(:schema :version :migrations :capabilities :project :validate
-    :read-tables :hydrate :placement-invariant)
+  '(:schema :version :migrations :capabilities :project :project-scope :validate
+    :read-tables :hydrate :placement-invariant :fields :query-context
+    :producer-resolver)
   "Accepted keyword arguments for `dorg-register-extension'.")
+
+(defconst dorg-ext--read-table-keys
+  '(:name :key-column :scope-column :scope-parent :memberships :accumulate :marker)
+  "Closed keyword set for one `:read-tables' descriptor.")
+
+(defconst dorg-ext--scope-parent-keys '(:table :key-column)
+  "Closed keyword set for a one-edge rebuild scope-parent descriptor.")
+
+(defconst dorg-ext--membership-keys
+  '(:name :member-key :position-column :value-column :bridge-table
+    :bridge-key :heading-column :root-column)
+  "Closed keyword set for one extension query-membership descriptor.")
+
+(defconst dorg-ext--field-keys
+  '(:name :type :cardinality :dependencies :context :sql :eval)
+  "Keys in a query field declaration owned by an extension.")
+
+(defun dorg-ext--validate-fields (extension fields)
+  "Validate EXTENSION's typed query FIELDS before changing the registry."
+  (unless (proper-list-p fields)
+    (error "dorg-register-extension: :fields must be a proper list"))
+  (let ((prefix (concat (symbol-name extension) "/")) seen)
+    (dolist (field fields)
+      (dorg-ext--validate-plist-keys field dorg-ext--field-keys "query field")
+      (let ((name (plist-get field :name)))
+        (unless (and (symbolp name)
+                     (string-prefix-p prefix (symbol-name name))
+                     (string-match-p dorg-ext--name-re
+                                     (substring (symbol-name name) (length prefix))))
+          (error "dorg-register-extension: field %S must belong to %s" name prefix))
+        (when (memq name seen)
+          (error "dorg-register-extension: duplicate field %S" name))
+        (push name seen))
+      (unless (memq (plist-get field :type) '(string identity integer boolean timestamp))
+        (error "dorg-register-extension: invalid field type %S" (plist-get field :type)))
+      (unless (memq (plist-get field :cardinality) '(one many))
+        (error "dorg-register-extension: invalid field cardinality"))
+      (unless (and (proper-list-p (plist-get field :context))
+                   (cl-every #'keywordp (plist-get field :context)))
+        (error "dorg-register-extension: field context must list keyword dependencies"))
+      (unless (proper-list-p (plist-get field :dependencies))
+        (error "dorg-register-extension: field dependencies must form a list"))
+      (dolist (dependency (plist-get field :dependencies))
+        (pcase dependency
+          (`(field ,(or 'id 'title 'todo 'priority 'commented 'level 'parent-id)))
+          (`(property ,(pred stringp)))
+          (_ (error "dorg-register-extension: invalid stored dependency %S" dependency))))
+      (unless (or (plist-get field :sql) (plist-get field :eval))
+        (error "dorg-register-extension: field needs at least one backend implementation"))
+      (dolist (key '(:sql :eval))
+        (when (and (plist-get field key) (not (functionp (plist-get field key))))
+          (error "dorg-register-extension: field %s must be a function" key))))))
+
+(defun dorg-ext--validate-plist-keys (plist allowed subject)
+  "Validate PLIST as an even keyword plist confined to ALLOWED for SUBJECT."
+  (let ((length (proper-list-p plist)))
+    (unless (and length (zerop (% length 2)))
+      (error "dorg-register-extension: %s must be a key/value plist" subject)))
+  (let ((rest plist)
+        seen)
+    (while rest
+      (let ((key (pop rest)))
+        (unless (memq key allowed)
+          (error "dorg-register-extension: unknown %s key %S" subject key))
+        (when (memq key seen)
+          (error "dorg-register-extension: duplicate %s key %S" subject key))
+        (push key seen)
+        (pop rest)))))
+
+(defun dorg-ext--validate-read-tables (read-tables)
+  "Validate READ-TABLES and every declared query-membership fact.
+Returns READ-TABLES unchanged.  All identifier validation happens before an
+extension enters the registry, because these values are later spliced into
+DOrg-generated SQL."
+  (unless (or (null read-tables)
+              (and (listp read-tables) (cl-every #'listp read-tables)))
+    (error "dorg-register-extension: :read-tables must be a list of table descriptor plists"))
+  (let (relations)
+    (dolist (table read-tables)
+      (dorg-ext--validate-plist-keys
+       table dorg-ext--read-table-keys ":read-tables descriptor")
+      (unless (plist-member table :name)
+        (error "dorg-register-extension: :read-tables descriptor needs :name"))
+      (dolist (key '(:name :key-column :scope-column))
+        (when (plist-member table key)
+          (let ((identifier (plist-get table key)))
+            (unless (dorg-ext--index-identifier-safe-p identifier)
+              (error "dorg-register-extension: %s %S is not a safe identifier"
+                     key identifier)))))
+      (when-let ((parent (plist-get table :scope-parent)))
+        (dorg-ext--validate-plist-keys
+         parent dorg-ext--scope-parent-keys ":scope-parent descriptor")
+        (dolist (key '(:table :key-column))
+          (let ((identifier (plist-get parent key)))
+            (unless (dorg-ext--index-identifier-safe-p identifier)
+              (error "dorg-register-extension: :scope-parent %s %S is not a safe identifier"
+                     key identifier)))))
+      (let ((memberships (plist-get table :memberships)))
+        (unless (or (null memberships)
+                    (and (listp memberships) (cl-every #'listp memberships)))
+          (error "dorg-register-extension: :memberships must be a list of descriptor plists"))
+        (dolist (membership memberships)
+          (dorg-ext--validate-plist-keys
+           membership dorg-ext--membership-keys ":memberships descriptor")
+          (let ((relation (plist-get membership :name)))
+            (unless (and (symbolp relation)
+                         (string-match-p dorg-ext--name-re (symbol-name relation)))
+              (error "dorg-register-extension: membership :name %S is invalid"
+                     relation))
+            (when (memq relation relations)
+              (error "dorg-register-extension: duplicate membership name %S"
+                     relation))
+            (push relation relations))
+          (dolist (key '(:member-key :position-column :value-column
+                         :bridge-table :bridge-key :heading-column :root-column))
+            (let ((identifier (plist-get membership key)))
+              (unless (dorg-ext--index-identifier-safe-p identifier)
+                (error "dorg-register-extension: membership %s %S is not a safe identifier"
+                       key identifier)))))))
+    ;; Scope parents deliberately use their own declared join key.  The parent
+    ;; descriptor's :key-column is read-plane metadata, not a uniqueness law.
+    (dolist (table read-tables)
+      (when-let* ((parent (plist-get table :scope-parent))
+                  (parent-table (plist-get parent :table))
+                  (parent-descriptor
+                   (cl-find parent-table read-tables
+                            :key (lambda (d) (plist-get d :name)) :test #'string=)))
+        (when (or (string= parent-table (plist-get table :name))
+                  (plist-get parent-descriptor :scope-parent)
+                  (not (dorg-ext--index-identifier-safe-p
+                        (plist-get parent-descriptor :scope-column))))
+          (error "dorg-register-extension: :scope-parent must name a distinct directly scoped table")))
+      (when (and (plist-get table :scope-parent)
+                 (not (cl-find (plist-get (plist-get table :scope-parent) :table)
+                               read-tables
+                               :key (lambda (d) (plist-get d :name)) :test #'string=)))
+        (error "dorg-register-extension: :scope-parent names no owned parent table")))
+    (dorg-ext--validate-accumulator-declarations read-tables)
+    read-tables))
+
+(defun dorg-ext--validate-accumulator-declarations (read-tables)
+  "Validate the accumulator and marker declarations of READ-TABLES.
+An `:accumulate' table names its complete key columns, scope column included.
+Whenever any table accumulates, exactly one accumulating table is the
+completeness `:marker'.  Its value is t when the key is the scope column
+alone, else the required non-scope key alists every built root must hold.
+Violations signal `dorg-ext-index-error' before registration."
+  (let (markers accumulating)
+    (dolist (table read-tables)
+      (let ((key (plist-get table :accumulate))
+            (scope (and (plist-get table :scope-column)
+                        (intern (plist-get table :scope-column)))))
+        (when (plist-member table :accumulate)
+          (push table accumulating)
+          (unless (and key (proper-list-p key)
+                       (cl-every #'dorg-ext--index-column-safe-p key)
+                       (equal key (delete-dups (copy-sequence key)))
+                       scope (memq scope key))
+            (dorg-ext--index-raise
+             'accumulator-shape
+             "an :accumulate table names its complete key, scope column included"
+             :table (plist-get table :name) :accumulate key)))
+        (when (plist-member table :marker)
+          (push table markers)
+          (let ((required (plist-get table :marker))
+                (rest (and key (remq scope key))))
+            (unless (and key
+                         (if (eq required t)
+                             (null rest)
+                           (and (consp required) (proper-list-p required)
+                                (cl-every
+                                 (lambda (alist)
+                                   (and (proper-list-p alist)
+                                        (equal (mapcar #'car alist) rest)
+                                        (cl-every (lambda (cell)
+                                                    (dorg-ext--index-literal-p (cdr cell)))
+                                                  alist)))
+                                 required)
+                                (equal required (delete-dups (copy-sequence required))))))
+              (dorg-ext--index-raise
+               'marker-declaration
+               "a :marker is an :accumulate table naming its required non-scope keys"
+               :table (plist-get table :name) :marker required))))))
+    (when (and accumulating (/= 1 (length markers)))
+      (dorg-ext--index-raise
+       'marker-declaration
+       "accumulator tables need exactly one completeness :marker table"
+       :markers (mapcar (lambda (table) (plist-get table :name)) markers)))))
 
 (defun dorg-ext--sql-spec-p (spec)
   "Return non-nil if SPEC is a SQL string or a non-empty list of SQL strings."
@@ -675,23 +909,54 @@ Keyword ARGS:
   :project      Index projector: pure fn of a `dorg-ext-index-context'
                 returning a list of TYPED ROW DELTAS ((:table NAME :insert/:delete
                 …), NOT SQL) confined to the extension's `:read-tables' (optional)
+  :project-scope `bounded' (default) or `whole-root'.  A whole-root projector
+                receives a complete canonical root candidate image so it can
+                derive root-wide aggregate rows without an extension store read.
+                Sum- or xor-shaped aggregates use `:accumulate' tables instead.
   :validate     Pure fn of a `dorg-ext-index-context'; signalling aborts the
                 whole transaction before commit (optional)
   :read-tables  Read-plane manifest: list of generic projection-table
-                descriptor plists (optional; see `dorg-extension')
+                descriptor plists (optional; see `dorg-extension').  A
+                descriptor may add `:accumulate KEY-COLUMNS' (an aggregate
+                table maintained by accumulator effects) and, on exactly one
+                such table, `:marker' t or its required non-scope keys per
+                root (see `dorg-ext--validate-accumulator-declarations')
   :hydrate      Read participant: pure fn of a `dorg-ext-read-context'
                 returning a grouped query PLAN (optional; see
                 `dorg-ext-hydrate')
+  :fields       Typed query descriptors.  Each declares a namespaced name,
+                scalar type, cardinality, dependencies, and `:eval' and/or
+                `:sql' evaluator (optional)
+  :query-context Pure fn of one invocation plist, called once when one of
+                this extension's fields needs context.  The plist has source,
+                root, captured revision, and a revision-bound `:read'
+                capability.  Return `(:values PLIST ...)' of read/print-safe
+                data; DOrg copies and digests it before field evaluation.
+                (optional)
   :placement-invariant  Placement participant: pure fn of a
                 `dorg-ext-placement-context' returning a
                 `dorg-ext-placement-verdict' or nil (optional; see
                 `dorg-ext-classify-placement')
+  :producer-resolver Optional policy-upgrade resolver.  It receives one
+                DOrg-owned request plist
+                \(:producer IDENTITY :source SOURCE :revision H
+                 :identity POLICY :scope (:root-id ROOT)), where IDENTITY is
+                the requested (:implementation :dependencies :policy-digest)
+                producer, SOURCE the normalized store directory and H the
+                frozen base revision, and returns
+                \(:project FN :implementation STRING :dependencies STRING
+                 :policy STRING): the installed projector, the immutable
+                implementation/dependency identities it actually binds and
+                the canonical policy input.  DOrg computes the policy digest
+                and refuses any mismatch.  Ordinary mutation and root rebuild
+                do not call it.
 
 Each migration step migrates exactly FROM-VERSION -> FROM-VERSION+1.
 STEP is SQL (string or list of strings) or a function of one argument
 \(the dolt-dir) returning SQL; function steps may inspect the repo but
-must not commit or update `dorg_meta'.  See `dorg-repo-ensure-extensions'
-for the install/upgrade contract.
+must use `dorg-repo-migration-query' for repo reads during explicit migration
+and must not commit or update `dorg_meta'.  Ordinary open never runs migration
+steps; existing-store install/upgrade is owned by `dorg-migrate-schema'.
 
 The participant callbacks are pure and must not commit Dolt, save buffers, or
 write `dorg_meta'.  The `:project' index projector returns TYPED ROW DELTAS
@@ -722,10 +987,14 @@ preserving its position in the registration order."
         (migrations (plist-get args :migrations))
         (capabilities (plist-get args :capabilities))
         (project (plist-get args :project))
+        (project-scope (or (plist-get args :project-scope) 'bounded))
         (validate (plist-get args :validate))
         (read-tables (plist-get args :read-tables))
         (hydrate (plist-get args :hydrate))
-        (placement-invariant (plist-get args :placement-invariant)))
+        (fields (plist-get args :fields))
+        (query-context (plist-get args :query-context))
+        (placement-invariant (plist-get args :placement-invariant))
+        (producer-resolver (plist-get args :producer-resolver)))
     (unless (dorg-ext--sql-spec-p schema)
       (error "dorg-register-extension: :schema must be a SQL string or list of SQL strings"))
     (unless (and (integerp version) (> version 0))
@@ -734,33 +1003,35 @@ preserving its position in the registration order."
     (unless (or (null capabilities)
                 (and (listp capabilities) (cl-every #'symbolp capabilities)))
       (error "dorg-register-extension: :capabilities must be a list of source-kind symbols"))
+    (unless (memq project-scope '(bounded whole-root))
+      (error "dorg-register-extension: :project-scope must be bounded or whole-root"))
+    (when (and (eq project-scope 'whole-root) (not project))
+      (error "dorg-register-extension: whole-root scope requires a :project callback"))
     (dolist (cb (list (cons :project project)
                       (cons :validate validate)
                       (cons :hydrate hydrate)
-                      (cons :placement-invariant placement-invariant)))
+                      (cons :query-context query-context)
+                      (cons :placement-invariant placement-invariant)
+                      (cons :producer-resolver producer-resolver)))
       (unless (or (null (cdr cb)) (functionp (cdr cb)))
         (error "dorg-register-extension: %s must be a function, got %S"
                (car cb) (cdr cb))))
-    (unless (or (null read-tables)
-                (and (listp read-tables) (cl-every #'listp read-tables)))
-      (error "dorg-register-extension: :read-tables must be a list of table descriptor plists"))
-    ;; A manifest table name is spliced raw into DOrg-generated index SQL, so it
-    ;; must be a safe unqualified identifier — an unsafe name never registers.
-    (dolist (d read-tables)
-      (let ((n (plist-get d :name)))
-        (unless (dorg-ext--index-identifier-safe-p n)
-          (error "dorg-register-extension: :read-tables name %S is not a safe identifier"
-                 n))))
+    (dorg-ext--validate-read-tables read-tables)
+    (dorg-ext--validate-fields name fields)
     (let ((ext (make-dorg-extension :name name
                                     :schema schema
                                     :version version
                                     :migrations migrations
                                     :capabilities capabilities
                                     :project project
+                                    :project-scope project-scope
                                     :validate validate
                                     :read-tables read-tables
                                     :hydrate hydrate
-                                    :placement-invariant placement-invariant))
+                                    :fields (copy-tree fields)
+                                    :query-context query-context
+                                    :placement-invariant placement-invariant
+                                    :producer-resolver producer-resolver))
           (existing (assq name dorg--extensions)))
       (if existing
           (setcdr existing ext)
@@ -779,6 +1050,51 @@ Returns non-nil if an extension was removed."
 (defun dorg-get-extension (name)
   "Return the registered `dorg-extension' struct for NAME, or nil."
   (cdr (assq name dorg--extensions)))
+
+(defun dorg-ext-query-field (name)
+  "Return the registered descriptor for namespaced field NAME, or nil.
+The copy includes :extension naming its owner; no second registry is used."
+  (when (symbolp name)
+    (let ((owner (car (split-string (symbol-name name) "/"))) result)
+      (when-let ((extension (dorg-get-extension (intern owner))))
+        (dolist (field (dorg-extension-fields extension))
+          (when (eq name (plist-get field :name))
+            (setq result (append (copy-tree field)
+                                 (list :extension (dorg-extension-name extension)))))))
+      result)))
+
+(defun dorg-load-extension (name)
+  "Load and register installed extension NAME without loading an application.
+NAME is an ASCII extension name.  DOrg loads the conventional feature
+`dorg-extension-NAME'; that small feature must register NAME and may depend
+on its owning package, but DOrg never names or requires that package itself.
+Returns the registered extension or signals a clear error when the feature
+does not register the requested name."
+  (unless (and (stringp name) (string-match-p dorg-ext--name-re name))
+    (error "dorg-load-extension: invalid extension name %S" name))
+  (let ((symbol (intern name)))
+    (unless (dorg-get-extension symbol)
+      (require (intern (format "dorg-extension-%s" name)))
+      (unless (dorg-get-extension symbol)
+        (error "dorg-load-extension: feature for %s did not register it" name)))
+    (dorg-get-extension symbol)))
+
+(defun dorg-ext-query-membership (extension relation)
+  "Return EXTENSION's validated query descriptor for RELATION, or nil.
+The returned plist is a fresh copy of the registered membership descriptor,
+augmented with `:table' naming its containing read table.  Registration has
+already validated every identifier, so the query planner may splice these
+values into DOrg-owned SQL without accepting caller-authored identifiers."
+  (let ((ext (dorg-get-extension extension))
+        found)
+    (when ext
+      (dolist (table (dorg-extension-read-tables ext))
+        (dolist (membership (plist-get table :memberships))
+          (when (eq relation (plist-get membership :name))
+            (setq found
+                  (append (copy-sequence membership)
+                          (list :table (plist-get table :name)))))))
+      found)))
 
 (defun dorg-registered-extensions ()
   "Return the list of currently-registered `dorg-extension' structs.
@@ -803,6 +1119,27 @@ silently dropped."
   (cl-some (lambda (ext)
              (and (dorg-extension-project ext)
                   (memq source-kind (dorg-ext--effective-capabilities ext))))
+           (dorg-registered-extensions)))
+
+(defun dorg-ext-index-projector-requires-whole-root-p
+    (source-kind &optional installed-p)
+  "Return non-nil when a SOURCE-KIND projector needs a complete root image.
+
+This is an explicit registration property, not an inference from effect shape:
+DOrg chooses the canonical simulation scope before invoking any projector, so
+a root-aggregate projector cannot widen a bounded context after the fact.
+
+When INSTALLED-P is non-nil, it receives each otherwise eligible extension and
+must confirm that extension participates in the target store.  Registration is
+process-global, but a store that never installed an extension must retain its
+ordinary bounded mutation scope."
+  (when (and installed-p (not (functionp installed-p)))
+    (error "dorg-ext-index-projector-requires-whole-root-p: INSTALLED-P is not a function"))
+  (cl-some (lambda (ext)
+             (and (dorg-extension-project ext)
+                  (eq (dorg-extension-project-scope ext) 'whole-root)
+                  (memq source-kind (dorg-ext--effective-capabilities ext))
+                  (or (null installed-p) (funcall installed-p ext))))
            (dorg-registered-extensions)))
 
 (defvar dorg-ext--index-validation-phase nil
@@ -854,7 +1191,9 @@ Unlike `dorg-ext-normalize-sql', a nil SPEC is allowed (no projection)."
 
 (defconst dorg-ext-index-error-reasons
   '(not-an-effect no-table qualified bad-table bad-scope-column core-table unowned
-    bad-op bad-column bad-value)
+    bad-op bad-column bad-value
+    accumulator-shape accumulator-mixed accumulator-unbound negative-accumulator
+    xor-width marker-declaration derived-index-inconsistent root-outside-context)
   "Closed set of `:reason' symbols a `dorg-ext-index-error' may carry.")
 
 (defconst dorg-ext--index-identifier-re "\\`[a-zA-Z_][a-zA-Z0-9_]*\\'"
@@ -918,8 +1257,13 @@ materialized document lane cannot be written through the derived-index seam.")
     (while effect (push (car effect) keys) (setq effect (cddr effect)))
     (nreverse keys)))
 
-(defun dorg-ext-validate-index-effect (effect owned)
+(defun dorg-ext-validate-index-effect (effect owned &optional accumulate-specs)
   "Validate a typed index EFFECT against the extension's OWNED tables.
+ACCUMULATE-SPECS, from `dorg-ext-accumulate-specs', names the extension's
+accumulator tables: there an effect must be an accumulator (see
+`dorg-ext--validate-accumulator-effect'), and an accumulator anywhere else is
+rejected.  Without specs, an accumulator effect is rejected and DOrg-owned
+folded or clearing effects validate as ordinary insert/delete.
 Returns the touched table name on success; otherwise signals a typed
 `dorg-ext-index-error' whose reason is one of `dorg-ext-index-error-reasons'
 \(not-an-effect / no-table / qualified / core-table / unowned / bad-op /
@@ -931,6 +1275,16 @@ can generate deterministic SQL that touches ONLY that table."
     (dorg-ext--index-raise 'not-an-effect
                            "index effect is not a (:table … :insert/:delete …) plist"
                            :effect effect))
+  (if (plist-member effect :accumulate)
+      (dorg-ext--validate-accumulator-effect effect owned accumulate-specs)
+    (prog1 (dorg-ext--validate-row-effect effect owned)
+      (when (assoc (plist-get effect :table) accumulate-specs)
+        (dorg-ext--index-raise
+         'accumulator-mixed "an accumulator table takes only accumulator effects"
+         :table (plist-get effect :table))))))
+
+(defun dorg-ext--validate-row-effect (effect owned)
+  "Validate an ordinary insert/delete EFFECT against OWNED; return its table."
   ;; CLOSED shape: only keys :table/:insert/:delete, no duplicates.
   (let ((keys (dorg-ext--index-effect-keys effect)))
     (when (or (cl-set-difference keys '(:table :insert :delete))
@@ -988,6 +1342,347 @@ can generate deterministic SQL that touches ONLY that table."
                                  :column (car cell) :value (cdr cell)))))
     table)))
 
+;; ── Accumulator effects (root aggregates) ────────────────────────────
+;; An accumulator effect names one key of an `:accumulate' table and the
+;; group-valued deltas to apply to it:
+;;   (:table NAME :accumulate KEY-ALIST :add ((COL . INTEGER) ...)
+;;    :xor ((COL . HEX64) ...) :initial ((COL . VALUE) ...) :prune-zero COL)
+;; Integers under + and 256-bit digests under xor are commutative, associative
+;; and invertible, so folding any sequence of deltas from the identity is
+;; order-free: incremental maintenance equals a fresh rebuild.  Accumulators
+;; never reach SQL.  DOrg folds them against prior rows it reads at the plan
+;; base (`dorg-ext-fold-accumulators') into ordinary delete+insert effects.
+
+(defconst dorg-ext--accumulator-keys
+  '(:table :accumulate :add :xor :initial :prune-zero)
+  "Closed keyword set of one accumulator effect.")
+
+(defun dorg-ext-accumulate-specs (read-tables)
+  "Return (NAME . KEY-COLUMNS) for each `:accumulate' table in READ-TABLES."
+  (delq nil (mapcar (lambda (table)
+                      (and (plist-get table :accumulate)
+                           (cons (plist-get table :name) (plist-get table :accumulate))))
+                    read-tables)))
+
+(defun dorg-ext--hex64-p (value)
+  "Non-nil when VALUE is a 64-character lowercase hexadecimal string."
+  (and (stringp value) (string-match-p "\\`[0-9a-f]\\{64\\}\\'" value)))
+
+(defun dorg-ext--validate-accumulator-effect (effect owned accumulate-specs)
+  "Validate accumulator EFFECT against OWNED and ACCUMULATE-SPECS.
+Return the touched table name."
+  (let* ((keys (dorg-ext--index-effect-keys effect))
+         (table (plist-get effect :table))
+         (key (plist-get effect :accumulate))
+         (spec (cdr (assoc table accumulate-specs)))
+         (add (plist-get effect :add))
+         (xor (plist-get effect :xor))
+         (initial (plist-get effect :initial))
+         (prune (plist-get effect :prune-zero)))
+    (when (or (cl-set-difference keys dorg-ext--accumulator-keys)
+              (not (equal keys (delete-dups (copy-sequence keys)))))
+      (dorg-ext--index-raise 'not-an-effect
+                             "accumulator effect has an unknown or duplicate key"
+                             :effect effect :keys keys))
+    ;; Table, ownership, key columns and literal key values: exactly the
+    ;; ordinary checks, applied to the keyed row this accumulator addresses.
+    (dorg-ext--validate-row-effect (list :table table :delete key) owned)
+    (unless spec
+      (dorg-ext--index-raise 'accumulator-mixed
+                             "an ordinary table never takes an accumulator effect"
+                             :table table))
+    (dolist (payload (list add xor initial))
+      (unless (and (proper-list-p payload) (cl-every #'consp payload)
+                   (cl-every (lambda (cell) (dorg-ext--index-column-safe-p (car cell)))
+                             payload))
+        (dorg-ext--index-raise 'accumulator-shape
+                               "accumulator payload is not a safe column alist"
+                               :table table)))
+    (let ((key-columns (mapcar #'car key))
+          (counters (append (mapcar #'car add) (mapcar #'car xor)))
+          (others (mapcar #'car initial)))
+      (unless (and (= (length key-columns) (length spec))
+                   (null (cl-set-difference key-columns spec))
+                   (null (cl-set-difference spec key-columns)))
+        (dorg-ext--index-raise 'accumulator-shape
+                               "accumulator key is not the declared key"
+                               :table table :key key-columns :declared spec))
+      (unless (and counters
+                   (equal counters (delete-dups (copy-sequence counters)))
+                   (null (cl-intersection counters key-columns))
+                   (null (cl-intersection others key-columns))
+                   (null (cl-intersection others counters)))
+        (dorg-ext--index-raise 'accumulator-shape
+                               "accumulator columns overlap the key or each other"
+                               :table table))
+      (when (and prune (not (assq prune add)))
+        (dorg-ext--index-raise 'accumulator-shape
+                               "a prune column must be an :add column"
+                               :table table :prune-zero prune)))
+    (dolist (cell add)
+      (unless (integerp (cdr cell))
+        (dorg-ext--index-raise 'bad-value "accumulator :add value is not an integer"
+                               :column (car cell) :value (cdr cell))))
+    (dolist (cell xor)
+      (unless (dorg-ext--hex64-p (cdr cell))
+        (dorg-ext--index-raise 'xor-width
+                               "accumulator :xor value is not 64 lowercase hex digits"
+                               :column (car cell) :value (cdr cell))))
+    (dolist (cell initial)
+      (unless (dorg-ext--index-literal-p (cdr cell))
+        (dorg-ext--index-raise 'bad-value "accumulator :initial value is not a literal"
+                               :column (car cell) :value (cdr cell))))
+    table))
+
+(defun dorg-ext--accumulator-descriptor (read-tables table)
+  "Return TABLE's descriptor from READ-TABLES."
+  (cl-find table read-tables :key (lambda (d) (plist-get d :name)) :test #'string=))
+
+(defun dorg-ext--accumulator-marker (read-tables)
+  "Return the marker table descriptor of READ-TABLES, or nil."
+  (cl-find-if (lambda (d) (plist-member d :marker)) read-tables))
+
+(defun dorg-ext--effect-payload (effect)
+  "Return the column alist that addresses EFFECT's row or rows."
+  (or (plist-get effect :accumulate) (plist-get effect :insert) (plist-get effect :delete)))
+
+(defun dorg-ext--effect-root (read-tables effect)
+  "Return the root EFFECT addresses through its table's scope column.
+An accumulator extension's every effect must name its root, so the root's
+marker state can decide it; one that does not fails closed."
+  (let* ((descriptor (dorg-ext--accumulator-descriptor read-tables (plist-get effect :table)))
+         (scope (and descriptor (plist-get descriptor :scope-column)
+                     (intern (plist-get descriptor :scope-column))))
+         (cell (and scope (assq scope (dorg-ext--effect-payload effect)))))
+    (unless (and cell (integerp (cdr cell)))
+      (dorg-ext--index-raise 'accumulator-shape
+                             "an accumulator extension's effect must name its root"
+                             :table (plist-get effect :table)))
+    (cdr cell)))
+
+(defun dorg-ext--accumulator-canonical-key (key columns)
+  "Return KEY's cells in declared COLUMNS order."
+  (mapcar (lambda (column) (assq column key)) columns))
+
+(defun dorg-ext--sort-keys (keys)
+  "Return KEYS deduplicated and in a deterministic printed order."
+  (sort (delete-dups (copy-sequence keys))
+        (lambda (a b) (string< (prin1-to-string a) (prin1-to-string b)))))
+
+(defun dorg-ext--marker-required-keys (marker root)
+  "Return the full required marker keys MARKER declares for ROOT."
+  (let* ((columns (plist-get marker :accumulate))
+         (scope (intern (plist-get marker :scope-column)))
+         (required (plist-get marker :marker)))
+    (mapcar (lambda (rest)
+              (dorg-ext--accumulator-canonical-key (cons (cons scope root) rest) columns))
+            (if (eq required t) '(nil) required))))
+
+(defun dorg-ext-accumulator-prior-requests (read-tables effects)
+  "Return the keyed prior reads folding EFFECTS needs, per READ-TABLES.
+Each element is (TABLE KEY...) in declared table order.  An aggregate table
+names exactly the keys its accumulators touch.  The marker table names each
+touched root by its scope column alone, so every marker row of that root is
+read and the root's completeness can be judged."
+  (let ((marker (dorg-ext--accumulator-marker read-tables))
+        (roots (delete-dups (mapcar (lambda (effect)
+                                      (dorg-ext--effect-root read-tables effect))
+                                    effects)))
+        requests)
+    (dolist (descriptor read-tables)
+      (let* ((table (plist-get descriptor :name))
+             (columns (plist-get descriptor :accumulate))
+             (keys
+              (cond
+               ((eq descriptor marker)
+                (let ((scope (intern (plist-get descriptor :scope-column))))
+                  (mapcar (lambda (root) (list (cons scope root))) roots)))
+               (columns
+                (delq nil
+                      (mapcar (lambda (effect)
+                                (and (equal (plist-get effect :table) table)
+                                     (plist-member effect :accumulate)
+                                     (dorg-ext--accumulator-canonical-key
+                                      (plist-get effect :accumulate) columns)))
+                              effects))))))
+        (when keys
+          (push (cons table (dorg-ext--sort-keys keys)) requests))))
+    (nreverse requests)))
+
+(defun dorg-ext--row-matches-key-p (row key)
+  "Non-nil when ROW holds every cell of KEY."
+  (cl-every (lambda (cell) (equal (cdr (assq (car cell) row)) (cdr cell))) key))
+
+(defun dorg-ext--prior-row (priors table key)
+  "Return the prior row of TABLE whose key is KEY, or nil."
+  (cdr (cl-find-if (lambda (prior)
+                     (and (equal (car prior) table)
+                          (dorg-ext--row-matches-key-p (cdr prior) key)))
+                   priors)))
+
+(defun dorg-ext--root-state (read-tables effects priors empty-roots root)
+  "Return `fold' or `skip' for ROOT, or signal its inconsistent state.
+Built (every required marker row present) folds.  Unbuilt (none present)
+folds as a birth when ROOT had no headings at the base, which must write
+every required marker row, and is otherwise skipped wholly.  Some but not
+all required rows present is inconsistent and fails closed."
+  (let* ((marker (dorg-ext--accumulator-marker read-tables))
+         (table (plist-get marker :name))
+         (required (dorg-ext--marker-required-keys marker root))
+         (missing (cl-remove-if (lambda (key) (dorg-ext--prior-row priors table key))
+                                required)))
+    (cond
+     ((null missing) 'fold)
+     ((< (length missing) (length required))
+      (dorg-ext--index-raise
+       'derived-index-inconsistent
+       (format (concat "derived index for root %d is partly built; "
+                       "run dorg-ext-rebuild-index to repair it")
+               root)
+       :root root :missing missing))
+     ((not (memq root empty-roots)) 'skip)
+     (t
+      (let ((born (delq nil
+                        (mapcar (lambda (effect)
+                                  (and (equal (plist-get effect :table) table)
+                                       (plist-member effect :accumulate)
+                                       (dorg-ext--accumulator-canonical-key
+                                        (plist-get effect :accumulate)
+                                        (plist-get marker :accumulate))))
+                                effects))))
+        (unless (cl-every (lambda (key) (member key born)) required)
+          (dorg-ext--index-raise
+           'accumulator-shape
+           "a root's first index write must birth every required marker row"
+           :root root :required required))
+        'fold)))))
+
+(defun dorg-ext--accumulator-number (value)
+  "Return the stored integer VALUE, decoding a numeric string."
+  (cond ((null value) 0)
+        ((integerp value) value)
+        ((stringp value) (string-to-number value))
+        (t (dorg-ext--index-raise 'bad-value "stored accumulator is not an integer"
+                                  :value value))))
+
+(defun dorg-ext--accumulator-digest (value)
+  "Return stored 256-bit digest VALUE as an integer; absent is zero."
+  (cond ((null value) 0)
+        ((dorg-ext--hex64-p value) (string-to-number value 16))
+        (t (dorg-ext--index-raise 'xor-width "stored accumulator digest is not 64 hex"
+                                  :value value))))
+
+(defun dorg-ext--merge-accumulators (effects columns)
+  "Merge accumulator EFFECTS on one key into one (KEY ADD XOR INITIAL PRUNE)."
+  (let (add xor initial prune)
+    (dolist (effect effects)
+      (dolist (cell (plist-get effect :add))
+        (setf (alist-get (car cell) add) (+ (alist-get (car cell) add 0) (cdr cell))))
+      (dolist (cell (plist-get effect :xor))
+        (setf (alist-get (car cell) xor)
+              (logxor (alist-get (car cell) xor 0) (string-to-number (cdr cell) 16))))
+      (dolist (cell (plist-get effect :initial))
+        (unless (assq (car cell) initial) (push cell initial)))
+      (setq prune (or prune (plist-get effect :prune-zero))))
+    (list (dorg-ext--accumulator-canonical-key
+           (plist-get (car effects) :accumulate) columns)
+          (nreverse add) (nreverse xor) (nreverse initial) prune)))
+
+(defun dorg-ext--fold-one (table merged prior)
+  "Return the literal effects folding MERGED into PRIOR for TABLE."
+  (pcase-let ((`(,key ,add ,xor ,initial ,prune) merged))
+    (let* ((counters (append (mapcar #'car add) (mapcar #'car xor)))
+           (post-counters
+            (append
+             (mapcar (lambda (cell)
+                       (let ((value (+ (dorg-ext--accumulator-number
+                                        (cdr (assq (car cell) prior)))
+                                       (cdr cell))))
+                         (when (< value 0)
+                           (dorg-ext--index-raise
+                            'negative-accumulator "an accumulator folds below zero"
+                            :table table :key key :column (car cell) :value value))
+                         (cons (car cell) value)))
+                     add)
+             (mapcar (lambda (cell)
+                       (cons (car cell)
+                             (format "%064x"
+                                     (logxor (dorg-ext--accumulator-digest
+                                              (cdr (assq (car cell) prior)))
+                                             (cdr cell)))))
+                     xor)))
+           (others (cl-remove-if (lambda (cell)
+                                   (or (assq (car cell) key) (memq (car cell) counters)))
+                                 (or prior initial))))
+      (cond
+       ((and prune (eql 0 (cdr (assq prune post-counters))))
+        (and prior (list (list :table table :delete key))))
+       ((and prior
+             (cl-every (lambda (cell)
+                         (equal (cdr cell)
+                                (let ((stored (cdr (assq (car cell) prior))))
+                                  (if (assq (car cell) add)
+                                      (dorg-ext--accumulator-number stored)
+                                    stored))))
+                       post-counters))
+        nil)
+       (t
+        ;; A key with no stored row is born: there is nothing to delete.
+        (append (and prior (list (list :table table :delete key)))
+                (list (list :table table
+                            :insert (append key
+                                            (sort (copy-sequence others)
+                                                  (lambda (a b) (string< (car a) (car b))))
+                                            (sort (copy-sequence post-counters)
+                                                  (lambda (a b) (string< (car a) (car b)))))))))))))
+
+(defun dorg-ext-fold-accumulators (read-tables effects priors empty-roots)
+  "Fold accumulator EFFECTS into literal insert/delete effects.
+READ-TABLES are the extension's declarations.  PRIORS lists (TABLE . ROW)
+for the rows `dorg-ext-accumulator-prior-requests' named, read at the plan
+base.  EMPTY-ROOTS lists the touched roots that had no heading at the base.
+Each touched root is judged by its marker rows (`dorg-ext--root-state'): a
+skipped root receives no effect at all.  The result is the ordinary effects
+in projector order, then per key, in declared table and printed key order,
+nothing when the row is unchanged, a delete when a prune column reaches
+zero, or a delete followed by an insert of the complete literal post row.
+Without accumulator tables, EFFECTS are returned unchanged."
+  (if (not (dorg-ext-accumulate-specs read-tables))
+      effects
+    (let* ((roots (delete-dups (mapcar (lambda (effect)
+                                         (dorg-ext--effect-root read-tables effect))
+                                       effects)))
+           (skipped (cl-remove-if-not
+                     (lambda (root)
+                       (eq 'skip (dorg-ext--root-state
+                                  read-tables effects priors empty-roots root)))
+                     roots))
+           (kept (cl-remove-if (lambda (effect)
+                                 (memq (dorg-ext--effect-root read-tables effect) skipped))
+                               effects))
+           (ordinary (cl-remove-if (lambda (effect) (plist-member effect :accumulate)) kept))
+           folded)
+      (dolist (descriptor read-tables)
+        (let* ((table (plist-get descriptor :name))
+               (columns (plist-get descriptor :accumulate))
+               (groups nil))
+          (when columns
+            (dolist (effect kept)
+              (when (and (equal (plist-get effect :table) table)
+                         (plist-member effect :accumulate))
+                (let ((key (dorg-ext--accumulator-canonical-key
+                            (plist-get effect :accumulate) columns)))
+                  (push effect (alist-get key groups nil nil #'equal)))))
+            (dolist (key (dorg-ext--sort-keys (mapcar #'car groups)))
+              (setq folded
+                    (nconc folded
+                           (dorg-ext--fold-one
+                            table
+                            (dorg-ext--merge-accumulators
+                             (reverse (alist-get key groups nil nil #'equal)) columns)
+                            (dorg-ext--prior-row priors table key))))))))
+      (append ordinary folded))))
+
 (defun dorg-ext--index-quote (val)
   "Return the SQL literal for VAL (string via `dorg-sql-quote', number, or NULL)."
   (dorg-sql--literal-sql val))
@@ -1003,24 +1698,41 @@ delete statement generator and the postimage validator's transaction read port
 verified predicate cannot drift."
   (dorg-sql--effect-predicate-sql payload))
 
-(defun dorg-ext--index-effect-sql (effect)
-  "Return the DOrg-generated SQL for a VALIDATED typed index EFFECT.
-DOrg owns generation: the statement writes only the effect's single owned table
-from literal, candidate-derived values — never a read, join, or subquery."
+(defun dorg-ext--index-effect-item (effect)
+  "Return a VALIDATED typed index EFFECT as one lowering item.
+An insert is a typed `dorg-sql-row'; a delete is its single DELETE statement.
+DOrg owns generation: either form writes only the effect's single owned table
+from literal, candidate-derived values -- never a read, join, or subquery.
+Values stay in the effect literal domain (nil, string or number)."
   (let* ((table (plist-get effect :table))
          (op (dorg-ext--index-effect-op effect))
          (payload (cdr op)))
     (pcase (car op)
       ('insert
-       (format "INSERT INTO %s (%s) VALUES (%s)"
-               table
-               (mapconcat (lambda (c) (symbol-name (car c))) payload ", ")
-               (mapconcat (lambda (c) (dorg-ext--index-quote (cdr c))) payload ", ")))
+       (dolist (cell payload)
+         (unless (dorg-ext--index-literal-p (cdr cell))
+           (dorg-ext--index-raise 'bad-value "index effect value is not a literal"
+                                  :column (car cell) :value (cdr cell))))
+       (dorg-sql-row-make table (mapcar #'car payload) (mapcar #'cdr payload)))
       ('delete
        (let ((pred (dorg-ext-index-effect-predicate-sql payload)))
          (if pred
              (format "DELETE FROM %s WHERE %s" table pred)
            (format "DELETE FROM %s" table)))))))
+
+(defun dorg-ext--index-effect-sql (effect)
+  "Return the DOrg-generated SQL for a VALIDATED typed index EFFECT.
+DOrg owns generation: the statement writes only the effect's single owned table
+from literal, candidate-derived values -- never a read, join, or subquery."
+  (let ((item (dorg-ext--index-effect-item effect)))
+    (if (stringp item) item (dorg-sql-row-sql item))))
+
+(defun dorg-ext--index-effects-sql (effects)
+  "Return the lowered SQL for one extension's validated EFFECTS, in order.
+Adjacent insert effects of one table and column list merge into multi-row
+INSERTs; every delete stays a single statement in place.  DOrg knows no
+extension foreign keys, so it never reorders an extension's effects."
+  (dorg-sql-lower-statements (mapcar #'dorg-ext--index-effect-item effects)))
 
 (defun dorg-ext--owned-tables (ext)
   "Return the list of table names EXT declares it owns via `:read-tables'."
@@ -1042,21 +1754,40 @@ which rejects core, foreign, and malformed manifest targets by the shared guard.
        :extension (dorg-extension-name ext)))
     (mapcar
      (lambda (descriptor)
-       (let ((table (plist-get descriptor :name))
-             (scope-column (plist-get descriptor :scope-column)))
+       (let* ((table (plist-get descriptor :name))
+              (scope-column (plist-get descriptor :scope-column))
+              (scope-parent (plist-get descriptor :scope-parent))
+              (parent-table (plist-get scope-parent :table))
+              (parent-key (plist-get scope-parent :key-column))
+              (parent (and scope-parent
+                           (cl-find parent-table descriptors
+                                    :key (lambda (d) (plist-get d :name))
+                                    :test #'string=))))
          (unless (dorg-ext--index-identifier-safe-p scope-column)
            (dorg-ext--index-raise
             'bad-scope-column
             "rebuild table needs a safe unqualified :scope-column"
             :extension (dorg-extension-name ext)
             :table table :scope-column scope-column))
-         ;; The table itself and this DOrg-owned generated DELETE must pass the
-         ;; same ownership/core-table confinement as projector effects.
+         (when scope-parent
+           (unless (and parent
+                        (not (string= table parent-table))
+                        (not (plist-get parent :scope-parent))
+                        (dorg-ext--index-identifier-safe-p parent-key)
+                        (dorg-ext--index-identifier-safe-p
+                         (plist-get parent :scope-column)))
+             (dorg-ext--index-raise
+              'bad-scope-column
+              "rebuild scope-parent must name an owned directly scoped table"
+              :extension (dorg-extension-name ext) :table table
+              :scope-parent scope-parent)))
+         ;; The generated direct-shaped predicate is deliberately validated even
+         ;; for child tables; the rebuild compiler expands it per captured parent
+         ;; key before SQL lowering.
          (dorg-ext-validate-index-effect
-          (list :table table :delete
-                (list (cons (intern scope-column) 0)))
+          (list :table table :delete (list (cons (intern scope-column) 0)))
           (dorg-ext--owned-tables ext))
-         (list :name table :scope-column scope-column
+         (list :name table :scope-column scope-column :scope-parent scope-parent
                :key-column (plist-get descriptor :key-column))))
      descriptors)))
 
@@ -1069,16 +1800,57 @@ before any readback or transaction can observe them."
   effects)
 
 (defun dorg-ext--selected-index-extension-p (ext extension-names)
-  "Return non-nil when EXT is selected by optional EXTENSION-NAMES."
-  (or (null extension-names)
+  "Return non-nil when EXT is selected by EXTENSION-NAMES.
+The explicit symbol `:all' selects every registered extension.  Nil selects
+none, so a store with no installed projectors never falls back to every
+process-registered projector."
+  (or (eq extension-names :all)
       (memq (dorg-extension-name ext) extension-names)))
 
-(defun dorg-ext-collect-index-projection (index-context &optional extension-names)
-  "Run registered DOrg-owned index projectors against INDEX-CONTEXT.
+(defun dorg-ext--index-context-roots (index-context)
+  "Return the roots INDEX-CONTEXT establishes: its root, source and destination."
+  (delete-dups (delq nil (list (dorg-ext-index-context-root-id index-context)
+                               (dorg-ext-index-context-from-root-id index-context)
+                               (dorg-ext-index-context-to-root-id index-context)))))
+
+(defun dorg-ext--fold-through-port (name index-context read-tables effects
+                                         fold-port)
+  "Fold extension NAME's accumulator EFFECTS per READ-TABLES through FOLD-PORT.
+Every effect, accumulator or ordinary row, must address a root INDEX-CONTEXT
+establishes.  The check precedes every port read, so a projector cannot make
+DOrg read or write another root's index."
+  (unless (and (functionp (plist-get fold-port :priors))
+               (functionp (plist-get fold-port :empty-roots)))
+    (dorg-ext--index-raise
+     'accumulator-unbound
+     "this caller cannot bind accumulator effects to a commit base"
+     :extension name))
+  (let ((context-roots (dorg-ext--index-context-roots index-context))
+        (roots (delete-dups (mapcar (lambda (effect)
+                                      (dorg-ext--effect-root read-tables effect))
+                                    effects))))
+    (dolist (root roots)
+      (unless (memql root context-roots)
+        (dorg-ext--index-raise
+         'root-outside-context
+         "an accumulator extension's effect addresses a root outside its context"
+         :extension name :root root :context-roots context-roots)))
+    (dorg-ext-fold-accumulators
+     read-tables effects
+     (funcall (plist-get fold-port :priors)
+              (dorg-ext-accumulator-prior-requests read-tables effects))
+     (funcall (plist-get fold-port :empty-roots) roots))))
+
+(defun dorg-ext-collect-index-projection (index-context &optional extension-names
+                                                        fold-port)
+  "Run selected DOrg-owned index projectors against INDEX-CONTEXT.
 INDEX-CONTEXT is a `dorg-ext-index-context' (tracked-regression) — the canonical
 candidate-state context DOrg produces after core simulation.  This is the SINGLE
 projector path: it accepts NO caller payload, consumes NO implicit state, and runs
 purely as a function of the DOrg-owned context.
+
+EXTENSION-NAMES is an explicit list of registered names; nil selects none and
+the symbol `:all' selects every eligible registered extension.
 
 For each registered extension (in registration order) whose capabilities include
 the context's source kind and which declares a `:project' index projector, DOrg
@@ -1088,24 +1860,39 @@ effect is validated against the extension's declared `:read-tables' manifest via
 `dorg-ext-validate-index-effect' (owned, unqualified, non-core table; safe
 columns; literal values); a rejected effect signals `dorg-ext-index-error' and
 aborts fail-closed before any persistence.  DOrg — not the extension — GENERATES
-the SQL (`dorg-ext--index-effect-sql'), so no derived effect can read database
+the SQL (`dorg-ext--index-effects-sql'), so no derived effect can read database
 state or reach a table other than its own.
 
 Returns a plist:
   :sql        flat list of DOrg-generated SQL strings, appended AFTER core SQL in
-              the SAME Dolt transaction (one commit, atomic rollback);
+              the SAME Dolt transaction (one commit, atomic rollback).  Each
+              extension's adjacent same-shape inserts are merged into
+              multi-row INSERTs, in effect order;
   :effects    flat list of the VALIDATED typed row effects in execution order —
               the exact effect forms the `:sql' statements were generated from.
               The postimage validator (tracked-regression) compares in-transaction
               readback against THESE plan-time values, so retaining them here
               keeps the compared expectation the already-validated one rather
               than a recomputation;
-  :extensions alist (NAME . (:statements N)) of participants that ran;
+  :extensions alist (NAME . (:statements N)) of participants that ran, N
+              being the participant's post-fold effect count;
   :ext-dirty  alist (NAME . (:tables TABLES)) — the DOrg-owned dirty scope, i.e.
               the owned tables the validated effects actually touched.  This
               REPLACES the retired per-extension `:dirty-scope' callback: dirty
               scope is now derived deterministically from the one projector
-              result, never supplied by a second participant."
+              result, never supplied by a second participant.
+
+FOLD-PORT binds accumulator effects to a commit base.  It is a plist
+\(:priors FN :empty-roots FN): FN of `dorg-ext-accumulator-prior-requests'
+requests returns (TABLE . ROW) priors read AS OF the caller's plan base, and
+FN of a root list returns the roots that had no heading at that base.  An
+extension declaring `:accumulate' tables is folded through it with
+`dorg-ext-fold-accumulators' before SQL is generated, and the folded effects
+are revalidated as ordinary row effects.  Before any port read, every effect
+of such an extension must address a root the context establishes (its root,
+source or destination), else `root-outside-context'.  A caller that passes no FOLD-PORT
+cannot bind accumulators to a base, so any effect from such an extension
+fails closed (`accumulator-unbound')."
   (let ((kind (dorg-ext-index-context-source-kind index-context))
         (sql nil) (all-effects nil) (extensions nil) (ext-dirty nil))
     (dorg-ext-run-index-validators index-context 'projection extension-names)
@@ -1115,13 +1902,23 @@ Returns a plist:
         (when (and (dorg-ext--selected-index-extension-p ext extension-names)
                    project (memq kind (dorg-ext--effective-capabilities ext)))
           (let* ((owned (dorg-ext--owned-tables ext))
+                 (read-tables (dorg-extension-read-tables ext))
+                 (specs (dorg-ext-accumulate-specs read-tables))
                  (effects (funcall project index-context))
+                 (_validated (mapc (lambda (e) (dorg-ext-validate-index-effect e owned specs))
+                                   effects))
+                 (effects (if (and specs effects)
+                              (dorg-ext--fold-through-port
+                               name index-context read-tables effects fold-port)
+                            effects))
                  (tables (mapcar (lambda (e) (dorg-ext-validate-index-effect e owned))
                                  effects))
-                 (stmts (mapcar #'dorg-ext--index-effect-sql effects)))
+                 (stmts (dorg-ext--index-effects-sql effects)))
             (setq sql (nconc sql stmts))
             (setq all-effects (nconc all-effects (copy-sequence effects)))
-            (push (cons name (list :statements (length stmts))) extensions)
+            ;; The summary counts the post-fold effects, not the lowered
+            ;; statements, so receipts do not depend on how rows merge.
+            (push (cons name (list :statements (length effects))) extensions)
             (when tables
               (push (cons name (list :tables (delete-dups (copy-sequence tables))))
                     ext-dirty))))))
@@ -1132,9 +1929,9 @@ Returns a plist:
 
 ;;; Placement Participants
 ;;
-;; Generic DOrg stores heading `level' and `parent_id' as decoupled
-;; columns with NO invariant tying a level-1 heading to a genuine
-;; top-level identity.  The buffer star-count-authoritative write-back
+;; Generic DOrg stores a heading's `parent_id' and its parent-relative
+;; `level_offset', with NO invariant tying a top-level heading (offset 1
+;; under the root, effective level 1) to a genuine top-level identity.  The buffer star-count-authoritative write-back
 ;; (`dorg-parse-assign-ids') and the render path (`dorg-model-render-tree')
 ;; therefore cannot themselves tell a legitimate top-level heading — or an
 ;; intentional move-to-root — from a child section accidentally demoted to
@@ -1149,10 +1946,13 @@ All fields are owned and populated by DOrg; the participant consumes them
 and returns a `dorg-ext-placement-verdict' or nil.
 
 HEADING-ID and DORG-ID identify the heading (DORG-ID is its stable
-`:DORG_ID:').  ROOT-ID is the tree's level-0 root id.  STORED-PARENT-ID and
-STORED-LEVEL are the heading's lineage as recorded in the backing store
-\(nil when the heading is new).  BUFFER-PARENT-ID and BUFFER-LEVEL are the
-lineage the current buffer/render placement would record.  MOVE-INTENT is
+`:DORG_ID:').  ROOT-ID is the tree's level-0 root id.  STORED-PARENT-ID is
+the heading's parent as recorded in the backing store, and STORED-LEVEL its
+EFFECTIVE absolute Org level there (nil when the heading is new or the level
+is unknown).  The store persists only a parent-relative offset; a producer
+must derive STORED-LEVEL from ancestor-closed data, never pass an offset.
+BUFFER-PARENT-ID and BUFFER-LEVEL are the parent and effective level the
+current buffer/render placement would record.  MOVE-INTENT is
 non-nil when the mutation path carried an explicit reparent patch (mutate
 DSL), signalling an intentional move rather than an accidental demotion.
 SNAPSHOT is a domain-neutral alist of the heading's PROPERTIES (KEY . VALUE)

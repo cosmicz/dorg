@@ -44,12 +44,108 @@
 
 ;;; ─── Pure Dolt simulation harness (no server) ─────────────────────────
 
+(ert-deftest dorg-test-fhhwd-index-context-refuses-cyclic-cons-spines ()
+  "Unsupported circular patch batches and nested cells refuse boundedly."
+  (let* ((max-lisp-eval-depth 1000)
+         (patches (list '(:op update)))
+         (cells (list "cyclic")))
+    (setcdr patches patches)
+    (setcdr cells cells)
+    (should-error (dorg-ext-index-context-create :patches patches)
+                  :type 'circular-list)
+    (should-error (dorg-ext-index-context-create
+                   :patches (list (list :op 'update :cells cells)))
+                  :type 'circular-list)))
+
+(ert-deftest dorg-test-fhhwd-wide-index-context-create-and-read-own-patches ()
+  "512 typed patches retain copy-in/read isolation at the runner depth bound."
+  (let* ((max-lisp-eval-depth 1000)
+         (patches (cl-loop for id from 1 to 512
+                           collect (dorg-test-mutate--heading-update-patch
+                                    id :title (copy-sequence "ORIGINAL"))))
+         (context (dorg-ext-index-context-create
+                   :source-kind 'dolt :root-id 1 :patches patches))
+         (inspection (dorg-ext-index-context-patches context)))
+    (should (equal patches inspection))
+    (should (= 512 (length inspection)))
+    (aset (plist-get (plist-get (car (last patches)) :fields) :title) 0 ?X)
+    (setcar patches '(:poisoned t))
+    (should-not (plist-member (car (dorg-ext-index-context-patches context))
+                              :poisoned))
+    (should (equal "ORIGINAL"
+                   (plist-get
+                    (plist-get (car (last
+                                     (dorg-ext-index-context-patches context)))
+                               :fields)
+                    :title)))
+    (aset (plist-get (plist-get (car (last inspection)) :fields) :title) 0 ?Y)
+    (setcdr inspection nil)
+    (let ((again (dorg-ext-index-context-patches context)))
+      (should (= 512 (length again)))
+      (should (equal "ORIGINAL"
+                     (plist-get (plist-get (car (last again)) :fields)
+                                :title))))))
+
+(ert-deftest dorg-test-fhhwd-index-context-dotted-vector-leaves-are-owned ()
+  "Context copy-in/read detaches dotted tails, vectors and repeated leaves."
+  (with-temp-buffer
+    (let* ((handle (current-buffer))
+           (leaf (copy-sequence "leaf"))
+           (tail (copy-sequence "tail"))
+           (cells (vector (cons leaf tail) leaf handle))
+           (context (dorg-ext-index-context-create
+                     :source-kind 'plain-org :root-id 1
+                     :patches (list (list :op 'update :cells cells))))
+           (copy (plist-get (car (dorg-ext-index-context-patches context))
+                            :cells)))
+      (should (equal cells copy))
+      (should-not (eq cells copy))
+      (should-not (eq (aref cells 0) (aref copy 0)))
+      (should-not (eq (car (aref copy 0)) (aref copy 1)))
+      (should (eq handle (aref copy 2)))
+      (aset leaf 0 ?X)
+      (aset tail 0 ?X)
+      (aset cells 2 nil)
+      (should (equal '("leaf" . "tail") (aref copy 0)))
+      (should (equal "leaf" (aref copy 1)))
+      (aset (cdr (aref copy 0)) 0 ?Y)
+      (setcar (aref copy 0) "replaced")
+      (aset copy 1 "replaced")
+      (let ((again (plist-get
+                    (car (dorg-ext-index-context-patches context)) :cells)))
+        (should (equal '("leaf" . "tail") (aref again 0)))
+        (should (equal "leaf" (aref again 1)))
+        (should (eq handle (aref again 2)))))))
+
 (defun dorg-test-ic--scope-tree (headings &optional ids)
   "Return an id -> `dorg-heading' hash of HEADINGS, restricted to IDS when non-nil."
   (let ((tree (make-hash-table :test 'eql)))
     (dolist (h headings tree)
       (when (or (null ids) (member (dorg-heading-id h) ids))
         (puthash (dorg-heading-id h) h tree)))))
+
+(defun dorg-test-ic--order-facts (headings parent-id &optional bound side limit exclude-ids
+                                         offsets-sink)
+  "Serve an ordering read over in-memory HEADINGS like the store reader does.
+Like the store read, it reports each returned heading's level offset into
+OFFSETS-SINK when that is a hash."
+  (let* ((rows (cl-loop for h in headings
+                        when (and (eql parent-id (dorg-heading-parent-id h))
+                                  (not (memql (dorg-heading-id h) exclude-ids))
+                                  (or (null bound)
+                                      (if (eq side 'before)
+                                          (string< (dorg-heading-sort-key h) bound)
+                                        (string< bound (dorg-heading-sort-key h)))))
+                        collect (cons (dorg-heading-id h) (dorg-heading-sort-key h))))
+         (sorted (sort rows (if (eq side 'before)
+                                (lambda (a b) (string> (cdr a) (cdr b)))
+                              (lambda (a b) (string< (cdr a) (cdr b)))))))
+    (let ((out (if limit (seq-take sorted limit) sorted)))
+      (when offsets-sink
+        (dolist (cell out)
+          (let ((h (cl-find (car cell) headings :key #'dorg-heading-id)))
+            (puthash (car cell) (dorg-heading-level-offset h) offsets-sink))))
+      out)))
 
 (defun dorg-test-ic--dolt-sim (root-id headings patches &optional head identity scope-ids)
   "Simulate PATCHES over an in-memory ROOT-ID tree of HEADINGS at HEAD.
@@ -59,6 +155,7 @@ When IDENTITY is non-nil, it is threaded into the Dolt source descriptor.
 When SCOPE-IDS is non-nil, the core simulation's bounded scope is restricted to
 those ids while the stubbed loader can still serve later explicit owner-partition
 loads from the full in-memory store."
+  (dorg-test--fill-level-offsets headings)
   (let* ((desc (append (list :dolt-dir "/tmp/dorg-ic/" :root-id root-id)
                        (and identity (list :identity identity))))
          (src (dorg-mutate--resolve-source desc))
@@ -73,6 +170,13 @@ loads from the full in-memory store."
                          (cl-remove-if-not
                           (lambda (h) (eql parent-id (dorg-heading-parent-id h)))
                           headings))))
+              ;; Keys-only ordering reads (neighbours, neighbourhoods or the
+              ;; whole group), served from the same in-memory headings.
+              ((symbol-function 'dorg-mutate--dolt-order-facts)
+               (lambda (_dolt-dir _root-id parent-id &optional _as-of
+                                  bound side limit exclude-ids offsets-sink)
+                 (dorg-test-ic--order-facts headings parent-id
+                                            bound side limit exclude-ids offsets-sink)))
               ((symbol-function 'dorg-mutate--dolt-ancestor-ids)
                (lambda (_dolt-dir _root-id start-id &optional _as-of)
                  (dorg-test-ic--ancestor-ids start-id headings)))
@@ -83,7 +187,7 @@ loads from the full in-memory store."
                (lambda (&rest _)
                  (ert-fail "index-context sim must not whole-root load")))
               ((symbol-function 'dorg-model-load-headings)
-               (lambda (_dolt-dir _root-id ids &optional _as-of _headline-only)
+               (lambda (_dolt-dir _root-id ids &optional _as-of _headline-only &rest _)
                  (dorg-test-ic--scope-tree headings ids))))
       (let ((dorg-mutate--dolt-item-id-generator
              (let ((n 700000)) (lambda () (prog1 n (cl-incf n))))))
@@ -168,9 +272,9 @@ loads from the full in-memory store."
   "The Dolt index-context binds the exact base/CAS (S0) token and a distinct
 candidate identity, but exposes NO future commit token.
 Non-vacuity: the struct itself must not carry a commit-token slot."
-  (let* ((root (make-dorg-heading :id 100 :level 0 :title "Root"
+  (let* ((root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                   :sort-key (unibyte-string #x80)))
-         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
+         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
                                :sort-key (unibyte-string #x40)))
          (sim (dorg-test-ic--dolt-sim
                100 (list root a)
@@ -193,9 +297,9 @@ Non-vacuity: the struct itself must not carry a commit-token slot."
 
 (ert-deftest dorg-test-ext-index-context-binds-canonical-patches ()
   "The context binds the canonical resolved typed patches, not caller payloads."
-  (let* ((root (make-dorg-heading :id 100 :level 0 :title "Root"
+  (let* ((root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                   :sort-key (unibyte-string #x80)))
-         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
+         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
                                :sort-key (unibyte-string #x40)))
          (patches (list (dorg-test-mutate--heading-update-patch 101 :title "A*")))
          (sim (dorg-test-ic--dolt-sim 100 (list root a) patches))
@@ -208,15 +312,15 @@ Non-vacuity: the struct itself must not carry a commit-token slot."
 (ert-deftest dorg-test-ext-index-context-dolt-classifies-create-change-move-delete ()
   "One batch producing all four effect kinds is partitioned with before/after
 or tombstone data sufficient to derive additions and removals."
-  (let* ((root (make-dorg-heading :id 100 :level 0 :title "Root"
+  (let* ((root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                   :sort-key (unibyte-string #x80)))
-         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
+         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
                                :sort-key (unibyte-string #x20)))
-         (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :title "B"
+         (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :level-offset 1 :title "B"
                                :sort-key (unibyte-string #x40)))
-         (c (make-dorg-heading :id 103 :parent-id 100 :level 1 :title "C"
+         (c (make-dorg-heading :id 103 :parent-id 100 :level 1 :level-offset 1 :title "C"
                                :sort-key (unibyte-string #x60)))
-         (p (make-dorg-heading :id 104 :parent-id 100 :level 1 :title "P"
+         (p (make-dorg-heading :id 104 :parent-id 100 :level 1 :level-offset 1 :title "P"
                                :sort-key (unibyte-string #x70)))
          (patches
           (list (dorg-test-mutate--tree-insert-patch
@@ -266,9 +370,9 @@ or tombstone data sufficient to derive additions and removals."
 (ert-deftest dorg-test-ext-index-context-dolt-exposes-host-safe-images ()
   "Base image and candidate postimage are host-safe id -> heading maps, never
 the private mutable working model, and the seam carries no projection SQL."
-  (let* ((root (make-dorg-heading :id 100 :level 0 :title "Root"
+  (let* ((root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                   :sort-key (unibyte-string #x80)))
-         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
+         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
                                :sort-key (unibyte-string #x40)))
          (sim (dorg-test-ic--dolt-sim
                100 (list root a)
@@ -292,9 +396,9 @@ the private mutable working model, and the seam carries no projection SQL."
   "The candidate postimage is an immutable snapshot: mutating the working model
 AFTER construction does not alter the exposed context.
 Non-vacuity: the working-model heading really does change."
-  (let* ((root (make-dorg-heading :id 100 :level 0 :title "Root"
+  (let* ((root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                   :sort-key (unibyte-string #x80)))
-         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
+         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
                                :sort-key (unibyte-string #x40)))
          (sim (dorg-test-ic--dolt-sim
                100 (list root a)
@@ -316,12 +420,12 @@ Non-vacuity: the working-model heading really does change."
 1 recreated yields a base image of 16 children and a candidate of 1, so a
 consumer can prove `core remains N' BEFORE apply and refuse to retain stale
 rows.  This is the tracker-cli-id8i6 refusal affordance, not production policy."
-  (let* ((root (make-dorg-heading :id 100 :level 0 :title "Root"
+  (let* ((root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                   :sort-key (unibyte-string #x80)))
          (children
           (cl-loop for i from 1 to 16
                    collect (make-dorg-heading
-                            :id (+ 100 i) :parent-id 100 :level 1
+                            :id (+ 100 i) :parent-id 100 :level 1 :level-offset 1
                             :title (format "K%02d" i)
                             :sort-key (unibyte-string i))))
          (patches
@@ -347,11 +451,11 @@ rows.  This is the tracker-cli-id8i6 refusal affordance, not production policy."
 (ert-deftest dorg-test-ext-index-context-dolt-postimage-is-real-not-plan-data ()
   "The candidate postimage is a real candidate post-state (updated field values
 plus untouched siblings), not merely plan/patch/affected/freshness data."
-  (let* ((root (make-dorg-heading :id 100 :level 0 :title "Root"
+  (let* ((root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                   :sort-key (unibyte-string #x80)))
-         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
+         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
                                :sort-key (unibyte-string #x20)))
-         (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :title "B"
+         (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :level-offset 1 :title "B"
                                :sort-key (unibyte-string #x40)))
          (sim (dorg-test-ic--dolt-sim
                100 (list root a b)
@@ -437,12 +541,12 @@ Transformation: differ-in-exactly-one-field => differ-in-candidate-id."
                 (lambda (h) (setf (dorg-heading-title h) "T2"))
                 (lambda (h) (setf (dorg-heading-todo h) "DONE"))
                 (lambda (h) (setf (dorg-heading-priority h) ?A))
-                (lambda (h) (setf (dorg-heading-level h) 2))
+                (lambda (h) (setf (dorg-heading-level-offset h) 2))
                 (lambda (h) (setf (dorg-heading-parent-id h) 9))
                 (lambda (h) (setf (dorg-heading-sort-key h) (unibyte-string #x50)))
                 (lambda (h) (setf (dorg-heading-tags h) '("x")))
                 (lambda (h) (setf (dorg-heading-items-hash h) "deadbeef"))))
-    (let* ((base (make-dorg-heading :id 1 :parent-id 0 :level 1 :title "T"
+    (let* ((base (make-dorg-heading :id 1 :parent-id 0 :level 1 :level-offset 1 :title "T"
                                     :sort-key (unibyte-string #x40)))
            (variant (copy-dorg-heading base))
            (h1 (make-hash-table :test 'eql))
@@ -460,6 +564,247 @@ Transformation: differ-in-exactly-one-field => differ-in-candidate-id."
                          (dorg-mutate--index-candidate-id h2))))))
 
 ;;; ─── affected owner partitions (tracked-case RED) ──────────────────────
+
+(ert-deftest dorg-test-ext-index-context-owner-resolution-is-linear ()
+  "Changing N owners resolves membership once per side, not N times per owner."
+  (dolist (n '(4 8))
+    (let ((headings (list (dorg-test-ic--heading 100 nil 0 "Root" #x80)))
+          patches
+          (calls 0)
+          (resolve (symbol-function 'dorg-mutate--index-nearest-owner)))
+      (dotimes (i n)
+        (let ((id (+ 101 i)))
+          (push (dorg-test-ic--heading id 100 1 "Before" (+ 16 i)
+                                     :bead-id (format "owner-%s" i))
+                headings)
+          (push (dorg-test-mutate--heading-update-patch id :title "After") patches)))
+      (let* ((sim
+              (cl-letf (((symbol-function 'dorg-mutate--index-nearest-owner)
+                         (lambda (&rest args)
+                           (cl-incf calls)
+                           (apply resolve args))))
+                (dorg-test-ic--dolt-sim
+                 100 headings patches "H0" '(:property "BEAD_ID"))))
+             (parts (dorg-ext-index-context-owner-partitions
+                     (plist-get sim :index-context))))
+        (should (= n (length parts)))
+        (dolist (part parts)
+          (let* ((id (dorg-ext-owner-partition-owner-id part))
+                 (before (dorg-ext-owner-partition-base-image part))
+                 (after (dorg-ext-owner-partition-candidate-postimage part)))
+            (should (equal (list id) (dorg-test-ic--image-ids after)))
+            (should (equal "Before" (dorg-heading-title (gethash id before))))
+            (should (equal "After" (dorg-heading-title (gethash id after))))))
+        ;; Two entry sides and the nearest parent per owner.  The old overlay
+        ;; adds 2*N*N resolutions, including SQL for unrelated owners.
+        (should (= (* 3 n) calls))))))
+
+(ert-deftest dorg-test-ext-index-context-owner-overlay-indexes-each-image-once ()
+  "Affected partitions share one child index per immutable side image."
+  (dolist (n '(4 8))
+    (let ((headings (list (dorg-test-ic--heading 100 nil 0 "Root" #x80)))
+          patches
+          (calls 0)
+          (cells 0)
+          (build (symbol-function 'dorg-mutate--index-image-children)))
+      (dotimes (i n)
+        (let ((id (+ 101 i)))
+          (push (dorg-test-ic--heading id 100 1 "Before" (+ 16 i)
+                                       :bead-id (format "owner-%s" i))
+                headings)
+          (push (dorg-test-mutate--heading-update-patch id :title "After") patches)))
+      (cl-letf (((symbol-function 'dorg-mutate--index-image-children)
+                 (lambda (image)
+                   (cl-incf calls)
+                   (cl-incf cells (hash-table-count image))
+                   (funcall build image))))
+        (dorg-test-ic--dolt-sim
+         100 headings patches "H0" '(:property "BEAD_ID")))
+      ;; One complete base image and one complete candidate image, independent
+      ;; of the number of affected owner paths.
+      (should (= 2 calls))
+      (should (= (* 2 (1+ n)) cells)))))
+
+(ert-deftest dorg-test-ext-index-context-owner-overlay-preserves-move-sides ()
+  "Moving a plain heading removes its old ownership and installs the new one."
+  (let* ((headings
+          (list (dorg-test-ic--heading 100 nil 0 "Root" #x80)
+                (dorg-test-ic--heading 101 100 1 "Left" #x20 :bead-id "left")
+                (dorg-test-ic--heading 102 100 1 "Right" #x40 :bead-id "right")
+                (dorg-test-ic--heading 103 101 2 "Moving" #x20)
+                (dorg-test-ic--heading 105 102 2 "Untouched" #x20)))
+         (sim (dorg-test-ic--dolt-sim
+               100 headings
+               (list (dorg-test-mutate--move-patch
+                      103 (dorg-test-mutate--heading-address 102)))
+               "H0" '(:property "BEAD_ID")))
+         (parts (dorg-ext-index-context-owner-partitions
+                 (plist-get sim :index-context)))
+         (left (dorg-test-ic--owner-partition-by-value parts "left"))
+         (right (dorg-test-ic--owner-partition-by-value parts "right")))
+    (should (equal '(101 103)
+                   (dorg-test-ic--image-ids (dorg-ext-owner-partition-base-image left))))
+    (should (equal '(101)
+                   (dorg-test-ic--image-ids
+                    (dorg-ext-owner-partition-candidate-postimage left))))
+    (should (equal '(102 105)
+                   (dorg-test-ic--image-ids (dorg-ext-owner-partition-base-image right))))
+    (should (equal '(102 103 105)
+                   (dorg-test-ic--image-ids
+                    (dorg-ext-owner-partition-candidate-postimage right))))))
+
+(ert-deftest dorg-test-ext-index-context-owner-local-image-keeps-dorg-owner-singleton ()
+  "DOrg identity treats every heading as an owner despite hidden DORG_ID props."
+  (let* ((source (dorg-mutate--resolve-source
+                  '(:dolt-dir "/tmp/dorg-ic/" :root-id 100 :identity dorg)))
+         (image (make-hash-table :test 'eql)))
+    (puthash 101 (dorg-test-ic--heading 101 100 1 "Owner" #x20) image)
+    (puthash 102 (dorg-test-ic--heading 102 101 2 "Child" #x20) image)
+    (should (equal '(101)
+                   (dorg-mutate--index-image-owner-local-ids
+                    source image (dorg-mutate--index-image-children image) 101)))))
+
+(ert-deftest dorg-test-ext-index-context-owner-overlay-removes-transitive-descendants ()
+  "A moved plain depth-three branch leaves no stale row in its old owner."
+  (let* ((headings
+          (list (dorg-test-ic--heading 100 nil 0 "Root" #x80)
+                (dorg-test-ic--heading 101 100 1 "Left" #x20 :bead-id "left")
+                (dorg-test-ic--heading 102 100 1 "Right" #x40 :bead-id "right")
+                (dorg-test-ic--heading 103 101 2 "Moving" #x20)
+                (dorg-test-ic--heading 104 103 3 "Child" #x20)
+                (dorg-test-ic--heading 106 104 4 "Grandchild" #x20)
+                (dorg-test-ic--heading 105 102 2 "Untouched" #x20)))
+         (sim (dorg-test-ic--dolt-sim
+               100 headings
+               (list (dorg-test-mutate--move-patch
+                      103 (dorg-test-mutate--heading-address 102)))
+               "H0" '(:property "BEAD_ID")))
+         (parts (dorg-ext-index-context-owner-partitions
+                 (plist-get sim :index-context)))
+         (left (dorg-test-ic--owner-partition-by-value parts "left")))
+    (should (equal '(101 103 104 106)
+                   (dorg-test-ic--image-ids
+                    (dorg-ext-owner-partition-base-image left))))
+    ;; RED on 7ec9049a5: the entry-only overlay leaves 104 and 106 behind.
+    (should (equal '(101)
+                   (dorg-test-ic--image-ids
+                    (dorg-ext-owner-partition-candidate-postimage left))))))
+
+(ert-deftest dorg-test-ext-index-context-owner-overlay-adds-transitive-descendants ()
+  "A moved plain depth-three branch reaches its new owner completely."
+  (let* ((headings
+          (list (dorg-test-ic--heading 100 nil 0 "Root" #x80)
+                (dorg-test-ic--heading 101 100 1 "Left" #x20 :bead-id "left")
+                (dorg-test-ic--heading 102 100 1 "Right" #x40 :bead-id "right")
+                (dorg-test-ic--heading 103 101 2 "Moving" #x20)
+                (dorg-test-ic--heading 104 103 3 "Child" #x20)
+                (dorg-test-ic--heading 106 104 4 "Grandchild" #x20)
+                (dorg-test-ic--heading 105 102 2 "Untouched" #x20)))
+         (sim (dorg-test-ic--dolt-sim
+               100 headings
+               (list (dorg-test-mutate--move-patch
+                      103 (dorg-test-mutate--heading-address 102)))
+               "H0" '(:property "BEAD_ID")))
+         (parts (dorg-ext-index-context-owner-partitions
+                 (plist-get sim :index-context)))
+         (right (dorg-test-ic--owner-partition-by-value parts "right")))
+    (should (equal '(102 105)
+                   (dorg-test-ic--image-ids
+                    (dorg-ext-owner-partition-base-image right))))
+    ;; RED on 7ec9049a5: the entry-only overlay installs only 103.
+    (should (equal '(102 103 104 105 106)
+                   (dorg-test-ic--image-ids
+                    (dorg-ext-owner-partition-candidate-postimage right))))))
+
+(ert-deftest dorg-test-ext-index-context-owner-overlay-stops-before-nested-owner ()
+  "A moved branch does not fold a nested identity owner into its outer owner."
+  (let* ((headings
+          (list (dorg-test-ic--heading 100 nil 0 "Root" #x80)
+                (dorg-test-ic--heading 101 100 1 "Left" #x20 :bead-id "left")
+                (dorg-test-ic--heading 102 100 1 "Right" #x40 :bead-id "right")
+                (dorg-test-ic--heading 103 101 2 "Moving" #x20)
+                (dorg-test-ic--heading 104 103 3 "Nested" #x20 :bead-id "nested")
+                (dorg-test-ic--heading 106 104 4 "Nested child" #x20)
+                (dorg-test-ic--heading 105 102 2 "Untouched" #x20)))
+         (sim (dorg-test-ic--dolt-sim
+               100 headings
+               (list (dorg-test-mutate--move-patch
+                      103 (dorg-test-mutate--heading-address 102)))
+               "H0" '(:property "BEAD_ID")))
+         (parts (dorg-ext-index-context-owner-partitions
+                 (plist-get sim :index-context)))
+         (left (dorg-test-ic--owner-partition-by-value parts "left"))
+         (right (dorg-test-ic--owner-partition-by-value parts "right")))
+    (should (equal '(101 103)
+                   (dorg-test-ic--image-ids
+                    (dorg-ext-owner-partition-base-image left))))
+    (should (equal '(101)
+                   (dorg-test-ic--image-ids
+                    (dorg-ext-owner-partition-candidate-postimage left))))
+    (should (equal '(102 105)
+                   (dorg-test-ic--image-ids
+                    (dorg-ext-owner-partition-base-image right))))
+    (should (equal '(102 103 105)
+                   (dorg-test-ic--image-ids
+                    (dorg-ext-owner-partition-candidate-postimage right))))))
+
+(ert-deftest dorg-test-ext-index-context-owner-overlay-does-not-readd-deleted-descendant ()
+  "A moved branch never readds a descendant deleted in the same batch."
+  (let* ((headings
+          (list (dorg-test-ic--heading 100 nil 0 "Root" #x80)
+                (dorg-test-ic--heading 101 100 1 "Left" #x20 :bead-id "left")
+                (dorg-test-ic--heading 102 100 1 "Right" #x40 :bead-id "right")
+                (dorg-test-ic--heading 103 101 2 "Moving" #x20)
+                (dorg-test-ic--heading 104 103 3 "Deleted" #x20)
+                (dorg-test-ic--heading 105 102 2 "Untouched" #x20)))
+         (sim (dorg-test-ic--dolt-sim
+               100 headings
+               (list (dorg-test-mutate--move-patch
+                      103 (dorg-test-mutate--heading-address 102))
+                     (dorg-test-mutate--delete-patch 104 t))
+               "H0" '(:property "BEAD_ID")))
+         (parts (dorg-ext-index-context-owner-partitions
+                 (plist-get sim :index-context)))
+         (left (dorg-test-ic--owner-partition-by-value parts "left"))
+         (right (dorg-test-ic--owner-partition-by-value parts "right")))
+    (should (equal '(101)
+                   (dorg-test-ic--image-ids
+                    (dorg-ext-owner-partition-candidate-postimage left))))
+    (should (equal '(102 103 105)
+                   (dorg-test-ic--image-ids
+                    (dorg-ext-owner-partition-candidate-postimage right))))))
+
+(ert-deftest dorg-test-ext-index-context-owner-overlay-preserves-within-owner-content ()
+  "Within-owner reparenting preserves descendants and leaves other owners alone."
+  (let* ((headings
+          (list (dorg-test-ic--heading 100 nil 0 "Root" #x80)
+                (dorg-test-ic--heading 101 100 1 "Owner" #x20 :bead-id "owner")
+                (dorg-test-ic--heading 102 101 2 "Old parent" #x20)
+                (dorg-test-ic--heading 103 101 2 "New parent" #x40)
+                (dorg-test-ic--heading 104 102 3 "Moving" #x20)
+                (dorg-test-ic--heading 106 104 4 "Grandchild" #x20)
+                (dorg-test-ic--heading 105 101 2 "Unchanged" #x60)
+                (dorg-test-ic--heading 107 100 1 "Other owner" #x40 :bead-id "other")
+                (dorg-test-ic--heading 108 107 2 "Other child" #x20)))
+         (sim (dorg-test-ic--dolt-sim
+               100 headings
+               (list (dorg-test-mutate--move-patch
+                      104 (dorg-test-mutate--heading-address 103)))
+               "H0" '(:property "BEAD_ID")))
+         (ctx (plist-get sim :index-context))
+         (parts (dorg-ext-index-context-owner-partitions ctx))
+         (owner (dorg-test-ic--owner-partition-by-value parts "owner"))
+         (post (dorg-ext-owner-partition-candidate-postimage owner))
+         (core (dorg-ext-index-context-candidate-postimage ctx)))
+    (should (equal '(101 102 103 104 105 106)
+                   (dorg-test-ic--image-ids post)))
+    (should (eql 103 (dorg-heading-parent-id (gethash 104 post))))
+    (should (eql 104 (dorg-heading-parent-id (gethash 106 post))))
+    (should (equal "Unchanged" (dorg-heading-title (gethash 105 post))))
+    (should (equal (unibyte-string #x60) (dorg-heading-sort-key (gethash 105 post))))
+    (should-not (dorg-test-ic--owner-partition-by-value parts "other"))
+    (should (equal "Other child" (dorg-heading-title (gethash 108 core))))
+    (should (equal (unibyte-string #x20) (dorg-heading-sort-key (gethash 108 core))))))
 
 (ert-deftest dorg-test-ext-index-context-owner-partitions-use-nearest-ancestor-owner ()
   "c4l63 witness A: a nested child-bead nonstructural update exposes the child
@@ -498,6 +843,31 @@ partition accessor."
       (should (member '(:id 103 :side after :path (103))
                       (dorg-ext-owner-partition-affected-paths child)))
       (should (member 103 (dorg-ext-owner-partition-affected-ids child))))))
+
+(ert-deftest dorg-test-level-offset-nested-owner-partition-rebuilt-same-root ()
+  "A same-root move rebuilds the partition of an owner nested in the subtree.
+N (bead \"n\") sits inside P's subtree behind a plain wrapper.  Moving P under
+D changes N's ancestry but no stored field of N, so N reaches classification
+only through the explicit moved closure; its partition must still be rebuilt."
+  (let* ((headings
+          (list (dorg-test-ic--heading 100 nil 0 "Root" #x80)
+                (dorg-test-ic--heading 101 100 1 "P bead" #x20 :bead-id "p")
+                (dorg-test-ic--heading 102 101 2 "Wrapper" #x20)
+                (dorg-test-ic--heading 103 102 3 "N bead" #x20 :bead-id "n")
+                (dorg-test-ic--heading 104 100 1 "D bead" #x40 :bead-id "d")))
+         (sim (dorg-test-ic--dolt-sim
+               100 headings
+               (list (dorg-test-mutate--move-patch
+                      101 (dorg-test-mutate--heading-address 104)))
+               "H0" '(:property "BEAD_ID")))
+         (ctx (plist-get sim :index-context))
+         (partitions (dorg-ext-index-context-owner-partitions ctx))
+         (nested (dorg-test-ic--owner-partition-by-value partitions "n")))
+    (should (memql 103 (plist-get sim :moved)))
+    (should (memql 103 (mapcar #'dorg-ext-index-entry-id
+                               (dorg-ext-index-context-moved ctx))))
+    (should nested)
+    (should (eql 103 (dorg-ext-owner-partition-owner-id nested)))))
 
 (ert-deftest dorg-test-ext-index-context-owner-partitions-expose-dense-owner-local-section ()
   "c4l63 witness B: a nested section/note change exposes one unique owner with a
@@ -579,6 +949,7 @@ closure load that includes owner/path/local ids outside that core scope."
                      :identity '(:property "BEAD_ID"))))
          (patches (list (dorg-test-mutate--heading-update-patch 102 :title "Target*")))
          (load-calls nil))
+    (dorg-test--fill-level-offsets headings)
     (cl-letf (((symbol-function 'dorg-head-commit)
                (lambda (_dolt-dir) "H0"))
               ((symbol-function 'dorg-mutate--dolt-scope-ids)
@@ -589,6 +960,13 @@ closure load that includes owner/path/local ids outside that core scope."
                          (cl-remove-if-not
                           (lambda (h) (eql parent-id (dorg-heading-parent-id h)))
                           headings))))
+              ;; Keys-only ordering reads (neighbours, neighbourhoods or the
+              ;; whole group), served from the same in-memory headings.
+              ((symbol-function 'dorg-mutate--dolt-order-facts)
+               (lambda (_dolt-dir _root-id parent-id &optional _as-of
+                                  bound side limit exclude-ids offsets-sink)
+                 (dorg-test-ic--order-facts headings parent-id
+                                            bound side limit exclude-ids offsets-sink)))
               ((symbol-function 'dorg-mutate--dolt-ancestor-ids)
                (lambda (_dolt-dir _root-id start-id &optional _as-of)
                  (dorg-test-ic--ancestor-ids start-id headings)))
@@ -599,7 +977,7 @@ closure load that includes owner/path/local ids outside that core scope."
                (lambda (&rest _)
                  (ert-fail "owner partition construction must not full-root load")))
               ((symbol-function 'dorg-model-load-headings)
-               (lambda (_dolt-dir _root-id ids &optional _as-of _headline-only)
+               (lambda (_dolt-dir _root-id ids &optional _as-of _headline-only &rest _)
                  (push ids load-calls)
                  (should ids)
                  (dorg-test-ic--scope-tree headings ids))))
@@ -723,9 +1101,9 @@ descendant OUTSIDE the scope is excluded (bounded, not full-root)."
   "The candidate postimage deep-copies NESTED tags/items, so mutating a tag
 through the exposed image cannot reach DOrg's private simulation (`ps') state.
 Non-vacuity: a shallow copy aliases the tags list and poisons `ps'."
-  (let* ((root (make-dorg-heading :id 100 :level 0 :title "Root"
+  (let* ((root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                   :sort-key (unibyte-string #x80)))
-         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
+         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
                                :sort-key (unibyte-string #x40)
                                :tags (list "alpha")))
          (sim (dorg-test-ic--dolt-sim
@@ -745,9 +1123,9 @@ Non-vacuity: a shallow copy aliases the tags list and poisons `ps'."
   "Each image read returns an INDEPENDENT deep copy: one consumer poisoning its
 view (injecting an id, mutating a heading) cannot affect a later consumer's read.
 Non-vacuity: a shared hash would carry the injection and mutation forward."
-  (let* ((root (make-dorg-heading :id 100 :level 0 :title "Root"
+  (let* ((root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                   :sort-key (unibyte-string #x80)))
-         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
+         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
                                :sort-key (unibyte-string #x40)))
          (sim (dorg-test-ic--dolt-sim
                100 (list root a)
@@ -766,9 +1144,9 @@ Non-vacuity: a shared hash would carry the injection and mutation forward."
 (ert-deftest dorg-test-ext-index-context-entry-snapshots-are-copy-on-read ()
   "Entry BEFORE/AFTER are copy-on-read deep copies: mutating one read affects
 neither a later read nor DOrg state."
-  (let* ((root (make-dorg-heading :id 100 :level 0 :title "Root"
+  (let* ((root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                   :sort-key (unibyte-string #x80)))
-         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
+         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
                                :sort-key (unibyte-string #x40) :tags (list "alpha")))
          (sim (dorg-test-ic--dolt-sim
                100 (list root a)
@@ -819,9 +1197,9 @@ corrupt what a later consumer reads.  Direct Navigator receipt on the real
 `dorg-mutate--dolt-simulate' path (production-patches=(:poisoned),
 changed-first=999).  Non-vacuity: returning the stored list by reference makes
 the second consumer observe the poison."
-  (let* ((root (make-dorg-heading :id 100 :level 0 :title "Root"
+  (let* ((root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                   :sort-key (unibyte-string #x80)))
-         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
+         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
                                :sort-key (unibyte-string #x40)))
          (sim (dorg-test-ic--dolt-sim
                100 (list root a)
@@ -851,7 +1229,7 @@ returns an independent copy per read, so a consumer's spine mutation never
 reaches a later reader.  Built through the public constructor so all five lists
 are guaranteed non-empty (a production sim rarely populates all four kinds at
 once)."
-  (let* ((h (make-dorg-heading :id 1 :parent-id 0 :level 1 :title "H"
+  (let* ((h (make-dorg-heading :id 1 :parent-id 0 :level 1 :level-offset 1 :title "H"
                                :sort-key (unibyte-string #x40)))
          (mk (lambda (kind id) (dorg-ext-index-entry-create
                                 :kind kind :id id :before h :after h)))
@@ -905,9 +1283,9 @@ never a closure (whose captured environment is introspectable via `aref') nor a
 live owned hash.  Direct Navigator receipt: a slot-stored vault closure returned
 by `...---vault' let `(aref it 2)' reach the captured `base-image'/`before' by
 reference.  Non-vacuity: a closure-valued slot fails the `functionp' guard."
-  (let* ((root (make-dorg-heading :id 100 :level 0 :title "Root"
+  (let* ((root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                   :sort-key (unibyte-string #x80)))
-         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
+         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
                                :sort-key (unibyte-string #x40) :tags (list "alpha")))
          (sim (dorg-test-ic--dolt-sim
                100 (list root a)
@@ -993,9 +1371,9 @@ exercised explicitly (its hand-written copy-on-read branch)."
 consumer that `aset's a nested title string cannot poison a later reader OR the
 source typed patch.  `copy-tree' copies only cons spines and shares mutable string
 leaves (Navigator receipt: first=later=original=\"XRIGINAL\" same-string=t)."
-  (let* ((root (make-dorg-heading :id 100 :level 0 :title "Root"
+  (let* ((root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                   :sort-key (unibyte-string #x80)))
-         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
+         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
                                :sort-key (unibyte-string #x40)))
          (sim (dorg-test-ic--dolt-sim
                100 (list root a)
@@ -1042,6 +1420,105 @@ Non-vacuity: the consumer's mutations land on its own copy."
     (let ((v3 (plist-get (car (dorg-ext-index-context-patches ctx)) :cells)))
       (should (equal "VLEAF" (aref v3 0)))
       (should (equal "SLOT1" (aref v3 1))))))
+
+
+;;; ─── Final state wins over intermediate rekeys (review at bdae3d133) ─────
+
+(defun dorg-test-ic--rekey-fixture (later)
+  "Simulate an insert that rebalances owner 101's aged children, then LATER.
+LATER is nil (rebalance only), `move' (move child 103 to the end of the same
+parent) or `delete' (delete child 103, then insert another child after 102).
+Runs the production simulate and owner-partition builder through the
+fake-store harness; returns the sim plist."
+  (let* ((headings
+          (list (dorg-test-ic--heading 100 nil 0 "Root" #x80)
+                (dorg-test-ic--heading 101 100 1 "Owner" #x40 :bead-id "owner")
+                (dorg-test-ic--heading 102 101 2 "A" #x20)
+                (dorg-test-ic--heading 103 101 2 "B" #x40)
+                (dorg-test-ic--heading 104 101 2 "C" #x60)))
+         (patches (list (dorg-test-mutate--tree-insert-patch
+                         (dorg-test-mutate--heading-address 101)
+                         '(:id 300 :title "Inserted")
+                         :before (dorg-test-mutate--heading-address 102)))))
+    (dolist (h (cddr headings))
+      (setf (dorg-heading-sort-key h)
+            (dorg-test-mutate--aged-key (- (dorg-heading-id h) 101))))
+    (pcase later
+      ('move
+       (setq patches (append patches
+                             (list (dorg-test-mutate--move-patch
+                                    103 (dorg-test-mutate--heading-address 101))))))
+      ('delete
+       (setq patches (append patches
+                             (list (dorg-test-mutate--delete-patch 103 t)
+                                   (dorg-test-mutate--tree-insert-patch
+                                    (dorg-test-mutate--heading-address 101)
+                                    '(:id 301 :title "After A")
+                                    :after (dorg-test-mutate--heading-address 102)))))))
+    (dorg-test-ic--dolt-sim 100 headings patches "H0" '(:property "BEAD_ID"))))
+
+(defun dorg-test-ic--owner-children-order (sim)
+  "Return (CORE . PROJECTED): child ids of owner 101 in key order from the PS and the owner image."
+  (let* ((ps (plist-get sim :ps))
+         (ctx (plist-get sim :index-context))
+         (owner (dorg-test-ic--owner-partition-by-value
+                 (dorg-ext-index-context-owner-partitions ctx) "owner"))
+         (image (dorg-ext-owner-partition-candidate-postimage owner)))
+    (cl-flet ((order (table)
+                (mapcar #'car
+                        (sort (let (cells)
+                                (maphash (lambda (id h)
+                                           (when (eql 101 (dorg-heading-parent-id h))
+                                             (push (cons id (dorg-heading-sort-key h)) cells)))
+                                         table)
+                                cells)
+                              (lambda (a b) (string< (cdr a) (cdr b)))))))
+      (cons (order (dorg-mutate--ps-headings ps)) (order image)))))
+
+(ert-deftest dorg-test-ic-rekey-only-owner-image-matches-core ()
+  "Control: a rebalance alone leaves the owner image equal to the core state."
+  (let* ((sim (dorg-test-ic--rekey-fixture nil))
+         (orders (dorg-test-ic--owner-children-order sim)))
+    (should (equal (car orders) '(300 102 103 104)))
+    (should (equal (car orders) (cdr orders)))
+    (should (null (plist-get sim :changed)))))
+
+(ert-deftest dorg-test-ic-rekey-then-move-final-key-wins ()
+  "F1: a move after a rebalance owns the row's final key in core, lowering and the owner image."
+  (let* ((sim (dorg-test-ic--rekey-fixture 'move))
+         (ps (plist-get sim :ps))
+         (orders (dorg-test-ic--owner-children-order sim))
+         (ctx (plist-get sim :index-context))
+         (owner (dorg-test-ic--owner-partition-by-value
+                 (dorg-ext-index-context-owner-partitions ctx) "owner"))
+         (final (dorg-heading-sort-key (gethash 103 (dorg-mutate--ps-headings ps))))
+         (projected (dorg-heading-sort-key
+                     (gethash 103 (dorg-ext-owner-partition-candidate-postimage owner)))))
+    (should (member 103 (plist-get sim :changed)))
+    (should (equal final projected))
+    (should (equal (car orders) '(300 102 104 103)))
+    (should (equal (car orders) (cdr orders)))
+    ;; No pending rekey survives for a row a later semantic op re-keyed, and
+    ;; no rekey op names it.
+    (should-not (gethash 103 (dorg-mutate--ps-rekeys ps)))
+    (should-not (cl-some (lambda (op)
+                           (and (eq (car op) :rekey) (assq 103 (caddr op))))
+                         (plist-get sim :db-ops)))))
+
+(ert-deftest dorg-test-ic-rekey-then-delete-leaves-no-pending-row ()
+  "F2: a deleted rekeyed row is neither a pending ordering row nor in the owner image,
+and a later placement in the same batch orders correctly without it."
+  (let* ((sim (dorg-test-ic--rekey-fixture 'delete))
+         (ps (plist-get sim :ps))
+         (delta (dorg-mutate--ps-order-delta ps 101))
+         (orders (dorg-test-ic--owner-children-order sim)))
+    (should (member 103 (plist-get sim :deleted)))
+    (should-not (gethash 103 (dorg-mutate--ps-headings ps)))
+    (should-not (assq 103 (cdr delta)))
+    (should (member 103 (car delta)))
+    (should-not (gethash 103 (dorg-mutate--ps-rekeys ps)))
+    (should (equal (car orders) '(300 102 301 104)))
+    (should (equal (car orders) (cdr orders)))))
 
 (provide 'dorg-ext-index-context-tests)
 ;;; dorg-ext-index-context-tests.el ends here

@@ -1,7 +1,7 @@
 #+title: DOrg Administrative Import
 
 #+begin_quote
-*DOrg 0.1.0 administrative surface.*  This operation is not an authoring
+*Administrative surface.*  This operation is not an authoring
 workflow.  Use it only with recoverable data.
 #+end_quote
 
@@ -96,12 +96,16 @@ Import rejects incomplete or ambiguous inputs before document mutation:
 - unreadable or identity-less sources;
 - case-alias targets that resolve to more than one root;
 - duplicate heading IDs and IDs owned by another root;
+- registered owned-metadata families with unavailable owners, noncanonical
+  keys, or invalid records (validated through that family's owner);
 - populated/previously imported bootstrap targets;
 - missing or stale replace bases; and
 - an uncommitted Dolt working set.
 
 Repository initialization and schema ensure are administrative prerequisites
-and may create or migrate the repository before document planning.  After that,
+and may create a new repository before document planning.  An existing
+incompatible schema is refused; migration is an explicit operator step, not
+an import side effect.  After that,
 the document operation plans against one HEAD, constructs the same immutable
 ~dorg-ext-index-context~ used by ordinary mutation, runs registered ~:project~
 index projectors against that canonical candidate, acquires the same store

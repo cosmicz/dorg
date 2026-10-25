@@ -32,6 +32,7 @@
 (declare-function dorg-materialized-view-scope "dorg-mode"
                   (&optional buffer))
 (declare-function dorg-mutate--postimage-plan "dorg-mutate")
+(declare-function dorg-mutate--accumulator-fold-port "dorg-mutate" (dolt-dir revision))
 
 (define-error 'dorg-import-error
               "DOrg document import failed")
@@ -111,6 +112,33 @@
               (goto-char next)))
           found)))))
 
+(defun dorg-import--owned-metadata-keyword-p (buffer)
+  "Return non-nil when BUFFER has a registered-family Org keyword.
+
+Registered metadata persists only in a PROPERTIES drawer.  This recognizes
+actual Org keyword elements, rather than documentation/example text that
+happens to resemble one, before parsing can discard the db-local keyword."
+  (with-current-buffer buffer
+    (save-excursion
+      (save-restriction
+        (widen)
+        (goto-char (point-min))
+        (let ((case-fold-search t)
+              found)
+          (while
+              (and (not found)
+                   (re-search-forward "^[ \\t]*#\\+\\([^:\\n]+\\):" nil t))
+            (let ((begin (match-beginning 0))
+                  (next (match-end 0)))
+              (goto-char begin)
+              (let ((element (org-element-context)))
+                (when (and (eq (org-element-type element) 'keyword)
+                           (dorg-owned-metadata-key-p
+                            (org-element-property :key element)))
+                  (setq found t)))
+              (goto-char next)))
+          found)))))
+
 (defun dorg-import--assert-source-buffer (buffer)
   "Reject BUFFER unless it is a complete, non-projection Org source."
   (unless (buffer-live-p buffer)
@@ -132,7 +160,10 @@
               (list "a live DOrg materialized projection cannot be imported")))
     (when (dorg-import--projection-metadata-p buffer)
       (signal 'dorg-import-source-error
-              (list "DORG_HASH/DORG_WINDOW marks the source as an output projection")))))
+              (list "DORG_HASH/DORG_WINDOW marks the source as an output projection")))
+    (when (dorg-import--owned-metadata-keyword-p buffer)
+      (signal 'dorg-import-source-error
+              (list "registered metadata must use a PROPERTIES drawer")))))
 
 (defun dorg-import--snapshot-buffer (text source-file)
   "Return a read-only Org buffer containing immutable TEXT for SOURCE-FILE."
@@ -182,6 +213,9 @@ Returns (:file FILE :string TEXT :buffer SNAPSHOT)."
                    'dorg-import-source-error
                    (list
                     "DORG_HASH/DORG_WINDOW marks the source as an output projection")))
+                (when (dorg-import--owned-metadata-keyword-p snapshot)
+                  (signal 'dorg-import-source-error
+                          (list "registered metadata must use a PROPERTIES drawer")))
                 (list :file file :string text :buffer snapshot))
             (error
              (kill-buffer snapshot)
@@ -216,7 +250,7 @@ Returns (:file FILE :string TEXT :buffer SNAPSHOT)."
               dolt-dir
               (format
                (concat
-                "SELECT h.id, h.parent_id, h.level, HEX(h.sort_key) AS sort_key_hex,"
+                "SELECT h.id, h.parent_id, h.level_offset, HEX(h.sort_key) AS sort_key_hex,"
                 " h.todo_keyword, h.priority, h.commented, h.title,"
                 " h.post_blank, h.items_hash,"
                 " (SELECT COUNT(*) FROM heading_tags t WHERE t.heading_id = h.id) AS tag_count,"
@@ -241,7 +275,7 @@ Returns (:file FILE :string TEXT :buffer SNAPSHOT)."
                      (= (length rows) 1)
                      root-row
                      (null (alist-get 'parent_id root-row))
-                     (eql (alist-get 'level root-row) 0)
+                     (eql (alist-get 'level_offset root-row) 0)
                      (equal (alist-get 'sort_key_hex root-row) "01")
                      (null (alist-get 'todo_keyword root-row))
                      (null (alist-get 'priority root-row))
@@ -314,50 +348,65 @@ Returns (:file FILE :string TEXT :buffer SNAPSHOT)."
                           :id id :root-id owner))))))))
 
 (defun dorg-import--root-reconcile-sql (root id-generator)
-  "Return SQL replacing existing ROOT content while preserving its id."
+  "Return (BARRIERS . ROWS) replacing existing ROOT content, keeping its id.
+BARRIERS are the root's UPDATE and its tag and item DELETEs, in order; ROWS
+are its new tag and item insert rows.  ID-GENERATOR allocates item ids."
   (let ((id (dorg-heading-id root)))
-    (append
+    (cons
      (list (dorg-sql-gen-heading-update root)
-           (format "DELETE FROM heading_tags WHERE heading_id = %d" id))
-     (dorg-sql-gen-tag-inserts id (dorg-heading-tags root))
-     (list (format "DELETE FROM heading_items WHERE heading_id = %d" id))
-     (dorg-sql-gen-heading-items-sql root id-generator))))
+           (format "DELETE FROM heading_tags WHERE heading_id = %d" id)
+           (format "DELETE FROM heading_items WHERE heading_id = %d" id))
+     (append
+      (dorg-sql-gen-tag-rows id (dorg-heading-tags root))
+      (dorg-sql-gen-heading-items-rows root id-generator)))))
 
 (defun dorg-import--core-sql
     (dolt-dir parsed target-file existing-root mode id-generator)
   "Return complete core SQL for PARSED import into TARGET-FILE in DOLT-DIR.
 EXISTING-ROOT is nil for a new target.  MODE is `bootstrap' or
-`replace'.  ID-GENERATOR allocates item ids."
+`replace'.  ID-GENERATOR allocates item ids.
+
+Rows are generated per heading in document order, exactly as one statement
+per row would be, so item ids and sort keys bind identically.  The statement
+order is:
+- every barrier, in order: replace's delete of the root's children, then an
+  existing root's update and its tag and item deletes;
+- every insert row, grouped by `dorg-sql-gen-order-core-rows' and lowered
+  into multi-row INSERTs;
+- the file binding and the import marker.
+Every delete still precedes every insert, and each parent row precedes its
+children."
   (let* ((root-id (dorg-parse-result-root-id parsed))
          (headings (dorg-parse-result-headings parsed))
-         sql)
-    (when (eq mode 'replace)
-      (push (format "DELETE FROM headings WHERE parent_id = %d" root-id) sql))
+         (barriers (when (eq mode 'replace)
+                     (list (format "DELETE FROM headings WHERE parent_id = %d"
+                                   root-id))))
+         (chunks nil))
+    ;; One row list per heading, in generation order, joined once at the end.
     (if existing-root
-        (progn
-          (setq sql
-                (nconc (nreverse sql)
-                       (dorg-import--root-reconcile-sql
-                        (car headings) id-generator)))
+        (let ((root (dorg-import--root-reconcile-sql (car headings) id-generator)))
+          (setq barriers (append barriers (car root)))
+          (push (cdr root) chunks)
           (dolist (heading (cdr headings))
-            (setq sql
-                  (nconc sql
-                         (dorg-sql-gen-heading-full-sql
-                          heading root-id id-generator)))))
-      (setq sql (nreverse sql))
+            (push (dorg-sql-gen-heading-full-rows heading root-id id-generator)
+                  chunks)))
       (dolist (heading headings)
-        (setq sql
-              (nconc sql
-                     (dorg-sql-gen-heading-full-sql
-                      heading root-id id-generator)))))
-    (nconc
-     sql
-     (list
-      (dorg-repo-file-row-statement dolt-dir root-id target-file)
-      (format
-       (concat "INSERT INTO dorg_meta (`key`, value) VALUES (%s, '1') "
-               "ON DUPLICATE KEY UPDATE value = '1'")
-       (dorg-sql-quote (format "document-import:%d" root-id)))))))
+        (push (dorg-sql-gen-heading-full-rows heading root-id id-generator)
+              chunks)))
+    (let ((rows nil))
+      ;; CHUNKS runs last heading first, so prepending restores document
+      ;; order while walking each chunk once.
+      (dolist (chunk chunks)
+        (setq rows (nconc chunk rows)))
+      (nconc
+       (dorg-sql-lower-statements
+        (append barriers (dorg-sql-gen-order-core-rows rows)))
+       (list
+        (dorg-repo-file-row-statement dolt-dir root-id target-file)
+        (format
+         (concat "INSERT INTO dorg_meta (`key`, value) VALUES (%s, '1') "
+                 "ON DUPLICATE KEY UPDATE value = '1'")
+         (dorg-sql-quote (format "document-import:%d" root-id))))))))
 
 (defun dorg-import--same-path-p (left right)
   "Return non-nil when file identities LEFT and RIGHT name one path."
@@ -389,7 +438,7 @@ EXISTING-ROOT is nil for a new target.  MODE is `bootstrap' or
             (format
              (concat "SELECT id FROM headings%s"
                      " WHERE id = %%d AND root_id = %%d"
-                     " AND parent_id IS NULL AND level = 0")
+                     " AND parent_id IS NULL AND level_offset = 0")
              suffix)
             root-id root-id)))
       (unless (= (length root) 1)
@@ -451,6 +500,86 @@ EXISTING-ROOT is nil for a new target.  MODE is `bootstrap' or
   (let ((image (dorg-ext--index-empty-image)))
     (dolist (heading headings image)
       (puthash (dorg-heading-id heading) (dorg-heading-deep-copy heading) image))))
+
+(defun dorg-import--image-owned-metadata-families (image)
+  "Return canonical registered family prefixes represented in IMAGE.
+IMAGE is a complete immutable import-side heading image.  Drawer properties
+are canonical storage, so this scans every drawer rather than only the parsed
+candidate's changed headings."
+  (let (families)
+    (maphash
+     (lambda (_id heading)
+       (dolist (item (dorg-heading-items heading))
+         (when (cl-typep item 'dorg-drawer-item)
+           (dolist (cell (dorg-drawer-item-properties item))
+             (when-let ((family (dorg-owned-metadata-family (car cell))))
+               (cl-pushnew (car family) families :test #'equal))))))
+     image)
+    (sort families #'string<)))
+
+(defun dorg-import--assert-canonical-owned-metadata (index-context)
+  "Refuse noncanonical registered-family keys in INDEX-CONTEXT.
+
+Both images matter: a replacement must not normalize an existing invalid key
+away before the owner observes it."
+  (dolist (image (list (dorg-ext-index-context-base-image index-context)
+                       (dorg-ext-index-context-candidate-postimage index-context)))
+    (when image
+      (maphash
+       (lambda (_id heading)
+         (dolist (item (dorg-heading-items heading))
+           (when (cl-typep item 'dorg-drawer-item)
+             (dolist (cell (dorg-drawer-item-properties item))
+               (when (and (dorg-owned-metadata-key-p (car cell))
+                          (not (dorg-owned-metadata-canonical-key-p (car cell))))
+                 (signal 'dorg-import-target-error
+                         (list "owned metadata key is not canonical"
+                               :detail 'owned-metadata-noncanonical
+                               :key (car cell))))))))
+       image))))
+
+(defun dorg-import--validate-owned-metadata (index-context)
+  "Validate every import family in INDEX-CONTEXT through its lazy owner.
+
+Replace import owns both prior and candidate images: an omitted family value is
+also a domain removal and must not evade validation merely by disappearing
+from the candidate.  An unavailable owner still refuses before the import
+transaction; an available owner receives this complete immutable context and
+may reject it before any projection or core write begins."
+  (dorg-import--assert-canonical-owned-metadata index-context)
+  (let ((families
+         (delete-dups
+          (append
+           (dorg-import--image-owned-metadata-families
+            (dorg-ext-index-context-base-image index-context))
+           (dorg-import--image-owned-metadata-families
+            (dorg-ext-index-context-candidate-postimage index-context))))))
+    (dolist (family (sort families #'string<))
+      (let* ((participants
+              (condition-case err
+                  (dorg-owned-metadata-participants family)
+                (error
+                 (signal 'dorg-import-target-error
+                         (append
+                          (list "registered metadata owner refused import"
+                                :family family)
+                          (dorg-owned-metadata-normalize-owner-signal
+                           family nil err))))))
+             (validate (and (listp participants) (plist-get participants :import))))
+        (unless (functionp validate)
+          (signal 'dorg-import-target-error
+                  (list "registered metadata owner is unavailable"
+                        :detail 'owner-unavailable :family family
+                        :families (list family))))
+        (condition-case err
+            (funcall validate index-context)
+          (error
+           (signal 'dorg-import-target-error
+                   (append
+                    (list "registered metadata owner refused import"
+                          :family family)
+                    (dorg-owned-metadata-normalize-owner-signal
+                     family participants err)))))))))
 
 (defun dorg-import--image-ids (image)
   "Return sorted heading ids in IMAGE."
@@ -850,9 +979,13 @@ materializes TARGET-FILE.  Use `dorg-materialize' with the returned
                           (dorg-import--index-context
                            dolt-dir target-file root-id head
                            candidate-image mode))
+                         (_ (dorg-import--validate-owned-metadata
+                             index-context))
                          (projection
                           (dorg-ext-collect-index-projection
-                           index-context))
+                           index-context :all
+                           ;; Commit lands only while HEAD equals HEAD here.
+                           (dorg-mutate--accumulator-fold-port dolt-dir head)))
                          (extensions (plist-get projection :extensions))
                          (ext-dirty (plist-get projection :ext-dirty))
                          (postimage

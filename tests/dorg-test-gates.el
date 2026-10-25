@@ -16,8 +16,10 @@
 ;;   - MEDIUM (`make test-medium') — every other `dorg-test-*' suite: the
 ;;     Dolt/sql-server/CLI/serve/transport integration tests.  For
 ;;     merge-fallout and backend-integration changes.
-;;   - FULL   (`make test')        — the complete acceptance suite
-;;     (`^dorg-test-'), unchanged.  The only gate that proves a release.
+;;   - REPRESENTATIVE (`make test') — FAST plus named real-integration files;
+;;     the bounded default for ordinary feedback.
+;;   - FULL   (`make test-full')   — every project-owned ERT test, including
+;;     `dorg-perf-*' and opt-in benchmark fixtures.  The release gate.
 ;;
 ;; Classification is by DEFINING FILE, attributed authoritatively with
 ;; `(symbol-file TEST 'ert--test)' — correct even for macro-generated tests
@@ -25,10 +27,10 @@
 ;; ALLOWLIST of files proven Dolt-free; everything else is MEDIUM by
 ;; default, so a newly added (possibly Dolt-touching) suite is never
 ;; silently admitted to the quick gate.  The partition is exhaustive and
-;; disjoint by construction (MEDIUM == the `^dorg-test-' complement of
-;; FAST); `dorg-project-tests.el' proves this and that each FAST file is
-;; statically Dolt-free, so the gates can never silently replace or shrink
-;; the full acceptance suite.
+;; disjoint by construction (MEDIUM == the regular `^dorg-test-' complement
+;; of FAST); `dorg-project-tests.el' proves this, proves that the full gate
+;; covers the project test inventory, and that each FAST file is statically
+;; Dolt-free.
 
 ;;; Code:
 
@@ -37,14 +39,20 @@
 
 (defconst dorg-test-gate-fast-files
   '("dorg-binding-isolation-tests"
+    "dorg-dolt-server-evidence-tests"
+    "dorg-file-lock-tests"
+    "dorg-git-maintenance-tests"
     "dorg-git-sync-tests"
     "dorg-git-tests"
     "dorg-id-tests"
+    "dorg-level-offset-tests"
     "dorg-project-tests"
+    "dorg-ql-door-tests"
     "dorg-ql-ast-tests"
     "dorg-ql-eval-tests"
     "dorg-reload-tests"
     "dorg-sortkey-tests"
+    "dorg-test-job-tests"
     "dorg-timestamp-tests")
   "Basenames of the Dolt-free `tests/dorg-*-tests.el' files in the FAST gate.
 Every `dorg-test-*' test defined in one of these files runs in `make
@@ -54,10 +62,26 @@ sql-server (enforced by `dorg-test-project-gate-fast-files-are-dolt-free'
 in `dorg-project-tests.el').  Any file NOT listed is MEDIUM by default, so
 a newly added suite is never silently admitted to the quick gate.")
 
-(defconst dorg-test-gate-full-selector "^dorg-test-"
-  "ERT selector for the FULL acceptance suite.
-Must match the Makefile `test' target default (`SEL ?= ^dorg-test-').
-`dorg-perf-*' benchmarks are deliberately outside this namespace.")
+(defconst dorg-test-gate-regular-selector "^dorg-test-"
+  "ERT selector for regular, non-benchmark DOrg tests.
+FAST and MEDIUM partition exactly this selector; it deliberately remains
+separate from the exhaustive FULL selector.")
+
+(defconst dorg-test-gate-full-selector
+  `(or ,dorg-test-gate-regular-selector "^dorg-perf-")
+  "ERT selector for the exhaustive acceptance suite.
+This selects every project test namespace, including `dorg-perf-*'.  The
+Makefile's `test-full' target also enables DORG_BENCH for benchmarks that
+are otherwise explicitly opt-in.")
+
+(defconst dorg-test-gate-representative-dolt-files
+  '("dorg-dolt-tests"
+    "dorg-dolt-server-tests"
+    "dorg-transport-tests")
+  "Integration-file allowlist added to FAST for the default representative.
+These files exercise the Dolt backend, SQL server lifecycle, and transport
+path.  They are deliberately a finite, named list so a new integration file
+cannot silently enlarge the bounded default; FULL retains all coverage.")
 
 (defun dorg-test-gate--test-file-base (test)
   "Return the base name of the file defining ert TEST, or nil.
@@ -72,18 +96,29 @@ and independent of `require' order."
                dorg-test-gate-fast-files)
        t))
 
+(defun dorg-test-gate-representative-p (test)
+  "Return non-nil when ERT TEST belongs in the default representative gate."
+  (or (dorg-test-gate-fast-p test)
+      (member (dorg-test-gate--test-file-base test)
+              dorg-test-gate-representative-dolt-files)))
+
 (defun dorg-test-gate-selector (gate)
-  "Return the ERT selector for GATE, one of `fast', `medium', `full'.
-FAST and MEDIUM are scoped to the `^dorg-test-' namespace (so `dorg-perf-*'
-is excluded as it is from the full suite) and are exact complements:
-FULL == FAST ∪ MEDIUM, FAST ∩ MEDIUM == ∅."
+  "Return the ERT selector for GATE.
+GATE is one of `fast', `medium', `representative', or `full'.  FAST and
+MEDIUM are exact complements within the regular `^dorg-test-' namespace.
+REPRESENTATIVE contains FAST and the named integration-file allowlist.  FULL
+includes regular and `dorg-perf-*' tests."
   (pcase gate
-    ('fast   `(and ,dorg-test-gate-full-selector
+    ('fast   `(and ,dorg-test-gate-regular-selector
                    (satisfies dorg-test-gate-fast-p)))
-    ('medium `(and ,dorg-test-gate-full-selector
+    ('medium `(and ,dorg-test-gate-regular-selector
                    (not (satisfies dorg-test-gate-fast-p))))
+    ('representative
+     `(and ,dorg-test-gate-regular-selector
+           (satisfies dorg-test-gate-representative-p)))
     ('full   dorg-test-gate-full-selector)
-    (_ (error "Unknown test gate: %S (expected fast/medium/full)" gate))))
+    (_ (error "Unknown test gate: %S (expected fast/medium/representative/full)"
+              gate))))
 
 (provide 'dorg-test-gates)
 ;;; dorg-test-gates.el ends here

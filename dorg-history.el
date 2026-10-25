@@ -124,11 +124,13 @@ rows and items).  Each entry is a plist
 
 ;;; ─── Restore planner (pure: two trees -> typed patches) ───────────────
 
-(defun dorg-history--item-to-value (item)
+(defun dorg-history--item-to-value (item &optional omit-owned-metadata)
   "Serialize an EIEIO `dorg-heading-item' ITEM to a typed `:items' value plist.
 Returns nil for a DOrg-owned item (a DORG_* keyword, or a drawer left empty
-after dropping DORG_* properties) so the restore never re-emits protected
-metadata DOrg manages itself."
+after dropping system DORG_* properties) so the restore never re-emits
+protected metadata DOrg manages itself.  Registered owned-family properties
+remain in the typed value: the normal typed boundary then routes them to their
+owner, or refuses atomically when that owner is unavailable."
   (cond
    ((cl-typep item 'dorg-text-item)
     (list :kind 'text :text (dorg-text-item-text item)))
@@ -143,7 +145,10 @@ metadata DOrg manages itself."
           :closed (dorg-planning-item-closed item)))
    ((cl-typep item 'dorg-drawer-item)
     (let ((props (cl-remove-if
-                  (lambda (kv) (dorg-protected-keyword-p (car kv)))
+                  (lambda (kv)
+                    (and (dorg-protected-keyword-p (car kv))
+                         (or omit-owned-metadata
+                             (not (dorg-owned-metadata-key-p (car kv))))))
                   (dorg-drawer-item-properties item)))
           (lines (dorg-drawer-item-lines item))
           (name (dorg-drawer-item-name item)))
@@ -152,10 +157,116 @@ metadata DOrg manages itself."
             (t nil))))
    (t (error "dorg-history: unknown heading-item type %S" item))))
 
-(defun dorg-history--items-to-values (items)
+(defun dorg-history--items-to-values (items &optional omit-owned-metadata)
   "Serialize a heading's ITEMS (EIEIO objects) to typed `:items' value plists,
-dropping DOrg-owned items (see `dorg-history--item-to-value')."
-  (delq nil (mapcar #'dorg-history--item-to-value items)))
+dropping DOrg-owned items (see `dorg-history--item-to-value').  When
+OMIT-OWNED-METADATA is non-nil, registered drawer properties are also omitted
+so their owner, rather than the generic item replacement, supplies their
+restore patches."
+  (delq nil (mapcar (lambda (item)
+                      (dorg-history--item-to-value item omit-owned-metadata))
+                    items)))
+
+(defun dorg-history--heading-owned-metadata-families (heading)
+  "Return canonical registered families represented by HEADING's drawers."
+  (let (families)
+    (dolist (item (dorg-heading-items heading))
+      (when (cl-typep item 'dorg-drawer-item)
+        (dolist (cell (dorg-drawer-item-properties item))
+          (when-let ((family (dorg-owned-metadata-family (car cell))))
+            (cl-pushnew (car family) families :test #'equal)))))
+    (sort families #'string<)))
+
+(defun dorg-history--heading-owned-metadata-values (heading family)
+  "Return HEADING's FAMILY drawer entries as stored key/value pairs."
+  (let (values)
+    (dolist (item (dorg-heading-items heading))
+      (when (cl-typep item 'dorg-drawer-item)
+        (dolist (cell (dorg-drawer-item-properties item))
+          (when (equal family (car-safe (dorg-owned-metadata-family (car cell))))
+            (push cell values)))))
+    (nreverse values)))
+
+(defun dorg-history--owned-metadata-restore-plan
+    (current target base &optional current-image target-image scope-ids)
+  "Delegate one heading's changed registered families from CURRENT to TARGET.
+
+BASE identifies the snapshot being restored.  Each owner receives immutable
+identity and before/after value lists, then returns its typed patches.  An
+absent or refusing owner fails the entire restore before any persistence."
+  (let ((heading (or target current))
+        (families
+         (delete-dups
+          (append (and current
+                       (dorg-history--heading-owned-metadata-families current))
+                  (and target
+                       (dorg-history--heading-owned-metadata-families target)))))
+        plans)
+    (dolist (family families)
+      (let ((before (and current
+                         (dorg-history--heading-owned-metadata-values current family)))
+            (after (and target
+                        (dorg-history--heading-owned-metadata-values target family))))
+        (unless (equal before after)
+          (let* ((participants
+                  (condition-case err
+                      (dorg-owned-metadata-participants family)
+                    (error
+                     (apply #'dorg-mutate--raise
+                            'invalid-target "owned metadata owner refused restore"
+                            :family family
+                            (dorg-owned-metadata-normalize-owner-signal
+                             family nil err)))))
+                 (restore (and (listp participants) (plist-get participants :restore))))
+            (unless (functionp restore)
+              (dorg-mutate--raise 'invalid-target
+                                  "owned metadata owner is unavailable"
+                                  :family family :detail 'owner-unavailable))
+            (let* ((context (list :family family
+                                  :identity (list :heading :id (dorg-heading-id heading))
+                                  :before before :after after :base base
+                                  :current-image current-image
+                                  :target-image target-image
+                                  :scope-ids scope-ids))
+                   (result
+                    (condition-case err
+                        (funcall restore context)
+                      (error
+                       (apply #'dorg-mutate--raise
+                              'invalid-target "owned metadata owner refused restore"
+                              :family family
+                              (dorg-owned-metadata-normalize-owner-signal
+                               family participants err)))))
+                   (patches (and (listp result) (plist-get result :patches))))
+              (unless (listp patches)
+                (dorg-mutate--raise 'invalid-target
+                                    "owned metadata owner refused restore"
+                                    :family family :detail 'owner-refused
+                                    :owner-message "owner returned no patches"
+                                    :owner-reason nil))
+              (push (list :family family :patches patches
+                          :capability
+                          (dorg-mutate--owner-capability--make
+                           :family family
+                           :request (list :action 'restore
+                                          :scope-ids (copy-sequence scope-ids))
+                           :execution-id
+                           (make-symbol "dorg-owned-metadata-restore-")))
+                    plans))))))
+    (if (= (length plans) 1) (car plans) (nreverse plans))))
+
+(defun dorg-history--owned-metadata-restore-plans
+    (current target scope-ids base)
+  "Return all owner restore plans for CURRENT -> TARGET within SCOPE-IDS."
+  (let (plans)
+    (dolist (id scope-ids)
+      (let ((result (dorg-history--owned-metadata-restore-plan
+                     (gethash id current) (gethash id target) base
+                     current target scope-ids)))
+        (cond ((null result))
+              ((plist-member result :family) (push result plans))
+              (t (setq plans (nconc (nreverse result) plans))))))
+    (nreverse plans)))
 
 (defun dorg-history--headline-fields (heading)
   "Return HEADING's exact typed mutable headline fields.
@@ -178,51 +289,131 @@ after the target commit must be cleared rather than silently retained."
                 (and (dorg-heading-commented tgt) t))
             (eql (dorg-heading-post-blank cur) (dorg-heading-post-blank tgt)))))
 
-(defun dorg-history--update-patches (cur tgt)
+(defun dorg-history--update-patches (cur tgt &optional omit-owned-metadata)
   "Return typed patches restoring CUR to TGT for an id in both trees.
 A heading update is emitted when fields differ, plus a whole-items replacement
-when the (DOrg-owned-stripped) item content differs."
-  (let (patches)
+when the (DOrg-owned-stripped) item content differs.  An empty target body uses
+descending occurrence deletes: the v2 item-all cell requires a nonempty body,
+and descending order keeps each ordinal valid as the batch removes items."
+  (let ((current-items (dorg-heading-items cur))
+        (target-values (dorg-history--items-to-values
+                        (dorg-heading-items tgt) omit-owned-metadata))
+        (host (list :heading :id (dorg-heading-id tgt)))
+        patches)
     (when (dorg-history--headline-differs-p cur tgt)
       (push (list :op 'update
                   :target (list :heading :id (dorg-heading-id tgt))
                   :fields (dorg-history--headline-fields tgt))
             patches))
-    (unless (equal (dorg-history--items-to-values (dorg-heading-items cur))
-                   (dorg-history--items-to-values (dorg-heading-items tgt)))
-      (push (list :op 'replace
-                  :target (list :items
-                                :host (list :heading :id (dorg-heading-id tgt)))
-                  :items (dorg-history--items-to-values (dorg-heading-items tgt)))
-            patches))
-    (nreverse patches)))
+    (setq patches (nreverse patches))
+    (unless (equal (dorg-history--items-to-values current-items omit-owned-metadata)
+                   target-values)
+      (setq patches
+            (append patches
+                    (if target-values
+                        (list (list :op 'replace
+                                    :target (list :item :host host :select '(:all))
+                                    :items target-values))
+                      (cl-loop for item in current-items for n from 1
+                               when (dorg-history--item-to-value item omit-owned-metadata)
+                               collect (list :op 'delete
+                                             :target (list :item :host host
+                                                           :select (list :occurrence n)))
+                               into deletes
+                               finally return (nreverse deletes))))))
+    patches))
 
-(defun dorg-history--insert-patch (tgt)
-  "Return a private typed tree insert re-creating TGT exactly."
+(defun dorg-history--insert-patch (tgt &optional anchor omit-owned-metadata)
+  "Return a private typed tree insert re-creating TGT exactly.
+The internal :offset carries TGT's level offset, so a skipped level is
+restored.  ANCHOR, when non-nil, is a (:before HOST) or (:after HOST) tail
+placing TGT at its target sibling position."
   (let ((parent (dorg-heading-parent-id tgt)))
     (list :op 'insert
-          :target (list :tree :under
-                        (if parent (list :heading :id parent) :root))
+          :target (append (list :tree :under
+                                (if parent (list :heading :id parent) :root))
+                          anchor
+                          (list :offset (dorg-heading-level-offset tgt)))
           :heading
           (append (list :id (dorg-heading-id tgt))
                   (dorg-history--headline-fields tgt)
                   (list :items
                         (dorg-history--items-to-values
-                         (dorg-heading-items tgt)))))))
+                         (dorg-heading-items tgt) omit-owned-metadata))))))
 
-(defun dorg-restore--patches (current-ht target-ht scope-ids)
+(defun dorg-history--fans (headings)
+  "Return a hash from parent id to HEADINGS' child ids in sort-key order."
+  (let ((fans (make-hash-table :test 'eql)))
+    (maphash (lambda (id h)
+               (when (dorg-heading-parent-id h)
+                 (push (cons (or (dorg-heading-sort-key h) "") id)
+                       (gethash (dorg-heading-parent-id h) fans))))
+             headings)
+    (maphash (lambda (parent pairs)
+               (puthash parent
+                        (mapcar #'cdr (sort pairs (lambda (a b)
+                                                    (string< (car a) (car b)))))
+                        fans))
+             fans)
+    fans))
+
+(defun dorg-history--anchor (id fan pred-p &optional succ-p)
+  "Return an anchor tail keeping ID at its place in FAN, an ordered id list.
+The anchor is (:after P) for the nearest preceding id satisfying PRED-P,
+else (:before S) for the nearest following id satisfying SUCC-P (default
+PRED-P), else nil (ID alone)."
+  (let* ((tail (memq id fan))
+         (before (cl-loop for x in fan until (eql x id) collect x))
+         (pred (cl-find-if pred-p (reverse before)))
+         (succ (cl-find-if (or succ-p pred-p) (cdr tail))))
+    (cond (pred (list :after (list :heading :id pred)))
+          (succ (list :before (list :heading :id succ))))))
+
+(defun dorg-history--offset-move-patch (cur tgt current-fans present-p)
+  "Return a same-parent move restoring TGT's level offset onto CUR.
+The move is anchored to CUR's current position among its PRESENT-P siblings
+in CURRENT-FANS, so only the offset changes, through the single move door."
+  (let ((id (dorg-heading-id cur))
+        (parent (dorg-heading-parent-id cur)))
+    (list :op 'move
+          :target (list :subtree :id id)
+          :to (append (list :under (list :heading :id parent))
+                      (dorg-history--anchor
+                       id (gethash parent current-fans)
+                       (lambda (x) (and (not (eql x id)) (funcall present-p x))))
+                      (list :offset (dorg-heading-level-offset tgt))))))
+
+(defun dorg-restore--patches (current-ht target-ht scope-ids
+                                          &optional omit-owned-metadata)
   "Return typed patches transforming CURRENT-HT into
 TARGET-HT within SCOPE-IDS.
 
 For each id in SCOPE-IDS:
   - in CURRENT only        -> typed heading delete (emitted leaf-up),
   - in TARGET only         -> typed tree insert preserving id+items+parent
-                              (emitted root-down),
+                              and level offset, anchored at its target
+                              sibling position (emitted root-down),
   - in both, content differ -> typed heading update and/or items replace,
+  - in both, same parent, offset differs -> a same-parent move restoring
+                              the offset in place,
   - unchanged              -> no op.
-Deletes are ordered deepest-first and inserts shallowest-first so parent
-invariants hold when the plan is applied in order."
-  (let (deletes inserts updates)
+A parent or order difference is not restored.
+Deletes are ordered deepest-first and inserts shallowest-first (by tree
+depth) so parent invariants hold when the plan is applied in order.  Offset
+moves come after the deletes: decreases last sibling first, then increases
+first sibling first, so every intermediate fan stays representable as Org.
+Inserts of one fan run in target sibling order, so each one's anchor already
+exists.  A step Org cannot represent is refused before anything is written."
+  (let ((current-fans (dorg-history--fans current-ht))
+        (target-fans (dorg-history--fans target-ht))
+        (deleted (make-hash-table :test 'eql))
+        (inserted (make-hash-table :test 'eql))
+        deletes inserts updates lowered raised)
+    (dolist (id scope-ids)
+      (let ((cur (gethash id current-ht))
+            (tgt (gethash id target-ht)))
+        (cond ((and cur (null tgt)) (puthash id t deleted))
+              ((and tgt (null cur)) (puthash id t inserted)))))
     (dolist (id scope-ids)
       (let ((cur (gethash id current-ht))
             (tgt (gethash id target-ht)))
@@ -232,18 +423,71 @@ invariants hold when the plan is applied in order."
                       (list :op 'delete :target (list :heading :id id)))
                 deletes))
          ((and tgt (null cur))
-          (push (cons (dorg-heading-level tgt)
-                      (dorg-history--insert-patch tgt))
-                inserts))
+          (let* ((parent (dorg-heading-parent-id tgt))
+                 (present-p
+                  (lambda (x)
+                    (or (gethash x inserted)
+                        (let ((c (gethash x current-ht)))
+                          (and c (not (gethash x deleted))
+                               (eql (dorg-heading-parent-id c) parent)))))))
+            (push (list (dorg-history--depth id target-ht)
+                        (or (dorg-heading-sort-key tgt) "")
+                        (dorg-history--insert-patch
+                         tgt (and parent
+                                  (dorg-history--target-anchor
+                                   id (gethash parent target-fans) present-p
+                                   inserted))
+                         omit-owned-metadata))
+                  inserts)))
          ((and cur tgt)
           (setq updates
-                (nconc updates (dorg-history--update-patches cur tgt)))))))
+                (nconc updates (dorg-history--update-patches
+                                cur tgt omit-owned-metadata)))
+          (when (and (eql (dorg-heading-parent-id cur) (dorg-heading-parent-id tgt))
+                     (dorg-heading-parent-id cur)
+                     (not (eql (dorg-heading-level-offset cur)
+                               (dorg-heading-level-offset tgt))))
+            (let ((move (cons (or (dorg-heading-sort-key cur) "")
+                              (dorg-history--offset-move-patch
+                               cur tgt current-fans
+                               (lambda (x) (not (gethash x deleted)))))))
+              (if (< (dorg-heading-level-offset tgt)
+                     (dorg-heading-level-offset cur))
+                  (push move lowered)
+                (push move raised))))))))
     (nconc
      ;; deletes deepest-first (leaf-up)
      (mapcar #'cdr (sort deletes (lambda (a b) (> (car a) (car b)))))
      updates
-     ;; inserts shallowest-first (root-down)
-     (mapcar #'cdr (sort inserts (lambda (a b) (< (car a) (car b))))))))
+     (mapcar #'cdr (sort lowered (lambda (a b) (string< (car b) (car a)))))
+     (mapcar #'cdr (sort raised (lambda (a b) (string< (car a) (car b)))))
+     ;; inserts shallowest-first by tree depth (root-down; an effective
+     ;; level would split a gapped fan), then in target sibling order
+     (mapcar #'caddr
+             (sort inserts (lambda (a b)
+                             (or (< (car a) (car b))
+                                 (and (= (car a) (car b))
+                                      (string< (cadr a) (cadr b))))))))))
+
+(defun dorg-history--target-anchor (id fan present-p inserted)
+  "Return the anchor tail placing inserted ID at its place in target FAN.
+A preceding sibling anchors (:after P) when it will exist at insert time:
+PRESENT-P holds for it, and an INSERTED one is inserted earlier because a
+fan's inserts run in target order.  Otherwise the nearest following sibling
+that already exists (PRESENT-P but not INSERTED) anchors (:before S)."
+  (dorg-history--anchor
+   id fan present-p
+   (lambda (x) (and (funcall present-p x) (not (gethash x inserted))))))
+
+(defun dorg-history--depth (id headings)
+  "Return ID's number of ancestors in HEADINGS, bounded by their count."
+  (let ((depth 0)
+        (limit (hash-table-count headings))
+        (h (gethash id headings)))
+    (while (and h (dorg-heading-parent-id h) (< depth limit))
+      (setq depth (1+ depth)
+            h (gethash (dorg-heading-parent-id h) headings)))
+    depth))
 
 ;;; ─── Restore command (durable, forward-only write) ────────────────────
 
@@ -295,15 +539,39 @@ reloads the current tree, re-plans against the fresh HEAD, and retries."
              (base (dorg-head-commit dolt-dir))
              (scope-ids (dorg-history--scope-ids
                          dolt-dir root-id scope-id commit current target))
-             (patches (dorg-restore--patches current target scope-ids)))
+             ;; Generic history restoration deliberately excludes registered
+             ;; drawer values.  Their typed owner receives immutable before /
+             ;; after values first and supplies its own patches plus private
+             ;; plan authority; no unavailable owner can silently degrade to
+             ;; an ordinary item replacement.
+             (owner-plans
+              (dorg-history--owned-metadata-restore-plans
+               current target scope-ids base))
+             (patches
+              (append (dorg-restore--patches current target scope-ids t)
+                      (apply #'append (mapcar (lambda (plan)
+                                                (plist-get plan :patches))
+                                              owner-plans))))
+             (owner-capabilities
+              (mapcar (lambda (plan) (plist-get plan :capability)) owner-plans)))
         (if (null patches)
             (progn (message "dorg: already at that state") nil)
-          (dorg-mutate--apply-patches
-           (list :dolt-dir dolt-dir :root-id root-id)
-           patches nil
-           :base-commit base
-           :message (or message
-                        (dorg-history--default-message scope-id commit))))))))
+          (if owner-capabilities
+              ;; Only an owner restore needs the trusted internal authority
+              ;; carrier.  Keep ordinary history restores on their long-lived
+              ;; public entrypoint, including its retry/receipt seam.
+              (dorg-mutate--apply-patches-internal
+               (list :dolt-dir dolt-dir :root-id root-id)
+               patches nil owner-capabilities
+               :base-commit base
+               :message (or message
+                            (dorg-history--default-message scope-id commit)))
+            (dorg-mutate--apply-patches
+             (list :dolt-dir dolt-dir :root-id root-id)
+             patches nil
+             :base-commit base
+             :message (or message
+                          (dorg-history--default-message scope-id commit)))))))))
 
 ;;; ─── Command-level UX (thin, testable entry points) ───────────────────
 

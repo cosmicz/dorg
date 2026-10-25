@@ -133,6 +133,29 @@ Pure: SQL plan only, no execution."
                               "WHERE root_id = %d ORDER BY heading_id")
                       (dorg-ext-read-context-root-id ctx)))))
 
+(defun dorg-test-extr--hydrate-staged (ctx)
+  "Return a two-stage, DOrg-executed plan for CTX's projection rows.
+
+The second stage is built only from ids the first stage returned.  It remains
+declarative so the extension read executor validates and revision-binds both
+stages rather than letting the participant execute a follow-up query itself."
+  (let ((root-id (dorg-ext-read-context-root-id ctx)))
+    (list :sql
+          (list (format (concat "SELECT heading_id FROM demo_read_proj "
+                                "WHERE root_id = %d ORDER BY heading_id")
+                        root-id))
+          :next
+          (lambda (first-stage)
+            (let ((ids (mapcar (lambda (row) (alist-get 'heading_id row))
+                               (car first-stage))))
+              (list :sql
+                    (list
+                     (format (concat "SELECT heading_id, title FROM demo_read_proj "
+                                     "WHERE root_id = %d AND heading_id IN (%s) "
+                                     "ORDER BY heading_id")
+                             root-id (mapconcat #'number-to-string ids ", ")))
+                    :reduce (lambda (second-stage) (car second-stage))))))))
+
 (defun dorg-test-extr--register (&optional opts)
   "Register the demo read extension.  OPTS overrides plist members."
   (apply #'dorg-register-extension 'demoread
@@ -145,7 +168,7 @@ Pure: SQL plan only, no execution."
 
 (defun dorg-test-extr--install (dolt-dir)
   "Apply the demo extension schema to an already-initialized DOLT-DIR."
-  (dorg-repo-ensure-extensions dolt-dir)
+  (dorg-migrate-schema dolt-dir)
   (dorg-commit dolt-dir "install demo read ext"))
 
 (defun dorg-test-extr--seed (dolt-dir n &optional root-id)
@@ -194,6 +217,19 @@ rows; their titles match the projected data."
       (should (cl-every (lambda (r) (string-match-p "^T[0-9]+$"
                                                     (format "%s" (cdr (assq 'title r)))))
                         rows)))))
+
+(ert-deftest dorg-test-ext-read-staged-plan-is-revision-bound ()
+  "A :next plan receives rows but can return only a DOrg-executed second stage."
+  (dorg-test-extr--with-dolt
+    (dorg-test-extr--register (list :hydrate #'dorg-test-extr--hydrate-staged))
+    (dorg-test-extr--install dolt-dir)
+    (let* ((root (dorg-test-extr--seed dolt-dir 3))
+           (cache (dorg-ext-read-cache-make))
+           (rows (dorg-ext-hydrate cache 'demoread
+                                   (dorg-test-extr--src dolt-dir root)
+                                   '(:scope :root))))
+      (should (equal '("T1" "T2" "T3")
+                     (mapcar (lambda (row) (alist-get 'title row)) rows))))))
 
 (ert-deftest dorg-test-ext-read-grouped-not-per-row ()
   "NON-VACUITY GUARD: a grouped hydrate of N projection rows issues a
@@ -1077,25 +1113,46 @@ run under the shared-server fixture, i.e. the other tests in this file
 when the suite server is up.)"
   (if (not (bound-and-true-p dorg-test--dolt-available))
       (ert-skip "dolt not installed")
-    (let ((dorg-test--server-port nil))   ; force standalone copy-repo + CLI seam
-      (dorg-test--with-temp-db dolt-dir
-        (let ((dorg--extensions nil))
-          (dorg-test-extr--register)
-          (dorg-test-extr--install dolt-dir)
-          (let* ((root (dorg-test-extr--seed dolt-dir 2))
-                 (hid (+ (* root 100) 1))
-                 (base (dorg-head-commit dolt-dir))
-                 (cache (dorg-ext-read-cache-make))
-                 (res (dorg-test-extr--advance-before-nth-select 1
-                          (dorg-test-extr--advance-title dolt-dir hid "ADVANCED")
-                        (dorg-ext-read-snapshot cache 'demoread
-                                                (dorg-test-extr--src dolt-dir root)
-                                                '(:scope :root))))
-                 (row (cl-find hid (plist-get res :rows)
-                               :key (lambda (r) (cdr (assq 'heading_id r))))))
-            (should-not (equal (dorg-head-commit dolt-dir) base))
-            (should (equal (plist-get res :head) base))
-            (should (equal (cdr (assq 'title row)) "T1"))))))))
+    (unless dorg-test--server-port
+      (ert-skip "requires shared server fixture to install before CLI read seam"))
+    (dorg-test--with-temp-db dolt-dir
+      (let ((dorg--extensions nil))
+        (dorg-test-extr--register)
+        (dorg-test-extr--install dolt-dir)
+        (let* ((copy-root (make-temp-file "dorg-extr-cli-" t))
+               (cli-dolt-dir (expand-file-name "dolt/" copy-root)))
+          (unwind-protect
+              (progn
+                (copy-directory dolt-dir cli-dolt-dir nil t t)
+                (dolist (file (list (expand-file-name ".dolt/sql-server.info"
+                                                       cli-dolt-dir)
+                                    (dorg-dolt-server--claim-file cli-dolt-dir)
+                                    (concat (dorg-dolt-server--claim-file cli-dolt-dir)
+                                            ".lock")))
+                  (when (file-exists-p file)
+                    (if (file-directory-p file)
+                        (delete-directory file t)
+                      (delete-file file))))
+                (dorg-sql--with-cli-seam cli-dolt-dir
+                  (let* ((root (dorg-test-extr--seed cli-dolt-dir 2))
+                         (hid (+ (* root 100) 1))
+                         (base (dorg-head-commit cli-dolt-dir))
+                         (cache (dorg-ext-read-cache-make))
+                         (res (dorg-test-extr--advance-before-nth-select 1
+                                  (dorg-test-extr--advance-title
+                                   cli-dolt-dir hid "ADVANCED")
+                                (dorg-ext-read-snapshot
+                                 cache 'demoread
+                                 (dorg-test-extr--src cli-dolt-dir root)
+                                 '(:scope :root))))
+                         (row (cl-find
+                               hid (plist-get res :rows)
+                               :key (lambda (r)
+                                      (cdr (assq 'heading_id r))))))
+                    (should-not (equal (dorg-head-commit cli-dolt-dir) base))
+                    (should (equal (plist-get res :head) base))
+                    (should (equal (cdr (assq 'title row)) "T1")))))
+            (delete-directory copy-root t)))))))
 
 (provide 'dorg-ext-read-tests)
 ;;; dorg-ext-read-tests.el ends here

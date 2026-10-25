@@ -1,8 +1,8 @@
 #+title: DOrg Command-line Interface
 
 #+begin_quote
-*DOrg 0.1.0 command-line interface.*  This document describes the first public
-CLI surface.  Keep independent backups of important data.
+*Current DOrg command-line interface.*  The CLI exposes the query and
+mutation languages through the same public APIs as Elisp.  Keep independent backups of important data.
 #+end_quote
 
 This document is the detailed reference for =bin/dorg=, the
@@ -10,7 +10,7 @@ non-interactive CLI that exposes dorg's query, mutate, and
 explicit administrative import, plus Dolt-server-management helpers to
 downstream tools without an Emacs UI.
 
-DOrg *editing DSL*: *CLI* · [[file:query.org][query language]] · [[file:mutate.org][mutation API]].
+DOrg languages and transports: *CLI* · [[file:query.org][query language]] · [[file:mutate.org][mutation API]].
 
 The CLI app source lives at the repo root in =dorg-app.el= (app symbol
 ~dorg-cli~, presented to users as ~dorg~ via the wrapper).  Earlier
@@ -21,12 +21,12 @@ prototypes included a separate =bin/dorg-ql= binary backed by
 For the public command API this CLI is one transport of, see
 [[file:api.org][docs/api.org]]; for the mutate DSL and typed patch IR v2 see
 [[file:mutate.org][docs/mutate.org]]; for the ~dorg-ql~ query surface — the atomic predicates
-and the composable v2 DSL — see [[file:query.org][docs/query.org]].
+and the composable DSL — see [[file:query.org][docs/query.org]].
 
 * Overview
 
 #+begin_quote
-*DOrg 0.1.0 CLI surface.*  This page documents the =bin/dorg= surface:
+*CLI surface.*  This page documents the =bin/dorg= surface:
 the =query= and =mutate= verbs, explicit administrative =import=, and =dolt=
 server management.  The =mutate=
 verb (typed patch IR, mandatory =--dry-run= / =--apply= mode) *replaces*
@@ -39,7 +39,7 @@ retained).  The per-predicate read subcommands =id= / =property= / =tag= /
 development tree.
 #+end_quote
 
-=bin/dorg= is a non-interactive [[https://github.com/cosmicz/clime][Clime]] app with four command
+=bin/dorg= is a non-interactive [[https://github.com/cosmicz/clime][Clime]] app with these command
 families, so downstream tools can drive dorg-backed org
 trees without an Emacs UI.  It uses only stable public facades — never
 private helpers or a direct SQL path:
@@ -57,6 +57,8 @@ private helpers or a direct SQL path:
 - *dolt* — DOrg-managed Dolt sql-server management through the
   user-facing surface (~dorg-dolt-list~,
   ~dorg-dolt-start~, ~dorg-dolt-stop~, ~dorg-dolt-stop-all~).
+- *lock inspect* — read-only operator inspection of a local saved plain-Org
+  writer gate and its owner record.
 
 The interactive Emacs helper ~dorg-set-property~ is a one-property convenience
 over the same typed mutation boundary.  The CLI exposes the general
@@ -108,7 +110,7 @@ tail -n 10000 "$history_file" |
 * Query commands
 
 #+begin_src sh
-# Read — one dorg-ql form (atomic predicate or composable v2 pipeline):
+# Read — one dorg-ql form (atomic predicate or composable pipeline):
 dorg query '(property "CATEGORY" "red")' -f tasks.org
 dorg query '(id 100)'                    -f tasks.org
 dorg query '(tag "work")'                -f tasks.org
@@ -116,7 +118,7 @@ dorg query '(pipe (where (deadline (this-week))) (traverse children))' -f tasks.
 #+end_src
 
 =query= reads exactly one Lisp form: either an atomic predicate (=id=,
-=property=, =tag=, =title=, …) or a composable v2 pipeline (=pipe=,
+=property=, =tag=, =title=, …) or a composable pipeline (=pipe=,
 =where=, =traverse=, =and=/=or=/=not=, =field=, =timestamp=).  The CLI
 dispatches on the file's buffer backend, where composable forms are fully
 supported (the in-memory model-list adapter is not a CLI source).  Every
@@ -149,7 +151,7 @@ dorg mutate '(on (id 100) (set (property "STATUS") "DONE"))' --dry-run -f tasks.
 dorg mutate '(on (id 100) (set (property "STATUS") "DONE"))' --apply   -f tasks.org
 
 # Document-level keyword sequence (order-preserving whole-sequence replace):
-dorg mutate '(on document (replace (keywords "SEQ_TODO") "TODO" "NEXT" "DONE"))' --apply -f tasks.org
+dorg mutate '(on document (replace (keyword "SEQ_TODO" (all)) "TODO" "NEXT" "DONE"))' --apply -f tasks.org
 
 # Query-scoped apply — confirm the exact id set a prior dry-run resolved:
 dorg mutate '(on (where (property "STATUS" "OPEN")) (set (property "STATUS") "DONE"))' --dry-run -f tasks.org
@@ -163,8 +165,11 @@ requires *exactly one* of:
 
 - =--dry-run= — normalize and plan only; never writes.  Returns the
   normalized intent, typed patch IR, resolved target
-  ids, affected ids where known, the current source token, and any
-  validation errors.
+  ids, affected ids where known, and validation results.  The Elisp response
+  includes =:base=; the current CLI renderer omits that field and its Dolt
+  =base-commit= can be null on dry-run.  CLI callers capture
+  =data.snapshot.head= from a prior JSON query and pass it as =--base= to
+  dry-run and apply; do not substitute a later HEAD read for that base.
 - =--apply= — run the same normalization path, then execute under the
   safety gates.
 
@@ -181,9 +186,17 @@ Supplying neither or both flags is a usage error (=mode-error=); there is
 - =--allow-broad= — required to apply over more than
   ~dorg-api-broad-write-threshold~ (default 100) targets, else
   =broad-write-refused=.
+- =--lock-timeout SECONDS= — finite, nonnegative wait bound for a saved local
+  plain-Org writer gate.  On expiry, JSON reports =contended= with a
+  liveness-only detail; it does not disclose owner host, PID or time.
 
 =mutate= inherits =-f/--file= and =--dolt-dir= / =--root-id= for source
 selection (see /Source selection/).
+
+For operator diagnostics, =dorg lock inspect PATH --json= reports the
+canonical file's current gate state and owner metadata.  It only reads the
+lock; it does not acquire, reclaim or remove it.  The stable hidden sibling
+name is =.BASENAME.dorg-write.lock= with a possible =.reclaim= tombstone.
 
 * Import command
 
@@ -213,7 +226,7 @@ Bootstrap accepts only an unbound target or an exact never-imported synthetic
 root.  Replace preserves the existing root and file identity and rebuilds only
 that root.  Both reject partial/projection sources, duplicate or cross-root
 IDs, ambiguous targets, concurrent HEAD movement, and dirty working sets.
-Core and registered import-participant SQL commit together, and the JSON
+Core and registered derived-index projector SQL commit together, and the JSON
 response contains the normalized identities, root/base/commit, affected IDs,
 extension summaries, and invalidation scope.
 
@@ -239,6 +252,10 @@ dorg dolt start -f tasks.org
 # Reclaim unreachable chunks while preserving reachable history / undo:
 dorg dolt compact /repo/dolt
 dorg dolt compact --shallow -f tasks.org
+
+# Identify an older store once, or explicitly fork its identity:
+dorg dolt identify /repo/dolt
+dorg dolt identify /repo/dolt --fork
 
 # Repair one moved source binding at an exact Dolt revision (metadata only):
 dorg dolt rebind /repo/dolt /new/path/tasks.org --root-id 42 --base HASH
@@ -269,6 +286,11 @@ semantics exactly:
   byte counts; it does not delete reachable commit history, so DOrg history /
   undo remains readable.  =--shallow= requests Dolt's faster newgen-only GC
   pass.
+- =identify= writes one random 128-bit =store-id= row in =dorg_meta= under
+  the normal store mutation gate.  It refuses to replace an existing ID;
+  =--fork= replaces it and records the prior ID in the same commit.  A dirty
+  Dolt working set is refused before either write.  New
+  stores receive the ID during bootstrap.
 - =rebind= validates the schema, exact HEAD, root shape, normalized local
   locator, and collisions, then changes exactly one =dorg_files= locator in one
   gated commit.  It never searches for, creates, reads, or writes the Org file,
@@ -457,7 +479,7 @@ the shared envelope; the =Result= column names the =data= payload.
 | POST   | =/dolt/stop-all=            | =data.stopped= |
 
 The =sexp= query parameter is a URL-encoded dorg-ql form — an atomic
-predicate or a composable v2 pipeline — the same argument ~dorg query~
+predicate or a composable pipeline — the same argument ~dorg query~
 takes.  =POST /mutate= carries the public DSL form in the request body and
 the required =mode= (=dry-run= / =apply=) as a query/body parameter, with
 =base=, =expect-targets=, and =allow-broad= as further parameters (see
@@ -524,7 +546,7 @@ The CLI is a single =bin/dorg= binary.  The legacy =bin/dorg-ql= shim —
 and its =DORG_QL_FILE= environment variable, a deprecated alias for
 =DORG_FILE= — were removed during pre-release development.
 
-DOrg 0.1.0 does not expose the pre-release write surface (=set= / =POST /set=);
+DOrg does not expose the pre-release write surface (=set= / =POST /set=);
 use the canonical =mutate= verb (see the Overview note):
 
 - ~dorg set KEY VALUE --id ID~ and =POST /set= → =dorg mutate '(on (id ID)

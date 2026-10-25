@@ -39,6 +39,8 @@
 (require 'dorg-ql)
 (require 'dorg-registry)
 
+(declare-function dorg-repo-identify-store "dorg-repo" (dolt-dir fork))
+
 ;;; ─── Errors ──────────────────────────────────────────────────────────────
 
 (define-error 'dorg-api-error "dorg API command failed" 'dorg-error)
@@ -48,11 +50,38 @@
   (append dorg-mutate-error-reasons
           '(mode-error expected-targets-required target-set-changed
             broad-write-refused identity-violation
+            stale-active-interval conflict invalid-record ambiguous-adoption
+            unresolved
             ;; `malformed' is raised by the mutation-intent constructor when an
             ;; option (incl. the retired `:extension-inputs' key) is rejected as
             ;; foreign authority.
             malformed))
   "Closed set of `:reason' symbols a `dorg-api-error' may carry.")
+
+(defun dorg-api-identify-store (dolt-dir &rest options)
+  "Identify DOLT-DIR with a random 128-bit store ID in dorg_meta.
+An existing ID refuses unless OPTIONS explicitly contains :fork t.  A fork
+records the previous ID under a separate metadata key in the same commit.
+This is the only public store-identification write door."
+  (let* ((opts (dorg-api--intent-options options '(:fork)
+                                          "store identification"))
+         (fork (plist-get opts :fork)))
+    (unless (and (stringp dolt-dir) (file-directory-p dolt-dir)
+                 (or (null fork) (eq fork t)))
+      (dorg-api--raise 'malformed "store identification needs a Dolt dir and boolean :fork"))
+    (require 'dorg-repo)
+    (let* ((result (dorg-repo-identify-store dolt-dir fork))
+           (refusal (plist-get result :refusal)))
+      (pcase refusal
+        ('dirty-working-set
+         (dorg-api--raise 'conflict
+                          "store identification requires a clean Dolt working set"
+                          :detail refusal))
+        ('store-identified
+         (dorg-api--raise 'conflict "store already has an identity"
+                          :detail refusal :store-id (plist-get result :store-id)))
+        (`nil result)
+        (_ (dorg-api--raise 'malformed "store identification returned an invalid refusal"))))))
 
 (defun dorg-api--raise (reason message &rest data)
   "Signal `dorg-api-error' with REASON, MESSAGE, and extra DATA plist.
@@ -176,11 +205,23 @@ ALLOWED is a list of public one-symbol position forms such as
     (dorg-api--raise 'invalid-target "unsupported insertion position"
                      :position position :allowed allowed)))
 
+(defun dorg-api--sequence-position (position)
+  "Normalize a v0.2 sequence insertion POSITION.
+The collection-relative before/after occurrence anchors share the same
+one-based selector grammar as sequence replacement and deletion."
+  (pcase position
+    ((or '(before-first) '(after-last))
+     (dorg-api--position position '((before-first) (after-last))))
+    (`(before ,occurrence) (list :before (dorg-api--occurrence occurrence)))
+    (`(after ,occurrence) (list :after (dorg-api--occurrence occurrence)))
+    (_ (dorg-api--raise 'invalid-target "unsupported insertion position"
+                        :position position))))
+
 (defun dorg-api--check-property-key (k)
-  "Reject the identity property DORG_ID (protected metadata)."
+  "Reject DOrg-owned property K at the public normalization boundary."
   (dorg-api--string k :key)
-  (when (equal k dorg-id-property)
-    (dorg-api--raise 'invalid-target "DORG_ID is identity, not a property" :key k))
+  (when (dorg-protected-keyword-p k)
+    (dorg-api--raise 'invalid-target "DORG_-prefixed properties are protected" :key k))
   k)
 
 (defun dorg-api--check-keyword-key (k)
@@ -303,6 +344,16 @@ Integer id -> its decimal string; extern host (:extern :key K :value V) ->
   "Intrinsic heading fields accepted by the public set production.")
 (defconst dorg-api--planning-fields '(scheduled deadline closed))
 
+(defun dorg-api--move-offset (clause)
+  "Return the positive integer N of a public move (offset N) CLAUSE.
+Anything else (zero, negative, fractional, non-numeric, missing or extra
+arguments) signals `invalid-target' naming the clause."
+  (pcase clause
+    ((and `(offset ,n) (guard (and (fixnump n) (> n 0)))) n)
+    (_ (dorg-api--raise 'invalid-target
+                        "move offset must be (offset N) with N a positive integer"
+                        :offset clause))))
+
 (defun dorg-api--anchor (a source)
   "Return (:before HOST) / (:after HOST) tail for a move/insert anchor A.
 A is (before TARGET) or (after TARGET); nil when absent."
@@ -373,57 +424,87 @@ protected metadata; the engine re-validates the returned value on apply."
        (_ (dorg-api--raise 'invalid-op "invalid item form" :form form)))
      (list :post-blank post-blank))))
 
-(defun dorg-api--action->patch (host action source)
+(defun dorg-api--sequence-cell-from-action (action)
+  "Return ACTION's declared v0.2 sequence cell when its selector is explicit.
+This deliberately recognizes NO cells before the general action pcase so a
+known public selector is never reported as an undifferentiated malformed
+address.  Legal rows continue through their value-specific lowerers below."
+  (pcase action
+    (`(,op (text (all)) . ,_) (dorg-mutate-sequence-cell :text op '(:all)))
+    (`(,op (item (all)) . ,_) (dorg-mutate-sequence-cell :item op '(:all)))
+    (_ nil)))
+
+(defun dorg-api--action->patch-raw (host action source)
   "Lower one public ACTION under HOST to a typed patch plist."
+  (when-let ((cell (dorg-api--sequence-cell-from-action action)))
+    (unless (plist-get cell :legal)
+      (dorg-api--raise 'invalid-target "unsupported sequence selector"
+                       :detail 'unsupported-selector :action action)))
   (pcase action
     (`(set (property ,k) ,v)
      (list :op 'put :target (list :property :host host :name (dorg-api--check-property-key k))
            :value (dorg-api--string v :value)))
     (`(delete (property ,k))
      (list :op 'delete :target (list :property :host host :name (dorg-api--check-property-key k))))
-    (`(replace (keywords ,k) . ,vs)
+    (`(replace (keyword ,k (all)) . ,vs)
      (dorg-api--check-keyword-key k)
      (unless (and vs (cl-every #'stringp vs))
        (dorg-api--raise 'invalid-target
-                        "replace (keywords KEY) needs >=1 string value"
+                        "replace (keyword KEY (all)) needs >=1 string value"
                         :key k :values vs))
-     (list :op 'replace :target (list :keywords :host host :name k) :values vs))
-    (`(delete (keywords ,k))
-     (list :op 'delete :target (list :keywords :host host :name (dorg-api--check-keyword-key k))))
+     (list :op 'replace
+           :target (list :keyword :host host :name k :select '(:all))
+           :values vs))
+    (`(delete (keyword ,k (all)))
+     (list :op 'delete
+           :target (list :keyword :host host
+                         :name (dorg-api--check-keyword-key k) :select '(:all))))
     (`(replace (keyword ,k ,occ) ,v)
      (dorg-api--check-keyword-key k)
      (list :op 'replace
-           :target (list :keyword :host host :name k :occurrence (dorg-api--occurrence occ))
-           :value (dorg-api--string v :value) :missing :error))
+           :target (list :keyword :host host :name k
+                         :select (list :occurrence (dorg-api--occurrence occ)))
+           :value (dorg-api--string v :value)))
     (`(delete (keyword ,k ,occ))
      (dorg-api--check-keyword-key k)
      (list :op 'delete
-           :target (list :keyword :host host :name k :occurrence (dorg-api--occurrence occ))
-           :missing :error))
+           :target (list :keyword :host host :name k
+                         :select (list :occurrence (dorg-api--occurrence occ)))))
     (`(insert (keyword ,k) ,position ,v)
      (dorg-api--check-keyword-key k)
-     (list :op 'insert :target (list :keywords :host host :name k)
+     (list :op 'insert :target (list :keyword :host host :name k)
            :value (dorg-api--string v :value)
-           :position (dorg-api--position position
-                                         '((before-first) (after-last)))))
-    (`(insert (drawer-line ,name ,occurrence) ,position ,line)
-     ;; This capability intentionally addresses only the first same-name
-     ;; drawer.  Keep the public one-based selector explicit, then freeze its
-     ;; accepted value and position before constructing the typed IR.
-     (dorg-api--host-id host)
-     (let ((occurrence-number (dorg-api--occurrence occurrence)))
-       (unless (= occurrence-number 1)
-         (dorg-api--raise 'invalid-target
-                          "drawer-line insertion currently supports only occurrence 1"
-                          :occurrence occurrence))
-       (list :op 'insert
-             :target (list :drawer-lines :host host
-                           :name (dorg-api--drawer-line-name name)
-                           :occurrence occurrence-number)
-             :position (dorg-api--position position
-                                           '((before-first) (after-last)))
-             :missing :create
-             :value (dorg-api--drawer-raw-line line))))
+           :position (dorg-api--sequence-position position)))
+    (`(insert (drawer-line ,name) ,position ,line)
+     (list :op 'insert
+           :target (list :drawer-line :host host
+                         :name (dorg-api--drawer-line-name name))
+           :position (dorg-api--sequence-position position)
+           :value (dorg-api--drawer-raw-line line)))
+    (`(replace (drawer-line ,name (all)) . ,lines)
+     (unless lines
+       (dorg-api--raise 'invalid-target
+                        "replace (drawer-line NAME (all)) needs >=1 raw line"
+                        :action action))
+     (list :op 'replace
+           :target (list :drawer-line :host host
+                         :name (dorg-api--drawer-line-name name) :select '(:all))
+           :values (mapcar #'dorg-api--drawer-raw-line lines)))
+    (`(delete (drawer-line ,name (all)))
+     (list :op 'delete
+           :target (list :drawer-line :host host
+                         :name (dorg-api--drawer-line-name name) :select '(:all))))
+    (`(replace (drawer-line ,name ,occurrence) ,line)
+     (list :op 'replace
+           :target (list :drawer-line :host host
+                         :name (dorg-api--drawer-line-name name)
+                         :select (list :occurrence (dorg-api--occurrence occurrence)))
+           :value (dorg-api--drawer-raw-line line)))
+    (`(delete (drawer-line ,name ,occurrence))
+     (list :op 'delete
+           :target (list :drawer-line :host host
+                         :name (dorg-api--drawer-line-name name)
+                         :select (list :occurrence (dorg-api--occurrence occurrence)))))
     (`(set (heading ,field) ,v)
      (unless (memq field dorg-api--heading-fields)
        (dorg-api--raise 'invalid-target "unknown heading field" :field field))
@@ -434,27 +515,44 @@ protected metadata; the engine re-validates the returned value on apply."
        (dorg-api--raise 'invalid-target "unknown planning field" :field field))
      (list :op 'update :target (list :planning :host host)
            (intern (concat ":" (symbol-name field))) v))
-    (`(move (subtree) (under ,tgt . ,anchors))
-     (unless (proper-list-p anchors)
+    (`(move (subtree) (under ,tgt . ,clauses))
+     (unless (proper-list-p clauses)
        (dorg-api--raise 'invalid-target
-                        "move anchors must form a proper list" :anchors anchors))
-     (when (> (length anchors) 1)
-       (dorg-api--raise 'invalid-target
-                        "supply at most one of before/after" :anchors anchors))
-     (list :op 'move :target (dorg-api--heading-target :subtree host)
-           :to (append (list :under (dorg-api--structural-host tgt source))
-                       (when anchors (dorg-api--anchor (car anchors) source)))))
+                        "move anchors must form a proper list" :anchors clauses))
+     ;; The clauses after TGT are an unordered set of at most one sibling
+     ;; ANCHOR, (before ...) or (after ...), and at most one (offset N).
+     ;; Any other clause is unknown, never read as a malformed anchor.
+     (let ((offsets (cl-remove-if-not (lambda (c) (eq (car-safe c) 'offset))
+                                      clauses))
+           (anchors (cl-remove-if-not
+                     (lambda (c) (memq (car-safe c) '(before after)))
+                     clauses))
+           (unknown (cl-remove-if
+                     (lambda (c) (memq (car-safe c) '(offset before after)))
+                     clauses)))
+       (when unknown
+         (dorg-api--raise 'invalid-target "unknown move clause"
+                          :clauses unknown))
+       (when (> (length anchors) 1)
+         (dorg-api--raise 'invalid-target
+                          "supply at most one of before/after" :anchors anchors))
+       (when (> (length offsets) 1)
+         (dorg-api--raise 'invalid-target
+                          "supply at most one offset" :offsets offsets))
+       (list :op 'move :target (dorg-api--heading-target :subtree host)
+             :to (append (list :under (dorg-api--structural-host tgt source))
+                         (when anchors (dorg-api--anchor (car anchors) source))
+                         (when offsets
+                           (list :offset (dorg-api--move-offset (car offsets))))))))
     (`(delete (heading))
      (list :op 'delete :target (dorg-api--heading-target :heading host)))
     (`(delete (subtree))
      (list :op 'delete :target (dorg-api--heading-target :subtree host)))
     (`(insert (text) ,position ,text)
      ;; Text insertion addresses the collection and keeps placement explicit.
-     ;; Root has no public prose body; reject it during normalization.
-     (dorg-api--host-id host)
-     (list :op 'insert :target (list :texts :host host)
-           :position (dorg-api--position position
-                                         '((before-first) (after-last)))
+     ;; The closed sequence-row validator owns root legality.
+     (list :op 'insert :target (list :text :host host)
+           :position (dorg-api--sequence-position position)
            :value (dorg-api--string text :value)))
     (`(insert (text) . ,_)
      (dorg-api--raise 'invalid-target
@@ -464,40 +562,96 @@ protected metadata; the engine re-validates the returned value on apply."
      (dorg-api--raise 'invalid-target
                       "text insertion address must be exactly (text)"
                       :action action))
+    (`(replace (body (literal ,old)) ,text)
+     (unless (and (stringp old) (not (string-empty-p old)))
+       (dorg-api--raise 'invalid-target
+                        "body replacement requires a nonempty literal"
+                        :action action :literal old))
+     (list :op 'replace
+           :target (list :body :host host :literal old)
+           :value (dorg-api--string text :value)))
+    (`(replace (body . ,_) . ,_)
+     (dorg-api--raise 'invalid-target
+                      "body replacement requires (body (literal OLD)), NEW"
+                      :action action))
     (`(replace (text ,occurrence) ,text)
-     ;; Replacement is a strict single-occurrence edit.  Preserve the public
-     ;; one-based selector in typed IR; only occurrence one is supported today.
-     (dorg-api--host-id host)
      (let ((number (dorg-api--occurrence occurrence)))
-       (unless (= number 1)
-         (dorg-api--raise 'invalid-target
-                          "text replacement currently supports only occurrence 1"
-                          :occurrence occurrence))
        (list :op 'replace
-             :target (list :text :host host :occurrence number)
-             :missing :error :value (dorg-api--string text :value))))
+             :target (list :text :host host :select (list :occurrence number))
+             :value (dorg-api--string text :value))))
+    (`(delete (text ,occurrence))
+     (list :op 'delete
+           :target (list :text :host host
+                         :select (list :occurrence
+                                       (dorg-api--occurrence occurrence)))))
     (`(replace (text . ,_) . ,_)
      (dorg-api--raise 'invalid-target
                       "text replacement requires (text (occurrence 1)), TEXT"
                       :action action))
-    (`(replace (items) . ,items)
-     ;; Replace the heading's WHOLE ordered item sequence with an arbitrary mix
-     ;; of item forms (the only public verb that can express a full sequence).
-     ;; Normalizes to a typed whole-items replacement.  Root has no item body ->
-     ;; rejected; an empty sequence is refused (use the item forms to set >=1).
-     (dorg-api--host-id host)
+    (`(replace (item (all)) . ,items)
      (unless items
        (dorg-api--raise 'invalid-target
-                        "replace items needs >=1 item form (empty is not a clear)"
+                        "replace (item (all)) needs >=1 item form (empty is not a clear)"
                         :action action))
-     (list :op 'replace :target (list :items :host host)
+     (list :op 'replace :target (list :item :host host :select '(:all))
            :items (mapcar #'dorg-api--item-value items)))
+    (`(replace (item ,occurrence) ,item)
+     (list :op 'replace :target (list :item :host host
+                                    :select (list :occurrence
+                                                  (dorg-api--occurrence occurrence)))
+           :item (dorg-api--item-value item)))
+    (`(delete (item ,occurrence))
+     (list :op 'delete :target (list :item :host host
+                                   :select (list :occurrence
+                                                 (dorg-api--occurrence occurrence)))))
+    (`(insert (item) ,position ,item)
+     (list :op 'insert :target (list :item :host host)
+           :position (dorg-api--sequence-position position)
+           :item (dorg-api--item-value item)))
     (_
      (if (memq (car-safe action) '(set delete replace insert move))
          (dorg-api--raise 'invalid-target
                           "invalid or retired compound action address"
                           :action action)
-       (dorg-api--raise 'invalid-op "unknown action" :action action)))))
+     (dorg-api--raise 'invalid-op "unknown action" :action action)))))
+
+(defun dorg-api--verify-sequence-cell-patch (patch)
+  "Validate a lowered sequence PATCH against the shared v0.2 cell table.
+The raw parser owns syntax and value conversion.  This boundary owns the
+addressing algebra: legal cell, root host policy, payload field, and the
+non-empty sequence cardinality."
+  (let* ((target (plist-get patch :target))
+         (noun (car-safe target)))
+    (if (not (memq noun '(:keyword :text :body :item :drawer-line)))
+        patch
+      (let* ((operation (plist-get patch :op))
+             (select (if (eq noun :body)
+                         (list :literal (plist-get (cdr target) :literal))
+                       (plist-get (cdr target) :select)))
+             (cell (dorg-mutate-sequence-cell noun operation select))
+             (payload (and cell (plist-get cell :payload))))
+        (unless (and cell (plist-get cell :legal))
+          (dorg-api--raise 'invalid-target "unsupported sequence selector"
+                           :detail 'unsupported-selector :patch patch))
+        (when (and (eq (plist-get (cdr target) :host) :root)
+                   (not (plist-get cell :root)))
+          (dorg-api--raise 'invalid-target "operation requires a heading host"
+                           :patch patch))
+        (when payload
+          (unless (plist-member patch payload)
+            (dorg-api--raise 'invalid-target "sequence cell is missing payload"
+                             :cell (plist-get cell :id) :patch patch))
+          (when (and (memq (plist-get cell :cardinality)
+                           '(whole-non-empty-sequence))
+                     (null (plist-get patch payload)))
+            (dorg-api--raise 'invalid-target "sequence cell requires nonempty payload"
+                             :cell (plist-get cell :id) :patch patch)))
+        patch))))
+
+(defun dorg-api--action->patch (host action source)
+  "Lower ACTION under HOST to a typed patch checked by the sequence cell table."
+  (dorg-api--verify-sequence-cell-patch
+   (dorg-api--action->patch-raw host action source)))
 
 (defun dorg-api--heading-constructor (clauses)
   "Normalize recursive public heading constructor CLAUSES.
@@ -608,6 +762,43 @@ remain coalesced into the leading PROPERTIES drawer."
                         "invalid or retired insert-heading form" :form form))))
 
 ;;; ─── Public form normalization ───────────────────────────────────────────
+
+(defun dorg-api--retired-spelling-replacement (action)
+  "Return ACTION's mandatory v0.2 replacement, or nil when it is current.
+This syntactic classifier runs before target expansion, value validation, and
+patch construction, so retired public spellings have no compatibility path."
+  (pcase action
+    (`(replace (keywords ,key) . ,values)
+     `(replace (keyword ,key (all)) ,@values))
+    (`(delete (keywords ,key))
+     `(delete (keyword ,key (all))))
+    (`(insert (drawer-line ,name (occurrence 1)) . ,tail)
+     `(insert (drawer-line ,name) ,@tail))
+    (`(replace (items) . ,items)
+     `(replace (item (all)) ,@items))
+    (_ nil)))
+
+(defun dorg-api--raise-retired-spelling (action replacement)
+  "Signal the canonical hard-refusal diagnostic for ACTION -> REPLACEMENT."
+  (let ((print-length nil)
+        (print-level nil)
+        (print-integers-as-characters nil)
+        (print-quoted t)
+        (float-output-format nil)
+        (print-escape-newlines t)
+        (print-escape-control-characters t)
+        (print-escape-nonascii nil)
+        (print-circle nil))
+    (dorg-api--raise
+     'invalid-target
+     (format "dorg: retired mutation spelling; use %S" replacement)
+     :detail 'retired-spelling :action action :replacement replacement)))
+
+(defun dorg-api--reject-retired-action (action)
+  "Hard-refuse retired ACTION before lowering or engine work."
+  (let ((replacement (dorg-api--retired-spelling-replacement action)))
+    (when replacement
+      (dorg-api--raise-retired-spelling action replacement))))
 
 (defun dorg-api--project-hit (hit source &optional descriptive-where-p)
   "Project a `dorg-ql-select' HIT to a target host under SOURCE's identity policy.
@@ -788,8 +979,20 @@ after the scoped query expansion."
       (set-buffer-modified-p nil))
     (kill-buffer buffer)))
 
+(defun dorg-api--query-projects-p (query)
+  "Return non-nil when QUERY requests display columns rather than targets."
+  (pcase query
+    (`(one ,inner) (dorg-api--query-projects-p inner))
+    (`(pipe . ,steps)
+     (and (proper-list-p steps)
+          (cl-find 'select steps :key #'car-safe)))))
+
 (defun dorg-api--ql-select (query source)
   "Run QUERY against SOURCE, scoping any owned file query buffer to this call."
+  (when (dorg-api--query-projects-p query)
+    (dorg-api--raise 'invalid-target
+                     "mutation targets require heading selection without select"
+                     :query query))
   (let* ((resolved (and source
                         (or (dorg-mutate-source-p source)
                             (and (consp source) (keywordp (car source))))
@@ -822,6 +1025,7 @@ FORM is (on TARGET ACTION…) | (insert (heading …) (under …))
      (unless (proper-list-p actions)
        (dorg-api--raise 'invalid-target
                         "(on …) actions must form a proper list" :form form))
+     (mapc #'dorg-api--reject-retired-action actions)
      form)
     (`(insert (heading . ,_) (under . ,_)) form)
     (`(insert . ,_)
@@ -891,19 +1095,44 @@ identity to guard; the resolver call itself is never caught/collapsed)."
   form
   options)
 
+(cl-defstruct (dorg-api--owner-intent
+               (:constructor dorg-api--owner-intent-create)
+               (:copier nil))
+  "Opaque owner request, with no metadata write capability."
+  family request options)
+
+(defconst dorg-api--owner-intent-option-keys
+  '(:source :base :save :message :lock-timeout :op-id)
+  "Closed public option domain for an owner intent.")
+
+(defconst dorg-api--owner-request-fields
+  '(:scope-id :action :instant-utc :zone :task-ref :interval-id
+    :expected-active :correction :adoption)
+  "Fixed clock owner request digest order; absent fields encode as nil.")
+
 (defconst dorg-api--mutation-intent-option-keys
-  '(:source :base :expected-targets :allow-broad :save :message :op-id
-    :return-candidate-models)
+  '(:source :base :expected-targets :allow-broad :save :message :op-id :lock-timeout)
   "Closed option domain owned by a mutation intent.")
 
 (defun dorg-api--intent-copy (value)
   "Return an owned deep copy of mutable intent VALUE.
 Conses, strings, and vectors (including record-backed source descriptors) are
-copied recursively.  Buffers and other external identity handles are retained."
+copied recursively.  Cons spines are iterative so width does not consume Lisp
+depth.  Buffers and other external identity handles are retained."
   (cond
    ((consp value)
-    (cons (dorg-api--intent-copy (car value))
-          (dorg-api--intent-copy (cdr value))))
+    ;; cl-list-length detects circular spines; dotted tails remain copyable.
+    (condition-case nil
+        (unless (cl-list-length value) (signal 'circular-list nil))
+      (wrong-type-argument nil))
+    (let* ((head (cons nil nil))
+           (tail head))
+      (while (consp value)
+        (setcdr tail (cons (dorg-api--intent-copy (car value)) nil))
+        (setq tail (cdr tail)
+              value (cdr value)))
+      (setcdr tail (dorg-api--intent-copy value))
+      (cdr head)))
    ((stringp value) (copy-sequence value))
    ((vectorp value)
     (let ((copy (copy-sequence value))
@@ -940,6 +1169,66 @@ must be a proper, even plist with keyword keys and no duplicates."
              (push key seen)))
   (dorg-api--intent-copy options))
 
+(defun dorg-api-make-owner-intent (family request &rest options)
+  "Own FAMILY's immutable REQUEST and OPTIONS without an owner capability."
+  (unless (and (stringp family)
+               (equal family (car-safe (dorg-owned-metadata-family family))))
+    (dorg-api--raise 'malformed "unknown canonical metadata owner family"
+                     :family family))
+  (let* ((owned-request
+          (dorg-api--intent-options request dorg-api--owner-request-fields
+                                    "owner request"))
+         (owned-options
+          (dorg-api--intent-options options dorg-api--owner-intent-option-keys
+                                    "owner intent"))
+         (participant (dorg-owned-metadata-participants family))
+         (validate (plist-get participant :validate-request)))
+    (when validate
+      (condition-case err
+          (funcall validate owned-request owned-options)
+        (dorg-owner-refusal
+         (dorg-api--raise 'malformed (nth 3 err)
+                          :owner-reason (nth 2 err)))))
+    (dorg-api--owner-intent-create
+     :family (copy-sequence family)
+     :request owned-request
+     :options owned-options)))
+
+(defun dorg-api--raise-owner-classification (classification)
+  "Raise a declared API error from owner conflict CLASSIFICATION."
+  (let ((reason (plist-get classification :reason))
+        (message (plist-get classification :message))
+        (data (plist-get classification :data)))
+    (unless (memq reason dorg-api-error-reasons)
+      (dorg-api--raise 'malformed "owner conflict reason is undeclared"
+                       :detail 'undeclared-owner-reason))
+    (unless (and (stringp message) (proper-list-p data)
+                 (cl-evenp (length data)))
+      (dorg-api--raise 'malformed "owner conflict classification is malformed"
+                       :detail 'invalid-owner-classification))
+    (apply #'dorg-api--raise reason message data)))
+
+(defun dorg-api-owner-intent-digest (intent &optional source)
+  "Return INTENT's stable request digest at resolved SOURCE.
+The receipt key and first-apply base remain outside the canonical request."
+  (unless (dorg-api--owner-intent-p intent)
+    (dorg-api--raise 'malformed "expected an owner intent"))
+  (let* ((source (or source
+                     (dorg-mutate--resolve-source
+                      (plist-get (dorg-api--owner-intent-options intent)
+                                 :source))))
+         (family (dorg-api--owner-intent-family intent))
+         (entry (dorg-owned-metadata-family family))
+         (request (dorg-api--owner-intent-request intent))
+         (tuple (append
+                 (list :kind 'owner :family family
+                       :codec-version (nth 2 entry)
+                       :root-id (dorg-mutate-source-root-id source)
+                       :source-kind (dorg-mutate-source-kind source))
+                 (cl-loop for field in dorg-api--owner-request-fields
+                          append (list field (plist-get request field))))))
+    (secure-hash 'sha256 (prin1-to-string tuple))))
+
 (defun dorg-api-mutation-intent-p (value)
   "Return non-nil when VALUE is a first-class mutation intent."
   (dorg-api--mutation-intent-p value))
@@ -947,8 +1236,7 @@ must be a proper, even plist with keyword keys and no duplicates."
 (defun dorg-api-make-mutation-intent (form &rest options)
   "Return an immutable mutation intent owning public FORM and OPTIONS.
 The closed option domain is `:source', `:base', `:expected-targets',
-`:allow-broad', `:save', `:message', `:op-id', and
-`:return-candidate-models' (tracked-regression).  Construction validates
+`:allow-broad', `:save', `:message', `:op-id', and `:lock-timeout'.  Construction validates
 shape and ownership only: source descriptors and targets remain unresolved
 until each execution."
   (let ((owned-form (dorg-api--intent-copy form))
@@ -1007,7 +1295,11 @@ intent itself is canonical and duplicate-free."
                      "execute options must be a proper even plist"
                      :options options))
   (let (out)
-    (dolist (key dorg-api--mutation-intent-option-keys out)
+    ;; Forward this formerly known key solely so the constructor's existing
+    ;; closed-domain validator refuses it, including an explicit nil.  Other
+    ;; unknown raw keys still retain the historical ignored behavior.
+    (dolist (key (append dorg-api--mutation-intent-option-keys
+                        '(:return-candidate-models)) out)
       (when (plist-member options key)
         (setq out (append out (list key (plist-get options key))))))))
 
@@ -1077,13 +1369,108 @@ candidate state and accept no caller payload"
      :detail 'extension-inputs-retired)))
 
 (defun dorg-api--execute-intent (intent mode)
+  "Execute INTENT in MODE with the saved plain-Org gate around all planning."
+  (unless (or (dorg-api--mutation-intent-p intent)
+              (dorg-api--owner-intent-p intent))
+    (dorg-api--raise 'malformed "expected a mutation or owner intent"))
+  (unless (memq mode '(dry-run apply))
+    (dorg-api--raise 'mode-error "exactly one of dry-run / apply is required" :mode mode))
+  (let ((options (if (dorg-api--owner-intent-p intent)
+                     (dorg-api--owner-intent-options intent)
+                   (dorg-api--mutation-intent-options intent))))
+    (dorg-mutate--with-saved-plain-file-gate
+     (plist-get options :source) mode options
+     (lambda ()
+       (if (dorg-api--owner-intent-p intent)
+           (dorg-api--execute-owner-intent-locked intent mode)
+         (dorg-api--execute-intent-locked intent mode)))
+     #'dorg-api--raise)))
+
+(defun dorg-api--execute-owner-intent-locked (intent mode)
+  "Execute owned INTENT under the already-entered API gate."
+  (let* ((options (dorg-api--owner-intent-options intent))
+         (source (dorg-mutate--resolve-source (plist-get options :source)))
+         (family (dorg-api--owner-intent-family intent))
+         (participant (dorg-owned-metadata-participants family))
+         (request (dorg-api--intent-copy
+                   (dorg-api--owner-intent-request intent)))
+         (base (plist-get options :base))
+         (op-id (plist-get options :op-id))
+         (digest (dorg-api-owner-intent-digest intent source))
+         (engine-options
+          (append (when base (list :base-commit base))
+                  (when op-id (list :op-id op-id :intent-digest digest))
+                  (when (eq mode 'dry-run) (list :dry-run t))
+                  (when (plist-member options :save)
+                    (list :save (plist-get options :save)))
+                  (when (plist-member options :message)
+                    (list :message (plist-get options :message)))
+                  (when (plist-member options :lock-timeout)
+                    (list :lock-timeout (plist-get options :lock-timeout)))))
+         (result
+          (condition-case err
+              (apply #'dorg-mutate--owner-lowering-execute-locked
+                     source family request engine-options)
+            (dorg-mutate-error
+             (let* ((data (dorg-mutate-error-data err))
+                    (owner-reason (plist-get data :owner-reason)))
+               (cond
+                ((and (equal family (plist-get data :family))
+                      (symbolp owner-reason)
+                      (memq owner-reason dorg-api-error-reasons))
+                 (dorg-api--raise owner-reason
+                                  (plist-get data :owner-message)
+                                  :detail 'owner-refused
+                                  :family family
+                                  :owner-reason owner-reason))
+                ((and (eq 'overlap (dorg-mutate-error-reason err))
+                      (functionp (plist-get participant :classify-conflict))
+                      (let ((classification
+                             (funcall (plist-get participant :classify-conflict)
+                                      source request data)))
+                        (when classification
+                          (dorg-api--raise-owner-classification
+                           classification))))
+                 (signal (car err) (cdr err)))
+                (t
+                 (apply #'dorg-api--raise
+                        (dorg-mutate-error-reason err) (cadr err)
+                        (cl-loop for (key value) on data by #'cddr
+                                 unless (eq key :reason)
+                                 append (list key value)))))))))
+         (form (list 'owner family (dorg-api--intent-copy request)))
+         (response-base (or (plist-get result :base-commit)
+                            (plist-get result :head-commit))))
+    (append
+     (dorg-api--reshape result mode form (plist-get result :patches) nil
+                        response-base nil nil op-id)
+     (when (functionp (plist-get participant :result))
+       (funcall (plist-get participant :result)
+                request options result digest)))))
+
+(defun dorg-api--plain-base-equal-p (supplied current)
+  "Return non-nil when SUPPLIED and CURRENT name the same plain-file state.
+The public token may carry an alias while the saved engine reports its
+canonical path after commit.  All state fields must still compare exactly."
+  (or (equal supplied current)
+      (and (proper-list-p supplied) (proper-list-p current)
+           (stringp (plist-get supplied :file))
+           (stringp (plist-get current :file))
+           (condition-case nil
+               (equal (file-truename (plist-get supplied :file))
+                      (file-truename (plist-get current :file)))
+             (file-error nil))
+           (equal (plist-put (copy-sequence supplied) :file nil)
+                  (plist-put (copy-sequence current) :file nil)))))
+
+(defun dorg-api--execute-intent-locked (intent mode)
   "Execute immutable INTENT in MODE.
 MODE must be exactly `dry-run' or `apply' (neither/both -> `mode-error').
 Query-scoped apply requires :EXPECTED-TARGETS, compared against the re-expanded
 target set by set membership: order is ignored and duplicate expected ids are
 stably de-duplicated before comparison, so only a real membership difference is
 `target-set-changed'.  Honors :BASE, :ALLOW-BROAD, :SAVE, :MESSAGE, and
-`dorg-api-broad-write-threshold' from INTENT.  Its SOURCE descriptor remains
+`:lock-timeout' and `dorg-api-broad-write-threshold' from INTENT.  Its SOURCE descriptor remains
 unresolved until this call.  Signals `dorg-api-error' on any gate/validation
 failure.  This is the single execution core shared by raw forms and first-class
 intent values.
@@ -1095,8 +1482,9 @@ accept no caller payload.  See docs/api.org and docs/mutate.org."
   (dorg-api--require-mutation-intent intent)
   (unless (memq mode '(dry-run apply))
     (dorg-api--raise 'mode-error "exactly one of dry-run / apply is required" :mode mode))
-  ;; D4: resolve the public SOURCE descriptor ONCE and validate its identity
-  ;; policy up front — UNCAUGHT and load-bearing, so a malformed `:identity' or
+  ;; D4: the outer saved-file wrapper resolves only to select the gate; this
+  ;; body resolves the public SOURCE descriptor authoritatively under it and
+  ;; validates identity policy up front — UNCAUGHT and load-bearing, so a malformed `:identity' or
   ;; an underivable source kind signals here, before any normalization or engine
   ;; work (never caught, defaulted, or dummied).  Resolution is UNCONDITIONAL: a
   ;; nil source in public execute means the current buffer and must resolve to a
@@ -1164,7 +1552,7 @@ accept no caller payload.  See docs/api.org and docs/mutate.org."
     (let* ((kind (dorg-mutate-source-kind source))
            (pub-base (dorg-mutate--source-public-base source)))
       (when (and (eq mode 'apply) base (eq kind 'plain-org)
-                 (not (equal base pub-base)))
+                 (not (dorg-api--plain-base-equal-p base pub-base)))
         (dorg-api--raise 'stale "plain-org source changed since :base was captured"
                          :detail 'base-revision :base base :current pub-base))
       ;; `:op-id' is the PUBLIC exactly-once idempotency key (§2.6): the caller
@@ -1175,31 +1563,23 @@ accept no caller payload.  See docs/api.org and docs/mutate.org."
       ;; replay carrying the same op-id but a different intent is rejected.  Both
       ;; ride into the engine ONLY for a Dolt apply (the restart-safe evidence
       ;; log is Dolt-native); a plain-org op-id is echoed but not enforced.
-      (let* ((intent-digest (and op-id (eq kind 'dolt) (eq mode 'apply)
+      (let* ((engine-source (dorg-mutate--canonical-locked-source source))
+             (intent-digest (and op-id (eq kind 'dolt) (eq mode 'apply)
                                  (dorg-mutate--intent-digest patches source)))
              (engine-opts (append (when (and base (eq kind 'dolt))
                                     (list :base-commit base))
                                   (when (and op-id (eq kind 'dolt))
                                     (list :op-id op-id :intent-digest intent-digest))
-                                  ;; Wire v1 (tracked-regression): the candidate-model
-                                  ;; receipt is a Dolt-apply capability — models
-                                  ;; serialize from committed readback, which a
-                                  ;; dry-run or plain-org apply cannot produce.
-                                  ;; Elsewhere the option is inert; a consumer
-                                  ;; publishing verified success fails closed on
-                                  ;; the missing receipt, never silently.
-                                  (when (and (plist-get options
-                                                        :return-candidate-models)
-                                             (eq kind 'dolt) (eq mode 'apply))
-                                    (list :return-candidate-models t))
                                   (when (plist-member options :save)
                                     (list :save save))
                                   (when (plist-member options :message)
-                                    (list :message message))))
+                                    (list :message message))
+                                  (when (plist-member options :lock-timeout)
+                                    (list :lock-timeout (plist-get options :lock-timeout)))))
              (res (condition-case err
                       (if (eq mode 'dry-run)
-                          (apply #'dorg-mutate--plan-patches source patches nil engine-opts)
-                        (apply #'dorg-mutate--apply-patches source patches nil engine-opts))
+                          (apply #'dorg-mutate--plan-patches engine-source patches nil engine-opts)
+                        (apply #'dorg-mutate--apply-patches engine-source patches nil engine-opts))
                     (dorg-mutate-error
                      (let* ((data (dorg-mutate-error-data err))
                             (target (plist-get data :target)))
@@ -1237,7 +1617,8 @@ The retired `:extension-inputs' key fails closed by presence on either route
 derive any other variation with `dorg-api-mutation-intent-with'.  Both routes
 converge on `dorg-api--execute-intent'.  The response retains the public form in
 `:intent'; the opaque intent value is never serialized."
-  (if (dorg-api--mutation-intent-p form-or-intent)
+  (if (or (dorg-api--mutation-intent-p form-or-intent)
+          (dorg-api--owner-intent-p form-or-intent))
       (let* ((execute-options
               (dorg-api--intent-options options '(:mode)
                                         "mutation intent execution"))
@@ -1304,8 +1685,13 @@ stable fields, not the head)."
          :patches patches
          :targets targets
          :base base
+         ;; `:changed' names every heading whose persisted or derived placement
+         ;; changed: a moved or promoted subtree's descendants keep their
+         ;; stored rows, yet their Org level moved with them.
          :affected (list :created (plist-get res :created)
-                         :changed (plist-get res :changed)
+                         :changed (delete-dups
+                                   (append (plist-get res :changed)
+                                           (plist-get res :moved)))
                          :deleted (plist-get res :deleted))
          :supported (if (plist-member res :supported) (plist-get res :supported) t)
          :unsupported (plist-get res :unsupported)
@@ -1317,19 +1703,6 @@ stable fields, not the head)."
      (list :extensions (plist-get res :extensions)))
    (when (plist-member res :invalidation)
      (list :invalidation (plist-get res :invalidation)))
-   ;; Versioned canonical postimage receipt (tracked-regression): one entry per
-   ;; affected owner partition on a committed Dolt apply, and an idempotent
-   ;; replay RE-EMITS the receipt stored with its evidence row.  Surfaced
-   ;; only when non-empty — dry-run, plain-org, zero-effect, identity-less,
-   ;; and legacy-evidence results carry none, preserving the pre-change
-   ;; shape.
-   (when (plist-get res :postimages)
-     (list :postimages (plist-get res :postimages)))
-   ;; Wire v1 candidate models (tracked-regression AC4): present only when the
-   ;; caller requested them AND a committed (or settled) Dolt apply produced
-   ;; them from its verified readback.
-   (when (plist-get res :candidate-models)
-     (list :candidate-models (plist-get res :candidate-models)))
    ;; A Dolt apply through the per-store gate carries phase `:timings'
    ;; (gate-wait/gate-hold/plan/sql/commit); surface it when present so the
    ;; public result exposes the boundary latency (A11/A14).  Dry-run and

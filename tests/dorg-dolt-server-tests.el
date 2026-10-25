@@ -355,8 +355,8 @@ The snapshot seam is as fallible as the kill seams and must be guarded."
 (ert-deftest dorg-test-dolt-server-start-failure-includes-output ()
   "dorg-dolt-server--start enriches startup failures with sql-server output.
 Simulates a failed startup without a real failing Dolt binary by
-stubbing the readiness probe to signal and seeding the process
-buffer with fake sql-server output."
+stubbing the readiness probe to signal and seeding the child's log file
+with fake sql-server output."
   (let ((temp-base (dorg-test--make-owned-temp-dir "dorg-test-startup-" "dolt-server-tests"))
         (orig-start (symbol-function 'start-process)))
     (unwind-protect
@@ -364,14 +364,15 @@ buffer with fake sql-server output."
                                               :raw "stubbed")))
           (cl-letf (((symbol-function 'executable-find)
                      (lambda (&rest _) "/usr/bin/dolt"))
-                    ((symbol-function 'start-process)
-                     (lambda (name buffer &rest _args)
+                    ((symbol-function 'dorg-dolt-server--spawn-logged)
+                     (lambda (name _args logfile)
                        ;; Spawn a harmless real process so liveness checks and
-                       ;; cleanup behave, and seed fake sql-server output.
-                       (let ((proc (funcall orig-start name buffer "sleep" "30")))
-                         (when (bufferp buffer)
-                           (with-current-buffer buffer
-                             (insert "error: bind: address already in use\n")))
+                       ;; cleanup behave, and seed fake sql-server output into
+                       ;; the log the child would have written.
+                       (let ((proc (funcall orig-start name nil "sleep" "30")))
+                         (write-region "error: bind: address already in use\n"
+                                       nil logfile nil 'silent)
+                         (process-put proc 'dorg-server-log logfile)
                          proc)))
                     ;; Pre-start store validation passes so the test reaches
                     ;; the server-start/readiness-failure path it covers.
@@ -391,6 +392,47 @@ buffer with fake sql-server output."
               (should (string-match-p "probe failed" (cadr err))))
             ;; Registry stays clean after a failed start.
             (should-not (dorg-dolt-server-port temp-base))))
+      (dorg-test--delete-owned-root temp-base))))
+
+(ert-deftest dorg-test-dolt-server-start-failure-survives-log-error ()
+  "A readiness failure kills the child and clears ownership despite a bad log.
+Reading the child's log for the diagnostic is forced to signal; the start
+must still kill the child, drop its registry entry and claim, and raise the
+original startup failure, with the unreadable log noted in it."
+  (let ((temp-base (dorg-test--make-owned-temp-dir "dorg-test-startup-log-" "dolt-server-tests"))
+        (orig-start (symbol-function 'start-process))
+        (orig-insert (symbol-function 'insert-file-contents))
+        (child nil))
+    (unwind-protect
+        (let ((dorg-dolt--version-cache (list :version dorg-dolt-minimum-version
+                                              :raw "stubbed")))
+          (cl-letf (((symbol-function 'executable-find)
+                     (lambda (&rest _) "/usr/bin/dolt"))
+                    ((symbol-function 'dorg-dolt-server--spawn-logged)
+                     (lambda (name _args logfile)
+                       (write-region "error: bind: address already in use\n"
+                                     nil logfile nil 'silent)
+                       (setq child (funcall orig-start name nil "sleep" "30"))
+                       (process-put child 'dorg-server-log logfile)
+                       child))
+                    ((symbol-function 'insert-file-contents)
+                     (lambda (file &rest args)
+                       (if (string-suffix-p "server.log" file)
+                           (error "spec: log unreadable")
+                         (apply orig-insert file args))))
+                    ((symbol-function 'dorg-dolt-server--dir-store-valid-p)
+                     (lambda (&rest _) t))
+                    ((symbol-function 'dorg-dolt-server--wait-ready)
+                     (lambda (&rest _) (error "probe failed"))))
+            (let ((err (should-error (dorg-dolt-server--start temp-base) :type 'error)))
+              (should (string-match-p "failed to start dolt sql-server" (cadr err)))
+              (should (string-match-p "probe failed" (cadr err)))
+              (should (string-match-p "server log unreadable" (cadr err))))
+            (should child)
+            (should-not (process-live-p child))
+            (should-not (dorg-dolt-server-port temp-base))
+            (should-not (dorg-dolt-server--claim-read temp-base))))
+      (when (and child (process-live-p child)) (delete-process child))
       (dorg-test--delete-owned-root temp-base))))
 
 (ert-deftest dorg-test-dolt-server-start-pins-doltcfg-dir ()
@@ -413,10 +455,10 @@ is the store itself so artifacts stay inside it."
                        (lambda (&rest _) t))
                       ((symbol-function 'dorg-dolt-server--free-port)
                        (lambda () 39111))
-                      ((symbol-function 'start-process)
-                       (lambda (name buffer program &rest args)
-                         (setq captured-argv (cons program args))
-                         (setq proc (funcall orig-start name buffer "sleep" "30"))))
+                      ((symbol-function 'dorg-dolt-server--spawn-logged)
+                       (lambda (name args _logfile)
+                         (setq captured-argv args)
+                         (setq proc (funcall orig-start name nil "sleep" "30"))))
                       ((symbol-function 'dorg-dolt-server--wait-ready)
                        (lambda (&rest _) t))
                       ;; Post-start served-DB gate: the launched server serves
@@ -438,7 +480,7 @@ is the store itself so artifacts stay inside it."
                                                :test #'equal))
                          (target (dorg-dolt--target temp-base)))
                     (should (= port 39111))
-                    (should (equal (car captured-argv) "dolt"))
+                    (should (equal (car captured-argv) "sql-server"))
                     (should cfg-tail)
                     (should (equal (cadr cfg-tail)
                                    (expand-file-name ".doltcfg" temp-base)))
@@ -519,7 +561,7 @@ production so it cannot be reintroduced as a caller."
             ;; Insert data via CLI mode (no server)
             (dorg-sql--with-cli-seam dolt-dir
               (dorg-sql dolt-dir
-                        "INSERT INTO headings (id, root_id, parent_id, sort_key, level, title) VALUES (1, 1, NULL, X'01', 0, 'Root')")
+                        "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, title) VALUES (1, 1, NULL, X'01', 0, 'Root')")
               (dorg-commit dolt-dir "seed data"))
             ;; Start server and query through it
             (dorg-dolt-server--ensure-strict dolt-dir)
@@ -542,8 +584,8 @@ production so it cannot be reintroduced as a caller."
             (unwind-protect
                 (progn
                   (dorg-sql-batch dolt-dir
-                                  (list "INSERT INTO headings (id, root_id, parent_id, sort_key, level, title) VALUES (1, 1, NULL, X'01', 0, NULL)"
-                                        "INSERT INTO headings (id, root_id, parent_id, sort_key, level, title) VALUES (2, 1, 1, X'01', 1, 'Child')"))
+                                  (list "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, title) VALUES (1, 1, NULL, X'01', 0, NULL)"
+                                        "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, title) VALUES (2, 1, 1, X'01', 1, 'Child')"))
                   (let ((result (dorg-sql dolt-dir "SELECT COUNT(*) as cnt FROM headings")))
                     (should (= (alist-get 'cnt (car result)) 2))))
               (dorg-dolt-server--stop dolt-dir)))
@@ -556,13 +598,13 @@ production so it cannot be reintroduced as a caller."
     (insert-file-contents-literally file)
     (secure-hash 'sha256 (current-buffer))))
 
-(ert-deftest dorg-test-yybio-vendored-source-is-exact-upstream ()
-  "The vendored client is the selected standalone source, without a patch."
+(ert-deftest dorg-test-yybio-vendored-source-matches-recorded-patch ()
+  "The vendored client matches the documented local patch and upstream API."
   (let* ((root (file-name-directory (locate-library "dorg")))
          (mysql-file (expand-file-name "lib/mysql/mysql.el" root))
          (provenance (expand-file-name "lib/mysql/UPSTREAM.org" root))
          (mysql-sha
-          "42d058c1d8d6463c160402ecba787b8597673e25248a117c9790380e80b14718"))
+          "f56b75b236ca5223913dbed8cfd395158fd63b67eec911892ec25f6529d74624"))
     (should (file-exists-p provenance))
     (should (equal mysql-sha (dorg-test-yybio--file-sha256 mysql-file)))
     (with-temp-buffer
@@ -661,9 +703,9 @@ wire-protocol path is the one exercised."
           ;; id=2 has a non-empty title for the unchanged-behavior check.
           (dorg-sql--with-cli-seam dolt-dir
             (dorg-sql dolt-dir
-                      "INSERT INTO headings (id, root_id, parent_id, sort_key, level, title) VALUES (1, 1, NULL, X'01', 0, '')")
+                      "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, title) VALUES (1, 1, NULL, X'01', 0, '')")
             (dorg-sql dolt-dir
-                      "INSERT INTO headings (id, root_id, parent_id, sort_key, level, title) VALUES (2, 1, 1, X'02', 1, 'Child')")
+                      "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, title) VALUES (2, 1, 1, X'02', 1, 'Child')")
             (dorg-commit dolt-dir "seed empty-title row"))
           (dorg-dolt-server--ensure-strict dolt-dir)
           (unwind-protect
@@ -683,7 +725,7 @@ wire-protocol path is the one exercised."
                                      "SELECT title AS value FROM headings WHERE id = 1")))
                     (should (= (length r) 1))
                     (should (equal (alist-get 'value (car r)) "")))
-                  ;; (b) empty first column followed by a coerced numeric id.
+                  ;; (b) empty first column followed by an integer id.
                   (let ((r (dorg-sql dolt-dir
                                      "SELECT title AS value, id FROM headings WHERE id = 1")))
                     (should (= (length r) 1))
@@ -714,7 +756,7 @@ wire-protocol path is the one exercised."
             (unwind-protect
                 (let ((hash1 (dorg-head-commit dolt-dir)))
                   (dorg-sql dolt-dir
-                            "INSERT INTO headings (id, root_id, parent_id, sort_key, level, title) VALUES (1, 1, NULL, X'01', 0, 'Test')")
+                            "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, title) VALUES (1, 1, NULL, X'01', 0, 'Test')")
                   (dorg-commit dolt-dir "server-mode commit")
                   (let ((hash2 (dorg-head-commit dolt-dir)))
                     (should-not (equal hash1 hash2))))
@@ -869,7 +911,15 @@ server leaks into the test."
           (dorg-dolt-server--attached-ports (make-hash-table :test 'equal))
           (dorg-dolt-server--owned-claims (make-hash-table :test 'equal)))
      (unwind-protect
-         (progn ,@body)
+         ;; This runtime is an in-memory lifecycle double: its synthetic
+         ;; stores intentionally have no kernel-held noms LOCK.  The strict
+         ;; admission census is separately exercised against an owned real
+         ;; LOCK in dorg-dolt-server-evidence-tests.el; retain the existing
+         ;; mock lifecycle contracts without pretending their child doubles
+         ;; are OS process owners.
+         (cl-letf (((symbol-function 'dorg-dolt-server--admission-lock-holders)
+                    (lambda (&rest _) nil)))
+           (progn ,@body))
        (dorg-test--delete-runtime-server-metadata dorg-test--store-root)
        (dorg-test--delete-owned-root dorg-test--store-root))))
 
@@ -1116,9 +1166,9 @@ death fails the two claim assertions."
             (cl-letf (((symbol-function 'executable-find)
                        (lambda (&rest _) "/usr/bin/dolt"))
                       ;; Spawn a harmless real process so liveness/cleanup work.
-                      ((symbol-function 'start-process)
-                       (lambda (name buffer &rest _args)
-                         (funcall orig-start name buffer "sleep" "30")))
+                      ((symbol-function 'dorg-dolt-server--spawn-logged)
+                       (lambda (name &rest _)
+                         (funcall orig-start name nil "sleep" "30")))
                       ((symbol-function 'dorg-dolt-server--wait-ready)
                        (lambda (&rest _) t))
                       ;; Pre-start dir validation passes (store content OK);
@@ -1184,10 +1234,10 @@ would trip the sentinel `dorg-dolt-server--dir-store-valid-p' stub."
                        (lambda (&rest _) (error "bootstrap must not require preexisting dorg_files")))
                       ((symbol-function 'dorg-dolt-server--free-port)
                        (lambda () 39222))
-                      ((symbol-function 'start-process)
-                       (lambda (name buffer program &rest args)
-                         (setq captured-argv (cons program args))
-                         (setq proc (funcall orig-start name buffer "sleep" "30"))))
+                      ((symbol-function 'dorg-dolt-server--spawn-logged)
+                       (lambda (name args _logfile)
+                         (setq captured-argv args)
+                         (setq proc (funcall orig-start name nil "sleep" "30"))))
                       ((symbol-function 'dorg-dolt-server--wait-ready)
                        (lambda (port &rest _)
                          (should (= port 39222))
@@ -1213,8 +1263,7 @@ would trip the sentinel `dorg-dolt-server--dir-store-valid-p' stub."
               (unwind-protect
                   (let ((port (dorg-dolt-server--start-bootstrap temp-base)))
                     (should (= port 39222))
-                    (should (equal (car captured-argv) "dolt"))
-                    (should (member "sql-server" captured-argv))
+                    (should (equal (car captured-argv) "sql-server"))
                     (should (member "--data-dir" captured-argv))
                     (should (process-live-p proc))
                     (should (= wait-ready-calls 1))
@@ -1453,11 +1502,19 @@ This is the explicit interactive start path: it launches a DETACHED daemon
 \(see `dorg-dolt-server--ensure-detached').  Previously this mocked the
 session-scoped session selector, which the start path has not used
 since the detached-daemon change; the stale mock let the real ensure run."
-  (let (ensure-dir)
+  (let (ensure-dir ensure-explicit)
     (cl-letf (((symbol-function 'dorg-dolt-server--ensure-detached)
-               (lambda (dolt-dir) (setq ensure-dir dolt-dir) 4242)))
+               (lambda (dolt-dir &optional explicit)
+                 (setq ensure-dir dolt-dir ensure-explicit explicit)
+                 4242)))
       (should (= 4242 (dorg-dolt-start (dorg-test--repo "start-repo"))))
-      (should (equal ensure-dir (dorg-test--repo "start-repo"))))))
+      (should (equal ensure-dir (dorg-test--repo "start-repo")))
+      ;; This is the ONE production caller of the explicit
+      ;; persistent-start path, so it must ask for detached lifetime rather
+      ;; than for any usable port.  Asserted here rather than merely tolerated,
+      ;; because a stub that silently accepted the argument without checking it
+      ;; would let the wiring regress unnoticed.
+      (should ensure-explicit))))
 
 (ert-deftest dorg-test-read-dolt-dir-prefers-registered ()
   "`dorg-dolt-server--read-dolt-dir' prefers the buffer's registered Dolt dir."
@@ -1664,7 +1721,7 @@ data-query deadlock by querying the dir directly."
                       ((symbol-function 'dorg-dolt-server--expected-binding)
                        (lambda (&rest _) nil))
                       ;; A server must never be launched once validation fails.
-                      ((symbol-function 'start-process)
+                      ((symbol-function 'dorg-dolt-server--spawn-logged)
                        (lambda (&rest _) (setq started t)
                          (error "start-process must not be called")))
                       ((symbol-function 'dorg-dolt-server--publish-claim)
@@ -1710,7 +1767,7 @@ Non-vacuous: the schema gate passes; only the bound-file gate rejects."
                        (lambda (&rest _) (list :reason 'wrong-bound-file
                                                :tables '("dorg_files" "headings")
                                                :bound-file bound-file)))
-                      ((symbol-function 'start-process)
+                      ((symbol-function 'dorg-dolt-server--spawn-logged)
                        (lambda (&rest _) (setq started t)
                          (error "start-process must not be called")))
                       ((symbol-function 'dorg-dolt-server--publish-claim)
@@ -1742,9 +1799,9 @@ regression that would refuse a healthy bound store."
                  (list :version dorg-dolt-minimum-version :raw "stubbed")))
             (cl-letf (((symbol-function 'executable-find)
                        (lambda (&rest _) "/usr/bin/dolt"))
-                      ((symbol-function 'start-process)
-                       (lambda (name buffer &rest _args)
-                         (funcall orig-start name buffer "sleep" "30")))
+                      ((symbol-function 'dorg-dolt-server--spawn-logged)
+                       (lambda (name &rest _)
+                         (funcall orig-start name nil "sleep" "30")))
                       ((symbol-function 'dorg-dolt-server--wait-ready)
                        (lambda (&rest _) t))
                       ;; Pre-start dir validation passes (schema + bound file) ...
@@ -2022,9 +2079,9 @@ Non-vacuous: RED against the pre-fix double-probe (calls = 2, message lists
                        (lambda (&rest _) "/usr/bin/dolt"))
                       ;; A long-lived child so "no child remains" is a real
                       ;; proof the refusal reaped it (not a self-exit no-op).
-                      ((symbol-function 'start-process)
-                       (lambda (name buffer &rest _args)
-                         (setq child (funcall orig-start name buffer "sleep" "30"))))
+                      ((symbol-function 'dorg-dolt-server--spawn-logged)
+                       (lambda (name &rest _)
+                         (setq child (funcall orig-start name nil "sleep" "30"))))
                       ((symbol-function 'dorg-dolt-server--wait-ready)
                        (lambda (&rest _) t))
                       ((symbol-function 'dorg-dolt-server--expected-binding)
@@ -3698,7 +3755,7 @@ restorable history."
       (unwind-protect
           (let ((dolt-dir (dorg-test--copy-repo temp-base))) ; standalone: no shared server
             (dorg-sql--with-cli-seam dolt-dir
-              (dorg-sql dolt-dir "INSERT INTO headings (id,root_id,parent_id,sort_key,level,title) VALUES (1,1,NULL,X'01',0,'v1')")
+              (dorg-sql dolt-dir "INSERT INTO headings (id,root_id,parent_id,sort_key,level_offset,title) VALUES (1,1,NULL,X'01',0,'v1')")
               (dorg-commit dolt-dir "v1")
               (let ((early (dorg-head-commit dolt-dir)))
                 (dotimes (i 5)
@@ -3726,7 +3783,7 @@ reclaim; the plist is the observable contract."
       (unwind-protect
           (let ((dolt-dir (dorg-test--copy-repo temp-base)))
             (dorg-sql--with-cli-seam dolt-dir
-              (dorg-sql dolt-dir "INSERT INTO headings (id,root_id,parent_id,sort_key,level,title) VALUES (1,1,NULL,X'01',0,'x')")
+              (dorg-sql dolt-dir "INSERT INTO headings (id,root_id,parent_id,sort_key,level_offset,title) VALUES (1,1,NULL,X'01',0,'x')")
               (dorg-commit dolt-dir "x")
               (let ((rep (dorg-dolt-compact dolt-dir)))
                 (should (integerp (plist-get rep :before)))
@@ -4335,7 +4392,7 @@ now (wrong-db => kill-process + break-claim + no retention)."
                      (lambda (&rest _) '("sql-server")))
                     ((symbol-function 'dorg-dolt-server--free-port) (lambda () 59001))
                     ((symbol-function 'dorg-dolt-server--dir-store-valid-p) (lambda (&rest _) t))
-                    ((symbol-function 'start-process) (lambda (&rest _) fake))
+                    ((symbol-function 'dorg-dolt-server--spawn-logged) (lambda (&rest _) fake))
                     ((symbol-function 'dorg-dolt-server--wait-ready) (lambda (&rest _) nil))
                     ((symbol-function 'dorg-dolt-server--probe-served-dbs)
                      (lambda (_p) (cons 'inconclusive "post-start refused")))
@@ -4411,7 +4468,7 @@ re-probe a `probe-inconclusive' claim)."
                 ((symbol-function 'dorg-dolt-server--data-dir-and-db)
                  (lambda (d) (cons (expand-file-name d) "db")))
                 ((symbol-function 'dorg-dolt-server--expected-binding) (lambda (_d) nil))
-                ((symbol-function 'start-process)
+                ((symbol-function 'dorg-dolt-server--spawn-logged)
                  (lambda (&rest _) (setq started t) fake)))
         (dorg-dolt-server--ensure-strict dolt-dir)   ; REAL lifecycle entrypoint
         (should-not started)                          ; reused exact object
@@ -4442,7 +4499,7 @@ marker, and never re-probes)."
                 ((symbol-function 'dorg-dolt-server--data-dir-and-db)
                  (lambda (d) (cons (expand-file-name d) "db")))
                 ((symbol-function 'dorg-dolt-server--expected-binding) (lambda (_d) nil))
-                ((symbol-function 'start-process)
+                ((symbol-function 'dorg-dolt-server--spawn-logged)
                  (lambda (&rest _) (setq started t) fake)))
         (should-error (dorg-dolt-server--ensure-strict dolt-dir)
                       :type 'dorg-sql-transport-error)
@@ -4477,7 +4534,7 @@ port is returned (zero relaunch).  RED now (strict-port returns
                 ((symbol-function 'dorg-dolt-server--data-dir-and-db)
                  (lambda (d) (cons (expand-file-name d) "db")))
                 ((symbol-function 'dorg-dolt-server--expected-binding) (lambda (_d) nil))
-                ((symbol-function 'start-process)
+                ((symbol-function 'dorg-dolt-server--spawn-logged)
                  (lambda (&rest _) (setq started t) fake)))
         (should (eq (dorg-dolt-server--strict-port dolt-dir) 59005))
         (should (= validations 1))            ; hot path re-probed exactly once
@@ -4828,7 +4885,7 @@ launched child and breaks the claim."
                     ((symbol-function 'dorg-dolt--target-sql-server-args) (lambda (&rest _) '("sql-server")))
                     ((symbol-function 'dorg-dolt-server--free-port) (lambda () 59021))
                     ((symbol-function 'dorg-dolt-server--dir-store-valid-p) (lambda (&rest _) t))
-                    ((symbol-function 'start-process) (lambda (&rest _) fake))
+                    ((symbol-function 'dorg-dolt-server--spawn-logged) (lambda (&rest _) fake))
                     ((symbol-function 'dorg-dolt-server--wait-ready) (lambda (&rest _) nil))
                     ((symbol-function 'dorg-dolt-server--probe-served-dbs) #'dorg-test-dbprobe--served-other)
                     ((symbol-function 'dorg-dolt-server--list-served-dbs) (lambda (_) (list "other")))
@@ -6261,8 +6318,7 @@ the old native-first reconciliation returns owner-kind `dolt' here."
             (,canon (dorg-dolt-server--canonical-dir ,dolt-dir))
             (child-buffer (generate-new-buffer " *maij2-child*"))
             (,proc (start-process "maij2-child" child-buffer "sleep" "60"))
-            (,port 61082)
-            (launched-buffer nil))
+            (,port 61082))
        (set-process-query-on-exit-flag ,proc nil)
        (unwind-protect
            (cl-letf (((symbol-function 'dorg-dolt--target)
@@ -6275,15 +6331,12 @@ the old native-first reconciliation returns owner-kind `dolt' here."
                       (lambda () ,port))
                      ((symbol-function 'dorg-dolt-server--dir-store-valid-p)
                       (lambda (&rest _) t))
-                     ((symbol-function 'start-process)
-                      (lambda (_name buffer &rest _)
-                        (setq launched-buffer buffer)
-                        ,proc)))
+                     ((symbol-function 'dorg-dolt-server--spawn-logged)
+                      (lambda (&rest _) ,proc)))
              ,@body)
          (when (process-live-p ,proc) (delete-process ,proc))
          (accept-process-output ,proc 0.05)
-         (when (buffer-live-p child-buffer) (kill-buffer child-buffer))
-         (when (buffer-live-p launched-buffer) (kill-buffer launched-buffer))))))
+         (when (buffer-live-p child-buffer) (kill-buffer child-buffer))))))
 
 (ert-deftest dorg-test-maij2-child-publishes-before-ready-and-upgrades-in-place ()
   "Child startup publishes before readiness and finalizes the SAME claim."
@@ -6453,6 +6506,649 @@ the old native-first reconciliation returns owner-kind `dolt' here."
         (should-not broken)
         (should (eq (alist-get :state (dorg-dolt-server-claim store))
                     'probe-inconclusive))))))
+
+;;; ─── Explicit persistent start must not return a session child ──
+;;
+;; Pure controls.  Nothing here starts a real sql-server, runs dolt, or touches
+;; a store: every lifecycle primitive is stubbed and the "process" is an opaque
+;; object with `process-live-p' stubbed around it.  The claim lock is taken for
+;; real against a temp directory, which is filesystem-local and dolt-free.
+;;
+;; Reading guide.  Teeth marked RED witness an invariant that does NOT yet exist
+;; at this pin and must fail until the fix lands.  Teeth marked GREEN document a
+;; property the design RELIES on and that already holds; they are here so a
+;; later change cannot quietly remove the foundation the fix stands on.
+
+(defvar dorg-test-0zotj--trace nil
+  "Ordered trace of lifecycle events recorded by the 0zotj controls.")
+
+(defmacro dorg-test-0zotj--with-store (var &rest body)
+  "Bind VAR to a fresh temp store directory and run BODY."
+  (declare (indent 1) (debug t))
+  `(let ((,var (file-name-as-directory
+                (make-temp-file "dorg-persistent-start-" t))))
+     (unwind-protect (progn ,@body)
+       (delete-directory ,var t))))
+
+(defun dorg-test-0zotj--claim (store &rest overrides)
+  "Return a daemon claim alist for STORE with OVERRIDES applied."
+  (let ((base (list (cons :owner-kind 'daemon)
+                    (cons :state 'ready)
+                    (cons :host (system-name))
+                    (cons :dolt-dir (dorg-dolt-server--canonical-dir store))
+                    (cons :server-pid 4242)
+                    (cons :port 3399)
+                    (cons :uuid "uuid-0zotj"))))
+    (while overrides
+      (setf (alist-get (pop overrides) base) (pop overrides)))
+    base))
+
+(defun dorg-test-0zotj--native (_store &rest overrides)
+  "Return a dolt-native sql-server.info PLIST with OVERRIDES applied.
+The real reader returns (:pid INT :port INT :uuid STR); the store is implicit in
+the path it was read from, so there is no store or host field to mutate here —
+those live on the claim side."
+  (let ((base (list :pid 4242 :port 3399 :uuid "uuid-0zotj")))
+    (while overrides
+      (setq base (plist-put base (pop overrides) (pop overrides))))
+    base))
+
+;;;; T1-pure — retirement ordering happens BEFORE daemon publication (RED)
+
+(ert-deftest dorg-test-0zotj-t1-pure-retires-child-before-publishing-daemon ()
+  "Explicit start converts an owned child, retiring it BEFORE publication.
+Driven from a VALID exact session-child claim: an absent claim is no longer an
+authorization to retire anything, so a test that stubbed one to nil would be
+asserting the wrong contract.  Verification is isolated here — the M family
+owns it — so this tooth speaks only to ordering."
+  (dorg-test-0zotj--with-store store
+    (let* ((proc (make-symbol "fake-child"))
+           (dorg-test-0zotj--trace nil))
+      (dorg-test-0zotj--call-with-child
+       store proc 3300 (dorg-test-0zotj--session-claim store proc 3300)
+       (lambda (procs key)
+         (cl-letf (((symbol-function 'process-live-p) (lambda (_p) nil))
+                   ((symbol-function 'dorg-dolt-server--kill-process)
+                    (lambda (_p &optional _g) nil))
+                   ((symbol-function 'dorg-dolt-server--release-claim)
+                    (lambda (_d) (push 'retire-token dorg-test-0zotj--trace) t))
+                   ((symbol-function 'dorg-dolt-server--verified-daemon-identity)
+                    (lambda (_d) (list :server-pid 4242 :port 3399 :uuid "u")))
+                   ((symbol-function 'dorg-dolt-server--memo-attached-port)
+                    (lambda (_d port) port))
+                   ((symbol-function 'dorg-dolt-server--start-detached-unsafe)
+                    (lambda (_d)
+                      (push (if (gethash key procs) 'publish-with-entry-present
+                              'publish)
+                            dorg-test-0zotj--trace)
+                      3399)))
+           (should (equal 3399 (dorg-dolt-server--ensure-detached store t)))
+           (let ((trace (nreverse dorg-test-0zotj--trace)))
+             (should (memq 'publish trace))
+             (should-not (memq 'publish-with-entry-present trace))
+             (should (< (cl-position 'retire-token trace)
+                        (cl-position 'publish trace))))))))))
+
+(ert-deftest dorg-test-0zotj-t2-explicit-healthy-repeat-reuses-service ()
+  "An explicit start against an EXISTING healthy service reuses it.
+No start, break or release may occur, and the port returned and memoized is the
+VERIFIED one.  The pre-existing reuse test drives the implicit one-argument
+path, so it cannot see the explicit verification at all."
+  (dorg-test-0zotj--with-store store
+    (let ((started nil) (broke nil) (released nil) (memos nil))
+      (dorg-test-0zotj--call-with-service
+       store nil
+       (lambda ()
+         (cl-letf (((symbol-function 'dorg-dolt-server--start-detached-unsafe)
+                    (lambda (_d) (setq started t) 4400))
+                   ((symbol-function 'dorg-dolt-server--break-claim)
+                    (lambda (_d) (setq broke t) t))
+                   ((symbol-function 'dorg-dolt-server--release-claim)
+                    (lambda (_d) (setq released t) t))
+                   ((symbol-function 'dorg-dolt-server--memo-attached-port)
+                    (lambda (_d port) (push port memos) port)))
+           (should (equal 3399 (dorg-dolt-server--ensure-detached store t)))
+           (should-not started)
+           (should-not broke)
+           (should-not released)
+           (should (equal memos (list 3399)))))))))
+
+(ert-deftest dorg-test-0zotj-t3-port-must-match-the-verified-snapshot ()
+  "A lifecycle port the durable records do not corroborate is refused.
+Finding 3: the explicit path returned 4400 while the claim and native record
+both said 3399, so the caller was handed a number no second process could be
+expected to use.  Nothing may be memoized on that path."
+  (dorg-test-0zotj--with-store store
+    (let ((memos nil))
+      (dorg-test-0zotj--call-with-service
+       store nil
+       (lambda ()
+         (cl-letf (((symbol-function 'dorg-dolt-server--attach-live)
+                    (lambda (_d _c &rest _) 4400))
+                   ((symbol-function 'dorg-dolt-server--memo-attached-port)
+                    (lambda (_d port) (push port memos) port)))
+           (dorg-test-0zotj--refusal
+            (lambda () (dorg-dolt-server--ensure-detached store t)))
+           (should-not memos)))))))
+
+(ert-deftest dorg-test-0zotj-t3-delayed-sentinel-is-inert-after-retirement ()
+  "A sentinel firing after retirement releases nothing.
+
+GREEN at this pin, deliberately: `--child-exit-sentinel' already keys on exact
+PROC membership, and that guard is the entire protection the fix relies on.  It
+is asserted here so a later change cannot remove it silently."
+  (let* ((proc (make-symbol "retired-child"))
+         (released nil)
+         (procs (make-hash-table :test 'equal)))
+    (cl-letf (((symbol-function 'process-live-p) (lambda (_p) nil))
+              ((symbol-function 'process-buffer) (lambda (_p) nil))
+              (dorg-dolt-server--procs procs)
+              ((symbol-function 'dorg-dolt-server--release-claim)
+               (lambda (d) (push d released) t)))
+      ;; Entry already retired: the sentinel must find nothing to act on.
+      (dorg-dolt-server--child-exit-sentinel proc "finished\n")
+      (should-not released))))
+
+(ert-deftest dorg-test-0zotj-t3-control-sentinel-still-releases-when-registered ()
+  "Control for T3: with the entry PRESENT the same sentinel does release.
+Without this the inertness assertion would pass against a sentinel that never
+releases anything at all."
+  (let* ((proc (make-symbol "live-child"))
+         (released nil)
+         (procs (make-hash-table :test 'equal)))
+    (puthash "/tmp/0zotj-control/" (cons proc 3300) procs)
+    (cl-letf (((symbol-function 'process-live-p) (lambda (_p) nil))
+              ((symbol-function 'process-buffer) (lambda (_p) nil))
+              (dorg-dolt-server--procs procs)
+              ((symbol-function 'dorg-dolt-server--release-claim)
+               (lambda (d) (push d released) t)))
+      (dorg-dolt-server--child-exit-sentinel proc "finished\n")
+      (should (equal released (list "/tmp/0zotj-control/")))
+      (should-not (gethash "/tmp/0zotj-control/" procs)))))
+
+;;;; T4 — unconfirmed death retires nothing and publishes nothing (RED)
+
+(ert-deftest dorg-test-0zotj-t4-unconfirmed-death-publishes-nothing ()
+  "When the child cannot be proven dead, nothing is retired or published.
+Driven from a VALID session claim, so the refusal can only come from the death
+gate and not from missing authority."
+  (dorg-test-0zotj--with-store store
+    (let* ((proc (make-symbol "undying-child"))
+           (published nil) (released nil))
+      (dorg-test-0zotj--call-with-child
+       store proc 3300 (dorg-test-0zotj--session-claim store proc 3300)
+       (lambda (procs key)
+         (cl-letf (((symbol-function 'process-live-p) (lambda (_p) t))
+                   ((symbol-function 'dorg-dolt-server--kill-process)
+                    (lambda (_p &optional _g) nil))
+                   ((symbol-function 'dorg-dolt-server--release-claim)
+                    (lambda (_d) (setq released t) t))
+                   ((symbol-function 'dorg-dolt-server--start-detached-unsafe)
+                    (lambda (_d) (setq published t) 3399)))
+           (dorg-test-0zotj--refusal
+            (lambda () (dorg-dolt-server--ensure-detached store t)))
+           (should-not published)
+           (should-not released)
+           (should (gethash key procs))))))))
+
+(ert-deftest dorg-test-0zotj-t5-retirement-authority-table ()
+  "Retirement requires the RAW lock-held claim to prove the COMPLETE tuple.
+Finding 1: an absent claim previously proceeded to kill and release.  Each row
+mutates exactly one field, so no single check can be dropped without a row
+going green; the exact-match control keeps the table from passing against an
+implementation that refuses unconditionally."
+  (dorg-test-0zotj--with-store store
+    (let ((proc (make-symbol "child")))
+      (dolist (row (list
+                    (cons "absent claim" nil)
+                    (cons "owner-kind" (dorg-test-0zotj--session-claim
+                                        store proc 3300 :owner-kind 'daemon))
+                    (cons "host" (dorg-test-0zotj--session-claim
+                                  store proc 3300 :host "elsewhere"))
+                    (cons "store" (dorg-test-0zotj--session-claim
+                                   store proc 3300 :dolt-dir "/elsewhere/"))
+                    (cons "owner-pid" (dorg-test-0zotj--session-claim
+                                       store proc 3300 :owner-pid 999999))
+                    (cons "server-pid" (dorg-test-0zotj--session-claim
+                                        store proc 3300 :server-pid 999999))
+                    (cons "port" (dorg-test-0zotj--session-claim
+                                  store proc 3300 :port 9999))))
+        (let ((killed nil) (released nil) (published nil))
+          (dorg-test-0zotj--call-with-child
+           store proc 3300 (cdr row)
+           (lambda (procs key)
+             (cl-letf (((symbol-function 'process-live-p) (lambda (_p) nil))
+                       ((symbol-function 'dorg-dolt-server--kill-process)
+                        (lambda (_p &optional _g) (setq killed t) nil))
+                       ((symbol-function 'dorg-dolt-server--release-claim)
+                        (lambda (_d) (setq released t) t))
+                       ((symbol-function 'dorg-dolt-server--start-detached-unsafe)
+                        (lambda (_d) (setq published t) 3399)))
+               (let ((err (dorg-test-0zotj--refusal
+                           (lambda () (dorg-dolt-server--ensure-detached store t)))))
+                 (should (eq (car err) 'dorg-sql-transport-conflict)))
+               ;; Zero action, which is the part that matters.
+               (should-not killed)
+               (should-not released)
+               (should-not published)
+               (should (gethash key procs)))))))
+      ;; Token mismatch, with every other field exact.
+      (let ((killed nil))
+        (dorg-test-0zotj--call-with-child
+         store proc 3300 (dorg-test-0zotj--session-claim store proc 3300)
+         (lambda (_procs _key)
+           (cl-letf (((symbol-function 'process-live-p) (lambda (_p) nil))
+                     ((symbol-function 'dorg-dolt-server--kill-process)
+                      (lambda (_p &optional _g) (setq killed t) nil)))
+             (dorg-test-0zotj--refusal
+              (lambda () (dorg-dolt-server--ensure-detached store t)))
+             (should-not killed)))
+         'mismatch)))))
+
+(ert-deftest dorg-test-0zotj-t5-control-exact-claim-authorizes-retirement ()
+  "Control for the authority table: an EXACT claim DOES authorize retirement.
+Without it every row above would pass against an implementation that refuses
+unconditionally."
+  (dorg-test-0zotj--with-store store
+    (let* ((proc (make-symbol "child")) (killed nil))
+      (dorg-test-0zotj--call-with-child
+       store proc 3300 (dorg-test-0zotj--session-claim store proc 3300)
+       (lambda (procs key)
+         (cl-letf (((symbol-function 'process-live-p) (lambda (_p) nil))
+                   ((symbol-function 'dorg-dolt-server--kill-process)
+                    (lambda (_p &optional _g) (setq killed t) nil))
+                   ((symbol-function 'dorg-dolt-server--release-claim) (lambda (_d) t))
+                   ((symbol-function 'dorg-dolt-server--verified-daemon-identity)
+                    (lambda (_d) (list :server-pid 4242 :port 3399 :uuid "u")))
+                   ((symbol-function 'dorg-dolt-server--memo-attached-port)
+                    (lambda (_d port) port))
+                   ((symbol-function 'dorg-dolt-server--start-detached-unsafe)
+                    (lambda (_d) 3399)))
+           (should (equal 3399 (dorg-dolt-server--ensure-detached store t)))
+           (should killed)
+           (should-not (gethash key procs))))))))
+
+(ert-deftest dorg-test-0zotj-t6-explicit-intent-contrast ()
+  "`--ensure-detached' distinguishes implicit from explicit intent.
+Driven DIRECTLY rather than through `--strict-port', which short-circuits on
+its own local branches and would never reach this function in the case under
+test, and from a VALID session claim so the explicit half is not refused for
+want of authority."
+  (dorg-test-0zotj--with-store store
+    (let* ((proc (make-symbol "session-child"))
+           (converted nil))
+      (dorg-test-0zotj--call-with-child
+       store proc 3300 (dorg-test-0zotj--session-claim store proc 3300)
+       (lambda (procs key)
+         (ignore procs key)
+         (cl-letf (((symbol-function 'process-live-p) (lambda (_p) nil))
+                   ((symbol-function 'dorg-dolt-server--kill-process)
+                    (lambda (_p &optional _g) nil))
+                   ((symbol-function 'dorg-dolt-server--release-claim) (lambda (_d) t))
+                   ((symbol-function 'dorg-dolt-server--verified-daemon-identity)
+                    (lambda (_d) (list :server-pid 4242 :port 3399 :uuid "u")))
+                   ((symbol-function 'dorg-dolt-server--memo-attached-port)
+                    (lambda (_d port) port))
+                   ((symbol-function 'dorg-dolt-server--start-detached-unsafe)
+                    (lambda (_d) (setq converted t) 3399)))
+           ;; Implicit: today's behaviour, the child is returned untouched.
+           (should (equal 3300 (dorg-dolt-server--ensure-detached store)))
+           (should-not converted)
+           ;; Explicit: the conversion runs.
+           (should (equal 3399 (dorg-dolt-server--ensure-detached store t)))
+           (should converted)))))))
+
+(ert-deftest dorg-test-0zotj-t7-start-failure-is-reached-and-reported ()
+  "A start that fails signals, and is PROVEN to have been reached.
+
+GREEN at this pin: this property already holds on the existing path, and it is
+asserted through the CURRENT signature for that reason.  A failure raised
+BEFORE the start call would satisfy a naive `should-error' without exercising
+anything, so the stub records that it actually ran."
+  (dorg-test-0zotj--with-store store
+    (let ((reached nil))
+      (cl-letf (((symbol-function 'dorg-dolt--ensure-available) (lambda () t))
+                ((symbol-function 'dorg-dolt-server-port) (lambda (_d) nil))
+                ((symbol-function 'dorg-dolt-server--effective-claim)
+                 (lambda (_d) nil))
+                ((symbol-function 'dorg-dolt-server--start-detached-unsafe)
+                 (lambda (_d) (setq reached t) (error "dolt refused to start"))))
+        (should-error (dorg-dolt-server--ensure-detached store))
+        (should reached)))))
+
+;;;; M1-M7 — the verified return requires the FULL tuple (RED)
+
+
+;;;; Correction shapes for exact child authority and verified return.
+
+(defconst dorg-test-0zotj--child-pid 7777
+  "The pid the harness reports for its fake child process.")
+
+(defun dorg-test-0zotj--session-claim (store proc port &rest overrides)
+  "Return the EXACT session-child claim that authorizes retiring PROC.
+Every field the authority predicate reads is present and correct; OVERRIDES
+mutate exactly one of them so a table can prove each field is load-bearing."
+  (ignore proc)
+  (let ((base (list (cons :owner-kind 'emacs)
+                    (cons :state 'ready)
+                    (cons :host (system-name))
+                    (cons :dolt-dir (dorg-dolt-server--canonical-dir store))
+                    (cons :owner-pid (emacs-pid))
+                    ;; The fake child's pid, matching the harness stub. Calling
+                    ;; `process-id' here would run before the stub is installed,
+                    ;; because this claim is built as an ARGUMENT to the harness.
+                    (cons :server-pid dorg-test-0zotj--child-pid)
+                    (cons :port port)
+                    (cons :uuid "uuid-0zotj"))))
+    (while overrides
+      (setf (alist-get (pop overrides) base) (pop overrides)))
+    base))
+
+(defun dorg-test-0zotj--call-with-child (store proc port claim thunk &optional owned)
+  "Run THUNK with PROC registered for STORE and CLAIM as the RAW lock-held claim.
+OWNED overrides the token predicate.  It is a SYMBOL, not a boolean: passing
+nil for \"token mismatch\" is indistinguishable from omitting the argument, and
+that ambiguity let the token row silently assert nothing.  Pass `mismatch' to
+make the token disagree; anything else means the token agrees, so a table can
+isolate the NON-token fields."
+  (let ((procs (make-hash-table :test 'equal))
+        (key (dorg-dolt-server--canonical-dir store)))
+    (puthash key (cons proc port) procs)
+    (cl-letf (((symbol-function 'dorg-dolt--ensure-available) (lambda () t))
+              ((symbol-function 'process-id)
+               (lambda (_p) dorg-test-0zotj--child-pid))
+              ((symbol-function 'process-buffer) (lambda (_p) nil))
+              (dorg-dolt-server--procs procs)
+              ((symbol-function 'dorg-dolt-server--claim-read) (lambda (_d) claim))
+              ((symbol-function 'dorg-dolt-server--claim-host-local-p)
+               (lambda (c) (equal (alist-get :host c) (system-name))))
+              ((symbol-function 'dorg-dolt-server--claim-owned-here-p)
+               (lambda (_c) (not (eq owned 'mismatch))))
+              ((symbol-function 'dorg-dolt-server--effective-claim) (lambda (_d) nil))
+              ((symbol-function 'dorg-dolt-server-port)
+               (lambda (_d) (when (gethash key procs) port))))
+      (funcall thunk procs key))))
+
+(defun dorg-test-0zotj--call-with-service (store opts thunk)
+  "Run THUNK against an EXISTING HEALTHY detached service for STORE.
+OPTS mutates one field of the durable records or of the liveness/served
+verdicts.  No start primitive is stubbed to succeed here: the point of this
+shape is that an existing service is reused, so any start, break or release is
+itself a failure."
+  (let* ((claim-spec (plist-get opts :claim))
+         (native-spec (plist-get opts :native))
+         ;; Tri-state, not boolean: `absent' means the record is MISSING, which
+         ;; is a different fact from "present with default fields". An earlier
+         ;; revision documented an absent-record case while the harness always
+         ;; constructed both records, so the claim was never exercised.
+         (claim (unless (eq claim-spec 'absent)
+                  (apply #'dorg-test-0zotj--claim store claim-spec)))
+         (native (unless (eq native-spec 'absent)
+                   (apply #'dorg-test-0zotj--native store native-spec)))
+         (live (if (plist-member opts :live) (plist-get opts :live) t))
+         (served (if (plist-member opts :served) (plist-get opts :served) t)))
+    (cl-letf (((symbol-function 'dorg-dolt--ensure-available) (lambda () t))
+              ((symbol-function 'dorg-dolt-server-port) (lambda (_d) nil))
+              ((symbol-function 'dorg-dolt-server--claim-read) (lambda (_d) claim))
+              ((symbol-function 'dorg-dolt-server--dolt-server-info) (lambda (_d) native))
+              ((symbol-function 'dorg-dolt-server--claim-host-local-p)
+               (lambda (c) (equal (alist-get :host c) (system-name))))
+              ((symbol-function 'dorg-dolt-server--port-live-p) (lambda (_p) live))
+              ((symbol-function 'dorg-dolt-server--data-dir-and-db)
+               (lambda (_d) (cons "data" "db")))
+              ((symbol-function 'dorg-dolt-server--expected-binding) (lambda (_d) 'binding))
+              ((symbol-function 'dorg-dolt-server--store-valid-p)
+               (lambda (_p _n _b) served))
+              ;; The existing service is what the lifecycle finds and attaches
+              ;; to.  It is deliberately independent of the DURABLE records
+              ;; above: an absent durable record must still be reached through a
+              ;; live service, otherwise the row would refuse earlier for an
+              ;; unrelated reason and prove nothing about verification.
+              ((symbol-function 'dorg-dolt-server--effective-claim)
+               (lambda (_d) (or claim (dorg-test-0zotj--claim store))))
+              ((symbol-function 'dorg-dolt-server--claim-classify) (lambda (_c &optional _p) 'live))
+              ((symbol-function 'dorg-dolt-server--assert-claim-not-foreign-store)
+               (lambda (_d _c) t))
+              ((symbol-function 'dorg-dolt-server--attach-live)
+               (lambda (_d c &rest _) (alist-get :port c))))
+      (funcall thunk))))
+
+(defun dorg-test-0zotj--refusal (thunk)
+  "Call THUNK and return its error, asserting the error is a real REFUSAL.
+
+`should-error' alone is not enough here.  Before the explicit-intent parameter
+exists, every explicit call signals `wrong-number-of-arguments', which
+satisfies a bare `should-error' and makes the surrounding assertions trivially
+true because the function never ran.  Two of these teeth passed that way on
+their first run — green, and testing nothing.  An arity error is therefore
+rejected explicitly, so the tooth stays RED until a genuine refusal exists."
+  (let ((err (should-error (funcall thunk))))
+    (should-not (eq (car err) 'wrong-number-of-arguments))
+    err))
+
+(ert-deftest dorg-test-0zotj-m-control-healthy-service-verifies ()
+  "Control for the M family: an intact healthy service verifies and is reused.
+Without it every mutation below would pass against a verifier that rejects
+everything it is shown."
+  (dorg-test-0zotj--with-store store
+    (dorg-test-0zotj--call-with-service
+     store nil
+     (lambda ()
+       (cl-letf (((symbol-function 'dorg-dolt-server--memo-attached-port)
+                  (lambda (_d port) port)))
+         (should (equal 3399 (dorg-dolt-server--ensure-detached store t))))))))
+
+(ert-deftest dorg-test-0zotj-m-tuple-mismatches-all-refuse ()
+  "Each identity field mutated independently refuses, with zero side effects.
+
+Driven from an EXISTING HEALTHY SERVICE rather than a clean start: the shape
+that matters is a service already present whose durable records disagree, and a
+clean-start shape would never exercise it.  The rows cover the dolt-native
+pid/port/uuid, an EMPTY uuid (distinct from a mismatch, since a non-empty uuid
+is part of the predicate), the claim's store and host, owner-kind and state
+(an `emacs'-owned or probe-inconclusive claim is an attachment-class tuple and
+must not satisfy a DETACHED return), a dead port, a failed served-store
+verdict, and an absent record on either side."
+  (dorg-test-0zotj--with-store store
+    (dolist (row (list
+                  (cons "M1 native pid"   '(:native (:pid 9999)))
+                  (cons "M2 native port"  '(:native (:port 9999)))
+                  (cons "M3 native uuid"  '(:native (:uuid "other")))
+                  (cons "M4 empty uuid"   '(:claim (:uuid "") :native (:uuid "")))
+                  (cons "M5 claim store"  '(:claim (:dolt-dir "/elsewhere/")))
+                  (cons "M6 claim host"   '(:claim (:host "elsewhere")))
+                  (cons "M7 owner-kind"   '(:claim (:owner-kind emacs)))
+                  (cons "M8 state"        '(:claim (:state probe-inconclusive)))
+                  (cons "M9 dead port"    '(:live nil))
+                  (cons "M10 served-store" '(:served nil))
+                  ;; The absence cases the docstring promised. Each side is
+                  ;; missing in turn while the other is intact.
+                  (cons "M11 claim absent"  '(:claim absent))
+                  (cons "M12 native absent" '(:native absent))))
+      (let ((started nil) (broke nil) (released nil) (memos nil))
+        (dorg-test-0zotj--call-with-service
+         store (cdr row)
+         (lambda ()
+           (cl-letf (((symbol-function 'dorg-dolt-server--start-detached-unsafe)
+                      (lambda (_d) (setq started t) 3399))
+                     ((symbol-function 'dorg-dolt-server--break-claim)
+                      (lambda (_d) (setq broke t) t))
+                     ((symbol-function 'dorg-dolt-server--release-claim)
+                      (lambda (_d) (setq released t) t))
+                     ((symbol-function 'dorg-dolt-server--memo-attached-port)
+                      (lambda (_d port) (push port memos) port)))
+             (dorg-test-0zotj--refusal
+              (lambda () (dorg-dolt-server--ensure-detached store t)))
+             (should-not started)
+             (should-not broke)
+             (should-not released)
+             (should-not memos))))))))
+
+;;; ─── Child server output never stalls the transport ─────────────────────
+
+(defconst dorg-test--failed-statement-count 6
+  "Failed statements issued on one connection by the stall controls.")
+
+(defconst dorg-test--failed-statement-deadline 3.0
+  "Seconds within which each failed statement must be answered.
+Below the client's read-idle timeout, so a stall is a deadline breach.")
+
+(defun dorg-test--logged-failed-statement ()
+  "Return a failing statement carrying 16 KiB of query text.
+Dolt logs each failed statement as one `error running query' line of a few
+hundred bytes (the error, not the query text), so the payload does not grow
+the log.  Those lines plus Dolt's startup output fill an undrained pty by
+the fourth statement; a 64 KiB pipe would take hundreds, so a pipe-only
+spawn is caught instead by the log-content controls
+\(`dorg-test-dolt-server-child-log-truncated-at-start',
+`dorg-test-dolt-fixture-server-writes-its-log')."
+  (format "SELECT nosuch_col, '%s' AS pad FROM dual_absent" (make-string 16384 ?x)))
+
+(defun dorg-test--assert-failed-statements-answered (run-one)
+  "Assert RUN-ONE answers every failed statement promptly with a query error.
+RUN-ONE takes a statement and executes it on one connection."
+  (let ((sql (dorg-test--logged-failed-statement)))
+    (dotimes (i dorg-test--failed-statement-count)
+      (let* ((t0 (float-time))
+             (err (condition-case e (progn (funcall run-one sql) nil) (error e)))
+             (elapsed (- (float-time) t0)))
+        (ert-info ((format "statement %d: %S after %.2fs" i (car err) elapsed))
+          (should (eq (car err) 'mysql-query-error))
+          (should (< elapsed dorg-test--failed-statement-deadline)))))))
+
+(ert-deftest dorg-test-dolt-server-child-answers-repeated-failed-statements ()
+  "An Emacs-spawned child server answers repeated failed statements promptly.
+Its output must never be left for Emacs to drain: the mysql client waits
+on its own socket only, so a child whose logged errors fill an unread pty
+or pipe blocks mid-reply and the client times out."
+  (skip-unless dorg-test--dolt-available)
+  (dorg-test--with-dolt-server-runtime
+    (let* ((store (file-name-as-directory
+                   (dorg-test--make-owned-temp-dir "dorg-child-stall-" "dolt-server-tests")))
+           (conn nil))
+      (unwind-protect
+          (progn
+            (let ((default-directory store))
+              (should (eql 0 (call-process "dolt" nil nil nil "init"
+                                           "--name" "dorg" "--email" "dorg@localhost"))))
+            (let ((port (dorg-dolt-server--start-bootstrap-unsafe store)))
+              (setq conn (mysql-connect
+                          :host "127.0.0.1" :port port :user "root" :password ""
+                          :tls nil :read-idle-timeout 10
+                          :database (cdr (dorg-dolt-server--data-dir-and-db store))))
+              (dorg-test--assert-failed-statements-answered
+               (lambda (sql) (mysql-query conn sql)))))
+        (when conn (ignore-errors (mysql-disconnect conn)))
+        (ignore-errors (dorg-dolt-stop store))
+        (dorg-test--delete-owned-root store)))))
+
+(ert-deftest dorg-test-dolt-fixture-answers-repeated-failed-statements ()
+  "The shared test server answers repeated failed statements promptly.
+The fixture spawns its server exactly as production does, so the same
+undrained-output stall would time out every later statement."
+  (skip-unless dorg-test--dolt-available)
+  (dorg-test--with-temp-db dolt-dir
+    (dorg-test--assert-failed-statements-answered
+     (lambda (sql) (dorg-sql dolt-dir sql)))))
+
+(ert-deftest dorg-test-dolt-fixture-server-writes-its-log ()
+  "The shared test server writes its own output to its log file.
+A failed statement on the fixture's real server shows up in the log the
+fixture chose for it, so the server's output reaches the file and never
+an Emacs pipe that could fill."
+  (skip-unless dorg-test--dolt-available)
+  (skip-unless (and dorg-test--server-data-dir dorg-test--server-port))
+  (dorg-test--with-temp-db dolt-dir
+    (let ((marker (format "dorg_fixture_log_probe_%d" (random 1000000000)))
+          (log (dorg-dolt-fixture--shared-log dorg-test--server-data-dir
+                                              dorg-test--server-port))
+          (found nil))
+      ;; Dolt logs the error message, not the query text, so the marker is
+      ;; the missing table's name.
+      (should-error (dorg-sql dolt-dir (format "SELECT 1 FROM %s" marker)))
+      ;; Dolt writes its log asynchronously; allow a short grace.
+      (let ((deadline (+ (float-time) 3)))
+        (while (and (not found) (< (float-time) deadline))
+          (setq found (and (file-exists-p log)
+                           (with-temp-buffer
+                             (insert-file-contents log)
+                             (search-forward marker nil t))))
+          (unless found (sleep-for 0.1))))
+      (should found))))
+
+(defun dorg-test--kernel-cwd (pid)
+  "Return PID's kernel-reported working directory via lsof, or nil."
+  (with-temp-buffer
+    (when (eql 0 (call-process "lsof" nil t nil "-a" "-p" (number-to-string pid)
+                               "-d" "cwd" "-Fn"))
+      (goto-char (point-min))
+      (when (re-search-forward "^n\\(.+\\)$" nil t)
+        (match-string 1)))))
+
+(ert-deftest dorg-test-dolt-server-child-kernel-identity ()
+  "The logged child is dolt itself to every ownership probe.
+After readiness the spawned process object's pid owns the listening port,
+the kernel reports dolt's own name, the absolute-path argv a direct spawn
+would carry, and the data-dir cwd; both argv classifiers agree and the
+published claim's store verdict is proven from argv.  A wrapper that does
+not exec (sh would own the pid) or a relative argv[0] fails here."
+  (skip-unless dorg-test--dolt-available)
+  (dorg-test--with-dolt-server-runtime
+    (let ((store (file-name-as-directory
+                  (dorg-test--make-owned-temp-dir "dorg-child-identity-" "dolt-server-tests"))))
+      (unwind-protect
+          (progn
+            (let ((default-directory store))
+              (should (eql 0 (call-process "dolt" nil nil nil "init"
+                                           "--name" "dorg" "--email" "dorg@localhost"))))
+            (let* ((port (dorg-dolt-server--start-bootstrap-unsafe store))
+                   (target (dorg-dolt--target store))
+                   (proc (car (gethash (plist-get target :canonical-repo-dir)
+                                       dorg-dolt-server--procs)))
+                   (pid (process-id proc))
+                   (attrs (process-attributes pid))
+                   (canon (dorg-dolt-server--canonical-dir store)))
+              (should (eql pid (dorg-dolt-server--probe-socket-owner port)))
+              (should (equal "dolt" (file-name-nondirectory (cdr (assq 'comm attrs)))))
+              (should (equal (cdr (assq 'args attrs))
+                             (mapconcat #'identity
+                                        (cons (executable-find "dolt")
+                                              (dorg-dolt--target-sql-server-args target port))
+                                        " ")))
+              (should (equal (file-truename (file-name-as-directory (dorg-test--kernel-cwd pid)))
+                             (file-truename (file-name-as-directory
+                                             (plist-get target :server-data-dir)))))
+              (should (dorg-dolt-server--attrs-dolt-sql-server-p attrs))
+              (should (equal canon (dorg-dolt-server--attrs-data-dir attrs)))
+              (let ((verdict (dorg-dolt-server--claim-store-verdict
+                              store (dorg-dolt-server--claim-read store))))
+                (should (eq 'proven (plist-get verdict :evidence)))
+                (should (eq 'argv (plist-get verdict :source))))))
+        (ignore-errors (dorg-dolt-stop store))
+        (dorg-test--delete-owned-root store)))))
+
+(ert-deftest dorg-test-dolt-server-child-log-truncated-at-start ()
+  "Each child start truncates the store's server log.
+A marker left by an earlier server is gone once a new child is ready, and
+the log then holds the new server's own output."
+  (skip-unless dorg-test--dolt-available)
+  (dorg-test--with-dolt-server-runtime
+    (let ((store (file-name-as-directory
+                  (dorg-test--make-owned-temp-dir "dorg-child-log-" "dolt-server-tests"))))
+      (unwind-protect
+          (progn
+            (let ((default-directory store))
+              (should (eql 0 (call-process "dolt" nil nil nil "init"
+                                           "--name" "dorg" "--email" "dorg@localhost"))))
+            (let ((log (expand-file-name
+                        "server.log" (dorg-dolt-server--ensure-dorg-dir store))))
+              (write-region "STALE-PREVIOUS-SERVER-MARKER\n" nil log nil 'silent)
+              (dorg-dolt-server--start-bootstrap-unsafe store)
+              (let ((text (with-temp-buffer (insert-file-contents log) (buffer-string))))
+                (should-not (string-match-p "STALE-PREVIOUS-SERVER-MARKER" text))
+                (should (> (length text) 0)))))
+        (ignore-errors (dorg-dolt-stop store))
+        (dorg-test--delete-owned-root store)))))
 
 (provide 'dorg-dolt-server-tests)
 ;;; dorg-dolt-server-tests.el ends here

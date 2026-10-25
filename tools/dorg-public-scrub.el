@@ -9,6 +9,13 @@
 ;; One dependency-free predicate classifies private coordination metadata in
 ;; public-export bytes.  Both the ERT census and the release gate load this
 ;; file, so they cannot silently drift onto different rules.
+;;
+;; Private means tracker references and bead-shaped slugs, seat identities,
+;; home-directory paths and the internal codename.  The names of the sibling
+;; tools that consume DOrg, and their data directories, are public product
+;; names and are not classified (operator decision, 2026-10-05).  The
+;; home-directory pattern is spelled in two pieces because this file is
+;; itself exported.
 
 ;;; Code:
 
@@ -35,23 +42,16 @@
   `(("tracker reference"
      . ,(dorg-public-scrub--bounded
          (concat "b" "d:[a-z0-9][a-z0-9-]*")))
-    ("tracker brand"
-     . ,(dorg-public-scrub--bounded
-         (concat "\\(?:em" "bead\\|em" "bd\\)")))
-    ("coordination brand"
-     . ,(dorg-public-scrub--bounded (concat "me" "ld")))
     ("agent identity"
      . ,(dorg-public-scrub--bounded
          "\\(?:drv\\|nav\\|Ctl\\)-[[:alnum:]]\\{4,\\}"))
-    ("private path"
-     . ,(regexp-opt
-         (list (concat "/Us" "ers/")
-               (concat ".me" "ld/")
-               (concat ".em" "bead/"))))
+    ("private path" . ,(regexp-quote (concat "/Us" "ers/")))
     ("internal codename"
      . ,(dorg-public-scrub--bounded (concat "Amb" "ient")))
     ("bare tracker slug" . ,dorg-public-scrub--bare-slug-regexp))
-  "Named private-token classes forbidden in public-export bytes.")
+  "Named private-token classes forbidden in public-export bytes.
+Tool names and their data directories are deliberately absent: they are public
+product names (operator decision, 2026-10-05).")
 
 (defconst dorg-public-scrub-bare-slug-allowlist
   '(("dorg-api.elc" . "Public compiled-library filename used in a fixture.")
@@ -71,7 +71,8 @@
     ("dorg-scope" . "Public fixture name for a DOrg operation scope.")
     ("dorg-sync" . "Public conceptual name for DOrg synchronization behavior.")
     ("dorg-test" . "Public test fixture and scratch namespace.")
-    ("dorg-test.org" . "Public fixture document filename."))
+    ("dorg-test.org" . "Public fixture document filename.")
+    ("dorg-write.lock" . "Stable local writer-lock filename stem."))
   "Exact public tokens exempt from tracker-shaped bare-slug classification.
 Every entry is (TOKEN . RATIONALE); prefix, suffix, and regexp exemptions are
 deliberately unsupported.")

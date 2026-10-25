@@ -36,6 +36,57 @@ Restores the original registry after BODY."
 
 ;;; Unit Tests — Extension Registry
 
+(ert-deftest dorg-test-ext-query-fields-share-extension-registration ()
+  "Namespaced query fields belong to the extension, including replacement."
+  (dorg-test-with-clean-extensions
+    (let ((field (list :name 'demo/holder :type 'identity :cardinality 'one
+                       :dependencies '((property "HOLDER"))
+                       :context '(:pause-states)
+                       :eval #'ignore :sql #'ignore)))
+      (dorg-register-extension 'demo :schema "SELECT 1" :version 1
+                               :fields (list field) :query-context #'ignore)
+      (should (equal (plist-get (dorg-ext-query-field 'demo/holder) :type)
+                     'identity))
+      (should (eq (plist-get (dorg-ext-query-field 'demo/holder) :extension) 'demo))
+      (should-not (dorg-ext-query-field 'other/holder))
+      (dorg-register-extension 'demo :schema "SELECT 1" :version 1)
+      (should-not (dorg-ext-query-field 'demo/holder)))))
+
+(ert-deftest dorg-test-ext-query-fields-reject-invalid-before-registering ()
+  "Malformed field declarations cannot enter the live registry."
+  (dorg-test-with-clean-extensions
+    (dolist (field '((:name other/holder :type string :cardinality one :eval ignore)
+                     (:name demo/holder :type bogus :cardinality one :eval ignore)
+                     (:name demo/holder :type string :cardinality bogus :eval ignore)
+                     (:name demo/holder :type string :cardinality one)
+                     (:name demo/holder :type string :cardinality one :eval 3)))
+      (should-error (dorg-register-extension 'demo :schema "SELECT 1" :version 1
+                                             :fields (list field)))
+      (should-not (dorg-get-extension 'demo)))))
+
+(ert-deftest dorg-test-ext-query-fields-reject-nonstored-dependencies ()
+  "Field evaluators may depend only on declared stored heading/property values."
+  (dorg-test-with-clean-extensions
+    (should-error
+     (dorg-register-extension
+      'demo :schema "SELECT 1" :version 1
+      :fields (list (list :name 'demo/name :type 'string :cardinality 'one
+                          :dependencies '((field demo/other)) :eval #'ignore))))
+    (should-not (dorg-get-extension 'demo))))
+
+(ert-deftest dorg-test-ext-standalone-loader-requires-conventional-feature ()
+  "DOrg loads a declared extension entry point, never its application layer."
+  (dorg-test-with-clean-extensions
+    (let (required)
+      (cl-letf (((symbol-function 'require)
+                 (lambda (feature &optional _filename _noerror)
+                   (setq required feature)
+                   (when (eq feature 'dorg-extension-demo)
+                     (dorg-register-extension 'demo :schema "SELECT 1" :version 1))
+                   feature)))
+        (should (dorg-extension-p (dorg-load-extension "demo")))
+        (should (eq required 'dorg-extension-demo))))))
+
 (ert-deftest dorg-test-ext-register-basic ()
   "Registering an extension stores it in the registry."
   (dorg-test-with-clean-extensions
@@ -47,6 +98,23 @@ Restores the original registry after BODY."
       (should (eq (dorg-extension-name ext) 'demo))
       (should (equal (dorg-extension-schema ext) "CREATE TABLE demo (id INT);"))
       (should (= (dorg-extension-version ext) 1)))))
+
+(ert-deftest dorg-test-d0hyz-registers-optional-producer-resolver ()
+  "Policy migration producers are descriptor-owned and optional elsewhere."
+  (dorg-test-with-clean-extensions
+    (let ((resolver (lambda (_request) '(:project ignore))))
+      (dorg-register-extension
+       'demo :schema "SELECT 1" :version 1 :producer-resolver resolver)
+      (should (eq resolver
+                  (dorg-extension-producer-resolver (dorg-get-extension 'demo))))
+      ;; Re-registration without the optional seam keeps ordinary extensions
+      ;; free of a policy-upgrade producer contract.
+      (dorg-register-extension 'demo :schema "SELECT 1" :version 1)
+      (should-not (dorg-extension-producer-resolver (dorg-get-extension 'demo)))))
+  (dorg-test-with-clean-extensions
+    (should-error
+     (dorg-register-extension
+      'demo :schema "SELECT 1" :version 1 :producer-resolver 'not-a-function))))
 
 (ert-deftest dorg-test-ext-register-replaces ()
   "Re-registering the same name replaces the entry."
@@ -106,6 +174,89 @@ Restores the original registry after BODY."
     (should (dorg-register-extension 'my-ext :schema "SELECT 1;" :version 1))
     (should (dorg-register-extension 'my_ext2 :schema "SELECT 1;" :version 1))
     (should (dorg-register-extension 'MixedCase :schema "SELECT 1;" :version 1))))
+
+(defconst dorg-test-85e9w--membership-table
+  '(:name "assignment_rows"
+    :key-column "subject_id"
+    :scope-column "subject_id"
+    :memberships
+    ((:name assignee-at
+      :member-key "subject_id"
+      :position-column "ordinal"
+      :value-column "assignee"
+      :bridge-table "subjects"
+      :bridge-key "subject_id"
+      :heading-column "heading_id"
+      :root-column "root_id")))
+  "Valid literal membership descriptor used by registration REDs.")
+
+(ert-deftest dorg-test-85e9w-register-accepts-literal-membership-descriptor ()
+  "A closed literal membership descriptor registers without a callback."
+  (dorg-test-with-clean-extensions
+    (let* ((tables (list dorg-test-85e9w--membership-table
+                         '(:name "subjects"
+                           :key-column "subject_id"
+                           :scope-column "root_id")))
+           (ext (dorg-register-extension
+                 'demo :schema "SELECT 1" :version 1
+                 :read-tables tables)))
+      (should (equal tables (dorg-extension-read-tables ext))))))
+
+(ert-deftest dorg-test-85e9w-register-rejects-unknown-read-descriptor-key ()
+  "A misspelled declaration key refuses at registration, never at query time."
+  (dorg-test-with-clean-extensions
+    (should-error
+     (dorg-register-extension
+      'demo :schema "SELECT 1" :version 1
+      :read-tables
+      (list (append dorg-test-85e9w--membership-table
+                    '(:positon-column "ordinal")))))))
+
+(ert-deftest dorg-test-85e9w-register-rejects-every-unsafe-membership-identifier ()
+  "Every identifier DOrg will splice is validated when the extension registers."
+  (dolist (key '(:member-key :position-column :value-column :bridge-table
+                 :bridge-key :heading-column :root-column))
+    (dorg-test-with-clean-extensions
+      (let* ((table (copy-tree dorg-test-85e9w--membership-table))
+             (memberships (plist-get table :memberships))
+             (membership (copy-sequence (car memberships))))
+        (setq membership (plist-put membership key "bad.name"))
+        (setq table (plist-put table :memberships (list membership)))
+        (should-error
+         (dorg-register-extension
+          'demo :schema "SELECT 1" :version 1
+          :read-tables (list table)))))))
+
+(ert-deftest dorg-test-85e9w-register-rejects-duplicate-membership-name ()
+  "One extension cannot register two ambiguous declarations for one relation."
+  (dorg-test-with-clean-extensions
+    (let* ((first (copy-tree dorg-test-85e9w--membership-table))
+           (second (copy-tree dorg-test-85e9w--membership-table)))
+      (setq second (plist-put second :name "other_assignment_rows"))
+      (should-error
+       (dorg-register-extension
+        'demo :schema "SELECT 1" :version 1
+        :read-tables (list first second))))))
+
+(ert-deftest dorg-test-85e9w-register-rejects-missing-or-duplicate-descriptor-fields ()
+  "Membership SQL facts are complete and single-valued at registration."
+  (dorg-test-with-clean-extensions
+    (let* ((table (copy-tree dorg-test-85e9w--membership-table))
+           (membership (copy-sequence (car (plist-get table :memberships)))))
+      (setq membership
+            (cl-loop for (key value) on membership by #'cddr
+                     unless (eq key :root-column)
+                     append (list key value)))
+      (setq table (plist-put table :memberships (list membership)))
+      (should-error
+       (dorg-register-extension
+        'demo :schema "SELECT 1" :version 1 :read-tables (list table)))))
+  (dorg-test-with-clean-extensions
+    (let ((table (append (copy-tree dorg-test-85e9w--membership-table)
+                         '(:name "duplicate_name"))))
+      (should-error
+       (dorg-register-extension
+        'demo :schema "SELECT 1" :version 1 :read-tables (list table))))))
 
 (ert-deftest dorg-test-ext-unregister ()
   "`dorg-unregister-extension' removes an extension."
@@ -227,13 +378,13 @@ Restores the original registry after BODY."
             (let* ((reg (dorg-bind-dolt org-file dolt-dir))
                    (root-id (dorg-backend-root-id (dorg-registration-backend reg))))
               (should (integerp root-id))
-              ;; Root heading row exists with level=0, parent NULL
+              ;; Root heading row exists with level_offset=0, parent NULL
               (let ((rows (dorg-sql
                            dolt-dir
-                           "SELECT level, parent_id FROM headings WHERE id = %d"
+                           "SELECT level_offset, parent_id FROM headings WHERE id = %d"
                            root-id)))
                 (should (= (length rows) 1))
-                (should (= (alist-get 'level (car rows)) 0))
+                (should (= (alist-get 'level_offset (car rows)) 0))
                 (should (null (alist-get 'parent_id (car rows)))))
               ;; dorg_files row binds a store-relative path → root_id.
               (let ((rows (dorg-sql
@@ -373,7 +524,7 @@ Restores the original registry after BODY."
               (should-not (member "registered_t" tables))))
         (delete-directory temp-base t)))))
 
-;;; Integration Tests — Extension Ensure (install / upgrade)
+;;; Integration Tests — Explicit Extension Migration (install / upgrade)
 
 (defmacro dorg-test-ext--with-core-repo (dolt-var &rest body)
   "Run BODY over a fresh core-only Dolt repo with a clean extension registry.
@@ -399,24 +550,34 @@ DOLT-VAR is bound to the repo path.  Skips when dolt is unavailable."
      'demo
      :schema "CREATE TABLE demo_t (id INT PRIMARY KEY, label TEXT);"
      :version 1)
-    (dorg-repo-ensure-extensions dolt-dir)
+    (dorg-migrate-schema dolt-dir)
     ;; Table created and usable.
     (dorg-sql dolt-dir "INSERT INTO demo_t (id, label) VALUES (1, 'x')")
     (should (= 1 (length (dorg-sql dolt-dir "SELECT id FROM demo_t"))))
     ;; Version recorded without manual SQL.
     (should (equal (dorg-test-ext--db-version dolt-dir "demo") "1"))))
 
-(ert-deftest dorg-test-ext-ensure-noop-when-current ()
-  "Ensure is a no-op when the extension is already at the registered version.
+(ert-deftest dorg-test-ext-migrate-noop-when-current ()
+  "Explicit migration is a no-op when the extension is already current.
 Re-applying the fresh CREATE TABLE schema would error, so survival of
-seeded data proves the schema was not reapplied."
+seeded data proves the schema was not reapplied.  A current store returns
+before the clean-working-set check: no schema step can run, so no reset risk
+exists for unrelated uncommitted data."
   (dorg-test-ext--with-core-repo dolt-dir
     (dorg-register-extension
      'demo :schema "CREATE TABLE demo_t (id INT PRIMARY KEY);" :version 1)
-    (dorg-repo-ensure-extensions dolt-dir)
+    (dorg-migrate-schema dolt-dir)
     (dorg-sql dolt-dir "INSERT INTO demo_t (id) VALUES (42)")
-    ;; Second ensure: version equals registered → no-op, no error.
-    (dorg-repo-ensure-extensions dolt-dir)
+    ;; Second migration: version equals registered, so no-op and no error even
+    ;; with an unrelated dirty row.  It must not apply or commit a schema batch.
+    (let ((batches 0))
+      (cl-letf* ((orig-batch (symbol-function 'dorg-sql--lease-batch))
+                 ((symbol-function 'dorg-sql--lease-batch)
+                  (lambda (&rest args)
+                    (cl-incf batches)
+                    (apply orig-batch args))))
+        (dorg-migrate-schema dolt-dir))
+      (should (= batches 0)))
     (should (equal (dorg-test-ext--db-version dolt-dir "demo") "1"))
     (should (= 42 (alist-get 'id (car (dorg-sql dolt-dir
                                                 "SELECT id FROM demo_t")))))))
@@ -429,7 +590,7 @@ The migration also backfills data to prove data migrations run."
     ;; a clean working set at HEAD, as the real bind/open lifecycle does.
     (dorg-register-extension
      'demo :schema "CREATE TABLE demo_t (id INT PRIMARY KEY);" :version 1)
-    (dorg-repo-ensure-extensions dolt-dir)
+    (dorg-migrate-schema dolt-dir)
     (dorg-sql dolt-dir "INSERT INTO demo_t (id) VALUES (1)")
     (dorg-commit dolt-dir "seed demo row")
     ;; Re-register at v2 with a migration that adds and backfills a column.
@@ -439,19 +600,19 @@ The migration also backfills data to prove data migrations run."
      :version 2
      :migrations '((1 . ("ALTER TABLE demo_t ADD COLUMN label TEXT"
                          "UPDATE demo_t SET label = 'backfilled'"))))
-    (dorg-repo-ensure-extensions dolt-dir)
+    (dorg-migrate-schema dolt-dir)
     (should (equal (dorg-test-ext--db-version dolt-dir "demo") "2"))
     (should (equal (alist-get 'label (car (dorg-sql dolt-dir
                                                     "SELECT label FROM demo_t WHERE id = 1")))
                    "backfilled"))))
 
-(ert-deftest dorg-test-ext-ensure-chains-v1-to-v3 ()
-  "Ensure chains multiple migration steps until the registered version.
+(ert-deftest dorg-test-ext-migrate-chains-v1-to-v3 ()
+  "Explicit migration chains multiple steps until the registered version.
 Includes a function-valued step to exercise the callable contract."
   (dorg-test-ext--with-core-repo dolt-dir
     (dorg-register-extension
      'demo :schema "CREATE TABLE demo_t (id INT PRIMARY KEY);" :version 1)
-    (dorg-repo-ensure-extensions dolt-dir)
+    (dorg-migrate-schema dolt-dir)
     (dorg-register-extension
      'demo
      :schema "CREATE TABLE demo_t (id INT PRIMARY KEY, a TEXT, b TEXT);"
@@ -460,7 +621,7 @@ Includes a function-valued step to exercise the callable contract."
      (list (cons 1 "ALTER TABLE demo_t ADD COLUMN a TEXT")
            ;; Function step: receives the dolt-dir, returns SQL.
            (cons 2 (lambda (_dir) "ALTER TABLE demo_t ADD COLUMN b TEXT"))))
-    (dorg-repo-ensure-extensions dolt-dir)
+    (dorg-migrate-schema dolt-dir)
     (should (equal (dorg-test-ext--db-version dolt-dir "demo") "3"))
     ;; Both columns exist (queries would error otherwise).
     (dorg-sql dolt-dir "SELECT a, b FROM demo_t LIMIT 1")))
@@ -470,11 +631,11 @@ Includes a function-valued step to exercise the callable contract."
   (dorg-test-ext--with-core-repo dolt-dir
     (dorg-register-extension
      'demo :schema "CREATE TABLE demo_t (id INT PRIMARY KEY);" :version 1)
-    (dorg-repo-ensure-extensions dolt-dir)
+    (dorg-migrate-schema dolt-dir)
     ;; Re-register at v2 with no migration step for v1 -> v2.
     (dorg-register-extension
      'demo :schema "CREATE TABLE demo_t (id INT PRIMARY KEY);" :version 2)
-    (should-error (dorg-repo-ensure-extensions dolt-dir) :type 'error)
+    (should-error (dorg-migrate-schema dolt-dir) :type 'error)
     (should (equal (dorg-test-ext--db-version dolt-dir "demo") "1"))))
 
 (ert-deftest dorg-test-ext-ensure-errors-on-future-version ()
@@ -482,16 +643,16 @@ Includes a function-valued step to exercise the callable contract."
   (dorg-test-ext--with-core-repo dolt-dir
     (dorg-register-extension
      'demo :schema "CREATE TABLE demo_t (id INT PRIMARY KEY);" :version 1)
-    (dorg-repo-ensure-extensions dolt-dir)
+    (dorg-migrate-schema dolt-dir)
     ;; Force a future recorded version.
     (dorg-sql dolt-dir
               "UPDATE dorg_meta SET value = '5' WHERE `key` = 'ext:demo:version'")
     (dorg-commit dolt-dir "force future ext version for test")
-    (should-error (dorg-repo-ensure-extensions dolt-dir) :type 'error)
+    (should-error (dorg-migrate-schema dolt-dir) :type 'error)
     (should (equal (dorg-test-ext--db-version dolt-dir "demo") "5"))))
 
-(ert-deftest dorg-test-ext-ensure-leaves-unregistered-metadata ()
-  "Ensure does not touch metadata or tables for unregistered extensions."
+(ert-deftest dorg-test-ext-migrate-leaves-unregistered-metadata ()
+  "Explicit migration does not touch metadata or tables for unregistered extensions."
   (dorg-test-ext--with-core-repo dolt-dir
     ;; Simulate a foreign extension installed by some other tooling.
     (dorg-sql dolt-dir "CREATE TABLE ghost_t (id INT PRIMARY KEY)")
@@ -501,22 +662,21 @@ Includes a function-valued step to exercise the callable contract."
     ;; Only 'demo is registered.
     (dorg-register-extension
      'demo :schema "CREATE TABLE demo_t (id INT PRIMARY KEY);" :version 1)
-    (dorg-repo-ensure-extensions dolt-dir)
+    (dorg-migrate-schema dolt-dir)
     ;; Ghost metadata and table untouched.
     (should (equal (dorg-test-ext--db-version dolt-dir "ghost") "1"))
     (dorg-sql dolt-dir "SELECT id FROM ghost_t LIMIT 1")))
 
-(ert-deftest dorg-test-ext-ensure-schema-runs-extensions ()
-  "`dorg-repo-ensure-schema' runs extension ensure after core migrations.
-This proves the normal bind/open lifecycle installs registered extensions."
+(ert-deftest dorg-test-ext-ensure-schema-refuses-absent-extension ()
+  "`dorg-repo-ensure-schema' refuses an absent extension without installing it."
   (dorg-test-ext--with-core-repo dolt-dir
     (dorg-register-extension
      'demo :schema "CREATE TABLE demo_t (id INT PRIMARY KEY);" :version 1)
-    ;; Lifecycle entry point — core schema already current, so this only
-    ;; exercises the extension ensure path.
-    (dorg-repo-ensure-schema dolt-dir)
-    (should (equal (dorg-test-ext--db-version dolt-dir "demo") "1"))
-    (dorg-sql dolt-dir "SELECT id FROM demo_t LIMIT 1")))
+    (should-error (dorg-repo-ensure-schema dolt-dir)
+                  :type 'dorg-schema-migration-required)
+    (should-not (dorg-test-ext--db-version dolt-dir "demo"))
+    (should-error (dorg-sql dolt-dir "SELECT id FROM demo_t LIMIT 1")
+                  :type 'error)))
 
 (ert-deftest dorg-test-ext-ensure-migration-rolls-back-on-mid-step-failure ()
   "A multi-statement migration that fails partway rolls back atomically.
@@ -526,12 +686,12 @@ the last statement and never runs.  Afterward neither the schema/data
 change nor the recorded version may persist — they share the same
 transaction/rollback path."
   (dorg-test-ext--with-core-repo dolt-dir
-    ;; Install at v1 and seed a committed row.  Committing models the real
-    ;; ensure lifecycle, where migrations run against a working set at HEAD;
+    ;; Install at v1 and seed a committed row.  Committing models the explicit
+    ;; migration lifecycle, where migrations run against a working set at HEAD;
     ;; the failure reset discards working-set drift back to that committed state.
     (dorg-register-extension
      'demo :schema "CREATE TABLE demo_t (id INT PRIMARY KEY);" :version 1)
-    (dorg-repo-ensure-extensions dolt-dir)
+    (dorg-migrate-schema dolt-dir)
     (dorg-sql dolt-dir "INSERT INTO demo_t (id) VALUES (1)")
     (dorg-commit dolt-dir "seed demo row")
     ;; Re-register at v2 with a two-statement migration whose second
@@ -543,7 +703,7 @@ transaction/rollback path."
      :migrations
      '((1 . ("ALTER TABLE demo_t ADD COLUMN label TEXT"
              "INSERT INTO nonexistent_table (x) VALUES (1)"))))
-    (should-error (dorg-repo-ensure-extensions dolt-dir) :type 'error)
+    (should-error (dorg-migrate-schema dolt-dir) :type 'error)
     ;; Version must remain at v1 — the metadata bump never committed.
     (should (equal (dorg-test-ext--db-version dolt-dir "demo") "1"))
     ;; The partial DDL must have rolled back: the column is gone, so the
@@ -554,7 +714,7 @@ transaction/rollback path."
                                                "SELECT id FROM demo_t")))))))
 
 (ert-deftest dorg-test-ext-ensure-rejects-dirty-working-set ()
-  "Extension ensure refuses to run a step on a dirty Dolt working set.
+  "Explicit extension migration refuses to run a step on a dirty Dolt working set.
 The failure path issues `DOLT_RESET --hard', which discards the *entire*
 working set — so without a clean-working-set precondition a failing
 migration could erase unrelated uncommitted work.  A preflight rejects
@@ -564,7 +724,7 @@ intact and the recorded version unadvanced."
     ;; Install demo v1 and commit so the repo starts clean at HEAD.
     (dorg-register-extension
      'demo :schema "CREATE TABLE demo_t (id INT PRIMARY KEY);" :version 1)
-    (dorg-repo-ensure-extensions dolt-dir)
+    (dorg-migrate-schema dolt-dir)
     ;; Pre-existing uncommitted working-set change, unrelated to the migration.
     (dorg-sql dolt-dir "INSERT INTO demo_t (id) VALUES (99)")
     ;; Re-register at v2 with a migration that would fail mid-step — and thus
@@ -576,8 +736,8 @@ intact and the recorded version unadvanced."
      :migrations
      '((1 . ("ALTER TABLE demo_t ADD COLUMN label TEXT"
              "INSERT INTO nonexistent_table (x) VALUES (1)"))))
-    ;; Ensure must reject because the working set is dirty.
-    (should-error (dorg-repo-ensure-extensions dolt-dir) :type 'error)
+    ;; Explicit migration must reject because the working set is dirty.
+    (should-error (dorg-migrate-schema dolt-dir) :type 'error)
     ;; Version unchanged — no migration step ran.
     (should (equal (dorg-test-ext--db-version dolt-dir "demo") "1"))
     ;; Migration DDL never touched the schema.

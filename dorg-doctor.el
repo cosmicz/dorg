@@ -20,6 +20,7 @@
 (require 'cl-lib)
 (require 'dorg-backend)
 (require 'dorg-dolt)
+(require 'dorg-dolt-server)
 (require 'dorg-model)
 (require 'dorg-repo)
 (require 'dorg-registry)
@@ -30,7 +31,7 @@
   "Find root headings with no dorg_files entry in DOLT-DIR."
   (let ((rows (dorg-sql dolt-dir
                 "SELECT h.id FROM headings h \
-WHERE h.id = h.root_id AND h.level = 0 \
+WHERE h.id = h.root_id AND h.level_offset = 0 \
 AND h.id NOT IN (SELECT root_id FROM dorg_files)")))
     (mapcar (lambda (row)
               (let ((id (alist-get 'id row)))
@@ -76,7 +77,7 @@ doctor reports the typed failure and never guesses a repair."
           (concat "SELECT f.root_id AS root_id, "
                   "f.relative_path AS relative_path, h.id AS heading_id, "
                   "h.root_id AS heading_root_id, "
-                  "h.parent_id AS parent_id, h.level AS level "
+                  "h.parent_id AS parent_id, h.level_offset AS level_offset "
                   "FROM dorg_files f LEFT JOIN headings h "
                   "ON h.id = f.root_id ORDER BY f.root_id")))
         findings)
@@ -89,7 +90,7 @@ doctor reports the typed failure and never guesses a repair."
                     (eql root-id (alist-get 'heading_id row))
                     (eql root-id (alist-get 'heading_root_id row))
                     (null (alist-get 'parent_id row))
-                    (zerop (or (alist-get 'level row) -1))))
+                    (zerop (or (alist-get 'level_offset row) -1))))
           (push (list :check "invalid-file-binding"
                       :severity 'error
                       :message (format "dorg_files root %S is not a valid level-0 root"
@@ -109,21 +110,37 @@ doctor reports the typed failure and never guesses a repair."
                    findings)))))))))
 
 (defun dorg-doctor--root-invariants (dolt-dir)
-  "Find root headings violating level=0 / parent_id=NULL in DOLT-DIR."
+  "Find root headings violating level_offset=0 / parent_id=NULL in DOLT-DIR."
   (let ((rows (dorg-sql dolt-dir
-                "SELECT id, level, parent_id FROM headings \
-WHERE id = root_id AND (level != 0 OR parent_id IS NOT NULL)")))
+                "SELECT id, level_offset, parent_id FROM headings \
+WHERE id = root_id AND (level_offset != 0 OR parent_id IS NOT NULL)")))
     (mapcar (lambda (row)
               (let ((id (alist-get 'id row))
-                    (level (alist-get 'level row))
+                    (level (alist-get 'level_offset row))
                     (pid (alist-get 'parent_id row)))
                 (list :check "root-invariant"
                       :severity 'error
-                      :message (format "Root %d: level=%d parent_id=%s (expected 0/NULL)"
+                      :message (format "Root %d: level_offset=%d parent_id=%s (expected 0/NULL)"
                                        id level (if pid (number-to-string pid) "NULL"))
-                      :fix-sql (format "UPDATE headings SET level = 0, parent_id = NULL WHERE id = %d"
+                      :fix-sql (format "UPDATE headings SET level_offset = 0, parent_id = NULL WHERE id = %d"
                                        id))))
             rows)))
+
+(defun dorg-doctor--nonpositive-offsets (dolt-dir)
+  "Find non-root headings whose level offset is not positive in DOLT-DIR.
+Every real heading sits at least one level below its parent; a zero or
+negative offset cannot render as Org and is reported, never repaired."
+  (mapcar (lambda (row)
+            (list :check "nonpositive-level-offset"
+                  :severity 'error
+                  :message (format "Heading %d: level_offset=%s under parent %s (expected > 0)"
+                                   (alist-get 'id row)
+                                   (alist-get 'level_offset row)
+                                   (alist-get 'parent_id row))
+                  :fix-sql nil))
+          (dorg-sql dolt-dir
+                    "SELECT id, level_offset, parent_id FROM headings \
+WHERE parent_id IS NOT NULL AND level_offset <= 0")))
 
 (defun dorg-doctor--dangling-parent (dolt-dir)
   "Find headings whose parent_id references a non-existent heading."
@@ -277,12 +294,38 @@ absence/age is a WARN (optional backend)."
   (append (dorg-doctor--mysql-available nil)
           (dorg-doctor--dolt-available nil)))
 
+(defun dorg-doctor--duplicate-live-owners (dolt-dir)
+  "Report duplicate or indeterminate sql-server owners for DOLT-DIR.
+The census is read-only: doctor neither starts, stops, signals, rewrites nor
+repairs a server.  An indeterminate observation is surfaced as a warning
+rather than a false clean result; one proven holder is normal, while multiple
+holders are an error naming every proven PID."
+  (pcase (dorg-dolt-server--admission-lock-holders dolt-dir)
+    ('unknown
+     (list (list :check "dolt-owner-census-indeterminate"
+                 :severity 'warn
+                 :message (format "Cannot determine live sql-server owners for %s"
+                                  (dorg-dolt-server--canonical-dir dolt-dir))
+                 :fix-sql nil)))
+    (`() nil)
+    (holders
+     (when (> (length holders) 1)
+       (list (list :check "duplicate-dolt-server-owners"
+                   :severity 'error
+                   :message (format "Multiple live sql-server owners hold %s: pid%s %s"
+                                    (dorg-dolt-server--canonical-dir dolt-dir)
+                                    (if (= (length holders) 1) "" "s")
+                                    (mapconcat #'number-to-string holders ", "))
+                   :fix-sql nil))))))
+
 (defconst dorg-doctor--checks
   '(dorg-doctor--mysql-available
+    dorg-doctor--duplicate-live-owners
     dorg-doctor--orphan-roots
     dorg-doctor--invalid-file-bindings
     dorg-doctor--case-duplicate-files
     dorg-doctor--root-invariants
+    dorg-doctor--nonpositive-offsets
     dorg-doctor--dangling-parent
     dorg-doctor--unreachable-headings
     dorg-doctor--dangling-items

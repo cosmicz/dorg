@@ -1152,5 +1152,59 @@ access.  This fails today because status consults Git before any Dolt gate."
                                                    "refs/heads/dorg/sync"))))))
         (delete-directory remote t)))))
 
+
+;;; ─── Maintenance dispatch: the committer dispatches ────────────────────
+
+;; The party that lands a sync-branch commit is the party that launches
+;; maintenance.  This facade is one of two such parties — a standalone DOrg
+;; caller never passes through a consumer, so a consumer-side trigger alone
+;; would never fire for it.
+
+(ert-deftest dorg-test-git-sync-dispatches-maintenance-after-sync-branch-commit ()
+  "A landed sync-branch commit launches exactly one worker, with its SHA."
+  (dorg-git-sync-tests--with-repo top root
+    (let ((calls nil))
+      (cl-letf (((symbol-function 'dorg-git-maintenance-dispatch)
+                 (lambda (&rest args) (push args calls) nil)))
+        (let ((result (dorg-git-sync (dorg-git-sync-tests--config root))))
+          (should (eq :committed (dorg-git-sync-result-status result)))
+          (should (= 1 (length calls)))
+          (pcase-let ((`(,repo ,common ,branch ,commit) (car calls)))
+            ;; REPO is a directory inside this repository (the facade passes
+            ;; the authority file's directory, which git resolves from), and
+            ;; COMMON is that repository's own common git dir.
+            (should (string-prefix-p (file-truename top)
+                                     (file-truename (expand-file-name repo))))
+            (should (file-directory-p common))
+            (should (equal (file-truename common)
+                           (file-truename (dorg-git--common-dir repo))))
+            (should (equal branch (dorg-git-sync-result-branch result)))
+            ;; The SHA the facade captured, not a ref read back later.
+            (should (equal commit (dorg-git-sync-result-commit result)))))))))
+
+(ert-deftest dorg-test-git-sync-does-not-dispatch-maintenance-on-current-branch ()
+  "A successful CURRENT-branch commit is a negative dispatch control."
+  (dorg-git-sync-tests--with-repo top root
+    (ignore top)
+    (let ((calls 0))
+      (cl-letf (((symbol-function 'dorg-git-maintenance-dispatch)
+                 (lambda (&rest _) (cl-incf calls) nil)))
+        (let ((result (dorg-git-sync
+                       (dorg-git-sync-tests--config root :mode :current-branch))))
+          (should (eq :committed (dorg-git-sync-result-status result)))
+          (should (= 0 calls)))))))
+
+(ert-deftest dorg-test-git-sync-does-not-dispatch-maintenance-without-a-commit ()
+  "No commit, no dispatch: a second identical sync has nothing to publish."
+  (dorg-git-sync-tests--with-repo top root
+    (ignore top)
+    (let ((calls 0))
+      (dorg-git-sync (dorg-git-sync-tests--config root))
+      (cl-letf (((symbol-function 'dorg-git-maintenance-dispatch)
+                 (lambda (&rest _) (cl-incf calls) nil)))
+        (let ((result (dorg-git-sync (dorg-git-sync-tests--config root))))
+          (should-not (eq :committed (dorg-git-sync-result-status result)))
+          (should (= 0 calls)))))))
+
 (provide 'dorg-git-sync-tests)
 ;;; dorg-git-sync-tests.el ends here

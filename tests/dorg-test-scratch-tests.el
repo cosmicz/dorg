@@ -14,6 +14,7 @@
 ;;; Code:
 
 (require 'ert)
+(require 'cl-lib)
 (require 'subr-x)
 
 (defconst dorg-test-scratch--project-root
@@ -36,6 +37,27 @@
     (let ((default-directory dorg-test-scratch--project-root)
           (status (apply #'call-process dorg-test-scratch--script nil t nil args)))
       (cons status (buffer-string)))))
+
+(defun dorg-test-scratch--make-dry-run (&rest args)
+  "Expand make ARGS without a parent make's selector state.
+The metadata guards inspect target recipes, not the selector used to run this
+ERT test.  GNU make forwards command-line variables through MAKEFLAGS, so
+clear that inherited state here.  Callers that need a focused expansion pass
+SELECT or SELECTOR explicitly in ARGS."
+  (let ((process-environment
+         (cons "MAKEFLAGS="
+               (cons "MFLAGS="
+                     (cons "MAKEOVERRIDES="
+                           (cl-remove-if
+                            (lambda (entry)
+                              (or (string-prefix-p "MAKEFLAGS=" entry)
+                                  (string-prefix-p "MFLAGS=" entry)
+                                  (string-prefix-p "MAKEOVERRIDES=" entry)
+                                  (string-prefix-p "SEL=" entry)
+                                  (string-prefix-p "SELECT=" entry)
+                                  (string-prefix-p "SELECTOR=" entry)))
+                            process-environment))))))
+    (apply #'call-process "make" nil t nil "--no-print-directory" "-n" args)))
 
 (defun dorg-test-scratch--write-marker
     (candidate namespace owner-pid created-at &optional recorded-root body)
@@ -258,16 +280,50 @@ strict fields.  When BODY is non-nil, write it verbatim instead."
 
 (ert-deftest dorg-test-scratch-make-test-targets-use-runner ()
   "Every supported DOrg test target expands through the scratch runner."
-  (dolist (target '("test" "test-fast" "test-medium" "perf" "bench"))
+  (dolist (target '("test" "test-full" "test-fast" "test-medium" "perf" "bench"))
     (with-temp-buffer
       (let ((default-directory dorg-test-scratch--project-root)
-            (status (call-process "make" nil t nil "--no-print-directory"
-                                  "-n" target)))
+            (status (dorg-test-scratch--make-dry-run target)))
         (should (equal 0 status))
         (should (string-match-p
                  "tools/test-scratch run dorg --" (buffer-string)))
         (should (string-match-p
                  "dorg-tests-runner" (buffer-string)))))))
+
+(ert-deftest dorg-test-scratch-make-targets-pin-benchmark-environment ()
+  "Defaults clear DORG_BENCH; explicit focused runs retain its opt-in.
+An inherited DORG_BENCH cannot perturb representative/fast/medium timing, but
+an explicit SELECT/SELECTOR or the dedicated perf target remains able to run a
+benchmark when the caller deliberately sets it."
+  (dolist (target '("test" "test-fast" "test-medium" "test-derived" "bench"))
+    (with-temp-buffer
+      (let ((default-directory dorg-test-scratch--project-root))
+        (should (equal 0 (dorg-test-scratch--make-dry-run target)))
+        (should (string-match-p "env -u DORG_BENCH" (buffer-string))))))
+  (dolist (args '(("test" "SELECT=^dorg-test-mutate-dolt-bench-")
+                  ("test" "SELECTOR=^dorg-test-mutate-dolt-bench-")
+                  ("bench" "SELECT=^dorg-test-mutate-dolt-bench-")
+                  ("perf")))
+    (with-temp-buffer
+      (let ((default-directory dorg-test-scratch--project-root))
+        (should (equal 0 (apply #'dorg-test-scratch--make-dry-run args)))
+        (should-not (string-match-p "env -u DORG_BENCH" (buffer-string))))))
+  (with-temp-buffer
+    (let ((default-directory dorg-test-scratch--project-root))
+      (should (equal 0 (dorg-test-scratch--make-dry-run "test-full")))
+      (should (string-match-p "DORG_BENCH=1" (buffer-string)))
+      (should-not (string-match-p "env -u DORG_BENCH" (buffer-string))))))
+
+(ert-deftest dorg-test-scratch-make-dry-runs-ignore-parent-selector ()
+  "Recipe guards do not inherit a selector from their parent make process."
+  (let ((process-environment
+         (cons "MAKEFLAGS= -- SELECT=^dorg-test-scratch-make-targets"
+               (cons "MFLAGS= -- SELECT=^dorg-test-scratch-make-targets"
+                     process-environment))))
+    (with-temp-buffer
+      (let ((default-directory dorg-test-scratch--project-root))
+        (should (equal 0 (dorg-test-scratch--make-dry-run "test")))
+        (should (string-match-p "env -u DORG_BENCH" (buffer-string)))))))
 
 (ert-deftest dorg-test-scratch-sweep-refuses-unsafe-scan-roots ()
   "Relative, missing, symlinked, filesystem-root, and home targets are refused."

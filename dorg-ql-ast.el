@@ -39,6 +39,7 @@
 ;;
 ;;   (pipe STEP...)          STEP = (where P) | (traverse REL...) | (unique)
 ;;   (where PREDICATE)       (traverse RELATION...)        (unique)
+;;   (rank-bm25 QUERY :profile PROFILE :top-k K)
 ;;   (and P...) (or P...) (not P)
 ;;   (field FIELD OP VALUE)  (property KEY OP VALUE)
 ;;   (tag OP VALUE)          (id OP VALUE)
@@ -53,6 +54,7 @@
 ;; where each subsequent STEP is one of, in order:
 ;;
 ;;   (:filter EXPR)          (:traverse REL...)            (:unique)
+;;   (:rank-bm25 QUERY :profile PROFILE :top-k K)
 ;;
 ;; Steps stay ORDERED (filters and traversals may interleave), which is why
 ;; the pipeline is a flat ordered list rather than the bucketed slot shape
@@ -63,11 +65,14 @@
 ;;
 ;;   (:and EXPR...) (:or EXPR...) (:not EXPR)
 ;;   (:id OP INTEGER)
-;;   (:cmp FIELD OP VALUE)
-;;   (:property KEY OP VALUE)          ; VALUE nil for exists/missing
-;;   (:keyword KEY OP VALUE)           ; VALUE nil for exists/missing
-;;   (:tag OP VALUE)                   ; VALUE nil for exists/missing
+;;   (:cmp FIELD OP VALUE :case MODE)  ; string fields only
+;;   (:property KEY OP VALUE :case MODE); VALUE nil for exists/missing
+;;   (:keyword KEY OP VALUE :case MODE) ; VALUE nil for exists/missing
+;;   (:tag OP VALUE :case MODE)         ; VALUE nil for exists/missing
 ;;   (:timestamp SOURCE REL (START . END))
+;;
+;; The reader form (contains-any EXPR (VALUE...) [:case MODE]) adds no node:
+;; it normalizes to (:or LEAF...) of the corresponding `contains' leaves.
 ;;
 ;; SOURCE is a planning/body/logbook symbol or (:property KEY) / (:property *).
 ;; START and END are `(YEAR MONTH DAY)' date triples or nil (open bound).
@@ -81,6 +86,7 @@
 
 (require 'cl-lib)
 (require 'dorg-ql-core)
+(require 'dorg-ext)
 
 ;;; ─── Vocabularies ─────────────────────────────────────────────────────
 
@@ -133,6 +139,12 @@ those are later slices and currently signal `dorg-ql-error'.")
   '(self parent children ancestors descendants siblings)
   "Tree relations accepted by a `traverse' step.")
 
+(defconst dorg-ql--rank-bm25-profiles '(sensitive insensitive)
+  "Closed lexical profile names accepted by the public BM25 rank step.")
+
+(defconst dorg-ql--rank-bm25-max-top-k 100
+  "Largest bounded result count accepted by the public BM25 rank step.")
+
 ;;; ─── Window-span delegation ───────────────────────────────────────────
 
 ;; Window normalization is owned entirely by `dorg-ql-core' (the
@@ -159,6 +171,31 @@ Malformed windows signal `dorg-ql-error' (never widened to match-all)."
    (t (dorg-ql--window-bound-span window))))
 
 ;;; ─── Operator / value validation ──────────────────────────────────────
+
+(defun dorg-ql--field-operators (field)
+  "Return operators for a stored or registered scalar FIELD."
+  (or (cdr (assq field dorg-ql--field-operators))
+      (when-let ((descriptor (dorg-ext-query-field field)))
+        (when (eq (plist-get descriptor :cardinality) 'one)
+          (pcase (plist-get descriptor :type)
+            ('string dorg-ql--string-operators)
+            ('integer dorg-ql--scalar-operators)
+            ((or 'identity 'boolean 'timestamp) '(= !=)))))))
+
+(defun dorg-ql--normalize-extension-literal (field value)
+  "Validate VALUE against registered FIELD's scalar type."
+  (let ((type (plist-get (dorg-ext-query-field field) :type)))
+    (pcase type
+      ((or 'string 'identity 'timestamp)
+       (unless (stringp value)
+         (dorg-ql--error "field %S requires a string literal" field))
+       value)
+      ('integer (dorg-ql--normalize-id value))
+      ('boolean
+       (unless (memq value '(nil t :json-false))
+         (dorg-ql--error "field %S requires a boolean literal" field))
+       (if value value :json-false))
+      (_ (dorg-ql--error "unknown field %S" field)))))
 
 (defun dorg-ql--check-operator (op allowed kind)
   "Signal `dorg-ql-error' unless OP is in ALLOWED for predicate KIND."
@@ -188,32 +225,80 @@ their value type.  Signals `dorg-ql-error' on a type mismatch."
      (unless (stringp value)
        (dorg-ql--error "field %s value must be a string: %S" field value))
      value)
-    (_ (dorg-ql--error "unknown field `%S'; expected one of %S"
-                       field (mapcar #'car dorg-ql--field-operators)))))
+    (_ (dorg-ql--normalize-extension-literal field value))))
+
+(defun dorg-ql--string-field-p (field)
+  "Non-nil when FIELD is a scalar field eligible for literal case mode."
+  (or (memq field '(title todo))
+      (eq (plist-get (dorg-ql--query-field field) :type) 'string)))
+
+(defun dorg-ql--parse-case-option (tail query)
+  "Parse the exact optional `:case MODE' TAIL for QUERY.
+Return `(MODE . EXPLICITP)'.  The public option is deliberately a single,
+trailing pair so duplicate, unknown, and misplaced reader tokens fail before
+any source dispatch."
+  (pcase tail
+    ('() (cons 'sensitive nil))
+    (`(:case ,(and mode (or 'sensitive 'insensitive))) (cons mode t))
+    (`(:case ,mode)
+     (dorg-ql--error "case mode must be sensitive or insensitive: %S" mode))
+    (_ (dorg-ql--error
+        "string comparison accepts at most one trailing :case MODE pair: %S"
+        query))))
+
+(defun dorg-ql--validate-insensitive-literal (value)
+  "Refuse a non-Unicode/raw-byte insensitive literal VALUE before source work."
+  (unless (and (stringp value)
+               (cl-every (lambda (char)
+                           (and (<= 0 char #x10ffff)
+                                (not (<= #xd800 char #xdfff))
+                                (or (multibyte-string-p value) (<= char #x7f))))
+                         (string-to-list value)))
+    (dorg-ql--unsupported
+     "case-insensitive literal contains a non-Unicode/raw-byte character"))
+  value)
+
+(defun dorg-ql--string-leaf (prefix op value mode)
+  "Build one canonical string leaf with PREFIX.
+PREFIX is the non-case leaf prefix; every string leaf stores MODE exactly once."
+  (when (eq mode 'insensitive)
+    (dorg-ql--validate-insensitive-literal value))
+  (append prefix (list op value :case mode)))
 
 ;;; ─── Predicate normalization ──────────────────────────────────────────
 
-(defun dorg-ql--normalize-field-comparison (field op value _query)
+(defun dorg-ql--normalize-field-comparison
+    (field op value query &optional mode explicit-case-p)
   "Normalize FIELD OP VALUE into a field AST node.
 _QUERY is accepted for normalizer signature parity and is unused.
 A `field id' folds into the dedicated `(:id OP INTEGER)' identity node."
-  (let ((allowed (cdr (assq field dorg-ql--field-operators))))
+  (let ((allowed (dorg-ql--field-operators field)))
     (unless allowed
       (dorg-ql--error "unknown field `%S'; expected one of %S"
                       field (mapcar #'car dorg-ql--field-operators)))
     (dorg-ql--check-operator op allowed (format "field %s" field))
     (let ((nval (dorg-ql--normalize-field-value field value)))
-      (if (eq field 'id)
-          (list :id op nval)
-        (list :cmp field op nval)))))
+      (cond
+       ((eq field 'id)
+        (when explicit-case-p
+          (dorg-ql--error ":case is not supported for identity field: %S" query))
+        (list :id op nval))
+       ((dorg-ql--string-field-p field)
+        (dorg-ql--string-leaf (list :cmp field) op nval (or mode 'sensitive)))
+       (explicit-case-p
+        (dorg-ql--error ":case is not supported for field %S: %S" field query))
+       (t (list :cmp field op nval))))))
 
 (defun dorg-ql--normalize-field (args query)
   "Normalize a `(field FIELD VALUE)' equality atom into an AST node.
 QUERY is the original form for error messages.  A `field id' folds into
 the dedicated `(:id OP INTEGER)' identity node."
-  (unless (= (length args) 2)
+  (unless (>= (length args) 2)
     (dorg-ql--error "(field FIELD VALUE) takes two arguments: %S" query))
-  (dorg-ql--normalize-field-comparison (nth 0 args) '= (nth 1 args) query))
+  (pcase-let* ((`(,mode . ,explicit-case-p)
+                (dorg-ql--parse-case-option (nthcdr 2 args) query)))
+    (dorg-ql--normalize-field-comparison
+     (nth 0 args) '= (nth 1 args) query mode explicit-case-p)))
 
 (defun dorg-ql--normalize-id-form (args query)
   "Normalize the `id' predicate ARGS into a `(:id OP INTEGER)' node.
@@ -232,22 +317,20 @@ Accepts only the `(property KEY VALUE)' equality atom in predicate position."
   (let ((key (car args)))
     (unless (stringp key)
       (dorg-ql--error "property KEY must be a string: %S" query))
-    (pcase (cdr args)
-      ((and `(,value) (guard (stringp value)))
-       (list :property key '= value))
-      (_ (dorg-ql--error
-          "property form must be (property KEY VALUE): %S"
-          query)))))
+    (let ((value (nth 1 args)))
+      (unless (stringp value)
+        (dorg-ql--error "property form must be (property KEY VALUE): %S" query))
+      (pcase-let ((`(,mode . ,_) (dorg-ql--parse-case-option (nthcdr 2 args) query)))
+        (dorg-ql--string-leaf (list :property key) '= value mode)))))
 
 (defun dorg-ql--normalize-tag-form (args query)
   "Normalize the `tag' predicate ARGS into a `(:tag OP VALUE)' node.
 Accepts only the `(tag TAG)' membership atom in predicate position."
-  (pcase args
-    ((and `(,tag) (guard (stringp tag)))
-     (list :tag '= tag))
-    (_ (dorg-ql--error
-        "tag form must be (tag TAG): %S"
-        query))))
+  (let ((tag (car args)))
+    (unless (stringp tag)
+      (dorg-ql--error "tag form must be (tag TAG): %S" query))
+    (pcase-let ((`(,mode . ,_) (dorg-ql--parse-case-option (cdr args) query)))
+      (dorg-ql--string-leaf (list :tag) '= tag mode))))
 
 (defun dorg-ql--normalize-keyword-form (args query)
   "Normalize a keyword predicate ARGS into a `(:keyword KEY OP VALUE)' node."
@@ -256,11 +339,12 @@ Accepts only the `(tag TAG)' membership atom in predicate position."
       (dorg-ql--error "keyword KEY must be a string: %S" query))
     (pcase (cdr args)
       ('() (list :keyword key 'exists nil))
-      ((and `(,value) (guard (stringp value)))
-       (list :keyword key '= value))
-      (_ (dorg-ql--error
-          "keyword form must be (keyword KEY) or (keyword KEY VALUE): %S"
-          query)))))
+      (`(,value . ,tail)
+       (unless (stringp value)
+         (dorg-ql--error
+          "keyword form must be (keyword KEY) or (keyword KEY VALUE): %S" query))
+       (pcase-let ((`(,mode . ,_) (dorg-ql--parse-case-option tail query)))
+         (dorg-ql--string-leaf (list :keyword key) '= value mode))))))
 
 (defun dorg-ql--normalize-operator-expr (expr query)
   "Normalize prefix-operator operand EXPR from QUERY into an operand plist."
@@ -272,7 +356,8 @@ Accepts only the `(tag TAG)' membership atom in predicate position."
      (unless (= (length (cdr expr)) 1)
        (dorg-ql--error "(field FIELD) is the operator operand form: %S" query))
      (let ((field (cadr expr)))
-       (unless (assq field dorg-ql--field-operators)
+       (unless (or (assq field dorg-ql--field-operators)
+                   (dorg-ext-query-field field))
          (dorg-ql--error "unknown field `%S'; expected one of %S"
                          field (mapcar #'car dorg-ql--field-operators)))
        (list :field field)))
@@ -295,28 +380,54 @@ Accepts only the `(tag TAG)' membership atom in predicate position."
 
 (defun dorg-ql--normalize-prefix-operator (op args query)
   "Normalize `(OP EXPR VALUE)' from QUERY into an AST leaf."
-  (unless (= (length args) 2)
+  (unless (>= (length args) 2)
     (dorg-ql--error "(%s EXPR VALUE) takes two arguments: %S" op query))
   (let ((target (dorg-ql--normalize-operator-expr (nth 0 args) query))
-        (value (nth 1 args)))
+        (value (nth 1 args))
+        (case-option (dorg-ql--parse-case-option (nthcdr 2 args) query)))
     (pcase target
       (`(:field ,field)
-       (dorg-ql--normalize-field-comparison field op value query))
+       (dorg-ql--normalize-field-comparison
+        field op value query (car case-option) (cdr case-option)))
       (`(:property ,key)
        (dorg-ql--check-operator op dorg-ql--property-operators "property")
        (unless (stringp value)
          (dorg-ql--error "property VALUE must be a string: %S" value))
-       (list :property key op value))
+       (dorg-ql--string-leaf (list :property key) op value
+                             (car case-option)))
       (`(:keyword ,key)
        (dorg-ql--check-operator op dorg-ql--keyword-operators "keyword")
        (unless (stringp value)
          (dorg-ql--error "keyword VALUE must be a string: %S" value))
-       (list :keyword key op value))
+       (dorg-ql--string-leaf (list :keyword key) op value
+                             (car case-option)))
       ('(:tag)
        (dorg-ql--check-operator op dorg-ql--tag-operators "tag")
        (unless (stringp value)
          (dorg-ql--error "tag VALUE must be a string: %S" value))
-       (list :tag op value)))))
+       (dorg-ql--string-leaf (list :tag) op value
+                             (car case-option))))))
+
+(defun dorg-ql--normalize-contains-any (args query)
+  "Normalize `(contains-any EXPR (VALUE...) [:case MODE])' from QUERY.
+ARGS are the form's arguments.  This is reader sugar only: the result is
+exactly the `:or' of the `(contains EXPR VALUE [:case MODE])' leaves, in
+needle order with duplicates kept, so every operand, value check and case
+default is the plain `contains' one.  An empty needle list is refused like
+an empty `(or)'."
+  (unless (>= (length args) 2)
+    (dorg-ql--error "(contains-any EXPR (VALUE...)) takes two arguments: %S" query))
+  (let ((needles (nth 1 args)))
+    (unless (proper-list-p needles)
+      (dorg-ql--error "contains-any VALUES must be a list of strings: %S" query))
+    (when (null needles)
+      (dorg-ql--error "(contains-any EXPR (VALUE...)) requires at least one value"))
+    (cons :or
+          (mapcar (lambda (needle)
+                    (dorg-ql--normalize-prefix-operator
+                     'contains (append (list (nth 0 args) needle) (nthcdr 2 args))
+                     query))
+                  needles))))
 
 (defun dorg-ql--normalize-existence-operator (op args query)
   "Normalize `(exists EXPR)' or `(missing EXPR)' from QUERY into an AST leaf."
@@ -353,6 +464,29 @@ Accepts only the `(tag TAG)' membership atom in predicate position."
                                       dorg-ql--timestamp-relations "timestamp"))
         (span (dorg-ql--ast-normalize-window (nth 2 args))))
     (list :timestamp source rel span)))
+
+(defun dorg-ql--normalize-extension-member-form (args query)
+  "Normalize extension membership ARGS for QUERY into one typed leaf."
+  (unless (= (length args) 4)
+    (dorg-ql--error
+     "(extension-member EXTENSION RELATION ORDINAL VALUES) takes four arguments: %S"
+     query))
+  (let ((extension (nth 0 args))
+        (relation (nth 1 args))
+        (ordinal (nth 2 args))
+        (values (nth 3 args)))
+    (unless (symbolp extension)
+      (dorg-ql--error "extension-member EXTENSION must be a symbol: %S" query))
+    (unless (symbolp relation)
+      (dorg-ql--error "extension-member RELATION must be a symbol: %S" query))
+    (unless (and (integerp ordinal) (> ordinal 0))
+      (dorg-ql--error "extension-member ORDINAL must be a positive integer: %S"
+                      query))
+    (unless (and (consp values) (proper-list-p values)
+                 (cl-every #'stringp values))
+      (dorg-ql--error
+       "extension-member VALUES must be a nonempty string list: %S" query))
+    (list :extension-member extension relation ordinal values)))
 
 (defun dorg-ql--normalize-ts-alias (source head spec query)
   "Lower a timestamp alias to a `(:timestamp SOURCE :overlaps (START . END))' node.
@@ -424,15 +558,19 @@ and signal `dorg-ql-error' in predicate position."
       ('keyword   (dorg-ql--normalize-keyword-form args query))
       ('tag       (dorg-ql--normalize-tag-form args query))
       ('timestamp (dorg-ql--normalize-timestamp-form args query))
+      ('extension-member
+       (dorg-ql--normalize-extension-member-form args query))
       ((guard (memq head dorg-ql--prefix-operators))
        (dorg-ql--normalize-prefix-operator head args query))
+      ('contains-any (dorg-ql--normalize-contains-any args query))
       ((or 'exists 'missing)
        (dorg-ql--normalize-existence-operator head args query))
       ;; Atomic alias: title.
       ('title
-       (unless (and (= (length args) 1) (stringp (car args)))
+       (unless (and (>= (length args) 1) (stringp (car args)))
          (dorg-ql--error "(title TITLE) takes one string argument: %S" query))
-       (list :cmp 'title '= (car args)))
+       (pcase-let ((`(,mode . ,_) (dorg-ql--parse-case-option (cdr args) query)))
+         (dorg-ql--string-leaf (list :cmp 'title) '= (car args) mode)))
       ;; Pipeline steps are not predicates.
       ((or 'pipe 'where 'traverse 'unique)
        (dorg-ql--error
@@ -458,9 +596,87 @@ and signal `dorg-ql-error' in predicate position."
 
 ;;; ─── Pipeline step normalization ──────────────────────────────────────
 
+(defun dorg-ql--normalize-value (expr)
+  "Normalize a projection value EXPR, validating its field reference."
+  (pcase expr
+    (`(field ,name)
+     (unless (or (assq name dorg-ql--field-operators)
+                 (dorg-ext-query-field name))
+       (dorg-ql--error "unknown projection field: %S" name))
+     (list :field name))
+    (`(property ,(and key (pred stringp))) (list :property key))
+    (_ (dorg-ql--error "invalid projection expression: %S" expr))))
+
+(defun dorg-ql--normalize-select (args)
+  "Normalize projection ARGS into named expression columns."
+  (unless args
+    (dorg-ql--error "(select EXPR...) needs at least one expression"))
+  (let (names columns)
+    (dolist (arg args)
+      (unless (and (consp arg) (proper-list-p arg))
+        (dorg-ql--error "invalid projection expression: %S" arg))
+      (let* ((alias (and (eq (car-safe arg) 'as)
+                         (progn
+                           (unless (= (length arg) 3)
+                             (dorg-ql--error "expected (as EXPR NAME): %S" arg))
+                           (nth 2 arg))))
+             (expr (dorg-ql--normalize-value
+                    (if (eq (car-safe arg) 'as) (nth 1 arg) arg)))
+             (name (if (eq (car arg) 'as) alias (nth 1 expr))))
+        (when (and name (symbolp name) (not (keywordp name)))
+          (setq name (symbol-name name)))
+        (unless (and (stringp name) (> (length name) 0))
+          (dorg-ql--error "projection name must be a nonempty name: %S" arg))
+        (when (member name names)
+          (dorg-ql--error "duplicate projection name: %s" name))
+        (push name names)
+        (push (list :column name expr) columns)))
+    (cons :select (nreverse columns))))
+
+(defun dorg-ql--normalize-rank-bm25 (args step)
+  "Normalize one terminal `(rank-bm25 QUERY ...)' STEP.
+
+The rank form is intentionally a pipeline operation, not a predicate or
+projection.  Its option order is canonicalized in the returned AST, while
+duplicate, unknown, absent, or malformed options fail before any backend
+selection or source read."
+  (unless (and (consp args) (stringp (car args))
+               (not (string-empty-p (car args))))
+    (dorg-ql--error
+     "(rank-bm25 QUERY :profile PROFILE :top-k K) requires a nonempty string QUERY: %S"
+     step))
+  (let ((query (car args))
+        (options (cdr args))
+        profile top-k seen)
+    (unless (and (proper-list-p options) (cl-evenp (length options)))
+      (dorg-ql--error "rank-bm25 options must be complete key/value pairs: %S" step))
+    (while options
+      (let ((key (pop options))
+            (value (pop options)))
+        (unless (memq key '(:profile :top-k))
+          (dorg-ql--error "rank-bm25 has unknown option %S: %S" key step))
+        (when (memq key seen)
+          (dorg-ql--error "rank-bm25 repeats option %S: %S" key step))
+        (push key seen)
+        (pcase key
+          (:profile (setq profile value))
+          (:top-k (setq top-k value)))))
+    (unless (memq :profile seen)
+      (dorg-ql--error "rank-bm25 requires :profile: %S" step))
+    (unless (memq :top-k seen)
+      (dorg-ql--error "rank-bm25 requires :top-k: %S" step))
+    (unless (memq profile dorg-ql--rank-bm25-profiles)
+      (dorg-ql--error "rank-bm25 profile must be one of %S: %S"
+                      dorg-ql--rank-bm25-profiles step))
+    (unless (and (integerp top-k) (<= 1 top-k dorg-ql--rank-bm25-max-top-k))
+      (dorg-ql--error "rank-bm25 :top-k must be an integer in 1..%d: %S"
+                      dorg-ql--rank-bm25-max-top-k step))
+    (list :rank-bm25 query :profile profile :top-k top-k)))
+
 (defun dorg-ql--normalize-step (step)
   "Normalize one pipeline STEP into its AST form.
-A step is `(where PREDICATE)', `(traverse RELATION...)', or `(unique)'."
+A step is `(where PREDICATE)', `(traverse RELATION...)', `(unique)',
+`(rank-bm25 QUERY :profile PROFILE :top-k K)', or `(select EXPR...)'."
   (unless (and (consp step) (symbolp (car step)))
     (dorg-ql--error "pipeline step must be a list form: %S" step))
   (let ((head (car step))
@@ -484,9 +700,37 @@ A step is `(where PREDICATE)', `(traverse RELATION...)', or `(unique)'."
        (unless (null args)
          (dorg-ql--error "(unique) takes no arguments: %S" step))
        (list :unique))
+      ('rank-bm25 (dorg-ql--normalize-rank-bm25 args step))
+      ('select (dorg-ql--normalize-select args))
       (_ (dorg-ql--error
-          "unknown pipeline step `%S'; expected where, traverse, or unique: %S"
+          "unknown pipeline step `%S'; expected where, traverse, unique, rank-bm25, or select: %S"
           head step)))))
+
+(defun dorg-ql--validate-rank-bm25-placement (normalized query)
+  "Reject rank placement that would change its filter/top-k meaning.
+
+Rank owns ordering and bounding.  It may follow zero or more filters and may
+be followed only by the final projection; traversal and uniqueness are not
+defined for a ranked result and are refused rather than silently reordered."
+  (let ((rank-positions
+         (cl-loop for step in normalized
+                  for position from 0
+                  when (eq (car-safe step) :rank-bm25)
+                  collect position)))
+    (when (> (length rank-positions) 1)
+      (dorg-ql--error "rank-bm25 may occur only once: %S" query))
+    (when rank-positions
+      (let* ((position (car rank-positions))
+             (before (cl-subseq normalized 0 position))
+             (after (nthcdr (1+ position) normalized)))
+        (when (cl-some (lambda (step) (memq (car-safe step) '(:traverse :unique)))
+                       normalized)
+          (dorg-ql--error "rank-bm25 cannot compose with traverse or unique: %S" query))
+        (unless (cl-every (lambda (step) (eq (car-safe step) :filter)) before)
+          (dorg-ql--error "only where steps may precede rank-bm25: %S" query))
+        (unless (or (null after)
+                    (and (= (length after) 1) (eq (car-safe (car after)) :select)))
+          (dorg-ql--error "rank-bm25 is terminal except for one final select: %S" query))))))
 
 ;;; ─── Public entry point ───────────────────────────────────────────────
 
@@ -513,9 +757,11 @@ operators, or predicates, and malformed reader forms signal
                          query))
        (when (null steps)
          (dorg-ql--error "(pipe STEP...) requires at least one step: %S" query))
-       (cons :pipe
-             (cons '(:source :all)
-                   (mapcar #'dorg-ql--normalize-step steps)))))
+       (let ((normalized (mapcar #'dorg-ql--normalize-step steps)))
+         (when (cl-find :select (butlast normalized) :key #'car)
+           (dorg-ql--error "select must be the final pipeline step: %S" query))
+         (dorg-ql--validate-rank-bm25-placement normalized query)
+         (cons :pipe (cons '(:source :all) normalized)))))
     ('one
      ;; `(one QUERY)' — the public cardinality WRAPPER (docs/mutate.org,
      ;; docs/api.org "Grammar resolution").  Normalize the inner query and
@@ -524,8 +770,15 @@ operators, or predicates, and malformed reader forms signal
      (let ((args (cdr query)))
        (unless (and (proper-list-p args) (= (length args) 1))
          (dorg-ql--error "(one QUERY) takes exactly one query: %S" query))
-       (append (dorg-ql-normalize (car args)) (list '(:one)))))
-    ((or 'where 'traverse 'unique)
+       (let* ((inner (dorg-ql-normalize (car args)))
+              (columns (dorg-ql--projection-columns inner)))
+         (when (cl-find-if (lambda (step) (eq (car-safe step) :rank-bm25))
+                           inner)
+           (dorg-ql--error "(one QUERY) cannot wrap a terminal rank-bm25 query: %S"
+                           query))
+         (append (dorg-ql--selection-ast inner) (list '(:one))
+                 (and columns (list (cons :select columns)))))))
+    ((or 'where 'traverse 'unique 'rank-bm25 'select)
      (dorg-ql--error
       "`%s' is a pipeline step; wrap it in (pipe ...) at top level: %S"
       (car query) query))

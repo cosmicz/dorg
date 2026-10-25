@@ -1,8 +1,8 @@
 #+title: DOrg Backend & Extension Contracts
 
 #+begin_quote
-*DOrg 0.1.0 contracts.*  This document describes the first public backend and
-extension surface.
+*Current backend and extension contracts.*  These contracts describe
+storage capabilities, derived data and explicit schema upgrades.
 #+end_quote
 
 This document is the detailed reference for two related contracts:
@@ -26,6 +26,22 @@ plist.  Dispatch is by backend kind: =dorg-backend-plain-org-p= for the
 plain file backend and =dorg-backend-dolt-p= plus =dorg-backend-dolt-dir= /
 =dorg-backend-root-id= for Dolt-backed storage.
 
+* DOrg-owned metadata is not an extension registry
+
+DOrg's owned-metadata families are declared by a closed constant in the core.
+They are not dynamically registered by downstream extensions.  Generic writes
+of =DORG_= property/keyword names refuse; a registered family such as
+=DORG_CLOCK_= is written only through an immutable owner intent executed by
+~dorg-api-execute~.  ~dorg-api-make-owner-intent~ constructs the owner request;
+it does not grant arbitrary property or SQL access.  Import and restoration
+must validate canonical registered-family records through their owner, and
+refuse unavailable owners or invalid records rather than treating them as
+ordinary properties.
+
+Derived-index extensions continue to use the separate registration/projector
+contract below.  Their schema and read-field declarations do not confer
+ownership of core metadata.
+
 * Extension schema migration contract
 
 Extensions register a current =:version= and, optionally, a
@@ -41,12 +57,14 @@ of one argument (the dolt-dir) that returns SQL:
 #+end_src
 
 The extension version is recorded in =dorg_meta= as
-=ext:<name>:version=.  Extension ensure runs after core schema
-migrations during =dorg-init= and during the normal Dolt bind/open
-lifecycle (=dorg-bind-dolt= → =dorg-repo-ensure-schema=), so a repo
-created before an extension was enabled acquires it on next open, and
-downstream backends fail fast on stale extension schemas.  For each
-registered extension dorg:
+=ext:<name>:version=.  Fresh =dorg-init= applies registered extensions as part
+of store creation.  Existing stores are read-only on ordinary bind/open:
+=dorg-bind-dolt= → =dorg-repo-ensure-schema= checks core plus registered
+extension metadata and refuses stale, absent, missing or malformed components
+with =dorg-schema-migration-required=.  Existing-store install/upgrade is an
+explicit operator action through =M-x dorg-migrate-schema= after the required
+extensions are registered.  For each selected registered extension that explicit
+operator path:
 
 - installs the fresh =:schema= and records the version when none is
   recorded;
@@ -55,6 +73,11 @@ registered extension dorg:
   is lower, committing a deterministic step per version;
 - signals a future-version error when the recorded version is higher.
 
+The explicit path is managed-server only in this release.  A CLI-pinned or
+offline migration request refuses before lease acquisition, resolver
+evaluation, or writes; offline schema upgrade is deferred to the follow-up
+offline migration work.
+
 Dorg owns the =dorg_meta= version bump — extensions must not commit or
 update it themselves; the bump rides in the same committed transaction as
 the migration SQL, so a failed step does not advance the version.  Each
@@ -62,20 +85,49 @@ install/migration step is atomic: it runs inside a single
 transaction/=DOLT_COMMIT= boundary, and because Dolt follows MySQL
 implicit-commit-on-DDL semantics (an =ALTER=/=CREATE= that runs before a
 later statement fails would otherwise linger in the working set), a failed
-step also resets the working set back to HEAD.  The repo is therefore left
-exactly at the last successfully committed step — no partial schema, no
-half-applied data, and a clean retry on the next ensure.  Because that
-reset discards the *entire* working set, each install/migration step first
-requires a clean working set: if the repo has uncommitted Dolt changes,
-ensure signals an actionable error before touching any schema or data
-rather than risk the reset erasing unrelated pending work.  (A pure no-op
-ensure, where every extension is already current, touches nothing and so
-imposes no such requirement.)  Dorg never infers
+step attempts an owned reset back to HEAD.  When that reset succeeds, the repo
+is left exactly at the last successfully committed step — no partial schema, no
+half-applied data, and a clean retry on the next migration.  When the SQL
+transaction rolled back but the reset did not complete, DOrg reports unresolved
+cleanup with closed reset-failure facts; it does not claim the working set is
+restored.  A broken lease or indeterminate commit is a third outcome: DOrg does
+not reset, reconnect, replay or continue.  Because a successful reset discards
+the *entire* working set, each install/migration step first requires a clean
+working set: if the repo has uncommitted Dolt changes, the explicit migration
+signals an actionable error before touching any schema or data rather than risk
+the reset erasing unrelated pending work.  (A pure no-op check, where every
+extension is already current, touches nothing and so imposes no such
+requirement.)  Dorg never infers
 schema diffs and never downgrades.  A *missing* migration step is an
 actionable error, not silent drift: the extension (or the operator) must
-supply the step.  Manual SQL is an escape hatch only — after it, the
-operator must set =ext:<name>:version= accurately, and dorg will trust
-that metadata on the next ensure.
+supply the step.
+
+Function-valued migration steps keep the public one-argument callback shape:
+the callback receives the =dolt-dir= string.  During =dorg-migrate-schema=, a
+callback that needs to inspect repository state must call
+=dorg-repo-migration-query=:
+
+#+begin_src emacs-lisp
+(defun myapp-dorg--migration-1-to-2 (dolt-dir)
+  (let ((rows (dorg-repo-migration-query
+               dolt-dir
+               "SELECT COUNT(*) AS n FROM myapp_items")))
+    (if (zerop (alist-get 'n (car rows)))
+        "ALTER TABLE myapp_items ADD COLUMN empty_seen BOOLEAN DEFAULT TRUE"
+      "ALTER TABLE myapp_items ADD COLUMN migrated_at TEXT")))
+#+end_src
+
+The helper is scoped to the active migration resolver's exact store and owned
+session.  It accepts one fully formatted =SELECT= statement only; writes,
+transaction control and multi-statement requests refuse before execution.  It
+also refuses calls outside that resolver, calls for another store, and legacy
+callbacks that issue ordinary same-store SQL while the store is leased.  It is
+a read helper only; DOrg still owns returned SQL, version rows and commits.
+
+Explicit migration currently requires the managed sql-server route.  Offline or
+one-shot-CLI schema upgrade is deferred; a CLI-pinned migration request refuses
+before lease acquisition, server startup/attachment, resolver evaluation, or
+writes.
 
 * Index projectors
 
@@ -181,25 +233,40 @@ stale derived rows without accepting caller payloads.
 
 =dorg-ext-rebuild-index= is the Dolt-only administrative repair boundary for
 one registered index projector and one root at an exact committed revision.  It
-accepts an extension name, root id, =:dolt-dir=, =:revision=, and =:mode=
+accepts an extension name, root id, =:dolt-dir=, =:revision=, required
+=:identity= (=dorg= or =(:property KEY)=), and =:mode=
 (=audit= or =repair=); it accepts no extension SQL, rows, or callback beyond
 the existing =:validate= / =:project= contract.
 
 Rebuild passes that projector an honest full-snapshot context: an empty base
 image, the complete requested root as candidate postimage AS OF =:revision=,
-and every candidate heading classified =created=.  This is an administrative
+every candidate heading classified =created=, and canonical owner partitions
+built by the same complete-image builder as import.  Missing, malformed, or
+=none= identity is refused before SQL; a wrong valid identity reports drift.
+This is an administrative
 exception to ordinary mutation's bounded context, not a second projector
 protocol.  A projector that depends on entry kind, before image, or patches is
 therefore non-derivable; rebuild audit reports the resulting drift.
 
 Every rebuilt =:read-tables= descriptor must declare an identifier-safe,
-unqualified =:scope-column=.  DOrg owns =DELETE ... WHERE scope-column =
-root-id= for the clear and adds that same predicate to projector deletes.  It
-requires projector inserts to carry the requested root scope.  This narrowing
+unqualified =:scope-column=.  A directly root-scoped table has no further
+metadata.  A child table may declare exactly one =:scope-parent= of the form
+=(:table P :key-column K)=: its =:scope-column= joins parent =K= and P must be
+an owned, directly root-scoped descriptor.  DOrg captures M(root), the union
+of stored and projected parent keys, before any clear; it uses M for child
+audit reads and validated per-key clears.  Child effects are validated only
+against projected parent keys, which is stricter: a projector cannot retain a
+stored-only child key.  A parent key
+under another root, or a child effect without an allowed scope key, refuses.
+Only generated clears are ordered child-before-parent; projector effect order
+is unchanged.  This narrowing
 is deliberately rebuild-specific: it prevents a raw projector delete from
 altering another root while ordinary mutation effects retain their existing
 semantics.  Every generated clear and narrowed effect passes the same
 core-table/ownership validator as projector effects before a transaction opens.
+For a repair, this is one validated child DELETE per captured key (at Embead
+scale, roughly 2.8k keys times 7 child tables); membership and ambiguity reads
+are one parent-table query each, not one query per key per child table.
 Audit is read-only.  Repair is permitted only at current HEAD and
 uses the existing exact-base transaction gate; a historical revision can be
 audited but cannot be published beside newer core state.  Before a repair scope
@@ -225,6 +292,114 @@ repair: rows sharing a value there must not collapse and hide an unexplained
 row.  Consequently repair refuses before its scope clear whenever any current
 row occurrence is unmatched by the projector's expected multiset; duplicate
 complete rows are counted rather than overwritten.
+
+** Whole-store ownership audit
+
+=dorg-ext-rebuild-audit-store= is the separate read-only whole-store boundary.
+It requires =:dolt-dir=, an exact reachable =:revision= and =:identity=, and
+never accepts =:root-id= or a repair mode.  It inventories canonical roots at
+that revision using import's root predicate, including =level_offset = 0=, then
+reads every declared derived table at that same revision.  The audit is an
+ownership census, so it does not hydrate projected heading images.  Its audit
+data reads are exactly one root inventory plus one full-table read per declared
+table.  A stored-only root therefore remains visible even when no canonical
+document materializes it.
+
+The result is an ownership census, not a cell-value drift certificate.  Each
+full-row occurrence (including SQL NULL, bytes, and duplicates) is classified
+once as =owned-canonical-root=, =owned-stored-only-root=, =orphan-child=,
+=ambiguous=, or =undeclared-scope=.  Per-table =:rows-read= is captured before
+classification and must equal =:accounted-count= and the class-count sum.
+=:clean= is true only for a complete census containing canonical-root-owned
+rows alone.  A failed data read returns =:complete nil=, =:outcome incomplete=,
+=:clean nil= and structured =:errors=; an unread table has an unknown
+=:rows-read= (=nil=), never a fabricated zero.  This audit creates no
+transaction, schema change, effect, cleanup, or repair authority.
+
+** Explicit derived-policy upgrade and exact inverse
+
+=dorg-ext-rebuild-index= repairs only rows its current projector reproduces;
+it refuses to replace existing rows that differ.  A deliberate change of
+derivation policy is therefore a separate, explicit migration with three
+public operations: =dorg-ext-rebuild-plan-policy-upgrade=,
+=dorg-ext-rebuild-apply-policy-upgrade= and
+=dorg-ext-rebuild-invert-policy-upgrade=.  None accepts SQL, rows, a restore
+revision, a force mode or executable code; this is not ordinary repair and
+not a generic history restore.
+
+*Producers.*  The planning request is the closed plist
+=(:dolt-dir DIR :revision H :identity POLICY :scope (:root-id ROOT)
+:old-producer OLD :new-producer NEW)=.  OLD and NEW are content-addressed
+data identities =(:implementation I :dependencies D :policy-digest P)=, never
+names or callbacks.  They are resolved only through the extension's optional
+=:producer-resolver=, which receives
+=(:producer IDENTITY :source SOURCE :revision H :identity POLICY :scope SCOPE)=
+and returns =(:project FN :implementation I :dependencies D :policy TEXT)=.
+DOrg computes the policy digest and refuses any difference from the requested
+identity, so a changed implementation with an identical projection, a
+changed dependency or changed policy input all refuse.  The consumer, not
+DOrg, owns its historical baselines and known OLD implementations.
+
+*Planning* is read-only and frozen at H: every derived and heading read is
+=AS OF H=.  SOURCE is the store's normalized identity and is bound into the
+plan, its digest and the receipt.  Each producer image must lie inside the
+requested root on its own projected parents (the rebuild scope guard above);
+one image's parent never authorizes the other image's child.  For every
+complete typed row r (no row key; =:key-column= is grouping only) with
+multiplicities o, n and c in the OLD image, the NEW image and the stored rows
+C, current multiplicity is explainable iff 0 <= c <= max(o, n).  A row in
+neither image is =extra=; excess copies are =unexplained=; either makes the
+whole plan inapplicable with no effects.  Rows are compared only when they
+are lossless: unique, identifier-safe columns whose values are SQL NULL,
+integers or strings.  Any other row in OLD, NEW or C (a float, for example)
+is unexplained with reason =unsupported-row=, and the plan is inapplicable.
+Occurrence ranks are reported as
+=unchanged=, =upgrade=, =already-new=, =missing-new=, =extra= and
+=unexplained=.  The write delta is C to N: delete max(c - n, 0) and insert
+max(n - c, 0) copies, with complete-row, NULL-safe, byte-exact counted
+deletes.  =:write-count= counts complete-row occurrences written, not
+statements: a counted delete of three identical copies counts three.  SQL NULL
+differs from empty content.  Public per-table reports carry complete class,
+delete and insert counts but at most eight diagnostic example occurrences per
+class, in canonical row order; the effects and digests always cover every
+occurrence.  Plan, image and class
+digests depend only on complete-row multisets, not on emit or SELECT order or
+surrounding print settings.
+
+*Apply* accepts only a plan.  It re-derives the plan at H against the plan's
+own SOURCE with producers resolved anew and requires it to be identical, so
+an edited effects list refuses even with a recomputed digest.  HEAD = H and a
+clean working set are checked under the store gate.  An all-NEW plan
+(=:write-count 0=) returns a =:no-op t= receipt with =:post-head H= and opens
+no transaction.  Otherwise the delta commits at H through
+=dorg-transaction-commit=, whose validator re-reads the scoped NEW postimage
+and every row outside the scope; any difference rolls back.  The forward
+receipt is self-contained:
+=(:ok t :kind policy-upgrade-forward :source :extension :base H :post-head F
+:scope :tables :identity :old-producer :new-producer :preimage-digest
+:postimage-digest :plan-digest :write-count)=.  F relative to H is the only
+preimage store.
+
+*Lost replies.*  A =dorg-transaction-indeterminate= result is never retried.
+A read-only proof (F is HEAD, its only parent is H, its diff touches only the
+scope tables, every changed table reports =schema_change= false so no schema or
+index changed, its scoped rows equal the NEW image and rows outside the scope
+are unchanged) yields the same receipt as direct success.  A =schema_change=
+that is NULL or not an explicit false fails the proof.  HEAD still at H
+with no reported commit stays indeterminate with =:reconciled not-committed=
+and a re-derived =:next-plan=; anything else stays indeterminate with
+=:reconciled ambiguous= and no receipt.
+
+*Inverse* accepts only a forward receipt.  It requires the receipt's source
+to contain F, HEAD = F and a clean working set, re-derives the plan at H
+(resolving producers at H, not the current policy) and requires the receipt's
+preimage, postimage and plan digests, scoped derived rows at F equal to the
+postimage, and the same commit proof for F.  It then restores the exact C at
+H (multiplicity, already-new and missing rows included; never the OLD image)
+in one validated transaction at F.  A no-op receipt inverts without a
+transaction.  A newer HEAD, drift, a mismatched or malformed receipt, or a
+forward diff outside the derived scope refuses before writing; there is no
+force override.
 
 * Read-plane snapshot coherence contract
 

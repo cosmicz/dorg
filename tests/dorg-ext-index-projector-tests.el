@@ -202,7 +202,7 @@ participant.  The projector receives the exact `dorg-ext-index-context'."
                   (setq seen ctx)
                   (list '(:table "demo_ix" :insert ((root_id . 100) (id . 1))))))
       (let* ((ctx (dorg-test-ixp--ctx))
-             (proj (dorg-ext-collect-index-projection ctx)))
+             (proj (dorg-ext-collect-index-projection ctx :all)))
         (should (dorg-ext-index-context-p seen))
         (should (eql 100 (dorg-ext-index-context-root-id seen)))
         ;; DOrg generated the SQL from the typed delta.
@@ -210,6 +210,29 @@ participant.  The projector receives the exact `dorg-ext-index-context'."
                        (plist-get proj :sql)))
         (should (equal '(:statements 1)
                        (cdr (assq 'demo (plist-get proj :extensions)))))))))
+
+(ert-deftest dorg-test-ixp-empty-selection-runs-no-registered-projectors ()
+  "An explicit empty selection runs neither validators nor projectors.
+`:all' is the distinct opt-in that runs every eligible registered extension."
+  (dorg-test-ixp--with-clean-registry
+    (let ((validations 0)
+          (projections 0))
+      (dorg-register-extension
+       'demo :schema "CREATE TABLE demo_ix (id INT)" :version 1
+       :capabilities '(dolt) :read-tables '((:name "demo_ix" :key-column "id"))
+       :validate (lambda (_ctx) (cl-incf validations))
+       :project (lambda (_ctx)
+                  (cl-incf projections)
+                  (list '(:table "demo_ix" :insert ((root_id . 100) (id . 1))))))
+      (let ((none (dorg-ext-collect-index-projection (dorg-test-ixp--ctx))))
+        (should (= 0 validations))
+        (should (= 0 projections))
+        (should-not (plist-get none :sql))
+        (should-not (plist-get none :extensions)))
+      (let ((all (dorg-ext-collect-index-projection (dorg-test-ixp--ctx) :all)))
+        (should (= 1 validations))
+        (should (= 1 projections))
+        (should (equal '((demo :statements 1)) (plist-get all :extensions)))))))
 
 (ert-deftest dorg-test-ixp-collect-skips-ineligible-extensions ()
   "Only extensions declaring `:project' whose capabilities include the context
@@ -221,7 +244,8 @@ source kind run: a schema-only extension and a capability-excluded one are skipp
      'plainonly :schema "CREATE TABLE p (id INT)" :version 1
      :capabilities '(plain-org) :read-tables '((:name "p"))
      :project (lambda (_ctx) (list '(:table "p" :insert ((id . 1))))))
-    (let ((proj (dorg-ext-collect-index-projection (dorg-test-ixp--ctx 'dolt))))
+    (let ((proj (dorg-ext-collect-index-projection
+                 (dorg-test-ixp--ctx 'dolt) :all)))
       (should-not (plist-get proj :sql))
       (should-not (plist-get proj :extensions)))))
 
@@ -235,7 +259,8 @@ collection with a typed `dorg-ext-index-error' before any persistence."
      :project (lambda (_ctx) (list '(:table "headings" :delete ((id . 1))))))
     (should (eq 'core-table
                (condition-case e
-                   (progn (dorg-ext-collect-index-projection (dorg-test-ixp--ctx))
+                   (progn (dorg-ext-collect-index-projection
+                           (dorg-test-ixp--ctx) :all)
                           nil)
                  (dorg-ext-index-error (dorg-ext-index-error-reason e)))))))
 
@@ -247,7 +272,8 @@ collection with a typed `dorg-ext-index-error' before any persistence."
      :capabilities '(dolt) :read-tables '((:name "demo_ix"))
      :validate (lambda (_ctx) (error "veto"))
      :project (lambda (_ctx) (list '(:table "demo_ix" :insert ((id . 1))))))
-    (should-error (dorg-ext-collect-index-projection (dorg-test-ixp--ctx)))))
+    (should-error (dorg-ext-collect-index-projection
+                   (dorg-test-ixp--ctx) :all))))
 
 (ert-deftest dorg-test-ixp-collect-dirty-scope-is-owned-tables-touched ()
   "The collector's `:ext-dirty' is DOrg-owned: the set of owned tables the
@@ -260,7 +286,8 @@ validated effects actually touched — not a separate extension callback."
      :project (lambda (_ctx)
                 (list '(:table "a_ix" :delete ((root_id . 100)))
                       '(:table "b_ix" :insert ((root_id . 100) (id . 1))))))
-    (let* ((proj (dorg-ext-collect-index-projection (dorg-test-ixp--ctx)))
+    (let* ((proj (dorg-ext-collect-index-projection
+                  (dorg-test-ixp--ctx) :all))
            (dirty (cdr (assq 'two (plist-get proj :ext-dirty)))))
       (should (equal '(:statements 2)
                      (cdr (assq 'two (plist-get proj :extensions)))))
@@ -309,7 +336,7 @@ never SQL text and never a caller payload."
       :version 1 :capabilities '(dolt)
       :read-tables '((:name "demo_ix" :key-column "heading_id"))
       :project #'dorg-test-ixp--demo-project)
-     (dorg-repo-ensure-extensions ,dolt-dir)
+     (dorg-migrate-schema ,dolt-dir)
      (dorg-commit ,dolt-dir "install demo index projector")
      ,@body))
 
@@ -477,13 +504,15 @@ same core mutation WITHOUT the rogue projector does change the document."
         (should (equal "Beta" (dorg-test-ixp--scalar
                                dolt-dir (format "SELECT title FROM headings WHERE id = %d" a)))))
       ;; Rogue projector targeting the document lane is refused; document frozen.
-      (let ((dorg--extensions nil) (h0 (dorg-head-commit dolt-dir)))
+      (let ((dorg--extensions nil) (h0 nil))
         (dorg-register-extension
          'rogue :schema '("CREATE TABLE demo_ix (id INT)") :version 1
          :capabilities '(dolt) :read-tables '((:name "demo_ix"))
          :project (lambda (_ctx)
                     (list (list :table "headings"
                                 :delete (list (cons 'id a))))))
+        (dorg-migrate-schema dolt-dir)
+        (setq h0 (dorg-head-commit dolt-dir))
         (should-error (dorg-test-mutate--apply-patch-batch
                        src (list (dorg-test-mutate--heading-update-patch a :title "Gamma"))))
         (should (equal "Beta" (dorg-test-ixp--scalar
@@ -516,7 +545,7 @@ same core mutation WITHOUT the rogue projector does change the document."
                          (dorg-mutate--raise
                           'invariant "validator veto"
                           :detail 'candidate-validator-veto)))))
-        (dorg-repo-ensure-extensions dolt-dir)
+        (dorg-migrate-schema dolt-dir)
         (dorg-commit dolt-dir "install validator")
         (setq h0 (dorg-head-commit dolt-dir))
         (let ((data (dorg-test-mutate--error-data
@@ -598,7 +627,7 @@ predicate would leave the stale row forever)."
        'nd :schema '("CREATE TABLE demo_nd (heading_id BIGINT, tag TEXT)")
        :version 1 :capabilities '(dolt) :read-tables '((:name "demo_nd"))
        :project #'dorg-test-ixp--nd-project)
-      (dorg-repo-ensure-extensions dolt-dir)
+      (dorg-migrate-schema dolt-dir)
       (dorg-commit dolt-dir "install nd")
       (let* ((rid (dorg-test-mutate--seed dolt-dir "* Alpha\n" 100))
              (a (dorg-test-mutate--id-by-title dolt-dir "Alpha"))
@@ -650,7 +679,7 @@ stale edge, committed atomically with the core move."
        'rel :schema '("CREATE TABLE demo_rel (child_id BIGINT PRIMARY KEY, parent_id BIGINT)")
        :version 1 :capabilities '(dolt) :read-tables '((:name "demo_rel"))
        :project #'dorg-test-ixp--rel-project)
-      (dorg-repo-ensure-extensions dolt-dir)
+      (dorg-migrate-schema dolt-dir)
       (dorg-commit dolt-dir "install rel")
       (let* ((rid (dorg-test-mutate--seed dolt-dir "* Alpha\n** Kid\n* Beta\n" 100))
              (kid (dorg-test-mutate--id-by-title dolt-dir "Kid"))
@@ -701,15 +730,15 @@ replacement candidate."
              (real-collect (symbol-function 'dorg-ext-collect-index-projection))
              (real-sim (symbol-function 'dorg-mutate--dolt-simulate)))
         (cl-letf (((symbol-function 'dorg-ext-collect-index-projection)
-                   (lambda (ctx)
+                   (lambda (ctx &optional extension-names fold-port)
                      (push (cons (dorg-ext-index-context-base-commit ctx)
                                  (mapcar #'dorg-ext-index-entry-id
                                          (dorg-ext-index-context-changed ctx)))
                            proj-log)
-                     (funcall real-collect ctx)))
+                     (funcall real-collect ctx extension-names fold-port)))
                   ((symbol-function 'dorg-mutate--dolt-simulate)
-                   (lambda (source patches options)
-                     (let ((r (funcall real-sim source patches options)))
+                   (lambda (source patches options &optional owner-plan)
+                     (let ((r (funcall real-sim source patches options owner-plan)))
                        ;; After the TARGET's first sim (built at H0) and BEFORE its
                        ;; gate check, a DISJOINT writer commits, moving HEAD to H1.
                        (when (and (not injected) (member alpha (plist-get r :changed)))
@@ -795,7 +824,7 @@ derived row carrying Sibling H1, not attempt 1's stale Sibling H0."
        :version 1 :capabilities '(dolt)
        :read-tables '((:name "owner_ix" :key-column "heading_id"))
        :project #'dorg-test-ixp--owner-replan-project)
-      (dorg-repo-ensure-extensions dolt-dir)
+      (dorg-migrate-schema dolt-dir)
       (dorg-commit dolt-dir "install owner replan projector")
       (let* ((rid (dorg-test-mutate--seed
                    dolt-dir
@@ -831,8 +860,8 @@ derived row carrying Sibling H1, not attempt 1's stale Sibling H0."
                              owner-log))
                      (funcall real-project ctx)))
                   ((symbol-function 'dorg-mutate--dolt-simulate)
-                   (lambda (source patches options)
-                     (let ((r (funcall real-sim source patches options)))
+                   (lambda (source patches options &optional owner-plan)
+                     (let ((r (funcall real-sim source patches options owner-plan)))
                        (when (and (not injected)
                                   (member target (plist-get r :changed)))
                          (setq injected t)
@@ -981,6 +1010,519 @@ the candidate drops an undeclared child, before any persistence."
     (should-not (dorg-mutate--assert-candidate-consistency
                  orig candidate
                  (list (list :op 'delete :target (list :heading :id 2)))))))
+
+;;; ─── Accumulator effects: plan-time fold at the plan base ───────────────
+;;
+;; A projector may maintain a root aggregate with accumulator effects instead
+;; of whole-root derivation.  DOrg reads the touched prior rows at the plan
+;; base and folds them into ordinary literal delete+insert effects, so the
+;; commit proof, rebuild drift and SQL generation see only the established
+;; effect vocabulary.  One declared marker table, with a required key set per
+;; root, decides whether a root's index is built, unbuilt or inconsistent.
+;; These specs pin the declaration, validation and pure fold rules.
+
+(defconst dorg-test-ixp--acc-tables
+  '((:name "acc_docs" :key-column "heading_id" :scope-column "root_id")
+    (:name "acc_terms" :key-column "term" :scope-column "root_id"
+     :accumulate (root_id term))
+    (:name "acc_marker" :key-column "root_id" :scope-column "root_id"
+     :accumulate (root_id kind) :marker (((kind . "a")) ((kind . "b")))))
+  "An ordinary table, an aggregate table and a two-row completeness marker.")
+
+(defun dorg-test-ixp--acc-reason (thunk)
+  "Return the `dorg-ext-index-error' reason THUNK signals, or `ok'."
+  (condition-case e (progn (funcall thunk) 'ok)
+    (dorg-ext-index-error (dorg-ext-index-error-reason e))))
+
+(defun dorg-test-ixp--acc-register (tables)
+  "Register a projector extension declaring TABLES; return the reason or `ok'."
+  (dorg-test-ixp--acc-reason
+   (lambda ()
+     (dorg-register-extension 'acc :schema "SELECT 1" :version 1
+                              :read-tables tables
+                              :project (lambda (_context) nil)))))
+
+(ert-deftest dorg-test-ixp-accumulator-registration-needs-exactly-one-marker ()
+  "Accumulator tables declare exactly one marker table and its required keys.
+Zero or two markers, a marker on an ordinary table, a required key naming a
+non-key column, and an accumulator key without the scope column each fail
+closed at registration."
+  (let ((dorg--extensions nil)
+        (terms '(:name "acc_terms" :key-column "term" :scope-column "root_id"
+                 :accumulate (root_id term))))
+    (should (eq 'ok (dorg-test-ixp--acc-register dorg-test-ixp--acc-tables)))
+    (should (eq 'ok (dorg-test-ixp--acc-register
+                     (list terms '(:name "m" :key-column "root_id" :scope-column "root_id"
+                                   :accumulate (root_id) :marker t)))))
+    (should (eq 'marker-declaration (dorg-test-ixp--acc-register (list terms))))
+    (should (eq 'marker-declaration
+                (dorg-test-ixp--acc-register
+                 (list '(:name "m1" :key-column "root_id" :scope-column "root_id"
+                         :accumulate (root_id) :marker t)
+                       '(:name "m2" :key-column "root_id" :scope-column "root_id"
+                         :accumulate (root_id) :marker t)))))
+    (should (eq 'marker-declaration
+                (dorg-test-ixp--acc-register
+                 '((:name "acc_docs" :key-column "heading_id" :scope-column "root_id"
+                    :marker t)))))
+    ;; Required keys name exactly the non-scope key columns.
+    (should (eq 'marker-declaration
+                (dorg-test-ixp--acc-register
+                 (list terms '(:name "m" :key-column "root_id" :scope-column "root_id"
+                               :accumulate (root_id kind) :marker (((other . "a"))))))))
+    (should (eq 'marker-declaration
+                (dorg-test-ixp--acc-register
+                 (list terms '(:name "m" :key-column "root_id" :scope-column "root_id"
+                               :accumulate (root_id kind) :marker t)))))
+    (should (eq 'accumulator-shape
+                (dorg-test-ixp--acc-register
+                 '((:name "acc_terms" :key-column "term" :scope-column "root_id"
+                    :accumulate (term))
+                   (:name "m" :key-column "root_id" :scope-column "root_id"
+                    :accumulate (root_id) :marker t)))))
+    ;; An extension with no accumulator table needs no marker (unchanged).
+    (should (eq 'ok (dorg-test-ixp--acc-register
+                     '((:name "acc_docs" :key-column "heading_id"
+                        :scope-column "root_id")))))))
+
+(ert-deftest dorg-test-ixp-accumulator-effect-validation ()
+  "Accumulator effects are typed, literal, key-complete and never mixed."
+  (let ((owned '("acc_docs" "acc_terms" "acc_marker"))
+        (specs (dorg-ext-accumulate-specs dorg-test-ixp--acc-tables))
+        (hex (make-string 64 ?a)))
+    (cl-flet ((reason (effect)
+                (dorg-test-ixp--acc-reason
+                 (lambda () (dorg-ext-validate-index-effect effect owned specs)))))
+      (should (eq 'ok (reason '(:table "acc_terms" :accumulate ((root_id . 7) (term . "a"))
+                                :add ((df . 1)) :prune-zero df))))
+      (should (eq 'ok (reason `(:table "acc_marker"
+                                :accumulate ((root_id . 7) (kind . "a"))
+                                :add ((size . -1)) :xor ((gen . ,hex))
+                                :initial ((version . "v3"))))))
+      ;; An ordinary table never takes an accumulator, nor an aggregate table
+      ;; an insert/delete.
+      (should (eq 'accumulator-mixed
+                  (reason '(:table "acc_docs" :accumulate ((root_id . 7) (heading_id . 1))
+                            :add ((n . 1))))))
+      (should (eq 'accumulator-mixed
+                  (reason '(:table "acc_terms" :insert ((root_id . 7) (term . "a") (df . 1))))))
+      ;; The key is exactly the declared key, scope column included.
+      (should (eq 'accumulator-shape
+                  (reason '(:table "acc_terms" :accumulate ((term . "a")) :add ((df . 1))))))
+      (should (eq 'accumulator-shape
+                  (reason '(:table "acc_terms"
+                            :accumulate ((root_id . 7) (term . "a") (extra . 1))
+                            :add ((df . 1))))))
+      ;; Counter columns are disjoint from the key and from each other.
+      (should (eq 'accumulator-shape
+                  (reason '(:table "acc_terms" :accumulate ((root_id . 7) (term . "a"))
+                            :add ((term . 1))))))
+      (should (eq 'accumulator-shape
+                  (reason `(:table "acc_marker" :accumulate ((root_id . 7) (kind . "a"))
+                            :add ((gen . 1)) :xor ((gen . ,hex))))))
+      ;; A prune column must be an :add column.
+      (should (eq 'accumulator-shape
+                  (reason '(:table "acc_terms" :accumulate ((root_id . 7) (term . "a"))
+                            :add ((df . 1)) :prune-zero other))))
+      ;; Literal, typed values.
+      (should (eq 'bad-value
+                  (reason '(:table "acc_terms" :accumulate ((root_id . 7) (term . "a"))
+                            :add ((df . 1.5))))))
+      (should (eq 'xor-width
+                  (reason '(:table "acc_marker" :accumulate ((root_id . 7) (kind . "a"))
+                            :xor ((gen . "abc")))))))))
+
+(defun dorg-test-ixp--acc-terms (root term df)
+  "Return a df accumulator effect for TERM at ROOT."
+  `(:table "acc_terms" :accumulate ((root_id . ,root) (term . ,term))
+    :add ((df . ,df)) :prune-zero df))
+
+(defun dorg-test-ixp--acc-marker (root kind size gen)
+  "Return the KIND marker accumulator effect at ROOT."
+  `(:table "acc_marker" :accumulate ((root_id . ,root) (kind . ,kind))
+    :add ((size . ,size)) :xor ((gen . ,gen)) :initial ((version . "v3"))))
+
+(defun dorg-test-ixp--acc-markers (root size gen)
+  "Return both required marker accumulator effects at ROOT."
+  (list (dorg-test-ixp--acc-marker root "a" size gen)
+        (dorg-test-ixp--acc-marker root "b" size gen)))
+
+(defun dorg-test-ixp--acc-marker-row (root kind size gen)
+  "Return a stored KIND marker row at ROOT as a prior."
+  `("acc_marker" . ((root_id . ,root) (kind . ,kind) (gen . ,gen) (size . ,size)
+                    (version . "v3"))))
+
+(defconst dorg-test-ixp--hex-0 (make-string 64 ?0)
+  "The empty 256-bit digest.")
+
+(defconst dorg-test-ixp--hex-a (concat (make-string 63 ?0) "a")
+  "A 256-bit digest with low nibble 1010.")
+
+(defconst dorg-test-ixp--hex-c (concat (make-string 63 ?0) "c")
+  "A 256-bit digest with low nibble 1100.")
+
+(defconst dorg-test-ixp--hex-6 (concat (make-string 63 ?0) "6")
+  "The xor of the `a' and `c' digests.")
+
+(ert-deftest dorg-test-ixp-accumulator-prior-requests-are-keyed ()
+  "The prior read names exactly the touched keys plus each touched root's markers."
+  (should
+   (equal (dorg-ext-accumulator-prior-requests
+           dorg-test-ixp--acc-tables
+           (append (list '(:table "acc_docs" :insert ((root_id . 7) (heading_id . 1)))
+                         (dorg-test-ixp--acc-terms 7 "b" 1)
+                         (dorg-test-ixp--acc-terms 7 "a" 1)
+                         (dorg-test-ixp--acc-terms 7 "a" -1)
+                         (dorg-test-ixp--acc-terms 9 "a" 1))
+                   (dorg-test-ixp--acc-markers 7 1 dorg-test-ixp--hex-a)))
+          '(("acc_terms" ((root_id . 7) (term . "a")) ((root_id . 7) (term . "b"))
+                         ((root_id . 9) (term . "a")))
+            ("acc_marker" ((root_id . 7)) ((root_id . 9)))))))
+
+(ert-deftest dorg-test-ixp-accumulator-fold-folds-births-and-prunes ()
+  "On a built root accumulators fold into literal row effects.
+A new key is born from the identity, an existing key adds or xors, a count
+reaching zero is pruned, an unchanged key emits nothing, and ordinary
+effects pass through first in projector order."
+  (let* ((docs '(:table "acc_docs" :insert ((root_id . 7) (heading_id . 1))))
+         (priors (list '("acc_terms" . ((root_id . 7) (term . "old") (df . 1)))
+                       '("acc_terms" . ((root_id . 7) (term . "kept") (df . 2)))
+                       (dorg-test-ixp--acc-marker-row 7 "a" 3 dorg-test-ixp--hex-a)
+                       (dorg-test-ixp--acc-marker-row 7 "b" 3 dorg-test-ixp--hex-a)))
+         (out (dorg-ext-fold-accumulators
+               dorg-test-ixp--acc-tables
+               (append (list docs
+                             (dorg-test-ixp--acc-terms 7 "new" 1)
+                             (dorg-test-ixp--acc-terms 7 "old" -1)
+                             (dorg-test-ixp--acc-terms 7 "kept" 1)
+                             (dorg-test-ixp--acc-terms 7 "kept" -1)
+                             (dorg-test-ixp--acc-marker 7 "a" 1 dorg-test-ixp--hex-c))
+                       (list (dorg-test-ixp--acc-marker 7 "b" 0 dorg-test-ixp--hex-0)))
+               priors nil)))
+    (should
+     (equal out
+            `(,docs
+              (:table "acc_terms" :insert ((root_id . 7) (term . "new") (df . 1)))
+              (:table "acc_terms" :delete ((root_id . 7) (term . "old")))
+              (:table "acc_marker" :delete ((root_id . 7) (kind . "a")))
+              (:table "acc_marker"
+               :insert ((root_id . 7) (kind . "a") (version . "v3")
+                        (gen . ,dorg-test-ixp--hex-6) (size . 4))))))))
+
+(ert-deftest dorg-test-ixp-accumulator-fold-shape-table ()
+  "Each fold outcome has one literal shape.
+A key with no stored row is born as one insert, since there is nothing to
+delete.  A stored key whose counters change is replaced (delete, then
+insert); an unchanged one emits nothing; a count reaching zero deletes a
+stored row and emits nothing for a key that was never stored."
+  (let* ((markers (dorg-test-ixp--acc-markers 7 0 dorg-test-ixp--hex-0))
+         (priors (list '("acc_terms" . ((root_id . 7) (term . "changed") (df . 2)))
+                       '("acc_terms" . ((root_id . 7) (term . "unchanged") (df . 2)))
+                       '("acc_terms" . ((root_id . 7) (term . "pruned") (df . 1)))
+                       (dorg-test-ixp--acc-marker-row 7 "a" 3 dorg-test-ixp--hex-a)
+                       (dorg-test-ixp--acc-marker-row 7 "b" 3 dorg-test-ixp--hex-a)))
+         (fold (lambda (&rest terms)
+                 (dorg-ext-fold-accumulators dorg-test-ixp--acc-tables
+                                             (append terms markers) priors nil))))
+    (should (equal (funcall fold (dorg-test-ixp--acc-terms 7 "born" 1))
+                   '((:table "acc_terms" :insert ((root_id . 7) (term . "born") (df . 1))))))
+    (should (equal (funcall fold (dorg-test-ixp--acc-terms 7 "changed" 1))
+                   '((:table "acc_terms" :delete ((root_id . 7) (term . "changed")))
+                     (:table "acc_terms" :insert ((root_id . 7) (term . "changed") (df . 3))))))
+    (should-not (funcall fold (dorg-test-ixp--acc-terms 7 "unchanged" 1)
+                         (dorg-test-ixp--acc-terms 7 "unchanged" -1)))
+    (should (equal (funcall fold (dorg-test-ixp--acc-terms 7 "pruned" -1))
+                   '((:table "acc_terms" :delete ((root_id . 7) (term . "pruned"))))))
+    (should-not (funcall fold (dorg-test-ixp--acc-terms 7 "never" 1)
+                         (dorg-test-ixp--acc-terms 7 "never" -1)))))
+
+(ert-deftest dorg-test-ixp-accumulator-fold-refuses-negative-counts ()
+  "A count folding below zero fails closed rather than writing a lie."
+  (should (eq 'negative-accumulator
+              (dorg-test-ixp--acc-reason
+               (lambda ()
+                 (dorg-ext-fold-accumulators
+                  dorg-test-ixp--acc-tables
+                  (cons (dorg-test-ixp--acc-terms 7 "absent" -1)
+                        (dorg-test-ixp--acc-markers 7 0 dorg-test-ixp--hex-0))
+                  (list (dorg-test-ixp--acc-marker-row 7 "a" 3 dorg-test-ixp--hex-0)
+                        (dorg-test-ixp--acc-marker-row 7 "b" 3 dorg-test-ixp--hex-0))
+                  nil))))))
+
+(defun dorg-test-ixp--acc-root-effects (root)
+  "Return a document insert, a term and both markers for ROOT."
+  (append (list `(:table "acc_docs" :insert ((root_id . ,root) (heading_id . 1)))
+                (dorg-test-ixp--acc-terms root "t" 1))
+          (dorg-test-ixp--acc-markers root 1 dorg-test-ixp--hex-a)))
+
+(ert-deftest dorg-test-ixp-accumulator-fold-three-marker-states ()
+  "A root is built, unbuilt or inconsistent by its required marker rows.
+Built (every required row present) folds.  Unbuilt (none) emits nothing
+when the root had headings at the base, and births every required row
+when it was empty.  Inconsistent (some but not all) fails closed, naming
+the missing keys and the rebuild."
+  (let ((effects (dorg-test-ixp--acc-root-effects 7))
+        (both (list (dorg-test-ixp--acc-marker-row 7 "a" 2 dorg-test-ixp--hex-c)
+                    (dorg-test-ixp--acc-marker-row 7 "b" 2 dorg-test-ixp--hex-c))))
+    ;; Built.
+    (should (equal (dorg-ext-fold-accumulators dorg-test-ixp--acc-tables effects both nil)
+                   `((:table "acc_docs" :insert ((root_id . 7) (heading_id . 1)))
+                     (:table "acc_terms" :insert ((root_id . 7) (term . "t") (df . 1)))
+                     (:table "acc_marker" :delete ((root_id . 7) (kind . "a")))
+                     (:table "acc_marker"
+                      :insert ((root_id . 7) (kind . "a") (version . "v3")
+                               (gen . ,dorg-test-ixp--hex-6) (size . 3)))
+                     (:table "acc_marker" :delete ((root_id . 7) (kind . "b")))
+                     (:table "acc_marker"
+                      :insert ((root_id . 7) (kind . "b") (version . "v3")
+                               (gen . ,dorg-test-ixp--hex-6) (size . 3))))))
+    ;; Unbuilt, root had headings at the base: nothing at all.
+    (should-not (dorg-ext-fold-accumulators dorg-test-ixp--acc-tables effects nil nil))
+    ;; Unbuilt, root empty at the base: every required marker row is born.
+    (let ((born (dorg-ext-fold-accumulators dorg-test-ixp--acc-tables effects nil '(7))))
+      (should (equal (cl-remove-if-not (lambda (e) (plist-member e :insert)) born)
+                     `((:table "acc_docs" :insert ((root_id . 7) (heading_id . 1)))
+                       (:table "acc_terms" :insert ((root_id . 7) (term . "t") (df . 1)))
+                       (:table "acc_marker"
+                        :insert ((root_id . 7) (kind . "a") (version . "v3")
+                                 (gen . ,dorg-test-ixp--hex-a) (size . 1)))
+                       (:table "acc_marker"
+                        :insert ((root_id . 7) (kind . "b") (version . "v3")
+                                 (gen . ,dorg-test-ixp--hex-a) (size . 1)))))))
+    ;; A birth that would write only some required rows fails closed.
+    (should (eq 'accumulator-shape
+                (dorg-test-ixp--acc-reason
+                 (lambda ()
+                   (dorg-ext-fold-accumulators
+                    dorg-test-ixp--acc-tables (butlast effects) nil '(7))))))
+    ;; Inconsistent: one required row present, one missing.
+    (let ((err (should-error
+                (dorg-ext-fold-accumulators
+                 dorg-test-ixp--acc-tables effects (list (car both)) nil)
+                :type 'dorg-ext-index-error)))
+      (should (eq 'derived-index-inconsistent (dorg-ext-index-error-reason err)))
+      (should (equal '(((root_id . 7) (kind . "b")))
+                     (plist-get (dorg-error-data err) :missing)))
+      (should (string-match-p "dorg-ext-rebuild-index" (error-message-string err))))))
+
+(ert-deftest dorg-test-ixp-accumulator-fold-states-are-per-root ()
+  "An unbuilt root is skipped while a built root in the same projection folds."
+  (let* ((effects (append (dorg-test-ixp--acc-root-effects 7)
+                          (list '(:table "acc_docs" :delete ((root_id . 9) (heading_id . 2)))
+                                (dorg-test-ixp--acc-terms 9 "t" -1))
+                          (dorg-test-ixp--acc-markers 9 -1 dorg-test-ixp--hex-a)))
+         (priors (list '("acc_terms" . ((root_id . 9) (term . "t") (df . 2)))
+                       (dorg-test-ixp--acc-marker-row 9 "a" 2 dorg-test-ixp--hex-c)
+                       (dorg-test-ixp--acc-marker-row 9 "b" 2 dorg-test-ixp--hex-c)))
+         (out (dorg-ext-fold-accumulators dorg-test-ixp--acc-tables effects priors nil)))
+    (should-not (cl-find-if (lambda (e)
+                              (equal 7 (alist-get 'root_id
+                                                  (or (plist-get e :insert)
+                                                      (plist-get e :delete)))))
+                            out))
+    (should (equal (car out) '(:table "acc_docs" :delete ((root_id . 9) (heading_id . 2)))))
+    (should (member '(:table "acc_terms" :insert ((root_id . 9) (term . "t") (df . 1))) out))))
+
+(ert-deftest dorg-test-ixp-accumulator-fold-is-order-free ()
+  "Folding two batches in sequence equals folding their union once.
+This is the algebraic reason incremental maintenance can equal a rebuild."
+  (let* ((batch-1 (append (list (dorg-test-ixp--acc-terms 7 "a" 1)
+                                (dorg-test-ixp--acc-terms 7 "b" 2))
+                          (dorg-test-ixp--acc-markers 7 2 dorg-test-ixp--hex-a)))
+         (batch-2 (append (list (dorg-test-ixp--acc-terms 7 "b" -2)
+                                (dorg-test-ixp--acc-terms 7 "c" 1))
+                          (dorg-test-ixp--acc-markers 7 -1 dorg-test-ixp--hex-c)))
+         (rows (lambda (effects &optional start)
+                 (let ((table (copy-sequence start)))
+                   (dolist (effect effects)
+                     (let ((name (plist-get effect :table)))
+                       (if (plist-member effect :delete)
+                           (setq table (cl-remove-if
+                                        (lambda (row)
+                                          (and (equal (car row) name)
+                                               (cl-every (lambda (cell)
+                                                           (equal (cdr (assq (car cell) (cdr row)))
+                                                                  (cdr cell)))
+                                                         (plist-get effect :delete))))
+                                        table))
+                         (push (cons name (plist-get effect :insert)) table))))
+                   (sort table (lambda (a b) (string< (prin1-to-string a)
+                                                      (prin1-to-string b)))))))
+         (once (funcall rows (dorg-ext-fold-accumulators
+                              dorg-test-ixp--acc-tables (append batch-1 batch-2) nil '(7))))
+         (first (funcall rows (dorg-ext-fold-accumulators
+                               dorg-test-ixp--acc-tables batch-1 nil '(7))))
+         (twice (funcall rows (dorg-ext-fold-accumulators
+                               dorg-test-ixp--acc-tables batch-2 first nil)
+                         first)))
+    (should (equal once twice))
+    (should (cl-find-if (lambda (row) (equal (alist-get 'term (cdr row)) "c")) once))
+    (should-not (cl-find-if (lambda (row) (equal (alist-get 'term (cdr row)) "b")) once))))
+
+(ert-deftest dorg-test-ixp-accumulator-fold-is-identity-without-accumulators ()
+  "An insert/delete-only effect list folds to itself, byte for byte."
+  (let ((effects '((:table "t" :delete ((root_id . 7) (id . 1)))
+                   (:table "t" :insert ((root_id . 7) (id . 1) (title . "x"))))))
+    (should (eq effects
+                (dorg-ext-fold-accumulators
+                 '((:name "t" :key-column "id" :scope-column "root_id"))
+                 effects nil nil)))))
+
+;; Root confinement: an accumulator extension writes only its context's roots.
+
+(defun dorg-test-ixp--acc-confinement (context effects)
+  "Collect EFFECTS through a projector in CONTEXT; return (RESULT . PORT-CALLS).
+RESULT is the collected projection or the refusal reason."
+  (let ((dorg--extensions nil) (calls 0))
+    (dorg-register-extension 'acc :schema "SELECT 1" :version 1
+                             :read-tables dorg-test-ixp--acc-tables
+                             :project (lambda (_context) effects))
+    (let ((result
+           (condition-case e
+               (dorg-ext-collect-index-projection
+                context '(acc)
+                (list :priors (lambda (_requests) (cl-incf calls) nil)
+                      :empty-roots (lambda (roots) (cl-incf calls) roots)))
+             (dorg-ext-index-error (dorg-ext-index-error-reason e)))))
+      (cons result calls))))
+
+(ert-deftest dorg-test-ixp-accumulator-effects-are-confined-to-context-roots ()
+  "Every effect of an accumulator extension names a root of its context.
+A same-root context admits its root; a cross-root context admits both its
+source and destination roots; any other root fails closed before a prior or
+emptiness read and before SQL, for accumulator and ordinary effects alike."
+  (let ((same (dorg-ext-index-context-create :source-kind 'dolt :root-id 7))
+        (cross (dorg-ext-index-context-create :source-kind 'dolt :root-id 9
+                                              :from-root-id 7 :to-root-id 9)))
+    ;; Same root: admitted, folded, read through the port.
+    (let ((outcome (dorg-test-ixp--acc-confinement
+                    same (dorg-test-ixp--acc-root-effects 7))))
+      (should (plist-get (car outcome) :sql))
+      (should (> (cdr outcome) 0)))
+    ;; Cross root: both roots admitted.
+    (let ((outcome (dorg-test-ixp--acc-confinement
+                    cross (append (dorg-test-ixp--acc-root-effects 7)
+                                  (dorg-test-ixp--acc-root-effects 9)))))
+      (should (plist-get (car outcome) :sql)))
+    ;; A third root: refused with no port call, as an accumulator ...
+    (should (equal '(root-outside-context . 0)
+                   (dorg-test-ixp--acc-confinement
+                    same (append (dorg-test-ixp--acc-root-effects 7)
+                                 (list (dorg-test-ixp--acc-terms 999 "t" 1))))))
+    ;; ... as an ordinary row effect ...
+    (should (equal '(root-outside-context . 0)
+                   (dorg-test-ixp--acc-confinement
+                    same (append (dorg-test-ixp--acc-root-effects 7)
+                                 (list '(:table "acc_docs"
+                                         :insert ((root_id . 999) (heading_id . 1))))))))
+    ;; ... and beside a cross-root context's two legitimate roots.
+    (should (equal '(root-outside-context . 0)
+                   (dorg-test-ixp--acc-confinement
+                    cross (append (dorg-test-ixp--acc-root-effects 9)
+                                  (dorg-test-ixp--acc-root-effects 11)))))))
+
+;;; ─── Multi-row insert lowering of extension effects ──────────────────────
+
+(defconst dorg-test-ixp--ib-dir
+  (expand-file-name "fixtures/insert-batching/"
+                    (file-name-directory (or load-file-name buffer-file-name)))
+  "The insert-batching reference model and FK test extension.")
+
+(require 'dorg-insert-batching-capture
+         (expand-file-name "capture" dorg-test-ixp--ib-dir))
+(require 'dorg-insert-batching-reference
+         (expand-file-name "reference" dorg-test-ixp--ib-dir))
+(require 'dorg-insert-batching-extension
+         (expand-file-name "extension" dorg-test-ixp--ib-dir))
+(require 'dorg-bm25)
+
+(defvar dorg-test--dolt-available)
+(defvar dorg-test--server-port)
+
+(ert-deftest dorg-test-ixp-collect-merges-adjacent-inserts-and-counts-effects ()
+  "Adjacent same-shape insert effects lower to one statement.
+:statements still counts the effects.  Deletes stay single statements in
+place, and different shapes never merge."
+  (dorg-test-ixp--with-clean-registry
+    (dorg-register-extension
+     'merge :schema "CREATE TABLE a_ix (id INT)" :version 1
+     :capabilities '(dolt)
+     :read-tables '((:name "a_ix") (:name "b_ix"))
+     :project (lambda (_ctx)
+                (list '(:table "a_ix" :insert ((root_id . 100) (id . 1)))
+                      '(:table "a_ix" :insert ((root_id . 100) (id . 2)))
+                      '(:table "a_ix" :delete ((root_id . 100) (id . 9)))
+                      '(:table "a_ix" :insert ((root_id . 100) (id . 3)))
+                      '(:table "a_ix" :insert ((root_id . 100) (id . 4)))
+                      '(:table "b_ix" :insert ((root_id . 100) (id . 5)))
+                      '(:table "a_ix" :insert ((id . 6) (root_id . 100))))))
+    (let ((proj (dorg-ext-collect-index-projection (dorg-test-ixp--ctx) :all)))
+      (should (equal '("INSERT INTO a_ix (root_id, id) VALUES (100, 1), (100, 2)"
+                       "DELETE FROM a_ix WHERE root_id = 100 AND id = 9"
+                       "INSERT INTO a_ix (root_id, id) VALUES (100, 3), (100, 4)"
+                       "INSERT INTO b_ix (root_id, id) VALUES (100, 5)"
+                       "INSERT INTO a_ix (id, root_id) VALUES (6, 100)")
+                     (plist-get proj :sql)))
+      (should (= 7 (length (plist-get proj :effects))))
+      (should (equal '(:statements 7)
+                     (cdr (assq 'merge (plist-get proj :extensions))))))))
+
+(ert-deftest dorg-test-ixp-third-party-fk-extension-equals-scalar-effects ()
+  "An FK-bearing extension's effects lower without reordering.
+The test extension interleaves child and parent deletes with parent inserts,
+then emits a child insert run.  For a bootstrap and a replace, the lowered
+SQL equals the reference model applied to the scalar effect SQL (BM25 is
+registered too), and the
+stored extension and core rows equal a second store that executed the scalar
+effect SQL."
+  (unless (and dorg-test--dolt-available dorg-test--server-port)
+    (ert-skip "dolt sql-server unavailable"))
+  (let ((run
+         (lambda (scalar)
+           (dorg-test--with-temp-db dolt-dir
+             (let ((dir (make-temp-file "dorg-ibx-" t))
+                   (dorg--extensions nil)
+                   (ids (dorg-ib-id-generator))
+                   (collect-fn (symbol-function 'dorg-ext-collect-index-projection))
+                   (sql-log nil))
+               (unwind-protect
+                   (progn
+                     ;; BM25 rides along: the oracle dump covers its tables.
+                     (dorg-bm25-register-extension)
+                     (dorg-ibx-register (list nil))
+                     (dorg-migrate-schema dolt-dir)
+                     (dorg-commit dolt-dir "install bm25 and the fk test extension")
+                     (cl-letf (((symbol-function 'dorg-ext-collect-index-projection)
+                                (lambda (&rest args)
+                                  (let* ((result (copy-sequence (apply collect-fn args)))
+                                         (effect-sql (mapcar #'dorg-ext--index-effect-sql
+                                                             (plist-get result :effects))))
+                                    (push (cons effect-sql (plist-get result :sql)) sql-log)
+                                    (if scalar (plist-put result :sql effect-sql) result)))))
+                       (dorg-ib-import ids dolt-dir dir "corpus" dorg-ib-corpus-bootstrap
+                                       'bootstrap)
+                       (dorg-ib-import ids dolt-dir dir "corpus" dorg-ib-corpus-replace
+                                       'replace (dorg-head-commit dolt-dir)))
+                     (list :sql (nreverse sql-log)
+                           :dump (dorg-ib-normalize
+                                  (dorg-ib-dump dolt-dir dorg-ibx-dump-tables) nil)))
+                 (delete-directory dir t))))))
+         (lowered nil) (scalar nil))
+    (setq lowered (funcall run nil)
+          scalar (funcall run t))
+    (should (equal (plist-get scalar :dump) (plist-get lowered :dump)))
+    (should (= 2 (length (plist-get lowered :sql))))
+    (dolist (pair (plist-get lowered :sql))
+      (should (equal (dorg-ibr-lower (car pair)
+                                     (append dorg-ibx-tables dorg-ibr-bm25-tables))
+                     (cdr pair))))
+    ;; The replace really interleaves deletes and inserts and merges a run.
+    (let ((replace (cadr (plist-get lowered :sql))))
+      (should (cl-some (lambda (s) (string-prefix-p "DELETE FROM ib_child" s))
+                       (car replace)))
+      (should (cl-some (lambda (s) (string-prefix-p "INSERT INTO ib_parent" s))
+                       (car replace)))
+      (should (< (length (cdr replace)) (length (car replace)))))))
 
 (provide 'dorg-ext-index-projector-tests)
 ;;; dorg-ext-index-projector-tests.el ends here

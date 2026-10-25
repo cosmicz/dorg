@@ -46,6 +46,18 @@ constant is a net readability loss).")
 (defconst dorg-id--shard-bits 10
   "Number of shard bits in a snowflake id.")
 
+(defconst dorg-id--timestamp-bits
+  (- 63 dorg-id--shard-bits dorg-id--seq-bits)
+  "Number of timestamp bits in a positive snowflake id.")
+
+(defconst dorg-id-max
+  (1- (ash 1 (+ dorg-id--timestamp-bits
+                dorg-id--shard-bits
+                dorg-id--seq-bits)))
+  "Maximum positive DOrg snowflake id.
+Derived from the sign-bit-clear id layout so code that couples to the
+identity domain fails loudly if the layout width changes.")
+
 (defconst dorg-id--seq-max (1- (ash 1 dorg-id--seq-bits))
   "Maximum sequence value (4095).")
 

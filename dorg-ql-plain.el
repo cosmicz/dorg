@@ -63,27 +63,36 @@ when the file does not exist."
     (or (find-buffer-visiting file)
         (dorg--find-file-noselect file))))
 
-(defun dorg-ql--plain-org-local-properties ()
-  "Return an alist of the local PROPERTIES drawer at the heading at point.
+(defun dorg-ql--plain-org-local-properties (element)
+  "Return the local PROPERTIES alist owned by headline ELEMENT.
 Reads the literal `node-property' entries of the entry's own drawer via
-the org-element API, exactly as the parser does, so inherited and
+the headline boundary, exactly as the parser does, so inherited and
 special values — most notably CATEGORY, which `org-entry-get' always
 synthesizes with inheritance — are never returned.  DORG_ID is excluded:
 identity is owned by the `id' predicate, mirroring the model and Dolt
 adapters, which omit DORG_ID from their property sets."
-  (let ((block (org-get-property-block (point)))
-        out)
-    (when block
-      (save-excursion
-        (goto-char (car block))
-        (beginning-of-line)
-        (while (< (point) (cdr block))
-          (when (looking-at org-property-re)
-            (let ((key (match-string-no-properties 2))
-                  (value (or (match-string-no-properties 3) "")))
-              (unless (equal (upcase key) dorg-id-property)
-                (push (cons key value) out))))
-          (forward-line 1))))
+  (let (out)
+    (save-excursion
+      ;; Do not call `org-get-property-block': it performs another
+      ;; `org-element-at-point' lookup.  The already decoded headline gives
+      ;; the exact local drawer start boundary, including an optional planning
+      ;; line, and the literal scan preserves duplicate and `+' keys.
+      (goto-char (org-element-property :begin element))
+      (forward-line 1)
+      (when (looking-at-p org-planning-line-re)
+        (forward-line 1))
+      (when (looking-at org-property-drawer-re)
+        (let ((end (match-end 0)))
+          (beginning-of-line)
+          (forward-line 1)
+          (while (< (point) end)
+            (unless (looking-at-p "^[ \t]*:END:[ \t]*$")
+              (when (looking-at org-property-re)
+              (let ((key (match-string-no-properties 2))
+                    (value (or (match-string-no-properties 3) "")))
+                (unless (equal (upcase key) dorg-id-property)
+                    (push (cons key value) out)))))
+            (forward-line 1)))))
     (nreverse out)))
 
 ;;; ─── Normalized v2 AST adapter ────────────────────────────────────────
@@ -140,38 +149,52 @@ fields with light, local Org APIs only --- no item/body projection."
         (props (make-hash-table :test 'eql))
         (ord 0)
         ;; Ancestor stack of (LEVEL . ORDINAL), nearest ancestor first.
-        (stack nil))
+        (stack nil)
+        ;; This is the parser's phantom policy.  Compute it once, and test
+        ;; before decoding so sample headings never become rows or ancestors.
+        (verbatim-regions (dorg-parse--verbatim-regions)))
     (goto-char (point-min))
     (let ((case-fold-search t))
       (while (re-search-forward org-heading-regexp nil t)
         (beginning-of-line)
-        (let ((lvl (org-current-level))
-              (this-ord (cl-incf ord)))
-          ;; Pop any ancestors at this level or deeper; the remaining top is
-          ;; the structural parent.
-          (while (and stack (>= (caar stack) lvl))
-            (setq stack (cdr stack)))
-          (let* ((parent-ord (and stack (cdar stack)))
-                 (title (org-get-heading t t t t))
-                 (todo (org-get-todo-state))
-                 (priority (let ((c (nth 3 (org-heading-components))))
-                             (and c (char-to-string c))))
-                 ;; Own COMMENT flag (non-inherited): the title with the
-                 ;; COMMENT keyword kept differs from the title with it
-                 ;; stripped exactly when this heading is commented.
-                 (commented (not (equal title (org-get-heading t t t nil))))
-                 (tags (org-get-tags nil t))
-                 (real (dorg-id-at-point))
-                 (h (make-dorg-heading
-                     :id this-ord :parent-id parent-ord :level lvl
-                     :title title :todo todo :priority priority
-                     :commented commented :tags tags)))
-            (push h ordered)
-            (puthash this-ord real real-id)
-            (puthash this-ord (copy-marker (point)) markers)
-            (puthash this-ord (dorg-ql--plain-org-local-properties) props)
-            (push (cons lvl this-ord) stack))
-          (end-of-line))))
+        (unless (dorg-parse--position-verbatim-p (point) verbatim-regions)
+          ;; `org-heading-regexp' also sees recognised inline-task lines.
+          ;; Decode each non-phantom candidate once, then retain only actual
+          ;; headline elements; an inline task is never an ancestor.
+          (let ((element (org-element-at-point)))
+            (when (eq (org-element-type element) 'headline)
+              (let ((lvl (org-element-property :level element))
+                    (this-ord (cl-incf ord)))
+                ;; Pop any ancestors at this level or deeper; the remaining top is
+                ;; the structural parent.
+                (while (and stack (>= (caar stack) lvl))
+                  (setq stack (cdr stack)))
+                (let* ((parent-ord (and stack (cdar stack)))
+                       (title (let ((raw (org-element-property :raw-value element)))
+                                (and raw (substring-no-properties raw))))
+                       (todo (let ((keyword (org-element-property :todo-keyword element)))
+                               (and keyword (substring-no-properties keyword))))
+                       (priority (let ((c (org-element-property :priority element)))
+                                   (and c (char-to-string c))))
+                       (commented (and (org-element-property :commentedp element) t))
+                       (tags (mapcar #'substring-no-properties
+                                     (org-element-property :tags element)))
+                       (real (dorg-id-at-point-plain))
+                       (h (make-dorg-heading
+                           :id this-ord :parent-id parent-ord :level lvl
+                           ;; A top-level heading's parent is the document (0).
+                           :level-offset (- lvl (if stack (caar stack) 0))
+                           :title title :todo todo :priority priority
+                           :commented commented :tags tags)))
+                  (push h ordered)
+                  (puthash this-ord real real-id)
+                  (puthash this-ord (copy-marker (point)) markers)
+                  (puthash this-ord
+                           (dorg-ql--plain-org-local-properties element) props)
+                  (push (cons lvl this-ord) stack))))))
+        ;; Always advance: a verbatim phantom has no decoded row but still
+        ;; occupies the current regexp match.
+        (end-of-line)))
     (list :ordered (nreverse ordered)
           :real-id real-id :markers markers :props props)))
 
@@ -206,7 +229,26 @@ by `dorg-ql--eval-expr-match-p'."
      (let* ((pord (dorg-heading-parent-id heading))
             (real (and pord (gethash pord (plist-get ctx :real-id)))))
        (and real (dorg-ql--apply-order-op op real value))))
+    (`(:cmp parent-id ,_ ,_ :case ,_)
+     (dorg-ql--error ":case is not supported for parent-id"))
+    (`(:cmp ,field ,op ,value :case ,mode)
+     (if (dorg-ql--query-field field)
+         (dorg-ql--extension-match-p
+          field op value
+          (lambda (expr) (dorg-ql--plain-value expr heading ctx)) mode)
+       (dorg-ql--model-leaf-match-p expr heading)))
+    (`(:cmp ,field ,op ,value)
+     (if (dorg-ql--query-field field)
+         (dorg-ql--extension-match-p
+          field op value
+          (lambda (expr) (dorg-ql--plain-value expr heading ctx)))
+       (dorg-ql--model-leaf-match-p expr heading)))
+    (`(:property ,key ,op ,value :case ,mode)
+     (dorg-ql--alist-match-p
+      key op value (gethash (dorg-heading-id heading) (plist-get ctx :props)) mode))
     (`(:property ,key ,op ,value)
+     (unless (memq op '(exists missing))
+       (dorg-ql--error "string property comparison lacks canonical :case mode: %S" expr))
      (dorg-ql--alist-match-p
       key op value (gethash (dorg-heading-id heading) (plist-get ctx :props))))
     (_ (dorg-ql--expr-match-p expr heading))))
@@ -219,7 +261,24 @@ with the plain-org leaf matcher closed over CTX."
    expr heading
    (lambda (node h) (dorg-ql--plain-leaf-match-p node h ctx))))
 
-(defun dorg-ql--plain-materialize (headings index)
+(defun dorg-ql--plain-value (expr heading index)
+  "Read EXPR from HEADING using INDEX's real identity and local properties."
+  (let ((ids (plist-get index :real-id)))
+    (pcase expr
+      (`(:field id) (gethash (dorg-heading-id heading) ids))
+      (`(:field parent-id) (gethash (dorg-heading-parent-id heading) ids))
+      (`(:property ,key)
+       (cdr (assoc key (gethash (dorg-heading-id heading)
+                               (plist-get index :props)))))
+      (`(:field ,field)
+       (if (dorg-ql--query-field field)
+           (dorg-ql--extension-value
+            field (lambda (dependency)
+                    (dorg-ql--plain-value dependency heading index)))
+         (dorg-ql--model-value expr heading)))
+      (_ (dorg-ql--model-value expr heading)))))
+
+(defun dorg-ql--plain-materialize (headings index &optional columns)
   "Map HEADINGS to result plists in their current order using INDEX.
 `:heading-id' is the real DORG_ID (nil when the heading has none),
 `:marker' is the heading's live marker, and `:properties' is its local
@@ -230,27 +289,32 @@ produces."
         (props (plist-get index :props)))
     (mapcar (lambda (h)
               (let ((ord (dorg-heading-id h)))
-                (dorg-ql--make-result
-                 :heading-id (gethash ord real-id)
-                 :marker (gethash ord markers)
-                 :title (dorg-heading-title h)
-                 :properties (gethash ord props))))
+                (if columns
+                    (dorg-ql--project-row
+                     columns (gethash ord real-id) (gethash ord markers)
+                     (lambda (expr) (dorg-ql--plain-value expr h index)))
+                  (dorg-ql--make-result
+                   :heading-id (gethash ord real-id)
+                   :marker (gethash ord markers)
+                   :title (dorg-heading-title h)
+                   :properties (gethash ord props)))))
             headings)))
 
-(defun dorg-ql--plain-eval (ast reg)
+(defun dorg-ql--plain-eval (ast reg &optional buffer)
   "Plan and execute a normalized v2 AST against REG's plain-org buffer.
 AST is `(:pipe (:source :all) STEP...)' from `dorg-ql-normalize'.  Returns
 result plists in document/tree order with live markers and de-duplication
 matching the model baseline.  Builds one light headline-only index; items
 are projected exactly once per heading only when `:timestamp' or `:keyword'
 predicates are present.  Signals `dorg-ql-error' for a non-pipeline AST or an
-unknown node."
+unknown node.  When BUFFER is non-nil, evaluate that already-captured source
+rather than opening REG again."
   (unless (and (consp ast) (eq (car ast) :pipe)
                (equal (cadr ast) '(:source :all)))
     (dorg-ql--error
      "plain-org planner expects a normalized (:pipe (:source :all) ...) AST: %S"
      ast))
-  (let ((buf (dorg-ql--plain-org-buffer reg))
+  (let ((buf (or buffer (dorg-ql--plain-org-buffer reg)))
         (project-items (or (dorg-ql--any-node-p ast :timestamp)
                            (dorg-ql--any-node-p ast :keyword))))
     (with-current-buffer buf
@@ -264,9 +328,10 @@ unknown node."
                            :props (plist-get index :props)))
                 (working
                  (dorg-ql--eval-pipeline
-                  (cddr ast) ordered idx
+                  (cddr (dorg-ql--selection-ast ast)) ordered idx
                   (lambda (expr h) (dorg-ql--plain-expr-match-p expr h ctx)))))
-           (dorg-ql--plain-materialize working index)))))))
+           (dorg-ql--plain-materialize
+            working index (dorg-ql--projection-columns ast))))))))
 
 (provide 'dorg-ql-plain)
 ;;; dorg-ql-plain.el ends here

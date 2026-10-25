@@ -3,8 +3,23 @@
 - Source :: https://github.com/LuciusChen/mysql.el
 - Version :: 0.2.4
 - Commit :: a59dd867884938b2c6d7ea528ffb2a8b093674f5
-- mysql.el SHA-256 :: 42d058c1d8d6463c160402ecba787b8597673e25248a117c9790380e80b14718
+- Upstream mysql.el SHA-256 :: 42d058c1d8d6463c160402ecba787b8597673e25248a117c9790380e80b14718
+- Patched mysql.el SHA-256 :: f56b75b236ca5223913dbed8cfd395158fd63b67eec911892ec25f6529d74624
 - LICENSE SHA-256 :: 3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
 
-The vendored =mysql.el= is copied byte-for-byte from that commit.  DOrg carries
-no local patch; dependency-path naming remains separate work in =tracked-case=.
+The vendored =mysql.el= starts from that commit and carries two local patches.
+
+First, ~mysql--send-packet~ sends each header and payload fragment in one socket
+write.  Separate short writes can introduce a TCP delayed-ACK wait for every
+command.  Fragment boundaries, sequence numbers, and wire bytes are unchanged.
+The packet contract in [[file:../../tests/dorg-transport-tests.el][dorg-transport-tests.el]] covers empty, small,
+exact-limit, and split payloads, including sequence wrap and empty terminators.
+
+Second, the text-protocol row decoder ~mysql--parse-typed-value~ and the
+prepared/binary string decoder ~mysql--binary-text-value~ decode wire bytes
+with =utf-8-unix= instead of =utf-8=.  Plain =utf-8= applies automatic
+end-of-line conversion, so a stored CRLF value read back as LF.  Binary-charset
+and BINARY-flag columns and custom type parsers still receive the raw bytes.
+The regressions and controls are in the same test file.
+
+Both patches are local to DOrg; neither is an upstream release.

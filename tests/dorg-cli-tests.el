@@ -9,7 +9,7 @@
 ;; Tests for `dorg-app.el' (the `bin/dorg' Clime app) and its build /
 ;; vendoring / compatibility contract.  Coverage:
 ;;
-;;   - Pure helpers: `dorg-app--hit', `dorg-app--text', the `--json'
+;;   - Pure helpers: `dorg-ql-snapshot-public', `dorg-app--text', the `--json'
 ;;     envelope finalizer `dorg-app--json-finalize' and the server helpers
 ;;     `dorg-app--dolt-json' /
 ;;     `dorg-app--dolt-target'.
@@ -62,6 +62,37 @@
 ;; unset in the test process, so `clime-main-script-p' returns nil).
 (require 'dorg-app)
 
+(ert-deftest dorg-test-cli-query-json-emits-one-snapshot-envelope ()
+  "JSON query output delegates common source/snapshot data to QL once."
+  (cl-letf (((symbol-function 'clime-out-format) (lambda () 'json))
+            ((symbol-function 'dorg-command-run-query)
+             (lambda (&rest _) (ert-fail "JSON must not issue a second query")))
+             ((symbol-function 'dorg-ql-select-snapshot)
+              (lambda (&rest _)
+               '(:rows ((:heading-id 9 :marker nil :values (("state" . "WAIT"))))
+                 :source (:kind dolt :file "/tmp/tracker.org" :store "/tmp/store/")
+                 :snapshot (:kind dolt :head "abc123")
+                 :root 42 :context-digest "ctx"))))
+    (let ((result (dorg-app--emit-query '(id 9) 'fixture-buffer)))
+      (should (eq (plist-get result :command) 'query))
+      (should (= (plist-get result :root) 42))
+      (should (equal (plist-get result :source)
+                     '(:kind dolt :file "/tmp/tracker.org" :store "/tmp/store/")))
+      (should (equal (plist-get result :snapshot) '(:kind dolt :head "abc123")))
+      (should (equal (plist-get result :context-digest) "ctx"))
+      (should (= (plist-get result :count) 1))
+      (should (equal (aref (plist-get result :results) 0) '(("state" . "WAIT")))))))
+
+(ert-deftest dorg-test-cli-query-json-distinguishes-empty-collection ()
+  "A selected empty collection is JSON [] while a missing scalar is null."
+  (let ((json (json-encode (aref (plist-get
+                                  (dorg-ql-snapshot-public
+                                   '(:rows ((:heading-id 1
+                                            :values (("tags" . []) ("owner"))))))
+                                  :results) 0))))
+    (should (string-search "\"tags\":[]" json))
+    (should (string-search "\"owner\":null" json))))
+
 (defun dorg-test-cli--path (rel)
   "Return the absolute path of REL under the repo root."
   (expand-file-name rel dorg-test-cli--root))
@@ -78,12 +109,14 @@
 
 ;;; ─── Subprocess invoker ───────────────────────────────────────────────
 
-(defun dorg-test-cli--invoke (args &optional extra-env preload-form)
+(defun dorg-test-cli--invoke (args &optional extra-env preload-form capture)
   "Run the dorg app with ARGS (a list of strings); return (CODE . STDOUT).
 Uses the running Emacs + `dorg-app.el' so the test is hermetic and does
 not depend on \"emacs\" being on PATH.  EXTRA-ENV is a list of
-\"NAME=VALUE\" strings prepended to `process-environment'.  Stderr is
-discarded so STDOUT carries only the CLI's structured/text output.
+\"NAME=VALUE\" strings prepended to `process-environment'.  Unless CAPTURE is
+non-nil, stderr is discarded so STDOUT carries only the CLI's structured/text
+output.  When CAPTURE is non-nil, return a plist with raw command, argv,
+relevant environment, stdout, stderr, and exit facts.
 When PRELOAD-FORM is non-nil, evaluate it in the fresh child immediately
 before loading `dorg-app.el'.  This is reserved for process-boundary
 failure injection that cannot be represented by environment variables.
@@ -99,28 +132,58 @@ already pins one in EXTRA-ENV, in which case the caller override wins."
                            extra-env)
             (list (concat "DORG_DOLT_SERVER_INDEX_DIR="
                           (dorg-test--isolate-server-index)))))
-         (process-environment (append (list "CLIME_MAIN_APP=dorg-cli")
-                                      extra-env index-env process-environment))
+         (relevant-env (append (list "CLIME_MAIN_APP=dorg-cli")
+                               extra-env index-env))
+         (process-environment (append relevant-env process-environment))
          (default-directory dorg-test-cli--root))
-    (with-temp-buffer
-      (let* ((preload-args
-              (and preload-form
-                   (list "--eval" (prin1-to-string preload-form))))
-             (child-args
-              (append (list "--batch" "-Q"
-                            "-L" dorg-test-cli--root
-                            "-L" (dorg-test-cli--path "lib/clime"))
-                      preload-args
-                      (list "-l" (dorg-test-cli--path "dorg-app.el") "--")
+    (let ((stdout (generate-new-buffer " *dorg-test-cli-stdout*"))
+          (stderr-file (and capture
+                            (make-temp-file "dorg-test-cli-stderr-"))))
+      (unwind-protect
+          (let* ((preload-args
+                  (and preload-form
+                       (list "--eval" (prin1-to-string preload-form))))
+                 (child-args
+                  (append (list "--batch" "-Q"
+                                "-L" dorg-test-cli--root
+                                "-L" (dorg-test-cli--path "lib/clime"))
+                          preload-args
+                          (list "-l" (dorg-test-cli--path "dorg-app.el") "--")
                       args))
-             (code (apply #'call-process emacs nil
-                          (list (current-buffer) nil) nil child-args)))
-        (cons code (buffer-string))))))
+                 (code (apply #'call-process emacs nil
+                              (list stdout stderr-file) nil child-args))
+                 (stdout-text (with-current-buffer stdout (buffer-string))))
+            (if capture
+                (list :command emacs
+                      :argv child-args
+                      :args (copy-sequence args)
+                      :env (copy-sequence relevant-env)
+                      :exit code
+                      :stdout stdout-text
+                      :stderr (when (and stderr-file
+                                         (file-exists-p stderr-file))
+                                (with-temp-buffer
+                                  (insert-file-contents-literally stderr-file)
+                                  (buffer-string))))
+              (cons code stdout-text)))
+        (when (buffer-live-p stdout)
+          (kill-buffer stdout))
+        (when (and stderr-file (file-exists-p stderr-file))
+          (delete-file stderr-file))))))
 
 (defun dorg-test-cli--json (string)
   "Parse STRING as a JSON object alist with arrays as lists."
   (json-parse-string string :object-type 'alist :array-type 'list
                      :null-object nil :false-object :json-false))
+
+(defconst dorg-test-cli--wire-null :dorg-test-cli-wire-null
+  "Distinct parsed representation of a present JSON null in CLI tests.")
+
+(defun dorg-test-cli--json-with-wire-null (string)
+  "Parse STRING while preserving the distinction between null and absent keys."
+  (json-parse-string string :object-type 'alist :array-type 'list
+                     :null-object dorg-test-cli--wire-null
+                     :false-object :json-false))
 
 (defun dorg-test-cli--json-data (string)
   "Return the shared-envelope data object from JSON STRING."
@@ -657,23 +720,19 @@ Atoms and nil are reader-valid and remain domain validators' concern."
       (should (equal (plist-get (plist-get query :details) :detail)
                      (plist-get (plist-get mutate :details) :detail))))))
 
-(ert-deftest dorg-test-cli-exact-form-reader-disables-read-eval ()
-  "A side-effecting `#.' form is malformed input and is never evaluated."
+(ert-deftest dorg-test-cli-exact-form-reader-rejects-nondata ()
+  "Invalid reader syntax is malformed input and executes no side effects."
   (let ((dorg-test-cli--reader-side-effect nil))
-    (let ((payload
-           (dorg-test-cli--reader-error
-            "#.(setq dorg-test-cli--reader-side-effect t)" 'query)))
-      (should (eq 'malformed-syntax
-                  (plist-get (plist-get payload :details) :detail)))
-      (should-not dorg-test-cli--reader-side-effect))))
+    (dolist (text '("#.(setq dorg-test-cli--reader-side-effect t)" "("))
+      (let ((payload (dorg-test-cli--reader-error text 'query)))
+        (should (eq 'malformed-syntax
+                    (plist-get (plist-get payload :details) :detail)))
+        (should-not dorg-test-cli--reader-side-effect)))))
 
-(ert-deftest dorg-test-cli-exact-form-reader-is-the-only-reader-seam ()
-  "Production has exactly the vetted raw reader seams, each hardened.
-Two are allowed: the CLI exact-form reader (dorg-app.el, `#.' disabled by
-its reader harness) and the postimage evidence payload parser
-\(dorg-mutate.el, tracked-regression, whose closed grammar bans `#' before the
-reader runs — its static payload witness proves a `#.' payload is inert).
-Any further raw read is a new unvetted seam and must fail here."
+(ert-deftest dorg-test-cli-raw-readers-are-vetted ()
+  "Production has exactly two vetted raw readers.
+The CLI reads one exact user form; the file-lock leaf reads a bounded owner
+record.  Any further raw read is a new unvetted seam and must fail here."
   (let ((raw-count 0))
     (dolist (file (directory-files dorg-test-cli--root t "\\`dorg-.*\\.el\\'"))
       (setq raw-count
@@ -687,17 +746,66 @@ Any further raw read is a new unvetted seam and must fail here."
     (should (= 2 (dorg-test-cli--count-regexp
                   "(dorg-app--read-exact-form\\_>" app)))
     (should-not (string-match-p ":conform[ \t\n]+(lambda.*read-from-string"
-                                app))))
+                                app)))
+  (let ((leaf (dorg-test-cli--file-bytes
+               (dorg-test-cli--path "dorg-file-lock.el"))))
+    (should (= 1 (dorg-test-cli--count-regexp "(read-from-string\\_>" leaf)))))
 
-(ert-deftest dorg-test-cli-hit-shape ()
-  "`dorg-app--hit' yields {heading-id,title,properties} with no marker."
-  (let ((hit (dorg-app--hit
-              (list :heading-id 7 :marker (point-marker)
-                    :title "T" :properties '(("K" . "V"))))))
+(ert-deftest dorg-test-cli-selected-row-json-excludes-internal-identity ()
+  "Selected JSON contains exactly requested columns, including null/false."
+  (let* ((row '(:heading-id 101 :marker nil
+                :values (("label" . "Visible") ("missing")
+                         ("flag" . :json-false))))
+         (json (json-encode (aref (plist-get (dorg-ql-snapshot-public
+                                               (list :rows (list row)))
+                                           :results) 0))))
+    (should (equal json "{\"label\":\"Visible\",\"missing\":null,\"flag\":false}"))
+    (should (equal (dorg-app--text row) "Visible\tnull\tfalse"))))
+
+(ert-deftest dorg-test-cli-public-snapshot-row-shape ()
+  "Public QL data yields {heading-id,title,properties} with no marker."
+  (let ((hit (aref (plist-get
+                    (dorg-ql-snapshot-public
+                     (list :rows (list (list :heading-id 7 :marker (point-marker)
+                                            :title "T" :properties '(("K" . "V"))))))
+                    :results) 0)))
     (should (equal 7 (plist-get hit :heading-id)))
     (should (equal "T" (plist-get hit :title)))
     (should (equal '(("K" . "V")) (plist-get hit :properties)))
     (should-not (plist-member hit :marker))))
+
+(ert-deftest dorg-test-cli-query-envelope-keeps-plain-source-and-opaque-columns ()
+  "The real CLI reports a plain content token and verbatim requested names."
+  (dorg-test-cli--with-fixture file
+    (with-temp-buffer
+      (insert-file-contents file)
+      (goto-char (point-min))
+      (re-search-forward ":CATEGORY: red")
+      (end-of-line)
+      (insert "\n:BEAD_ID: x-1")
+      (write-region (point-min) (point-max) file nil 'silent))
+    (let* ((form "(pipe (where (id 100)) (select (as (field title) matched_seat) (property \"BEAD_ID\")))")
+           (first (dorg-test-cli--invoke (list "--json" "query" form "-f" file)))
+           (first-data (dorg-test-cli--json-data (cdr first)))
+           (first-snapshot (alist-get 'snapshot first-data)))
+      (should (= 0 (car first)))
+      (should (string-match-p "\"matched_seat\":\"First task\"" (cdr first)))
+      (should (string-match-p "\"BEAD_ID\":\"x-1\"" (cdr first)))
+      (should (equal "plain-org" (format "%s" (alist-get 'kind (alist-get 'source first-data)))))
+      (should (equal (file-truename file) (alist-get 'file (alist-get 'source first-data))))
+      (should (equal "plain-org" (format "%s" (alist-get 'kind first-snapshot))))
+      (should (stringp (alist-get 'content-sha256 first-snapshot)))
+      (with-temp-buffer
+        (insert-file-contents file)
+        (goto-char (point-max))
+        (insert "\n# changed\n")
+        (write-region (point-min) (point-max) file nil 'silent))
+      (let* ((second (dorg-test-cli--invoke (list "--json" "query" form "-f" file)))
+             (second-data (dorg-test-cli--json-data (cdr second))))
+        (should (= 0 (car second)))
+        (should-not (equal (alist-get 'content-sha256 first-snapshot)
+                           (alist-get 'content-sha256
+                                      (alist-get 'snapshot second-data))))))))
 
 (ert-deftest dorg-test-cli-text-line ()
   "`dorg-app--text' is \"<id>\\t<title>\", em dash when id is nil."
@@ -975,12 +1083,14 @@ served server-fault (usage nil) -> accumulate (not usage); text -> `error'."
 Non-vacuous: the test keeps `dorg-app--emit-query' and
 `dorg-command-run-query' real, gives the buffer a real Dolt registration,
 sets `dorg-sql--cli-exec' as a failing sentinel, and asserts the observed
-mysql port for both the selector query and result property load."
+mysql port for the HEAD capture plus one captured revision for the pinned
+selector query and result property load."
   (let* ((temp (file-name-as-directory (make-temp-file "dorg-cli-query-" t)))
          (org-file (expand-file-name "doc.org" temp))
          (dolt-dir (expand-file-name "dolt/" temp))
          (dorg--registry nil)
          (dorg-sql-transport 'server)
+         (dorg-sql--leases (make-hash-table :test 'equal))
          (mysql-ports nil)
          (sql-queries nil)
          (cli-called nil)
@@ -1007,25 +1117,75 @@ mysql port for both the selector query and result property load."
                        (let ((p (or port (dorg-dolt-server--strict-port dir))))
                          (push p mysql-ports)
                          (list :port p))))
+                    ;; Keep `dorg-sql--at-revision', its mysql branch, revision
+                    ;; validation, USE/restore protocol, and leased execution
+                    ;; real.  Replace only connection checkout/release.
+                    ((symbol-function 'dorg-sql--acquire-lease)
+                     (lambda (dir)
+                       (let* ((lease
+                               (dorg-sql--make-lease
+                                :dolt-dir dir :port 64021
+                                :conn 'fixture-connection :phase :active
+                                :owner (make-symbol "cli-query-lease")))
+                              (canon (dorg-dolt-server--canonical-dir dir)))
+                         (should-not (gethash canon dorg-sql--leases))
+                         (puthash canon lease dorg-sql--leases)
+                         (push 64021 mysql-ports)
+                         lease)))
+                    ((symbol-function 'dorg-sql--release-lease)
+                     (lambda (lease &optional broken)
+                       (let* ((dir (dorg-sql--lease-dolt-dir lease))
+                              (canon (dorg-dolt-server--canonical-dir dir)))
+                         (should-not broken)
+                         (should (eq lease (gethash canon dorg-sql--leases)))
+                         (remhash canon dorg-sql--leases)
+                         (setf (dorg-sql--lease-phase lease) :released))))
                     ((symbol-function 'dorg-sql--mysql-exec)
                      (lambda (query _conn)
                        (push query sql-queries)
                        (cond
+                        ((string-prefix-p "USE " query) nil)
+                        ((string-match-p "HASHOF('HEAD')" query)
+                         '(((hash . "abc123"))))
                         ((string-match-p "FROM heading_tags" query)
                          '(((id . 101) (title . "Server-aware"))))
                         ((string-match-p "FROM heading_properties" query)
                          '(((heading_id . 101)
                             (prop_key . "CATEGORY")
                             (prop_value . "ops"))))
-                        (t nil))))
+                        (t (ert-fail "unexpected mysql SQL: %s" query)))))
                     ((symbol-function 'dorg-sql--cli-exec)
                      (lambda (&rest _)
                        (setq cli-called t)
                        (error "raw SQL CLI reached from public query path"))))
             (let ((data (dorg-app--emit-query '(tag "ops") buf)))
               (should-not cli-called)
-              (should (equal mysql-ports '(64021 64021)))
-              (should (= (length sql-queries) 2))
+              (should (equal mysql-ports '(64021 64021 64021)))
+              (let ((data-queries
+                     (cl-remove-if (lambda (sql) (string-prefix-p "USE " sql))
+                                   sql-queries))
+                    (pin-uses
+                     (cl-remove-if-not
+                      (lambda (sql)
+                        (and (string-prefix-p "USE " sql)
+                             (string-search "/abc123`" sql)))
+                      sql-queries)))
+                (should (= (length data-queries) 3))
+                (should (= (length pin-uses) 2))
+                (should (= (length sql-queries) 7))
+                (should (= 1 (cl-count-if
+                              (lambda (sql)
+                                (string-match-p "HASHOF('HEAD')" sql))
+                              data-queries)))
+                (should (= 1 (cl-count-if
+                              (lambda (sql)
+                                (string-match-p "FROM heading_tags" sql))
+                              data-queries)))
+                (should (= 1 (cl-count-if
+                              (lambda (sql)
+                                (string-match-p "FROM heading_properties" sql))
+                              data-queries))))
+              (should (= 0 (hash-table-count dorg-sql--leases)))
               (should (eq (plist-get data :command) 'query))
               (should (= (plist-get data :count) 1))
               (let ((hit (aref (plist-get data :results) 0)))
@@ -1045,11 +1205,17 @@ mysql port for both the selector query and result property load."
                     :status 'live :policy 'strict :protocol 'mysql
                     :owner-pid 42 :server-pid 99 :host "h"
                     :created-at 1.0 :last-used 2.0
+                    :generation '(:directory (:device 1 :inode 2)
+                                  :native (:pid 99 :port 3306)
+                                  :source-hash "abc")
                     :proc 'NOT-SERIALIZABLE))))
     (should (equal "/repo/dolt" (plist-get obj :dolt-dir)))
     (should (equal 3306 (plist-get obj :port)))
     (should (eq 'owned (plist-get obj :role)))
     (should (eq 'live (plist-get obj :status)))
+    (should (equal '(:directory (:device 1 :inode 2)
+                     :native (:pid 99 :port 3306) :source-hash "abc")
+                   (plist-get obj :generation)))
     ;; Non-serializable process handle is not carried.
     (should-not (plist-member obj :proc))))
 
@@ -1069,8 +1235,8 @@ lists.  The retired lowered `:ops' echo is not serialized."
                    :patches ((:op replace
                               :target (:keyword
                                        :host (:heading :id 100)
-                                       :name "STATUS" :occurrence 1)
-                              :value "DONE" :missing :error))
+                                       :name "STATUS" :select (:occurrence 1))
+                              :value "DONE"))
                    :targets (100)
                    ;; A subtree move can now report its moved root and every
                    ;; descendant whose persisted level changed.
@@ -1437,6 +1603,305 @@ unknown predicate is a grammar failure, not a source capability refusal."
 
 ;;; ─── E2E server commands (dolt-free plumbing) ─────────────────────────
 
+(defun dorg-test-cli--lifecycle-root ()
+  "Return the DOrg tree root under test for the CLI lifecycle witness."
+  (file-name-as-directory
+   (expand-file-name (or (getenv "DORG_TEST_CLI_LIFECYCLE_ROOT")
+                         dorg-test-cli--root))))
+
+(defun dorg-test-cli--lifecycle-home-index (home)
+  "Return the HOME-derived server discovery index path for HOME."
+  (file-name-as-directory
+   (expand-file-name "dorg/server-stores/"
+                     (expand-file-name ".emacs.d/" home))))
+
+(defun dorg-test-cli--lifecycle-env (home tmpdir index-dir)
+  "Return the subprocess environment for HOME, TMPDIR, and INDEX-DIR.
+INDEX-DIR is deliberately the HOME-derived path.  Supplying it explicitly
+makes `dorg-test-cli--invoke' honor the incident-shape discovery index instead
+of installing its default isolated override."
+  (list (concat "HOME=" (file-name-as-directory home))
+        (concat "TMPDIR=" (file-name-as-directory tmpdir))
+        (concat "DORG_DOLT_SERVER_INDEX_DIR="
+                (file-name-as-directory index-dir))
+        "DORG_CLI_HISTORY_FILE="))
+
+(define-error 'dorg-test-cli-lifecycle-step-error
+  "DOrg CLI lifecycle step failed before domain assertions")
+
+(defun dorg-test-cli--lifecycle-invoke (root args env &optional preload-form capture)
+  "Invoke the public CLI in ROOT with ARGS and ENV via `dorg-test-cli--invoke'."
+  (let ((dorg-test-cli--root (file-name-as-directory root)))
+    (dorg-test-cli--invoke args env preload-form capture)))
+
+(defun dorg-test-cli--lifecycle-raw-step (name root args env &optional preload-form)
+  "Run NAME as CLI ARGS in ROOT/ENV and return its raw receipt plist."
+  (let* ((raw (dorg-test-cli--lifecycle-invoke
+               root args env preload-form t)))
+    (append (list :name name) raw)))
+
+(defun dorg-test-cli--lifecycle-decode-step (step)
+  "Return STEP with decoded JSON facts appended, preserving raw facts."
+  (let ((stdout (plist-get step :stdout))
+        obj
+        parse-error)
+    (when (string-match-p "\\S-" stdout)
+      (condition-case err
+          (setq obj (dorg-test-cli--json stdout))
+        (error (setq parse-error err))))
+    (append step
+            (list :json obj
+                  :parse-error parse-error
+                  :data (alist-get 'data obj)))))
+
+(defun dorg-test-cli--lifecycle-json-step (name root args env &optional preload-form)
+  "Run NAME as CLI ARGS in ROOT/ENV and return a decoded receipt plist."
+  (dorg-test-cli--lifecycle-decode-step
+   (dorg-test-cli--lifecycle-raw-step name root args env preload-form)))
+
+(defun dorg-test-cli--lifecycle-assert-json-step-ok (step)
+  "Assert STEP exited cleanly and decoded before domain-specific checks."
+  (cond
+   ((not (= 0 (plist-get step :exit)))
+    (signal 'dorg-test-cli-lifecycle-step-error
+            (list :exit step)))
+   ((plist-get step :parse-error)
+    (signal 'dorg-test-cli-lifecycle-step-error
+            (list :parse-error step)))
+   ((null (plist-get step :json))
+    (signal 'dorg-test-cli-lifecycle-step-error
+            (list :missing-json step))))
+  step)
+
+(defun dorg-test-cli--lifecycle-receipt-file ()
+  "Return an owned receipt file outside the lifecycle fixture root."
+  (expand-file-name
+   "receipt.el"
+   (file-name-as-directory
+    (make-temp-file "dorg-cli-lifecycle-receipt-" t))))
+
+(defun dorg-test-cli--lifecycle-persist-receipt (file receipt)
+  "Persist RECEIPT to FILE before assertions or fixture teardown."
+  (make-directory (file-name-directory file) t)
+  (with-temp-file file
+    (let ((print-length nil)
+          (print-level nil))
+      (pp receipt (current-buffer))))
+  file)
+
+(defun dorg-test-cli--lifecycle-read-file (file)
+  "Return FILE contents literally, or nil when FILE is absent."
+  (when (file-exists-p file)
+    (with-temp-buffer
+      (insert-file-contents-literally file)
+      (buffer-string))))
+
+(defun dorg-test-cli--lifecycle-dolt-version ()
+  "Return the Dolt binary version string visible to this test."
+  (with-temp-buffer
+    (let ((code (call-process "dolt" nil (current-buffer) nil "version")))
+      (list :exit code :stdout (buffer-string)))))
+
+(defun dorg-test-cli--lifecycle-runtime (store index-dir)
+  "Capture store/index/claim/native runtime state for STORE."
+  (let* ((canon (file-name-as-directory (file-truename store)))
+         (dorg-dolt-server-index-dir (file-name-as-directory index-dir))
+         (claim-file (dorg-dolt-server--claim-file canon))
+         (index-file (dorg-dolt-server--index-file canon))
+         (claim (ignore-errors (dorg-dolt-server--claim-read canon)))
+         (native (ignore-errors (dorg-dolt-server--dolt-server-info canon)))
+         (pid (or (and claim (alist-get :server-pid claim))
+                  (and native (plist-get native :pid))))
+         (port (or (and claim (alist-get :port claim))
+                   (and native (plist-get native :port)))))
+    (list :store canon
+          :store-exists (file-directory-p canon)
+          :claim-file claim-file
+          :claim claim
+          :claim-raw (dorg-test-cli--lifecycle-read-file claim-file)
+          :native-file (expand-file-name ".dolt/sql-server.info" canon)
+          :native native
+          :native-raw (dorg-test-cli--lifecycle-read-file
+                       (expand-file-name ".dolt/sql-server.info" canon))
+          :index-file index-file
+          :index-present (file-exists-p index-file)
+          :index-raw (dorg-test-cli--lifecycle-read-file index-file)
+          :pid pid
+          :port port
+          :pid-live (and (integerp pid) (dorg-dolt-server--pid-live-p pid))
+          :port-live (and (integerp port) (dorg-dolt-server--port-live-p port)))))
+
+(defun dorg-test-cli--lifecycle-exact-entry (servers store)
+  "Return the exact server entry for STORE from SERVERS, asserting uniqueness."
+  (let* ((canon (file-name-as-directory (file-truename store)))
+         (matches
+          (cl-remove-if-not
+           (lambda (entry)
+             (equal canon
+                    (file-name-as-directory
+                     (file-truename (alist-get 'dolt-dir entry)))))
+           servers)))
+    (should (= 1 (length matches)))
+    (car matches)))
+
+(defun dorg-test-cli--lifecycle-assert-setup (step store)
+  "Assert STEP observed the prior process's session-owned server for STORE."
+  (let* ((obj (plist-get step :json))
+         (data (plist-get step :data))
+         (entry (dorg-test-cli--lifecycle-exact-entry
+                 (alist-get 'servers data) store)))
+    (should (= 0 (plist-get step :exit)))
+    (should (eq t (alist-get 'ok obj)))
+    (should (equal "dolt-list" (format "%s" (alist-get 'command data))))
+    (should (integerp (alist-get 'port entry)))
+    (should (integerp (alist-get 'server-pid entry)))
+    (should (equal "live" (format "%s" (alist-get 'status entry))))
+    (should (equal "owned" (format "%s" (alist-get 'role entry))))
+    entry))
+
+(defun dorg-test-cli--lifecycle-assert-start (step store)
+  "Assert STEP is the expected successful public start for STORE."
+  (let ((obj (plist-get step :json))
+        (data (plist-get step :data))
+        (canon (file-name-as-directory (file-truename store))))
+    (should (= 0 (plist-get step :exit)))
+    (should (eq t (alist-get 'ok obj)))
+    (should (equal "dolt-start" (format "%s" (alist-get 'command data))))
+    (should (equal canon
+                   (file-name-as-directory
+                    (file-truename (alist-get 'dolt-dir data)))))
+    (should (integerp (alist-get 'port data)))
+    (should (eq t (alist-get 'started data)))))
+
+(defun dorg-test-cli--lifecycle-assert-list (step store runtime)
+  "Assert STEP lists exactly STORE and agrees with RUNTIME metadata."
+  (let* ((obj (plist-get step :json))
+         (data (plist-get step :data))
+         (servers (alist-get 'servers data))
+         (entry (dorg-test-cli--lifecycle-exact-entry servers store))
+         (claim (plist-get runtime :claim))
+         (native (plist-get runtime :native))
+         (canon (file-name-as-directory (file-truename store))))
+    (should (= 0 (plist-get step :exit)))
+    (should (eq t (alist-get 'ok obj)))
+    (should (equal "dolt-list" (format "%s" (alist-get 'command data))))
+    (should (plist-get runtime :store-exists))
+    (should (plist-get runtime :index-present))
+    (should claim)
+    (should native)
+    (should (equal canon (alist-get 'dolt-dir entry)))
+    (should (equal canon (alist-get :dolt-dir claim)))
+    (should (equal 'daemon (alist-get :owner-kind claim)))
+    (should (integerp (alist-get 'port entry)))
+    (should (integerp (alist-get 'server-pid entry)))
+    (should (integerp (alist-get 'owner-pid entry)))
+    (should (integerp (alist-get :port claim)))
+    (should (integerp (alist-get :server-pid claim)))
+    (should (integerp (alist-get :owner-pid claim)))
+    (should (integerp (plist-get native :port)))
+    (should (integerp (plist-get native :pid)))
+    (should (equal (alist-get 'port entry) (alist-get :port claim)))
+    (should (equal (alist-get 'server-pid entry)
+                   (alist-get :server-pid claim)))
+    (should (equal (alist-get 'owner-pid entry)
+                   (alist-get :owner-pid claim)))
+    (should (equal (plist-get native :port) (alist-get :port claim)))
+    (should (equal (plist-get native :pid) (alist-get :server-pid claim)))
+    (should (equal "live" (format "%s" (alist-get 'status entry))))
+    (should (equal "foreign" (format "%s" (alist-get 'role entry))))
+    entry))
+
+(defun dorg-test-cli--lifecycle-assert-stop (step store)
+  "Assert STEP is the expected successful public stop for STORE."
+  (let ((obj (plist-get step :json))
+        (data (plist-get step :data))
+        (canon (file-name-as-directory (file-truename store))))
+    (should (= 0 (plist-get step :exit)))
+    (should (eq t (alist-get 'ok obj)))
+    (should (equal "dolt-stop" (format "%s" (alist-get 'command data))))
+    (should (equal canon
+                   (file-name-as-directory
+                    (file-truename (alist-get 'dolt-dir data)))))
+    (should (eq t (alist-get 'stopped data)))))
+
+(defun dorg-test-cli--lifecycle-wait-stopped (pid port)
+  "Wait for PID and PORT to close inside the DOrg stop grace budget."
+  (let ((deadline (+ (float-time) dorg-dolt-server-stop-term-grace 1.0)))
+    (while (and (< (float-time) deadline)
+                (or (and (integerp pid) (dorg-dolt-server--pid-live-p pid))
+                    (and (integerp port) (dorg-dolt-server--port-live-p port))))
+      (accept-process-output nil 0.05)))
+  (list :pid-live (and (integerp pid) (dorg-dolt-server--pid-live-p pid))
+        :port-live (and (integerp port) (dorg-dolt-server--port-live-p port))))
+
+(defun dorg-test-cli--lifecycle-assert-post-list-absent (post-list store)
+  "Assert POST-LIST omits STORE."
+  (let* ((data (plist-get post-list :data))
+         (servers (alist-get 'servers data))
+         (canon (file-name-as-directory (file-truename store))))
+    (should (= 0 (plist-get post-list :exit)))
+    (should (eq t (alist-get 'ok (plist-get post-list :json))))
+    (should-not
+     (cl-find-if
+      (lambda (entry)
+        (equal canon
+               (file-name-as-directory
+                (file-truename (alist-get 'dolt-dir entry)))))
+      servers))))
+
+(defun dorg-test-cli--lifecycle-assert-stopped-dead (stopped)
+  "Assert STOPPED reports both the recorded pid and port are closed."
+  (should-not (plist-get stopped :pid-live))
+  (should-not (plist-get stopped :port-live)))
+
+(defun dorg-test-cli--lifecycle-assert-post-stop-absent (post-list store stopped)
+  "Assert POST-LIST omits STORE and STOPPED reports dead pid/port."
+  (dorg-test-cli--lifecycle-assert-post-list-absent post-list store)
+  (dorg-test-cli--lifecycle-assert-stopped-dead stopped))
+
+(defun dorg-test-cli--lifecycle-assert-nonvacuity
+    (store list-step list-entry runtime stop-step post-list stopped)
+  "Assert the CLI lifecycle witness assertions have data-level teeth."
+  (dorg-test-cli--lifecycle-assert-list list-step store runtime)
+  (dorg-test-cli--lifecycle-assert-stop stop-step store)
+  (dorg-test-cli--lifecycle-assert-post-list-absent post-list store)
+  (dorg-test-cli--lifecycle-assert-stopped-dead stopped)
+  (let* ((data (copy-tree (plist-get list-step :data)))
+         (foreign (copy-tree list-entry))
+         (canon (file-name-as-directory (file-truename store))))
+    ;; Exact-entry assertion rejects a widened/any-entry receipt mutant.
+    (setf (alist-get 'dolt-dir foreign) (concat canon "-foreign"))
+    (setf (alist-get 'servers data) (list foreign))
+    (should-error
+     (dorg-test-cli--lifecycle-exact-entry (alist-get 'servers data) store)
+     :type 'ert-test-failed))
+  ;; Stop result and post-stop liveness are independent receipt assertions.
+  (let* ((mut-stop (copy-tree stop-step))
+         (mut-json (copy-tree (plist-get mut-stop :json)))
+         (mut-data (copy-tree (plist-get mut-stop :data))))
+    (setf (alist-get 'stopped mut-data) :json-false)
+    (setf (alist-get 'data mut-json) mut-data)
+    (setq mut-stop (plist-put mut-stop :json mut-json))
+    (setq mut-stop (plist-put mut-stop :data mut-data))
+    (should-error
+     (dorg-test-cli--lifecycle-assert-stop mut-stop store)
+     :type 'ert-test-failed))
+  (should-error
+   (dorg-test-cli--lifecycle-assert-stopped-dead
+    (plist-put (copy-tree stopped) :pid-live t))
+   :type 'ert-test-failed)
+  (should-error
+   (dorg-test-cli--lifecycle-assert-stopped-dead
+    (plist-put (copy-tree stopped) :port-live t))
+   :type 'ert-test-failed)
+  ;; Early fixture deletion changes only store-exists; claim/native/index facts
+  ;; stay valid so this pins the store-presence assertion specifically.
+  (let ((runtime-missing-store (plist-put (copy-tree runtime) :store-exists nil)))
+    (should-error
+     (dorg-test-cli--lifecycle-assert-list
+      list-step store runtime-missing-store)
+     :type 'ert-test-failed)))
+
 (ert-deftest dorg-test-cli-dolt-list-empty-array ()
   "`server list --json' returns an empty server list under the envelope.
 Runs with isolated server state so no foreign claims leak into the test.
@@ -1471,6 +1936,265 @@ Listing is read-only and never starts a server."
     (should-not (= 0 (car res)))
     ;; no minibuffer prompt text leaked, no backtrace
     (should-not (string-match-p "Debugger\\|backtrace" (cdr res)))))
+
+(ert-deftest dorg-test-cli-lifecycle-receipt-preserves-partial-failure ()
+  "No-Dolt control for raw stderr and partial lifecycle receipt custody."
+  (let* ((root (dorg-test-cli--lifecycle-root))
+         (receipt-file (dorg-test-cli--lifecycle-receipt-file))
+         (receipt nil)
+         (continued nil))
+    (cl-labels
+        ((record
+          (step)
+          (setq receipt (append receipt (list step)))
+          (dorg-test-cli--lifecycle-persist-receipt receipt-file receipt)
+          step)
+         (replace-last
+          (step)
+          (setq receipt (append (butlast receipt) (list step)))
+          (dorg-test-cli--lifecycle-persist-receipt receipt-file receipt)
+          step)
+         (run-step
+          (name preload)
+          (let ((raw (record
+                      (dorg-test-cli--lifecycle-raw-step
+                       name root (list "--version") nil preload))))
+            (replace-last (dorg-test-cli--lifecycle-decode-step raw)))))
+      (let ((ok (run-step
+                 :ok
+                 '(progn
+                    (princ "{\"ok\":true,\"data\":{\"command\":\"ok\"}}\n")
+                    (kill-emacs 0)))))
+        (should (eq ok (dorg-test-cli--lifecycle-assert-json-step-ok ok))))
+      (let ((err
+             (should-error
+              (let ((bad (run-step
+                          :bad
+                          '(progn
+                             (princ "{malformed")
+                             (princ "transport stderr\n"
+                                    #'external-debugging-output)
+                             (kill-emacs 7)))))
+                (dorg-test-cli--lifecycle-assert-json-step-ok bad)
+                (setq continued t))
+              :type 'dorg-test-cli-lifecycle-step-error)))
+        (should-not continued)
+        (should (eq :exit (cadr err)))
+        (let* ((text (dorg-test-cli--lifecycle-read-file receipt-file))
+               (bad (cadr receipt)))
+          (should (string-match-p ":name :ok" text))
+          (should (string-match-p ":name :bad" text))
+          (should (= 7 (plist-get bad :exit)))
+          (should (plist-get bad :parse-error))
+          (should (string-match-p "transport stderr"
+                                  (plist-get bad :stderr))))))))
+
+(ert-deftest dorg-test-cli-lifecycle-data-controls-are-discriminating ()
+  "No-Dolt control for lifecycle receipt assertion non-vacuity."
+  (let* ((scratch (make-temp-file "dorg-cli-lifecycle-data-" t))
+         (store (file-name-as-directory (expand-file-name "store/" scratch))))
+    (unwind-protect
+        (progn
+          (make-directory store t)
+          (let* ((canon (file-name-as-directory (file-truename store)))
+                 (entry `((dolt-dir . ,canon)
+                          (port . 3306)
+                          (server-pid . 111)
+                          (owner-pid . 222)
+                          (status . "live")
+                          (role . "foreign")))
+                 (list-step
+                  `(:exit 0
+                    :json ((ok . t))
+                    :data ((command . "dolt-list")
+                           (servers . (,entry)))))
+                 (runtime
+                  `(:store-exists t
+                    :index-present t
+                    :claim ((:dolt-dir . ,canon)
+                            (:owner-kind . daemon)
+                            (:port . 3306)
+                            (:server-pid . 111)
+                            (:owner-pid . 222))
+                    :native (:port 3306 :pid 111)))
+                 (stop-step
+                  `(:exit 0
+                    :json ((ok . t))
+                    :data ((command . "dolt-stop")
+                           (dolt-dir . ,canon)
+                           (stopped . t))))
+                 (post-list
+                  '(:exit 0
+                    :json ((ok . t))
+                    :data ((command . "dolt-list")
+                           (servers . nil))))
+                 (stopped '(:pid-live nil :port-live nil)))
+            (should
+             (dorg-test-cli--lifecycle-assert-list
+              list-step store runtime))
+            (dorg-test-cli--lifecycle-assert-stop stop-step store)
+            (dorg-test-cli--lifecycle-assert-post-stop-absent
+             post-list store stopped)
+            (dorg-test-cli--lifecycle-assert-nonvacuity
+             store list-step entry runtime stop-step post-list stopped)))
+      (delete-directory scratch t))))
+
+(ert-deftest dorg-test-cli-dolt-intact-store-detached-start-list-stop ()
+  "Public CLI detached start/list/stop works while the owned store is intact.
+This is the detached lifecycle witness.  It uses fresh child processes through
+`dorg-test-cli--invoke' for start, list, stop, and post-stop list; it pins the
+discovery index to the HOME-derived path to mirror the observed consumer run."
+  (skip-unless dorg-test--dolt-available)
+  (require 'dorg-dolt-server)
+  (let* ((root (dorg-test-cli--lifecycle-root))
+         (scratch (file-name-as-directory
+                   (dorg-test--make-owned-temp-dir "dorg-cli-lifecycle-"
+                                                   "cli detached lifecycle witness")))
+         (home (expand-file-name "control-home/" scratch))
+         (tmpdir (expand-file-name "tmp/" scratch))
+         (user-emacs-directory (expand-file-name ".emacs.d/" home))
+         (index-dir (dorg-test-cli--lifecycle-home-index home))
+         (store (expand-file-name "store/" scratch))
+         (org-file (expand-file-name "doc.org" scratch))
+         (env (dorg-test-cli--lifecycle-env home tmpdir index-dir))
+         (receipt-file (dorg-test-cli--lifecycle-receipt-file))
+         (cleanup-ok nil)
+         first-error
+         receipt)
+    (make-directory user-emacs-directory t)
+    (make-directory tmpdir t)
+    (unwind-protect
+        (cl-labels
+            ((record
+              (step)
+              (setq receipt (append receipt (list step)))
+              (dorg-test-cli--lifecycle-persist-receipt receipt-file receipt)
+              step)
+             (replace-last
+              (step)
+              (setq receipt (append (butlast receipt) (list step)))
+              (dorg-test-cli--lifecycle-persist-receipt receipt-file receipt)
+              step)
+             (json-step
+              (name args &optional preload-form)
+              (let ((raw (record
+                          (dorg-test-cli--lifecycle-raw-step
+                           name root args env preload-form))))
+                (replace-last (dorg-test-cli--lifecycle-decode-step raw))))
+             (observe
+              (name facts)
+              (record (append (list :name name) facts))))
+          (condition-case err
+              (progn
+                (setq receipt
+                      (list (list :name :fixture
+                                  :subject-root root
+                                  :scratch scratch
+                                  :home home
+                                  :user-emacs-directory user-emacs-directory
+                                  :tmpdir tmpdir
+                                  :index-dir index-dir
+                                  :receipt-file receipt-file
+                                  :dolt-version
+                                  (dorg-test-cli--lifecycle-dolt-version))))
+                (dorg-test-cli--lifecycle-persist-receipt receipt-file receipt)
+                ;; Prior-process runner precondition: bind the fresh file/store with
+                ;; `dorg-bind-dolt', then ensure an implicit session-owned server via
+                ;; `dorg-dolt-server--ensure-strict'.  The child exits before the
+                ;; public detached lifecycle below begins.
+                (let* ((setup
+                        (json-step
+                         :setup (list "dolt" "list" "--json")
+                         `(progn
+                            (require 'dorg-registry)
+                            (require 'dorg-dolt-server)
+                            (setq dorg-dolt-server-autostart t)
+                            (make-directory ,(file-name-directory org-file) t)
+                            (with-temp-file ,org-file
+                              (insert "#+TITLE: CLI lifecycle fixture\n"
+                                      "#+DORG_DOLT_DIR: " ,store "\n\n"
+                                      "* Alpha\n:PROPERTIES:\n:DORG_ID: 100\n:END:\n"))
+                            (dorg-bind-dolt ,org-file ,store)
+                            (dorg-dolt-server--ensure-strict ,store))))
+                       (_setup-json
+                        (dorg-test-cli--lifecycle-assert-json-step-ok setup))
+                       (setup-entry
+                        (dorg-test-cli--lifecycle-assert-setup setup store))
+                       (setup-pid (alist-get 'server-pid setup-entry))
+                       (setup-port (alist-get 'port setup-entry))
+                       (setup-release
+                        (observe
+                         :setup-release
+                         (append
+                          (list :setup-entry setup-entry
+                                :pid setup-pid
+                                :port setup-port)
+                          (dorg-test-cli--lifecycle-wait-stopped
+                           setup-pid setup-port)))))
+                  (dorg-test-cli--lifecycle-assert-stopped-dead setup-release))
+                (let* ((start (json-step
+                               :start
+                               (list "dolt" "start" store "--json")))
+                       (_start-json
+                        (dorg-test-cli--lifecycle-assert-json-step-ok start))
+                       (_start-ok
+                        (dorg-test-cli--lifecycle-assert-start start store))
+                       (listed (json-step
+                                :list (list "dolt" "list" "--json")))
+                       (_list-json
+                        (dorg-test-cli--lifecycle-assert-json-step-ok listed))
+                       (runtime (observe
+                                 :runtime-before-stop
+                                 (dorg-test-cli--lifecycle-runtime
+                                  store index-dir)))
+                       (entry
+                        (dorg-test-cli--lifecycle-assert-list
+                         listed store runtime))
+                       (pid (plist-get runtime :pid))
+                       (port (plist-get runtime :port))
+                       (stop (json-step
+                              :stop
+                              (list "dolt" "stop" store "--json")))
+                       (_stop-json
+                        (dorg-test-cli--lifecycle-assert-json-step-ok stop))
+                       (_stop-ok
+                        (dorg-test-cli--lifecycle-assert-stop stop store))
+                       (stopped (observe
+                                 :stopped
+                                 (dorg-test-cli--lifecycle-wait-stopped
+                                  pid port)))
+                       (post-list (json-step
+                                   :post-list
+                                   (list "dolt" "list" "--json")))
+                       (_post-json
+                        (dorg-test-cli--lifecycle-assert-json-step-ok post-list))
+                       (post-runtime (observe
+                                      :runtime-after-stop
+                                      (dorg-test-cli--lifecycle-runtime
+                                       store index-dir))))
+                  (dorg-test-cli--lifecycle-assert-post-stop-absent
+                   post-list store stopped)
+                  (dorg-test-cli--lifecycle-assert-nonvacuity
+                   store listed entry runtime stop post-list stopped)
+                  (observe :post-stop-entry-check
+                           (list :post-runtime post-runtime))
+                  (message "dorg CLI lifecycle receipt file: %s" receipt-file)
+                  (message "dorg CLI lifecycle receipt: %S" receipt)
+                  (setq cleanup-ok t)))
+            (error
+             (setq first-error err)
+             (dorg-test-cli--lifecycle-persist-receipt
+              receipt-file
+              (append receipt
+                      (list (list :name :first-error
+                                  :error first-error
+                                  :scratch scratch
+                                  :receipt-file receipt-file))))
+             (signal (car err) (cdr err)))))
+      (if cleanup-ok
+          nil
+        (message "dorg CLI lifecycle preserving scratch root after failure: %s receipt: %s first-error: %S"
+                 scratch receipt-file first-error)))))
 
 ;;; ─── Build / vendoring contract ───────────────────────────────────────
 
@@ -2322,15 +3046,15 @@ Mirrors `dorg-test-with-doctor-repo' so the doctor CLI tests are
 self-contained in this file."
   (dorg-sql-batch dolt-dir
     (list
-     "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (1000, 1000, NULL, X'01', 0, FALSE, NULL, 0)"
-     "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (1001, 1000, 1000, X'01', 1, FALSE, 'Child', 0)"
+     "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (1000, 1000, NULL, X'01', 0, FALSE, NULL, 0)"
+     "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (1001, 1000, 1000, X'01', 1, FALSE, 'Child', 0)"
      "INSERT INTO dorg_files (root_id, relative_path) VALUES (1000, 'doc.org')"))
   (dorg-commit dolt-dir "seed"))
 
 (defun dorg-test-cli--doctor-inject-orphan (dolt-dir)
   "Inject a fixable orphan root (heading 9900, no dorg_files row) into DOLT-DIR."
   (dorg-sql dolt-dir
-    "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
+    "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
   (dorg-commit dolt-dir "inject orphan root"))
 
 (defmacro dorg-test-cli--with-doctor-db (dolt-var &rest body)
@@ -2549,6 +3273,34 @@ exactly one mode succeeds (non-vacuous positive control)."
         (insert-file-contents file)
         (should (string-match-p "^:STATUS:[ \t]+DONE" (buffer-string)))))))
 
+(ert-deftest dorg-test-cli-lock-inspect-and-public-contention ()
+  "Admin inspect reports the owner; a contended mutate JSON error omits it."
+  (dorg-test-cli--with-fixture file
+    (let ((lock (dorg-file-lock-path file))
+          (form "(on (id 100) (set (property \"STATUS\") \"DONE\"))"))
+      (dorg-file-lock-call
+       lock 0
+       (lambda (_record)
+         (let* ((inspection (dorg-test-cli--invoke
+                             (list "--json" "lock" "inspect" file)))
+                (report (alist-get 'report
+                                   (dorg-test-cli--json-data (cdr inspection))))
+                (owner (alist-get 'owner report)))
+           (should (= 0 (car inspection)))
+           (should (equal "live-holder" (alist-get 'status report)))
+           (should (equal (system-name) (alist-get 'host owner)))
+           (should (= (emacs-pid) (alist-get 'pid owner))))
+         (let* ((refusal (dorg-test-cli--invoke
+                          (list "--json" "mutate" form "--apply"
+                                "--lock-timeout" "0" "-f" file)))
+                (err (dorg-test-cli--single-json-error refusal 'contended
+                                                       'live-holder))
+                (wire (cdr refusal)))
+           (should (alist-get 'details err))
+           (should-not (string-match-p (regexp-quote (system-name)) wire))
+           (should-not (string-match-p
+                        (format "\\\"pid\\\":%d" (emacs-pid)) wire))))))))
+
 (ert-deftest dorg-test-cli-mutate-apply-is-one-saving-api-call ()
   "File-backed apply persists inside its sole API call, never via a facade."
   (dorg-test-cli--with-fixture file
@@ -2607,6 +3359,27 @@ command/mode/intent/patches/targets and stable envelope fields."
         (should (listp (alist-get 'changed affected)))
         (should (listp (alist-get 'deleted affected))))
       (should (assq 'unsupported data)))))
+
+(ert-deftest dorg-test-cli-mutate-receipt-fields-are-present-native-nulls ()
+  "Both plain-file mutate modes emit present, native-null receipt fields."
+  (dorg-test-cli--with-fixture file
+    (dolist (spec '(("--dry-run" base-commit new-token)
+                    ("--apply" base-commit base-revision)))
+      (let ((mode (car spec))
+            (inapplicable (cdr spec)))
+        (let* ((res (dorg-test-cli--invoke
+                     (list "mutate"
+                           "(on (id 100) (set (property \"STATUS\") \"DONE\"))"
+                           mode "--json" "-f" file)))
+               (obj (and (= 0 (car res))
+                         (ignore-errors
+                           (dorg-test-cli--json-with-wire-null (cdr res)))))
+               (data (alist-get 'data obj)))
+          (should (= 0 (car res)))
+          (dolist (key '(base-commit base-revision new-token))
+            (should (assq key data)))
+          (dolist (key inapplicable)
+            (should (eq dorg-test-cli--wire-null (alist-get key data)))))))))
 
 (ert-deftest dorg-test-cli-mutate-root-id-selects-explicit-dolt-source ()
   "`dorg mutate --dolt-dir DIR --root-id ID' passes an explicit Dolt source.
@@ -2873,6 +3646,28 @@ implicit index and count 0."
       (ignore-errors (delete-directory idx-c t))
       (ignore-errors (delete-directory idx-implicit t))
       (ignore-errors (delete-directory (plist-get planted :store) t)))))
+
+(ert-deftest dorg-test-level-offset-cli-mutate-move-offset-form ()
+  "The CLI `mutate' door carries the move (offset N) clause end to end.
+An invalid offset is refused as invalid-target; a valid one parses past the
+public lowering (plain-org then declines the move for its own reason); and
+the grammar-driven help shows the clause."
+  (dorg-test-cli--with-fixture file
+    (let ((bad (dorg-test-cli--invoke
+                (list "--json" "mutate"
+                      "(on (id 101) (move (subtree) (under (id 100) (offset 0))))"
+                      "--dry-run" "-f" file)))
+          (good (dorg-test-cli--invoke
+                 (list "--json" "mutate"
+                       "(on (id 101) (move (subtree) (under (id 100) (offset 2))))"
+                       "--dry-run" "-f" file))))
+      (let ((err (dorg-test-cli--single-json-error bad 'invalid-target)))
+        (should (string-match-p "offset" (format "%s" (alist-get 'message err)))))
+      (let ((err (dorg-test-cli--json-error
+                  (car (split-string (cdr good) "\n" t)))))
+        (should-not (equal "invalid-target" (format "%s" (alist-get 'reason err)))))
+      (should (string-match-p "\\[OFFSET\\]"
+                              (cdr (dorg-test-cli--invoke (list "mutate" "--help"))))))))
 
 (provide 'dorg-cli-tests)
 ;;; dorg-cli-tests.el ends here

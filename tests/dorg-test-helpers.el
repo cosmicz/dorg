@@ -338,6 +338,25 @@ Returns the dolt-dir path."
 
 ;;; ─── Parse + Seed Helper ────────────────────────────────────────────
 
+(defun dorg-test--fill-level-offsets (headings)
+  "Set each nil level offset in HEADINGS from its parent in the same list.
+Fixtures that build headings with absolute levels only get the offset the
+store would hold: 0 for a parentless root, else the level minus the parent's
+level when that parent is in HEADINGS.  An offset already set is kept, and
+one that cannot be computed stays nil.  Returns HEADINGS."
+  (let ((by-id (make-hash-table :test 'eql)))
+    (dolist (h headings) (puthash (dorg-heading-id h) h by-id))
+    (dolist (h headings headings)
+      (unless (dorg-heading-level-offset h)
+        (let ((parent (and (dorg-heading-parent-id h)
+                           (gethash (dorg-heading-parent-id h) by-id))))
+          (setf (dorg-heading-level-offset h)
+                (cond ((null (dorg-heading-parent-id h)) 0)
+                      ((and parent (dorg-heading-level parent)
+                            (dorg-heading-level h))
+                       (- (dorg-heading-level h)
+                          (dorg-heading-level parent))))))))))
+
 (defun dorg-test--parse-to-sql (contents &optional root-id skip-root)
   "Parse org CONTENTS string and return SQL INSERT statements.
 Uses a deterministic sequential ID generator.  ROOT-ID defaults
@@ -422,8 +441,10 @@ Returns a list of SQL strings suitable for `dorg-sql-batch'."
           fields))
 
 (defun dorg-test--keyword-patch (verb host key &rest fields)
-  "Return a typed keyword collection patch."
-  (append (list :op verb :target (list :keywords :host host :name key))
+  "Return a current typed keyword insertion or all-occurrences patch."
+  (append (list :op verb :target (append (list :keyword :host host :name key)
+                                       (unless (eq verb 'insert)
+                                         '(:select (:all)))))
           fields))
 
 (defun dorg-test--keyword-occurrence-patch
@@ -431,12 +452,12 @@ Returns a list of SQL strings suitable for `dorg-sql-batch'."
   "Return a typed single-keyword occurrence patch."
   (append (list :op verb
                 :target (list :keyword :host host :name key
-                              :occurrence occurrence))
+                              :select (list :occurrence occurrence)))
           fields))
 
 (defun dorg-test--items-replace-patch (host items)
   "Return a typed whole-item-sequence replacement patch."
-  (list :op 'replace :target (list :items :host host) :items items))
+  (list :op 'replace :target (list :item :host host :select '(:all)) :items items))
 
 (defun dorg-test--plan-patches (source patches &rest options)
   "Plan typed PATCHES for SOURCE with engine OPTIONS."

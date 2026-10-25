@@ -34,14 +34,19 @@ Skips if dolt is not available."
              (child-id 1001))
          (dorg-sql-batch dolt-dir
            (list
-            (format "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (%d, %d, NULL, X'01', 0, FALSE, NULL, 0)"
+            (format "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (%d, %d, NULL, X'01', 0, FALSE, NULL, 0)"
                     root-id root-id)
-            (format "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (%d, %d, %d, X'01', 1, FALSE, 'Child', 0)"
+            (format "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (%d, %d, %d, X'01', 1, FALSE, 'Child', 0)"
                     child-id root-id root-id)
             (format "INSERT INTO dorg_files (root_id, relative_path) VALUES (%d, 'doc.org')"
                     root-id)))
          (dorg-commit dolt-dir "seed"))
-       ,@body)))
+       ;; These fixtures exercise database-integrity findings, not a real
+       ;; process-owner census.  The 10z7y controls below own that kernel
+       ;; contract; keep this shared data fixture independent of its runner.
+       (cl-letf (((symbol-function 'dorg-dolt-server--admission-lock-holders)
+                  (lambda (&rest _) nil)))
+         ,@body))))
 
 ;;; Tests — Clean repo
 
@@ -58,7 +63,7 @@ Skips if dolt is not available."
   (dorg-test-with-doctor-repo
     ;; Insert an orphan root (no dorg_files row)
     (dorg-sql dolt-dir
-      "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
+      "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
     (dorg-commit dolt-dir "add orphan")
     (let* ((findings (dorg-doctor dolt-dir))
            (orphans (cl-remove-if-not
@@ -71,7 +76,7 @@ Skips if dolt is not available."
   "Doctor fixes orphan roots by deleting them."
   (dorg-test-with-doctor-repo
     (dorg-sql dolt-dir
-      "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
+      "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
     (dorg-commit dolt-dir "add orphan")
     (dorg-doctor dolt-dir t)
     ;; Orphan should be gone
@@ -86,8 +91,8 @@ Skips if dolt is not available."
 (ert-deftest dorg-test-doctor-root-invariant ()
   "Doctor detects root headings with wrong level or parent_id."
   (dorg-test-with-doctor-repo
-    ;; Break the valid root: set level=1
-    (dorg-sql dolt-dir "UPDATE headings SET level = 1 WHERE id = 1000")
+    ;; Break the valid root: set level_offset=1
+    (dorg-sql dolt-dir "UPDATE headings SET level_offset = 1 WHERE id = 1000")
     (dorg-commit dolt-dir "break root")
     (let* ((findings (dorg-doctor dolt-dir))
            (violations (cl-remove-if-not
@@ -99,12 +104,12 @@ Skips if dolt is not available."
 (ert-deftest dorg-test-doctor-root-invariant-fix ()
   "Doctor fixes root invariant violations."
   (dorg-test-with-doctor-repo
-    (dorg-sql dolt-dir "UPDATE headings SET level = 3, parent_id = 1001 WHERE id = 1000")
+    (dorg-sql dolt-dir "UPDATE headings SET level_offset = 3, parent_id = 1001 WHERE id = 1000")
     (dorg-commit dolt-dir "break root")
     (dorg-doctor dolt-dir t)
-    (let* ((rows (dorg-sql dolt-dir "SELECT level, parent_id FROM headings WHERE id = 1000"))
+    (let* ((rows (dorg-sql dolt-dir "SELECT level_offset, parent_id FROM headings WHERE id = 1000"))
            (row (car rows)))
-      (should (= (alist-get 'level row) 0))
+      (should (= (alist-get 'level_offset row) 0))
       (should (null (alist-get 'parent_id row))))))
 
 ;;; Tests — Dangling parent_id
@@ -155,8 +160,8 @@ hit a missing parent, preserving existing diagnostic behavior."
     ;; the declared root 1000, so both are non-root-reachable.
     (dorg-sql-batch dolt-dir
       '("SET FOREIGN_KEY_CHECKS=0"
-        "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (2000, 1000, 2001, X'02', 1, FALSE, 'IslandA', 0)"
-        "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (2001, 1000, NULL, X'03', 2, FALSE, 'IslandB', 0)"
+        "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (2000, 1000, 2001, X'02', 1, FALSE, 'IslandA', 0)"
+        "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (2001, 1000, NULL, X'03', 2, FALSE, 'IslandB', 0)"
         "SET FOREIGN_KEY_CHECKS=1"))
     (dorg-commit dolt-dir "add island")
     (let* ((findings (dorg-doctor dolt-dir))
@@ -179,9 +184,9 @@ hit a missing parent, preserving existing diagnostic behavior."
     ;; Second valid root 3000; heading 2002 in root 1000 points at it.
     (dorg-sql-batch dolt-dir
       '("SET FOREIGN_KEY_CHECKS=0"
-        "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (3000, 3000, NULL, X'01', 0, FALSE, NULL, 0)"
+        "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (3000, 3000, NULL, X'01', 0, FALSE, NULL, 0)"
         "INSERT INTO dorg_files (root_id, relative_path) VALUES (3000, 'doc2.org')"
-        "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (2002, 1000, 3000, X'04', 1, FALSE, 'CrossRoot', 0)"
+        "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (2002, 1000, 3000, X'04', 1, FALSE, 'CrossRoot', 0)"
         "SET FOREIGN_KEY_CHECKS=1"))
     (dorg-commit dolt-dir "add cross-root child")
     (let* ((findings (dorg-doctor dolt-dir))
@@ -200,8 +205,8 @@ hit a missing parent, preserving existing diagnostic behavior."
     ;; 2000 <-> 2001 cycle, both within root 1000.
     (dorg-sql-batch dolt-dir
       '("SET FOREIGN_KEY_CHECKS=0"
-        "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (2000, 1000, 2001, X'02', 1, FALSE, 'CycA', 0)"
-        "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (2001, 1000, 2000, X'03', 1, FALSE, 'CycB', 0)"
+        "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (2000, 1000, 2001, X'02', 1, FALSE, 'CycA', 0)"
+        "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (2001, 1000, 2000, X'03', 1, FALSE, 'CycB', 0)"
         "SET FOREIGN_KEY_CHECKS=1"))
     (dorg-commit dolt-dir "add cycle")
     (let* ((findings (dorg-doctor dolt-dir))
@@ -289,7 +294,7 @@ The seed root 1000 maps /test/doc.org; a blank case-variant root 1500 maps
   (dorg-test-with-doctor-repo
     (dorg-sql-batch dolt-dir
       (list
-       "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (1500, 1500, NULL, X'01', 0, FALSE, NULL, 0)"
+       "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (1500, 1500, NULL, X'01', 0, FALSE, NULL, 0)"
        "INSERT INTO dorg_files (root_id, relative_path) VALUES (1500, 'Doc.org')"))
     (dorg-commit dolt-dir "add case-variant dup")
     (let* ((findings (dorg-doctor dolt-dir))
@@ -306,7 +311,7 @@ The seed root 1000 maps /test/doc.org; a blank case-variant root 1500 maps
   (dorg-test-with-doctor-repo
     (dorg-sql-batch dolt-dir
       (list
-       "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (1500, 1500, NULL, X'01', 0, FALSE, NULL, 0)"
+       "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (1500, 1500, NULL, X'01', 0, FALSE, NULL, 0)"
        "INSERT INTO dorg_files (root_id, relative_path) VALUES (1500, 'other.org')"))
     (dorg-commit dolt-dir "add distinct file")
     (let* ((findings (dorg-doctor dolt-dir))
@@ -344,7 +349,7 @@ The seed root 1000 maps /test/doc.org; a blank case-variant root 1500 maps
   "Report lists findings with severity."
   (dorg-test-with-doctor-repo
     (dorg-sql dolt-dir
-      "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
+      "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
     (dorg-commit dolt-dir "add orphan")
     (dorg-doctor dolt-dir)
     (with-current-buffer "*dorg-doctor*"
@@ -363,7 +368,7 @@ finding.  Non-vacuity: fails against the pre-qwhnl code, which bound
 `findings' once and returned the stale pre-fix list."
   (dorg-test-with-doctor-repo
     (dorg-sql dolt-dir
-      "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
+      "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
     (dorg-commit dolt-dir "add orphan")
     ;; Sanity: the orphan is present and fixable before the fix.
     (should (cl-some (lambda (f) (equal (plist-get f :check) "orphan-root"))
@@ -378,7 +383,7 @@ It must show the clean re-check report (\"No issues found\") plus the
 the pre-qwhnl code rendered the pre-fix report and only appended the note."
   (dorg-test-with-doctor-repo
     (dorg-sql dolt-dir
-      "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
+      "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
     (dorg-commit dolt-dir "add orphan")
     (dorg-doctor dolt-dir t)
     (with-current-buffer "*dorg-doctor*"
@@ -393,7 +398,7 @@ Returns (:applied 1) and POST-fix findings with the orphan gone; the DB
 row is actually deleted."
   (dorg-test-with-doctor-repo
     (dorg-sql dolt-dir
-      "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
+      "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
     (dorg-commit dolt-dir "add orphan")
     (let* ((seen 'unset)
            (result (dorg-doctor--run-fix-recheck
@@ -414,7 +419,7 @@ Returns (:applied 0) and the pre-fix findings (orphan still present); the
 DB row survives."
   (dorg-test-with-doctor-repo
     (dorg-sql dolt-dir
-      "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
+      "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
     (dorg-commit dolt-dir "add orphan")
     (let ((result (dorg-doctor--run-fix-recheck dolt-dir (lambda (_f) nil))))
       (should (= 0 (plist-get result :applied)))
@@ -451,7 +456,7 @@ run.  Non-vacuity: void-function pre-impl; an impl passing nil or the
 re-checked list fails the `equal'."
   (dorg-test-with-doctor-repo
     (dorg-sql dolt-dir
-      "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
+      "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
     (dorg-commit dolt-dir "add orphan")
     (let ((seen 'unset)
           (expected (dorg-doctor--run-checks dolt-dir)))
@@ -472,7 +477,7 @@ that tests interactivity inside the decision callback silently stops prompting
 and never applies — this test then fails (orphan survives)."
   (dorg-test-with-doctor-repo
     (dorg-sql dolt-dir
-      "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
+      "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
     (dorg-commit dolt-dir "add orphan")
     (let ((prompted nil))
       (cl-letf (((symbol-function 'read-directory-name)
@@ -493,7 +498,7 @@ transformation — same fixture, opposite answers, opposite DB state — proving
 the prompt result drives the fix rather than being ignored."
   (dorg-test-with-doctor-repo
     (dorg-sql dolt-dir
-      "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
+      "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (9900, 9900, NULL, X'01', 0, FALSE, NULL, 0)")
     (dorg-commit dolt-dir "add orphan")
     (let ((prompted nil))
       (cl-letf (((symbol-function 'read-directory-name)
@@ -601,6 +606,27 @@ error) — the Dolt backend is optional; plain-org needs no dolt."
                                         (string-match-p "[Dd]olt"
                                                         (or (plist-get f :message) ""))))
                        findings)))))
+
+(ert-deftest dorg-test-10z7y-doctor-reports-duplicate-and-indeterminate-owners ()
+  "Doctor reports the owner census without any lifecycle side effects."
+  (let ((store "/tmp/dorg-doctor-owner-census"))
+    (cl-letf (((symbol-function 'dorg-dolt-server--canonical-dir)
+               (lambda (_) store))
+              ((symbol-function 'dorg-dolt-server--admission-lock-holders)
+               (lambda (_) '(7101 7102))))
+      (let ((finding (car (dorg-doctor--duplicate-live-owners store))))
+        (should (equal "duplicate-dolt-server-owners" (plist-get finding :check)))
+        (should (eq 'error (plist-get finding :severity)))
+        (should (string-match-p "7101, 7102" (plist-get finding :message)))
+        (should-not (plist-get finding :fix-sql))))
+    (cl-letf (((symbol-function 'dorg-dolt-server--canonical-dir)
+               (lambda (_) store))
+              ((symbol-function 'dorg-dolt-server--admission-lock-holders)
+               (lambda (_) 'unknown)))
+      (let ((finding (car (dorg-doctor--duplicate-live-owners store))))
+        (should (equal "dolt-owner-census-indeterminate" (plist-get finding :check)))
+        (should (eq 'warn (plist-get finding :severity)))
+        (should-not (plist-get finding :fix-sql))))))
 
 (provide 'dorg-doctor-tests)
 ;;; dorg-doctor-tests.el ends here

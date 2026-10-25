@@ -25,6 +25,41 @@ typed command/mutation door.  This boundary is implemented by
 [[file:dorg-mode.el][dorg-mode.el]], and the storage modules listed in
 [[*Modules][Modules]].
 
+** Local file gate owner identity
+
+Saved plain-Org writes and Git maintenance share the atomic symlink owner
+protocol in [[file:dorg-file-lock.el][dorg-file-lock.el]].  Linux uses
+the kernel boot ID, PID namespace and raw start ticks from procfs; Emacs's
+derived wall-clock start can vary between observations of one live process.
+Darwin retains validated, semantically compared process start times.  Only
+affirmative death in the recorded scope permits reclamation; malformed,
+unreadable, foreign-host or incompatible identities preserve the lock.
+
+Legacy untagged maintenance owner records also remain preserved, including
+stale records after a crash.  They are not silently converted or automatically removed.
+Recovery requires separately authorized verification that the owner is dead;
+this change provides no cleanup command.  New owner records are published in
+one symlink creation, so a killed writer leaves either no lock or a complete
+record.  Token release and fixed tombstone election protect successor locks.
+
+** Managed clock authority
+
+The =DORG_CLOCK_= owner keeps interval identity, exact UTC seconds and the
+one-active pointer in one Dolt root.  An immutable owner intent enters the
+same API gate, mutation planner and operation receipt as other typed writes.
+Its request digest includes expected-active but excludes the first-apply base;
+the owner validates state at the planner's frozen base.  CLOCK text is a
+minute-resolution projection and cannot identify an interval.  Plain files
+may be task references, but a plain-only clock authority has no durable replay
+contract and refuses lifecycle writes.
+
+The closed owner registry in [[file:dorg-model.el][dorg-model.el]] resolves a
+participant by loading its declared feature at each API, mutation, restore
+and import boundary.  The clock participant and public API keep Dolt modules
+unloaded until a Dolt read or write is requested.  The explicit store
+identification door delegates its gate-held =dorg_meta= write to
+[[file:dorg-repo.el][dorg-repo.el]], which owns store identity and SQL.
+
 ** Layer Diagram
 
 Layers are listed top-down; each layer calls downward only.
@@ -42,7 +77,7 @@ Layers are listed top-down; each layer calls downward only.
 - One mutation door :: a public DSL form or intent lowers to typed patch IR;
   [[file:dorg-mutate.el][dorg-mutate.el]] plans and simulates the candidate;
   in-transaction validation gates the commit; the caller receives the commit
-  result and receipt; postimage audit and projection refresh follow.
+  result and compact receipt; projection refresh follows.
 - Model and derived views ::
   - [[file:dorg-model.el][dorg-model.el]] — headings, items, timestamps,
     LOGBOOK data
@@ -81,7 +116,7 @@ flowchart TD
     ir[public DSL / intent -> typed patch IR]
     mut[dorg-mutate.el plan and simulation]
     val[in-transaction validation]
-    rcpt[commit result, receipt, postimage audit]
+    rcpt[commit result, compact receipt]
   end
   subgraph M[Model and derived views]
     model[dorg-model.el domain model]
@@ -106,6 +141,12 @@ flowchart TD
 
 ** Write Path
 
+Extension owner partitions resolve changed-heading membership once against
+the immutable base and candidate images.  Their side-qualified affected paths
+drive the owner-local overlays through an entry-id index.  Overlaying must not
+re-resolve unrelated owners against a partial partition: sibling normalization
+can affect many owners, making that approach quadratic in database reads.
+
 1. A caller — ~dorg-api-execute~, ~dorg-set-property~, =dorg mutate=, or the
    HTTP mutate route — submits a public DSL form or mutation intent.
 2. [[file:dorg-api.el][dorg-api.el]] reads and normalizes the request,
@@ -119,7 +160,7 @@ flowchart TD
 5. Pre-commit validation runs HEAD/base checks, structural consistency,
    extension index candidate validation, and postimage expectations.
 6. Commit and receipt: ~dorg-sql-batch~ / ~dorg-commit~, the mutation log and
-   postimage payloads, and the response envelope.
+   compact operation identity/generation/intent fingerprint, and the response envelope.
 7. Derived readers refresh: materialized projections at the exact token,
    extension read-cache invalidation, and warm session freshness on the next
    read.
@@ -133,7 +174,7 @@ flowchart TD
   eng[dorg-mutate.el<br>resolve source, validate typed patches,<br>plan effects, simulate candidate image]
   gate[Store gate / transaction<br>store gate, SQL lease,<br>administrative exact-base commit where needed]
   pre[Pre-commit validation<br>HEAD/base checks, structural consistency,<br>extension index candidates, postimage expectations]
-  commit[Commit and receipt<br>SQL batch and Dolt commit,<br>mutation log, postimage payloads, response envelope]
+  commit[Commit and receipt<br>SQL batch and Dolt commit,<br>compact operation receipt, response envelope]
   refresh[Derived readers refresh<br>projection refresh at exact token,<br>extension cache invalidation, session freshness]
   caller --> dsl --> api --> eng --> gate --> pre --> commit --> refresh
 #+end_src
@@ -148,6 +189,23 @@ validation in the single write path.
 
 ** Consumer Boundary
 
+*** Query column selection
+
+A query may finish with ~(select EXPR...)~. Field and property expressions
+choose returned columns; ~(as EXPR NAME)~ names a column. The adapters keep
+heading identity separately from selected values, so result navigation does
+not depend on an optional display column. Mutation target expansion refuses
+queries with a ~select~ step; targets are heading selections.
+
+The parser and model/plain/Dolt adapters share this plan. SQL projection
+avoids fetching all properties: title-only results require no property read,
+and selected properties are fetched for the selected IDs and keys at the same
+captured revision. Warm-session serialization retains selected values while
+removing live markers. The query architecture preserves one shared plan
+across library, CLI, and downstream consumers.
+
+*** Public application surface
+
 A downstream application reaches typed mutation, query, materialization,
 import, and server lifecycle exclusively through the public surface.
 Supported calls:
@@ -155,6 +213,10 @@ Supported calls:
 - ~dorg-api-execute~
 - ~dorg-command-run-query~
 - ~dorg-ql-select~
+- ~dorg-ql-select-snapshot~ / ~dorg-ql-snapshot-public~
+- ~make-dorg-registration~, ~dorg-backend-dolt~ and ~dorg-repo-root-id~
+  for an ephemeral query binding to an existing Dolt root; see the
+  [[file:docs/api.org::#query-library-api][query source contract]]
 - ~dorg-materialize~ / ~dorg-refresh-materialized-view~
 - ~dorg-register-extension~ and documented extension callbacks
 
@@ -228,7 +290,7 @@ an unmanaged path accidentally.
   ~dorg-materialize~, ~dorg-refresh-materialized-view~, ~dorg-doctor~, and
   ~dorg-history~ through [[file:dorg-mode.el][dorg-mode.el]] /
   [[file:dorg-command.el][dorg-command.el]].
-- CLI commands: =query=, =id=, =property=, =tag=, =title=, =mutate=, =import=,
+- CLI commands: =query=, =id=, =property=, =tag=, =title=, =mutate=, =lock inspect=, =import=,
   =doctor=, =serve start|stop|status=, and
   =dolt list|status|start|stop|stop-all|compact|rebind= through
   [[file:dorg-app.el][dorg-app.el]].
@@ -240,16 +302,19 @@ an unmanaged path accidentally.
 
 * Modules
 
-#+begin_example
+#+begin_example text
 Module                     Layer              Responsibility / key public entry points
 dorg.el                   public surface      package entry point; dorg-version, dorg-reload, dorg-assign-id
-dorg-api.el               public surface      mutation DSL/intent/IR command API; dorg-api-read, dorg-api-normalize, dorg-api-execute
-dorg-app.el               public surface      Clime CLI/serve app backing bin/dorg; query/mutate/import/doctor/serve/dolt verbs
+dorg-api.el               public surface      mutation DSL/intent/IR command API and Dolt store identification; dorg-api-execute, dorg-api-identify-store
+dorg-app.el               public surface      Clime CLI/serve app backing bin/dorg; query/mutate/import/doctor/serve/dolt identify verbs
 dorg-command.el           public surface      interactive query/update facade; dorg-command-run-query, dorg-query, dorg-goto-id, dorg-set-property
+dorg-clock.el             public surface      persisted clock owner, stable task refs, immutable lifecycle intent, Org CLOCK projection
+dorg-clock-emacs.el       optional adapter    opt-in local Org clock interception, immutable intent retry, read-only reconciliation
 dorg-mode.el              public surface      minor mode, materialization, projection policy, setup; dorg-mode, dorg-setup, dorg-materialize
 dorg-envelope.el          public surface      command ok/data/error envelopes; dorg-envelope-success-json, dorg-envelope-error-json
 dorg-error.el             public surface      shared error root and accessors; dorg-error-data, dorg-error-reason
-dorg-ql.el                query              public query facade; dorg-ql-select
+dorg-file-lock.el         mutation door      atomic local file owner records, dead-owner proof, saved plain-Org writer gates and maintenance locks
+dorg-ql.el                query              public query facade; dorg-ql-select, dorg-ql-select-snapshot, dorg-ql-snapshot-public
 dorg-ql-ast.el            query              normalized v2 query AST and reader; dorg-ql-normalize
 dorg-ql-core.el           query              shared query validation, timestamp metadata, result shape
 dorg-ql-eval.el           query              backend-neutral boolean/pipeline/traversal evaluator
@@ -258,12 +323,12 @@ dorg-ql-plain.el          query              plain-org buffer query adapter
 dorg-ql-dolt.el           query              Dolt SQL query adapter
 dorg-session.el           query              warm read-only query session; dorg-session-open/query/refresh/close
 dorg-find.el              query              lookup facade; dorg-find-heading-by-id, dorg-find-headings-by-property
-dorg-mutate.el            mutation door      source-generic mutation engine; dorg-mutate-call-with-store-gate and typed apply/plan internals
+dorg-mutate.el            mutation door      source-generic mutation engine; dorg-mutate-call-with-store-gate and typed apply/plan internals, including byte-preserving plain-Org intrinsic heading-line updates
 dorg-mutate-grammar.el    mutation door      semantic mutation grammar; render/help/completion inventory
-dorg-sortkey.el           mutation door      fractional order keys; dorg-sortkey-midpoint, dorg-sortkey-rebalance-threshold
+dorg-sortkey.el           mutation door      fixed-width order keys; dorg-sortkey-step-after, dorg-sortkey-spread, dorg-sortkey-bounds
 dorg-id.el                mutation door      snowflake ids and DORG_ID readers; dorg-id-generate, dorg-id-at-point
 dorg-transaction.el       mutation door      exact-base administrative transaction; dorg-transaction-commit
-dorg-model.el             model              heading/item/timestamp/LOGBOOK domain model and render planning
+dorg-model.el             model              heading/item/timestamp/LOGBOOK domain model, render planning and lazy owner registry resolver
 dorg-model-load.el        model              DB to model hydration; dorg-model-load-tree, dorg-model-load-headings
 dorg-parse.el             model              Org buffer to model parser; dorg-parse-buffer and region parsers
 dorg-render.el            model              Dolt/model to Org rendering; dorg-render, dorg-render-island, dorg-render-subtree-ids
@@ -276,17 +341,21 @@ dorg-sql-gen.el           storage adapter    SQL generation/lowering from domain
 dorg-sql-quote.el         storage adapter    dependency-free SQL literal quoting; dorg-sql-quote, dorg-sql-escape-string
 dorg-transport.el         storage adapter    SQL transport policy above Dolt/server lifecycle
 dorg-schema.el            storage adapter    schema DDL/migrations; dorg-schema-version, dorg-schema-ddl
-dorg-repo.el              storage adapter    repository, root binding, schema migration; dorg-init, dorg-repo-root-id, dorg-rebind-file
+dorg-repo.el              storage adapter    repository, durable store ID and gated identification, root binding, schema migration; dorg-init, dorg-repo-store-id, dorg-rebind-file
 dorg-history.el           storage adapter    DB-level undo/history; dorg-history, dorg-restore-to-commit
 dorg-import.el            storage adapter    explicit full-document bootstrap/recovery import; dorg-import-document
 dorg-doctor.el            storage adapter    DB consistency diagnostics/fixes; dorg-doctor
 dorg-git.el               storage adapter    explicit-directory git primitives
 dorg-git-sync.el          storage adapter    plain-org git sync-branch publication adapter
+dorg-git-maintenance.el   storage adapter    branch-scoped object-store maintenance for publication churn
 dorg-registry.el          storage adapter    file/backend registry; dorg-bind-dolt, dorg-unregister, dorg-registered-backend
 dorg-backend.el           storage adapter    backend descriptors; dorg-backend-plain-org, dorg-backend-dolt
+dorg-bm25.el              extension plane    derived BM25 schema, projection, and bounded ranked-read plan
+dorg-extension-bm25.el    extension plane    conventional BM25 extension registration feature
 dorg-sexp-file.el         storage adapter    atomic single-sexp file read/write
 dorg-dolt-server.el       runtime            managed sql-server lifecycle, claims, registry, scrub, attach/stop commands
-dorg-ext.el               extension plane    extension schema, placement, index projection; dorg-register-extension
+dorg-test-job.el          test runtime       disposable suite job contract, bundle probe, artifact/census helpers
+dorg-ext.el               extension plane    extension schema, placement, index projection; dorg-register-extension, dorg-load-extension
 dorg-ext-rebuild.el       extension plane    exact-revision derived-index audit/repair; dorg-ext-rebuild-index
 dorg-ext-read.el          extension plane    grouped warm extension hydration and cache invalidation
 dorg-vfs.el               projection         read-only /dorg: file-name-handler; dorg-vfs-enable, dorg-vfs-disable
@@ -294,15 +363,20 @@ dorg-vfs.el               projection         read-only /dorg: file-name-handler;
 
 * Tests
 
-#+begin_example
+#+begin_example text
 Test file                              Responsibility
-dorg-2ij34-postimage-tests.el         postimage receipt, parity, and audit payloads
+dorg-2ij34-postimage-tests.el           full transaction parity, compact receipts, and exact scoped reads
 dorg-api-tests.el                      public mutation DSL, typed IR, command API, and safety gates
 dorg-backend-tests.el                  backend descriptors and capability behavior
+dorg-bm25-tests.el                     BM25 derivation, ranking, and measured-corpus controls
 dorg-binding-isolation-tests.el        backend binding isolation and contamination guards
 dorg-cli-tests.el                      bin/dorg CLI, serve, invocation history, vendoring
+dorg-clock-tests.el                    persisted clock owner, task identity, lifecycle, replay, restore and bounded hydration
+dorg-clock-emacs-tests.el              pre-edit Org clock interception, defer/retry and read-only reconciliation
 dorg-command-tests.el                  interactive query/navigation/update command layer
+dorg-derive-families-tests.el          derived pre-ACCEPT family selection, runner receipt, refusals
 dorg-doctor-tests.el                   DB consistency diagnostics and fix behavior
+dorg-dolt-server-evidence-tests.el     claim store evidence: argv, held store locks, socket owner
 dorg-dolt-server-tests.el              Dolt sql-server lifecycle, claims, cleanup, adoption
 dorg-dolt-tests.el                     Dolt CLI/repo/SQL primitives
 dorg-tracker-cli-dou7f-probe-tests.el downstream tracker command-composition probe coverage
@@ -313,19 +387,24 @@ dorg-ext-index-projector-tests.el      derived-index projector validation and pe
 dorg-ext-rebuild-tests.el              exact-revision derived-index rebuild, drift, and parity controls
 dorg-ext-read-tests.el                 extension read-plane hydration and cache invalidation
 dorg-ext-tests.el                      extension registry, schema, placement, participant contracts
+dorg-file-lock-tests.el                atomic owner publication, contention, reclaim and token safety
 dorg-faithful-tests.el                 downstream-faithful plain-org apply/render behavior
 dorg-find-tests.el                     heading lookup facade
 dorg-freshness-tests.el                content-hash primitive
+dorg-git-maintenance-tests.el          branch-scoped object-store maintenance
 dorg-git-sync-tests.el                 plain-org git sync-branch adapter
 dorg-git-tests.el                      explicit-directory git primitives
 dorg-grammar-tests.el                  DORG_ID and identity-drawer grammar constants
 dorg-history-tests.el                  DB-level history browse/restore
 dorg-id-tests.el                       id generation and DORG_ID readers
 dorg-import-tests.el                   administrative import, exact-base transaction, postconditions
+dorg-install-tests.el                  relocated make install: staging, compile, publish, rollback
 dorg-integration-tests.el              end-to-end integration behavior
 dorg-keywords-tests.el                 root keyword reader
 dorg-lease-tests.el                    endpoint ownership and session-affine leases
 dorg-materialize-lifecycle-tests.el    exact-revision/window materialization lifecycle
+dorg-level-offset-store-tests.el       level offsets against a store: v8 migration, loader modes, spine
+dorg-level-offset-tests.el             parent-relative level offsets: derivation, parser, representability
 dorg-mode-tests.el                     minor mode, setup, projection policy
 dorg-model-tests.el                    model load/render/accessor behavior
 dorg-mutate-grammar-tests.el           mutation grammar inventory, docs/help/completion drift
@@ -333,12 +412,17 @@ dorg-mutate-linearize-tests.el         multi-writer linearization and exactly-on
 dorg-mutate-persist-tests.el           atomic plain-org persistence
 dorg-mutate-tests.el                   source-generic mutation engine
 dorg-parse-tests.el                    Org parser and region parser behavior
-dorg-perf-tests.el                     parse/query/mutation benchmarks outside default selector
+dorg-perf-tests.el                     parse/query/mutation benchmarks in exhaustive test-full
 dorg-placement-tests.el                placement invariants and promoted-orphan quarantine
+dorg-postimage-partitions-tests.el     batched postimage partition proof: coverage, equivalence, checks, rollback
+dorg-postimage-readback-tests.el       batched postimage readback: port grammar, order, visibility, rollback
+dorg-postimage-row-checks-tests.el     postimage net-effect row-check planning: exact semantics and linear work
 dorg-project-tests.el                  module/test/doc map drift and documentation guards
 dorg-projection-tests.el               projection-buffer regions, marker scan, replacement
 dorg-ql-ast-tests.el                   normalized query AST and reader
+dorg-ql-door-tests.el                  public query validation and documented-form load boundary
 dorg-ql-eval-tests.el                  query evaluator/pipeline behavior
+dorg-qgr4z-golden-tests.el             mutation-addressing v0.1 byte goldens and v0.2 sequence controls
 dorg-ql-tests.el                       query API and adapters
 dorg-reload-tests.el                   module reload discovery and schema heal
 dorg-render-tests.el                   renderer behavior
@@ -348,7 +432,9 @@ dorg-sexp-file-tests.el                atomic sexp-file protocol
 dorg-sortkey-tests.el                  fractional sort-key algorithm
 dorg-sql-gen-tests.el                  SQL generation and heading-op lowering
 dorg-test-infra-tests.el               shared server and CLI seam test infrastructure
+dorg-test-job-tests.el                 disposable suite job contract, image/workflow, and launcher guards
 dorg-test-scratch-tests.el             kill-resilient owned scratch roots and cleanup
+dorg-test-time-profile-tests.el        opt-in bounded ERT fixture-phase profiler contract
 dorg-timestamp-tests.el                structured timestamp parser
 dorg-transport-tests.el                SQL transport/client protocol
 dorg-vfs-tests.el                      read-only /dorg: file-name-handler
@@ -356,9 +442,96 @@ dorg-vfs-tests.el                      read-only /dorg: file-name-handler
 
 * Build And Test Commands
 
+Query/API test fixtures build committed core data directly with
+~dorg-test-ql--seed-document~.  Every case gets a fresh writable database;
+setup parses its Org text, inserts the rows, commits once, and constructs the
+registration in memory.  It does not run administrative import or binding
+validation.  The fixture's parity test compares its committed model with a
+real import; the import, schema, and binding suites retain their real lifecycle
+paths.  The fixture deliberately rejects registered extensions because it
+only seeds the core schema.  The optional timing profiler reports this setup
+as the ~seed~ phase.  Its file-binding row is built directly from the owned
+store and document paths, whose casing is already known.  Ordinary fixtures
+do not pay for production binding's directory scans to discover that casing;
+the real import/binding contracts continue to verify path normalization.
+
+Automated Linux jobs use an init reaper and an unprivileged UID so detached
+process cleanup and permission assertions exercise normal user behavior.
+The common launcher passes Docker's =--init=; its exact runtime-managed
+=/sbin/docker-init= mount (=/usr/sbin/docker-init= on a merged-/usr image)
+is allowed alongside the standard Docker mounts.
+The only caller-supplied bind remains =/artifacts=.
+The suite image pins Git 2.49.0 and records the observed version before the
+gate; Debian Bookworm's Git 2.39 includes extra packed objects in two
+maintenance fixture scenarios. Toolchain sources and checksums live in
+[[file:.github/dorg-suite-job/image-lock.org][the image lock]].
+The shared local and Actions suite launcher runs its container with Docker
+=--network none=. Its external-egress allowlist is empty: suite tests use
+loopback fixtures, including Dolt. Image construction downloads pinned inputs
+before this isolated container starts. Before admitting source bytes, the
+entrypoint probes the actual namespace for non-loopback interfaces, IPv4 and
+IPv6 routes, and bounded outbound attempts in both families. Only immediate
+network-unreachable results pass. The manifest records the observed mode and
+probe results alongside the launcher expectation; a mismatch fails the gate.
+On GNU/Linux, store-claim recognition decodes Emacs's escaped process arguments
+before comparing an explicit data directory; Darwin retains its display parser.
+
+The existing CI workflow accepts an optional =selector= on manual dispatch.
+It passes the regexp to the same suite job's =--selector= mode, which records
+=gating=false=. Use this for focused remote diagnosis; release certification
+still requires the full job with no selector. Push and pull-request jobs
+continue to run the full suite.
+
+All DOrg gate and trunk pushes, and all manual gate dispatch, status and
+artifact-download operations, go through [[file:tools/dorg-private-venue][=tools/dorg-private-venue=]].
+Its =push-gate CODE SHA= command derives a candidate-unique =ci/CODE-SHA12=
+ref; =push-trunk SHA= publishes an exact merge commit. The command resolves
+the private GitHub push URL after Git rewrites, refuses ambiguous or different
+destinations, and reads back the pushed ref. =dispatch CODE SHA=, =list CODE
+SHA=, =view RUN_ID= and =download RUN_ID DIR= pin the same private repository
+for every GitHub CLI call. Raw =git push= and unqualified =gh workflow/run=
+commands bypass that venue check and are outside the DOrg gate process.
+The workflow job also checks its repository before starting, while the
+container records and verifies the Actions repository and server URL in its
+manifest. A skipped public job is not a certification receipt.
+
+The same job can admit a source packet for a consumer with private dependencies:
+=tools/dorg-suite-job-local --source-packet FILE --commit SHA --tree TREE=.
+Its source manifest names the exact root and complete recursive gitlink set;
+the importer validates standard Git bundles before any make command. The
+workflow/tooling revision remains separate from the candidate being certified.
+The existing compile/lint/full commands, isolation and result classifier still
+own execution. Packet transport needs no cross-repository credential or mutable
+submodule fetch. =tests/test_suite_source_packet.py= exercises real small Git
+fixtures through =dorg-test-job-source-packet-real-git-controls=; Python is an
+explicit image prerequisite. Platform and missing-consumer capability skips
+must be reported separately from executed tests.
+
+The host launcher keeps custody of its container when it is interrupted. It
+requires GNU =timeout= (and refuses before writing anything without it), gives
+=docker run= a run-private =--cidfile= and a unique =dorg-suite-job.run= label,
+and runs the export/Docker pipeline as a background job in its own process
+group so that HUP, INT and TERM are handled while Docker runs; a foreground
+pipeline would defer the traps until the container exits. A signal that
+arrives while the job is being started is held until its process group is
+recorded; once the outcome is fully written the launcher ignores further
+signals and exits with it. On any interruption
+or abnormal exit one handler ends only that job group, then stops and removes
+the container only when the full ID in the cidfile and the run label both
+verify, with every Docker call bounded. A missing or unverifiable identity is
+recorded in =host-census/cleanup.txt= and never guessed: a container created
+before its cidfile was written stays reported as residue. The interruption is a
+missing fact in the existing verdict, so the run is =incomplete= with its
+128+signal status even when the container had already written a green receipt,
+whose fields are retained. SIGKILL of the launcher and CI workflow cancellation
+are outside this contract and belong to the external job owner.
+=tests/test_suite_job_cancellation.py= drives the real launcher against a fake
+Docker client through =dorg-test-job-launcher-cancellation-controls=.
+
 #+begin_src sh
-make test                         # full default ERT selector, ^dorg-test-
-make test SELECT='^dorg-test-ql-' # focused selector
+make test                         # deterministic representative (fast + named integration files)
+make test SELECT='^dorg-test-ql-' # focused selector; preserves explicit DORG_BENCH opt-in
+make test-full                    # exhaustive selection + DORG_BENCH opt-in; capability skips are reported, not executed
 make test-fast                    # Dolt-free fast partition
 make test-medium                  # Dolt/integration partition
 make compile                      # byte-compile
@@ -374,7 +547,66 @@ make test SELECT='^dorg-test-project-'
 
 That selector is the repository's docs checker.  It verifies module/test maps,
 API census rows, demoted-symbol exclusions, CLI external-Dolt-SQL wording, and
-install-surface constraints without starting Dolt.
+install-surface constraints.  The ~make test~ wrapper starts the shared Dolt
+fixture regardless of selector.  Under source/no-Dolt authority, use direct
+batch Emacs with only the required definitions loaded and test capability flags
+prebound nil; never cite skipped material tests as passing evidence.
+
+** Derived pre-ACCEPT families
+
+=make test-derived BASE=<rev> [OUT=<dir>] [DRY=1]= runs the whole test files a
+candidate (the clean checkout's HEAD) must pass, derived from its changes
+against =merge-base(BASE, HEAD)=.  [[file:tools/dorg-derive-families.el][=tools/dorg-derive-families.el=]] owns the
+rules; [[file:tests/dorg-derive-families-tests.el][its specs]] pin each one in both directions.
+
+The derivation reads git objects only: =diff -z --name-status -M= records
+(copy detection refused), changed line ranges, blobs and the candidate's
+=tests/= tree.  A test file is selected by any of:
+- R1, a changed test: added, modified or type-changed, or a renamed test's
+  new path.  A deleted test never is.
+- R2, a module: =tests/M-tests.el= and =tests/M-*-tests.el= for a changed root
+  module =M.el=, under its old and new names.
+- R3, a definition: the definitions /containing/ each changed line, found
+  syntactically in the old and new text.  Git's .el hunk headers name
+  docstrings, not definitions.  A test is selected when it references one as a
+  whole symbol.
+- R4, a helper: a changed =tests/= support file selects the tests that
+  require its features or load it by name.  A =tests/fixtures/DIR/= change
+  selects the tests naming that directory.
+- R5, a path: any changed non-test path that is not a root module selects the
+  tests naming it verbatim.
+- R6, the census: every test that enumerates the repository runs whole when
+  its trigger class fires.  The classes are root modules, =tests/*.el=,
+  =tests/**=, =tools/**/*.el=, =lib/=, =docs/=, the build surface, the
+  shipped file set, and any change.  The table and its reasoned exemptions
+  live in the tool, and a guard spec fails on any new undeclared enumerator.
+- R7, behaviour families: the lock, maintenance and plain-writer modules
+  select the infrastructure and persistence tests, and a module touching
+  =kill-emacs-hook= selects the infrastructure tests.
+
+The tool counts the selected tests in a child that loads the real runner,
+attributing each test by its defining file.  It then runs them in a second
+child through =dorg-run-tests--batch=, which keeps its own teardown and exit
+status.  HEAD, tree and cleanliness are rechecked before and after the run.
+The executed names must equal the counted names per file.
+
+The receipt in =OUT= holds:
+- =identity.txt= and =phase.txt=;
+- =derived.eld= (files and the reasons each was selected);
+- =counts.eld= and =selector.el=;
+- =census-before.txt= and =census-after.txt= (pid, ppid and basename of dolt
+  and emacs processes only, never command lines);
+- =run.log= and =result.txt=.
+
+Exit codes:
+- 0 pass or dry run;
+- 2 empty derivation;
+- 3 a selected file with no loaded test, i.e. unregistered;
+- 4 identity: BASE, merge-base, dirty tree or drift;
+- 5 a git, read or parse failure, or stale tool bytecode;
+- 6 a missing summary, or an executed set that differs from the counted one;
+- otherwise the runner's own failing status.
+No path falls back to a default or full selection.
 
 * Code Style
 

@@ -1,0 +1,674 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DORG_SUITE_JOB_ENTRYPOINT_VERSION=1
+
+usage() {
+  cat >&2 <<'EOF'
+usage: dorg-suite-job run {--source-bundle -|--source-packet - --tree FULL_TREE_SHA} --commit FULL_40_HEX_SHA --artifacts /artifacts [--selector REGEXP] [--test-mode]
+EOF
+}
+
+die() {
+  local message="dorg-suite-job: $*"
+  echo "$message" >&2
+  if [[ -n "${raw_log:-}" ]]; then
+    echo "$message" >>"$raw_log"
+  fi
+  if [[ -n "${artifacts:-}" && -d "$artifacts/probe" ]]; then
+    echo "$message" >>"$artifacts/probe/failure.txt"
+  fi
+  exit 2
+}
+
+if [[ "${1:-}" != "run" ]]; then
+  usage
+  exit 64
+fi
+shift
+
+source_bundle=
+source_packet=
+tree=
+commit=
+artifacts=
+selector=
+test_mode=false
+while (($#)); do
+  case "$1" in
+    --source-bundle)
+      source_bundle="${2:-}"
+      shift 2
+      ;;
+    --source-packet)
+      source_packet="${2:-}"
+      shift 2
+      ;;
+    --tree)
+      tree="${2:-}"
+      shift 2
+      ;;
+    --commit)
+      commit="${2:-}"
+      shift 2
+      ;;
+    --artifacts)
+      artifacts="${2:-}"
+      shift 2
+      ;;
+    --selector)
+      selector="${2:-}"
+      shift 2
+      ;;
+    --test-mode)
+      test_mode=true
+      shift
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ ( "$source_bundle" == "-" && -z "$source_packet" ) ||
+   ( "$source_packet" == "-" && -z "$source_bundle" ) ]] ||
+  die "exactly one source input must be -"
+[[ "$commit" =~ ^[0-9a-f]{40}$ ]] || die "--commit must be a full 40-character lowercase SHA"
+if [[ -n "$source_packet" || -n "$tree" ]]; then
+  [[ "$tree" =~ ^[0-9a-f]{40}$ ]] || die "--tree must be a full lowercase tree SHA"
+fi
+[[ -n "$artifacts" ]] || die "--artifacts is required"
+
+mkdir -p "$artifacts"/{probe,host-census}
+raw_log="$artifacts/raw.log"
+summary="$artifacts/ert-summary.txt"
+exit_status="$artifacts/exit.status"
+manifest="$artifacts/manifest.txt"
+: >"$raw_log"
+: >"$summary"
+: >"$exit_status"
+: >"$manifest"
+
+suite_deadline_seconds=1700
+if [[ -n "${DORG_SUITE_JOB_TEST_DEADLINE_SECONDS:-}" ]]; then
+  [[ "$test_mode" == true ]] ||
+    die "suite deadline override requires --test-mode"
+  [[ "$DORG_SUITE_JOB_TEST_DEADLINE_SECONDS" =~ ^[1-9][0-9]*$ ]] ||
+    die "test suite deadline must be a positive integer"
+  suite_deadline_seconds="$DORG_SUITE_JOB_TEST_DEADLINE_SECONDS"
+fi
+
+image_config=/usr/local/share/dorg-suite-job/image.env
+if [[ "$test_mode" == true && -n "${DORG_SUITE_JOB_IMAGE_CONFIG:-}" ]]; then
+  image_config="$DORG_SUITE_JOB_IMAGE_CONFIG"
+fi
+[[ -r "$image_config" ]] || die "image metadata is unavailable"
+# The Dockerfile writes this file from its declared build inputs.  Test mode
+# alone may replace it with a disposable fixture; a gating run never accepts a
+# caller-selected metadata file.
+# shellcheck disable=SC1090
+source "$image_config"
+[[ "${DORG_SUITE_JOB_TARGETARCH:-}" =~ ^(amd64|arm64)$ ]] ||
+  die "image target architecture is invalid"
+[[ "${DORG_SUITE_JOB_DOLT_ARCHIVE:-}" =~ ^dolt-linux-(amd64|arm64)\.tar\.gz$ ]] ||
+  die "image Dolt archive metadata is invalid"
+[[ "${DORG_SUITE_JOB_DOLT_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] ||
+  die "image Dolt hash metadata is invalid"
+[[ "${DORG_SUITE_JOB_EMACS_VERSION:-}" =~ ^[0-9]+\.[0-9]+$ ]] ||
+  die "image Emacs version metadata is invalid"
+[[ "${DORG_SUITE_JOB_EMACS_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] ||
+  die "image Emacs hash metadata is invalid"
+
+JOB_ROOT="${JOB_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/dorg-suite-job.XXXXXX")}"
+export JOB_ROOT
+export HOME="$JOB_ROOT/home"
+export TMPDIR="$JOB_ROOT/tmp"
+export DORG_DOLT_SERVER_INDEX_DIR="$JOB_ROOT/server-index"
+mkdir -p "$HOME" "$TMPDIR" "$DORG_DOLT_SERVER_INDEX_DIR" "$JOB_ROOT/checkout"
+
+completed=false
+
+finish_incomplete() {
+  local status=$?
+  if [[ "$completed" != true && $status -ne 0 ]]; then
+    {
+      echo "overall=$status"
+      echo "classification=incomplete"
+    } >>"$exit_status"
+    preserve_fixture_state || true
+  fi
+}
+
+preserve_fixture_state() {
+  local dest="$artifacts/fixture-state"
+  local max_files=200
+  local max_bytes=5242880
+  local copied_files=0
+  local copied_bytes=0
+  local omitted=false
+  mkdir -p "$dest"
+  {
+    echo "bounded fixture-state export"
+    echo "max_files=$max_files"
+    echo "max_bytes=$max_bytes"
+  } >"$dest/README.txt"
+  for name in tmp home server-index; do
+    local src="$JOB_ROOT/$name"
+    local out="$dest/$name"
+    if [[ -d "$src" ]]; then
+      mkdir -p "$out"
+      while IFS= read -r file; do
+        local rel="${file#$src/}"
+        if [[ -f "$file" ]]; then
+          local size
+          size="$(wc -c <"$file" | tr -d ' ')"
+          if (( copied_files >= max_files || copied_bytes + size > max_bytes )); then
+            omitted=true
+            echo "$name/$rel size=$size" >>"$dest/truncation.txt"
+            continue
+          fi
+          mkdir -p "$out/$(dirname "$rel")"
+          if cp -p "$file" "$out/$rel" 2>/dev/null; then
+            copied_files=$((copied_files + 1))
+            copied_bytes=$((copied_bytes + size))
+          else
+            omitted=true
+            echo "$name/$rel copy=failed" >>"$dest/truncation.txt"
+          fi
+        fi
+      done < <(find "$src" -type f)
+    fi
+  done
+  {
+    echo "copied_files=$copied_files"
+    echo "copied_bytes=$copied_bytes"
+    echo "omitted=$omitted"
+  } >>"$dest/README.txt"
+  if [[ "$omitted" != true ]]; then
+    : >"$dest/truncation.txt"
+  fi
+}
+
+trap finish_incomplete EXIT
+trap 'exit 130' INT TERM
+
+# Set both switches before the first Dolt process.  The job HOME is disposable,
+# so no caller or image-level configuration can silently change this gate.
+dolt config --global --add metrics.disabled true || die "Dolt metrics configuration failed"
+dolt config --global --add versioncheck.disabled true || die "Dolt version-check configuration failed"
+dolt_metrics_disabled="$(dolt config --global --get metrics.disabled)" ||
+  die "Dolt metrics configuration unreadable"
+dolt_versioncheck_disabled="$(dolt config --global --get versioncheck.disabled)" ||
+  die "Dolt version-check configuration unreadable"
+[[ "$dolt_metrics_disabled" == true ]] || die "Dolt metrics configuration mismatch"
+[[ "$dolt_versioncheck_disabled" == true ]] || die "Dolt version-check configuration mismatch"
+
+metadata_json_value() {
+  local key="$1"
+  printf '%s\n' "${DORG_SUITE_JOB_IMAGE_METADATA:-}" |
+    awk -v key="\"$key\"" '
+      index($0, key) {
+        if (match($0, /: *"[^"]+"/)) {
+          value = substr($0, RSTART, RLENGTH)
+          sub(/^: *"/, "", value)
+          sub(/"$/, "", value)
+          print value
+          exit
+        }
+      }
+    '
+}
+
+metadata_base_image_digest() {
+  printf '%s\n' "${DORG_SUITE_JOB_IMAGE_METADATA:-}" |
+    awk '
+      /"uri"/ && /pkg:docker\/debian@bookworm-slim[?]digest=sha256:/ {
+        if (match($0, /digest=sha256:[0-9a-f]+/)) {
+          value = substr($0, RSTART, RLENGTH)
+          sub(/^digest=/, "", value)
+          print value
+          exit
+        }
+      }
+    '
+}
+
+write_manifest_header() {
+  {
+    echo "schema=1"
+    echo "launcher=${DORG_SUITE_JOB_LAUNCHER:-unknown}"
+    echo "event_name=${DORG_SUITE_JOB_EVENT_NAME:-}"
+    echo "github_ref=${DORG_SUITE_JOB_REF:-}"
+    echo "github_head_ref=${DORG_SUITE_JOB_HEAD_REF:-}"
+    echo "github_repository=${DORG_SUITE_JOB_GITHUB_REPOSITORY:-}"
+    echo "github_server_url=${DORG_SUITE_JOB_GITHUB_SERVER_URL:-}"
+    echo "network_expected_mode=${DORG_SUITE_JOB_NETWORK_MODE:-}"
+    echo "network_egress_allowlist=none"
+    echo "launcher_workspace_sha=${DORG_SUITE_JOB_WORKSPACE_SHA:-}"
+    echo "entrypoint_version=$DORG_SUITE_JOB_ENTRYPOINT_VERSION"
+    echo "image_id=${DORG_SUITE_JOB_IMAGE_ID:-}"
+    echo "image_digest=${DORG_SUITE_JOB_IMAGE_DIGEST:-}"
+    echo "image_metadata_containerimage_digest=$(metadata_json_value containerimage.digest)"
+    echo "image_metadata_build_ref=$(metadata_json_value buildx.build.ref)"
+    echo "image_metadata_base_image_digest=$(metadata_base_image_digest)"
+    echo "image_cache_inferred=${DORG_SUITE_JOB_IMAGE_CACHE_INFERRED:-}"
+    echo "image_cache_inference_threshold_seconds=${DORG_SUITE_JOB_IMAGE_CACHE_INFERENCE_THRESHOLD_SECONDS:-}"
+    echo "image_build_seconds=${DORG_SUITE_JOB_IMAGE_BUILD_SECONDS:-}"
+    echo "target_arch=$DORG_SUITE_JOB_TARGETARCH"
+    echo "dolt_archive=$DORG_SUITE_JOB_DOLT_ARCHIVE"
+    echo "dolt_sha256=$DORG_SUITE_JOB_DOLT_SHA256"
+    echo "dolt_metrics_disabled=$dolt_metrics_disabled"
+    echo "dolt_versioncheck_disabled=$dolt_versioncheck_disabled"
+    echo "expected_emacs_version=$DORG_SUITE_JOB_EMACS_VERSION"
+    echo "expected_emacs_sha256=$DORG_SUITE_JOB_EMACS_SHA256"
+    echo "suite_deadline_seconds=$suite_deadline_seconds"
+    echo "test_mode=$test_mode"
+    echo "requested_sha=$commit"
+    echo "requested_tree=$tree"
+    echo "source_format=$([[ -n "$source_packet" ]] && echo packet || echo bundle)"
+    echo "selector=${selector:-}"
+    echo "gating=$([[ -z "$selector" ]] && echo true || echo false)"
+    echo "uid=$(id -u)"
+    echo "gid=$(id -g)"
+    echo "job_root=$JOB_ROOT"
+    echo "home=$HOME"
+    echo "tmpdir=$TMPDIR"
+    echo "server_index=$DORG_DOLT_SERVER_INDEX_DIR"
+    echo "started_utc=$(date -u +%FT%TZ)"
+    if [[ -n "$selector" ]]; then
+      echo "command_set=make compile;make lint;make test SELECT=<selector>"
+    else
+      echo "command_set=make compile;make lint;make test-full"
+    fi
+    echo "fail_fast=true"
+  } >>"$manifest"
+}
+
+runtime_mount_allowed() {
+  local target="$1"
+  local fstype="$2"
+  case "$target" in
+    /|/etc/hosts|/etc/hostname|/etc/resolv.conf|/sbin/docker-init|/usr/sbin/docker-init)
+      return 0
+      ;;
+    /proc|/proc/*)
+      [[ "$fstype" == "proc" || "$fstype" == "tmpfs" ]]
+      ;;
+    /dev|/dev/*)
+      [[ "$fstype" == "tmpfs" || "$fstype" == "devpts" || "$fstype" == "mqueue" ]]
+      ;;
+    /sys|/sys/*)
+      [[ "$fstype" == "sysfs" || "$fstype" == "cgroup" || "$fstype" == "cgroup2" || "$fstype" == "tmpfs" ]]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+probe_mounts() {
+  local mountinfo="/proc/self/mountinfo"
+  if [[ "$test_mode" == true && -n "${DORG_SUITE_JOB_MOUNTINFO:-}" ]]; then
+    mountinfo="$DORG_SUITE_JOB_MOUNTINFO"
+  fi
+  cp "$mountinfo" "$artifacts/probe/mounts.txt"
+  local unexpected=()
+  local caller=()
+  while IFS= read -r line; do
+    local before="${line%% - *}"
+    local after="${line#* - }"
+    read -r _ _ _ _ target _ <<<"$before"
+    read -r fstype _rest <<<"$after"
+    if [[ "$target" == "/artifacts" ]]; then
+        caller+=("$target")
+    elif ! runtime_mount_allowed "$target" "$fstype"; then
+        unexpected+=("$target")
+    fi
+  done < "$mountinfo"
+  printf '%s\n' "${caller[@]}" >"$artifacts/probe/caller-mounts.txt"
+  printf '%s\n' "${unexpected[@]}" >"$artifacts/probe/unexpected-mounts.txt"
+  [[ "${#caller[@]}" -eq 1 && "${caller[0]}" == "/artifacts" ]] || die "caller bind mount set is not exactly /artifacts"
+  [[ "${#unexpected[@]}" -eq 0 ]] || die "unexpected mount targets: ${unexpected[*]}"
+}
+
+write_manifest_header
+if [[ "${DORG_SUITE_JOB_LAUNCHER:-unknown}" == "actions" ]]; then
+  [[ "${DORG_SUITE_JOB_GITHUB_SERVER_URL:-}" == "https://github.com" &&
+     ( "${DORG_SUITE_JOB_GITHUB_REPOSITORY:-}" == "cosmicz/DOrg.oc" ||
+       ( "${DORG_SUITE_JOB_GITHUB_REPOSITORY:-}" == "cosmicz/dorg" &&
+         "${DORG_SUITE_JOB_EVENT_NAME:-}" == "push" &&
+         "${DORG_SUITE_JOB_REF:-}" == "refs/heads/main" ) ) ]] ||
+    die "Actions venue mismatch: expected private DOrg.oc or public dorg main push on https://github.com"
+fi
+if [[ "${DORG_SUITE_JOB_LAUNCHER:-unknown}" == "actions" && -z "${DORG_SUITE_JOB_IMAGE_DIGEST:-}" ]]; then
+  die "Actions image_digest missing"
+fi
+
+# Derive the effective mode from the namespace, never from the launcher claim.
+# Test-mode fixtures exercise the entrypoint without Docker; gating runs always
+# execute the real in-container probe before accepting source bytes.
+network_receipt="$artifacts/probe/network.txt"
+network_probe_status=0
+if [[ "$test_mode" == true && -n "${DORG_SUITE_JOB_NETWORK_PROBE_FIXTURE:-}" ]]; then
+  cp "$DORG_SUITE_JOB_NETWORK_PROBE_FIXTURE" "$network_receipt" ||
+    die "network probe fixture unavailable"
+else
+  python3 "$(dirname "${BASH_SOURCE[0]}")/dorg-suite-job-network.py" \
+    --receipt "$network_receipt" >>"$raw_log" 2>&1 || network_probe_status=$?
+fi
+if [[ -f "$network_receipt" ]]; then
+  cat "$network_receipt" >>"$manifest"
+else
+  echo "network_mode=unknown" >>"$manifest"
+fi
+echo "network_probe_exit=$network_probe_status" >>"$manifest"
+[[ "$network_probe_status" == 0 ]] || die "network probe failed"
+observed_network_mode="$(sed -n 's/^network_mode=//p' "$network_receipt")"
+[[ "$observed_network_mode" == none &&
+   "${DORG_SUITE_JOB_NETWORK_MODE:-}" == "$observed_network_mode" ]] ||
+  die "network mode mismatch: observed $observed_network_mode, expected ${DORG_SUITE_JOB_NETWORK_MODE:-missing}"
+
+if [[ -n "$source_packet" ]]; then
+  cat >"$JOB_ROOT/source.tar"
+  python3 "$(dirname "${BASH_SOURCE[0]}")/dorg-suite-job-source.py" \
+    --packet "$JOB_ROOT/source.tar" --commit "$commit" --tree "$tree" \
+    --destination "$JOB_ROOT/checkout/src" --receipt "$artifacts/probe/source-packet.json" \
+    >>"$raw_log" 2>&1 || die "source packet admission failed"
+else
+  cat >"$JOB_ROOT/source.bundle"
+  git clone "$JOB_ROOT/source.bundle" "$JOB_ROOT/checkout/src" >>"$raw_log" 2>&1
+fi
+inside_sha="$(git -C "$JOB_ROOT/checkout/src" rev-parse HEAD)"
+echo "inside_sha=$inside_sha" >>"$manifest"
+[[ "$inside_sha" == "$commit" ]] || die "bundle HEAD $inside_sha does not match requested $commit"
+inside_tree="$(git -C "$JOB_ROOT/checkout/src" rev-parse 'HEAD^{tree}')"
+echo "inside_tree=$inside_tree" >>"$manifest"
+[[ -z "$tree" || "$inside_tree" == "$tree" ]] || die "source tree does not match request"
+git -C "$JOB_ROOT/checkout/src" rev-list HEAD >/dev/null
+git -C "$JOB_ROOT/checkout/src" fsck --connectivity-only >>"$raw_log" 2>&1
+echo "history_connectivity=ok" >>"$manifest"
+
+{
+  echo "requested_sha=$commit"
+  echo "inside_sha=$inside_sha"
+  echo "git_dir=$JOB_ROOT/checkout/src/.git"
+  echo "rev_list=ok"
+  echo "fsck_connectivity=ok"
+} >"$artifacts/probe/git.txt"
+
+{
+  echo "uid=$(id -u)"
+  echo "gid=$(id -g)"
+  echo "cwd=$PWD"
+  echo "HOME=$HOME"
+  echo "TMPDIR=$TMPDIR"
+  echo "DORG_DOLT_SERVER_INDEX_DIR=$DORG_DOLT_SERVER_INDEX_DIR"
+} >"$artifacts/probe/env.txt"
+
+{
+  echo "uid=$(id -u)"
+  echo "gid=$(id -g)"
+  echo "job_root=$JOB_ROOT"
+  echo "checkout=$JOB_ROOT/checkout/src"
+  echo "artifacts=$artifacts"
+} >"$artifacts/probe/inside.txt"
+
+{
+  echo "HOME=$HOME"
+  echo "TMPDIR=$TMPDIR"
+  echo "DORG_DOLT_SERVER_INDEX_DIR=$DORG_DOLT_SERVER_INDEX_DIR"
+  echo "checkout=$JOB_ROOT/checkout/src"
+  for path in "$HOME" "$TMPDIR" "$DORG_DOLT_SERVER_INDEX_DIR" "$JOB_ROOT/checkout/src"; do
+    canary="$path/.dorg-suite-job-canary"
+    echo "canary=$canary"
+    echo ok >"$canary"
+    grep -q ok "$canary"
+    rm -f "$canary"
+  done
+  if { echo nope >"/dorg-suite-job-forbidden-canary"; } 2>>"$artifacts/probe/inside.txt"; then
+    rm -f "/dorg-suite-job-forbidden-canary" 2>/dev/null || true
+    echo "negative_canary=failed"
+    exit 1
+  else
+    echo "negative_canary=ok"
+  fi
+  forbidden_paths_text="/Users /var/run/docker.sock /run/docker.sock"
+  if [[ "$test_mode" == true && -n "${DORG_SUITE_JOB_FORBIDDEN_PATHS:-}" ]]; then
+    forbidden_paths_text="$DORG_SUITE_JOB_FORBIDDEN_PATHS"
+  fi
+  read -r -a forbidden_paths <<<"$forbidden_paths_text"
+  for forbidden in "${forbidden_paths[@]}"; do
+    if [[ -e "$forbidden" && -w "$forbidden" ]]; then
+      echo "forbidden_writable=$forbidden"
+      exit 1
+    fi
+  done
+  echo "forbidden_paths=ok"
+} >"$artifacts/probe/paths.txt"
+
+emacs_version_first_line() {
+  emacs --version | head -n 1
+}
+
+capture_version_probe() {
+  local name="$1" failure="$2" probe_file
+  shift 2
+  probe_file="$artifacts/probe/version-$name.txt"
+  "$@" >"$probe_file" 2>&1 || die "$failure"
+  # Command substitution removes trailing newlines; one explicit separator
+  # keeps even an unterminated Dolt warning away from the next tool's output.
+  printf '%s\n' "$(cat "$probe_file")" >>"$artifacts/probe/versions.txt"
+}
+
+read_version_probe() {
+  REPLY="$(cat "$artifacts/probe/version-$1.txt"; printf '\034')"
+  REPLY="${REPLY%$'\034'}"
+}
+
+expect_exact_version_probe() {
+  local name="$1" expected="$2" failure="$3"
+  read_version_probe "$name"
+  [[ "$REPLY" == "$expected" || "$REPLY" == "$expected"$'\n' ]] || die "$failure"
+}
+
+expect_pattern_version_probe() {
+  local name="$1" pattern="$2" failure="$3"
+  read_version_probe "$name"
+  [[ "$REPLY" != *$'\n' ]] || REPLY="${REPLY%$'\n'}"
+  [[ "$REPLY" =~ $pattern ]] || die "$failure"
+}
+
+expect_dolt_version_probe() {
+  local version='dolt version 1.86.4'
+  local warning='Warning: unable to query latest released Dolt version'
+  read_version_probe dolt
+  case "$REPLY" in
+    "$version"|"$version"$'\n'|"$version"$'\n'"$warning"|"$version"$'\n'"$warning"$'\n') ;;
+    *) die "Dolt version mismatch" ;;
+  esac
+}
+
+probe_versions() {
+  local tmux_version ps_version
+  : >"$artifacts/probe/versions.txt"
+  capture_version_probe git "Git version mismatch" git --version
+  capture_version_probe emacs "Emacs version mismatch" emacs_version_first_line
+  capture_version_probe gnutls "Emacs gnutls feature missing" \
+    emacs --batch -Q --eval "(princ (if (fboundp 'gnutls-available-p) \"gnutls=t\" \"gnutls=nil\"))"
+  capture_version_probe native "Emacs native compilation decision mismatch" \
+    emacs --batch -Q --eval "(princ (if (and (fboundp 'native-comp-available-p) (native-comp-available-p)) \"native-comp=t\" \"native-comp=nil\"))"
+  capture_version_probe dolt "Dolt version mismatch" dolt version
+  capture_version_probe tmux "tmux missing" tmux -V
+  capture_version_probe ps "procps ps missing" ps --version
+  capture_version_probe pgrep "procps pgrep missing" pgrep --version
+
+  expect_exact_version_probe git 'git version 2.49.0' "Git version mismatch"
+  expect_exact_version_probe emacs "GNU Emacs $DORG_SUITE_JOB_EMACS_VERSION" "Emacs version mismatch"
+  expect_exact_version_probe gnutls 'gnutls=t' "Emacs gnutls feature missing"
+  expect_exact_version_probe native 'native-comp=nil' "Emacs native compilation decision mismatch"
+  expect_dolt_version_probe
+  expect_pattern_version_probe tmux '^tmux [0-9]+([.][0-9]+)*[a-z]?$' "tmux missing"
+  tmux_version="$REPLY"
+  expect_pattern_version_probe ps '^ps from procps-ng [0-9]+([.][0-9]+)*([a-z][0-9]*)?$' "procps ps missing"
+  ps_version="$REPLY"
+  expect_pattern_version_probe pgrep '^pgrep from procps-ng [0-9]+([.][0-9]+)*([a-z][0-9]*)?$' "procps pgrep missing"
+  {
+    echo 'git_version=git version 2.49.0'
+    echo "observed_emacs_version=GNU Emacs $DORG_SUITE_JOB_EMACS_VERSION"
+    echo 'emacs_gnutls=t'
+    echo 'emacs_native_comp=nil'
+    echo 'dolt_version=1.86.4'
+    echo "tmux_version=$tmux_version"
+    echo "procps_version=$ps_version"
+  } >>"$manifest"
+}
+
+probe_mounts
+probe_versions
+
+dolt config --global --add user.name "dorg-ci"
+dolt config --global --add user.email "dorg-ci@example.invalid"
+dolt config --list >"$artifacts/probe/dolt-config.txt"
+[[ "$(dolt config --get user.name)" == "dorg-ci" ]] || die "Dolt user.name missing"
+[[ "$(dolt config --get user.email)" == "dorg-ci@example.invalid" ]] || die "Dolt user.email missing"
+
+run_step() {
+  local step="$1"
+  shift
+  printf '%s\n' "$step" >"$artifacts/interrupted-step"
+  echo "== $step ==" | tee -a "$raw_log"
+  set +e
+  "$@" 2>&1 | tee -a "$raw_log"
+  local status="${PIPESTATUS[0]}"
+  set -e
+  rm -f "$artifacts/interrupted-step"
+  echo "$step=$status" >>"$exit_status"
+  return "$status"
+}
+
+run_full_gate() {
+  cd "$JOB_ROOT/checkout/src"
+  if run_step compile make compile; then
+    :
+  else
+    echo "lint=skipped" >>"$exit_status"
+    echo "test=skipped" >>"$exit_status"
+    return 1
+  fi
+  if run_step lint make lint; then
+    :
+  else
+    echo "test=skipped" >>"$exit_status"
+    return 1
+  fi
+  if run_step test make test-full; then
+    :
+  else
+    return 1
+  fi
+}
+
+run_selected_gate() {
+  cd "$JOB_ROOT/checkout/src"
+  if run_step compile make compile; then
+    :
+  else
+    echo "lint=skipped" >>"$exit_status"
+    echo "test=skipped" >>"$exit_status"
+    return 1
+  fi
+  if run_step lint make lint; then
+    :
+  else
+    echo "test=skipped" >>"$exit_status"
+    return 1
+  fi
+  if run_step test make test "SELECT=$selector"; then
+    :
+  else
+    return 1
+  fi
+}
+
+overall=0
+classification=pass
+suite_started_epoch="$(date +%s)"
+suite_started_utc="$(date -u +%FT%TZ)"
+gate_status=0
+if [[ -n "$selector" ]]; then
+  if ! run_selected_gate; then
+    overall=1
+    classification=fail
+  fi
+else
+  export JOB_ROOT artifacts raw_log exit_status
+  export -f run_step run_full_gate
+  set +e
+  timeout --signal=TERM --kill-after=10 "$suite_deadline_seconds" \
+    bash -c 'run_full_gate'
+  gate_status=$?
+  set -e
+fi
+suite_ended_epoch="$(date +%s)"
+suite_ended_utc="$(date -u +%FT%TZ)"
+suite_elapsed_seconds=$((suite_ended_epoch - suite_started_epoch))
+if [[ -z "$selector" ]]; then
+  if { [[ "$gate_status" -eq 124 || "$gate_status" -eq 137 ]]; } &&
+     (( suite_elapsed_seconds >= suite_deadline_seconds )); then
+    overall="$gate_status"
+    classification=wall-time
+    # `timeout' may interrupt a pipeline before `run_step' records its
+    # terminal status.  Complete the receipt from the sole in-flight step;
+    # steps not reached remain explicitly skipped, including a deadline in
+    # compile or lint.
+    interrupted_step="$(cat "$artifacts/interrupted-step" 2>/dev/null || true)"
+    rm -f "$artifacts/interrupted-step"
+    case "$interrupted_step" in
+      compile)
+        echo "compile=$gate_status" >>"$exit_status"
+        echo "lint=skipped" >>"$exit_status"
+        echo "test=skipped" >>"$exit_status"
+        ;;
+      lint)
+        echo "lint=$gate_status" >>"$exit_status"
+        echo "test=skipped" >>"$exit_status"
+        ;;
+      test)
+        echo "test=$gate_status" >>"$exit_status"
+        ;;
+      *)
+        echo "test=$gate_status" >>"$exit_status"
+        ;;
+    esac
+  elif [[ "$gate_status" -ne 0 ]]; then
+    overall=1
+    classification=fail
+  fi
+fi
+
+grep -E "Ran [0-9]+ tests" "$raw_log" >"$summary" || {
+  echo "ERT summary not found; see raw.log" >"$summary"
+  [[ "$overall" -eq 0 ]] && overall=1
+}
+
+{
+  echo "overall=$overall"
+  echo "classification=$classification"
+  echo "gating=$([[ -z "$selector" ]] && echo true || echo false)"
+} >>"$exit_status"
+
+if [[ "$overall" -ne 0 ]]; then
+  preserve_fixture_state || true
+fi
+
+{
+  echo "suite_started_epoch=$suite_started_epoch"
+  echo "suite_ended_epoch=$suite_ended_epoch"
+  echo "suite_elapsed_seconds=$suite_elapsed_seconds"
+  echo "suite_started_utc=$suite_started_utc"
+  echo "suite_ended_utc=$suite_ended_utc"
+  echo "ended_utc=$suite_ended_utc"
+} >>"$manifest"
+echo "artifact_completeness=complete" >>"$manifest"
+completed=true
+exit "$overall"

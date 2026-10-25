@@ -23,14 +23,17 @@
                        (when details (list :details details)))))
 
 (defun dorg-envelope--key (key)
-  "Return KEY as a public kebab-case JSON key symbol."
-  (let* ((name (cond
-                ((keywordp key) (substring (symbol-name key) 1))
-                ((symbolp key) (symbol-name key))
-                ((stringp key) key)
-                (t (format "%s" key))))
-         (kebab (replace-regexp-in-string "_" "-" name)))
-    (intern kebab)))
+  "Return KEY's public JSON key, keeping opaque string keys unchanged."
+  (if (stringp key)
+      ;; String keys are caller data: projection aliases and Org property
+      ;; names are opaque, so a second envelope pass must never rewrite them.
+      key
+    (let* ((name (cond
+                  ((keywordp key) (substring (symbol-name key) 1))
+                  ((symbolp key) (symbol-name key))
+                  (t (format "%s" key))))
+           (kebab (replace-regexp-in-string "_" "-" name)))
+      (intern kebab))))
 
 (defun dorg-envelope--plist-p (value)
   "Return non-nil when VALUE is a keyword-keyed plist."
@@ -59,10 +62,11 @@
 Object keys are kebab-case symbols.  Ordered non-object lists become
 vectors so public arrays stay arrays under `json-encode'."
   (cond
+   ((eq value :json-null)
+    nil)
    ((or (null value)
         (eq value t)
         (eq value :json-false)
-        (eq value :json-null)
         (stringp value)
         (numberp value))
     value)

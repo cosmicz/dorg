@@ -76,6 +76,82 @@ buffer it creates."
 
 ;;; ─── Lifecycle ────────────────────────────────────────────────────────
 
+(ert-deftest dorg-test-session-selected-values-survive-host-serialization ()
+  "A warm query retains the requested columns while stripping markers."
+  (dorg-test-session--with-file dorg-test-session--sample (:file file)
+    (let ((session (dorg-session-open file)))
+      (unwind-protect
+          (let* ((query '(pipe (where (id 100))
+                              (select (as (field title) label))))
+                 (cold (dorg-session-query session query))
+                 (warm (dorg-session-query session query)))
+            (should (equal cold warm))
+            (should (equal (plist-get (car warm) :values)
+                           '(("label" . "Alpha"))))
+            (should-not (plist-member (car warm) :marker)))
+        (dorg-session-close session)))))
+
+(ert-deftest dorg-test-xeq5v-session-cache-key-preserves-case-mode ()
+  "Canonical case mode separates warm entries without splitting sensitive aliases."
+  (let ((omitted (dorg-ql-normalize '(title "Work")))
+        (sensitive (dorg-ql-normalize '(title "Work" :case sensitive)))
+        (insensitive (dorg-ql-normalize '(title "Work" :case insensitive))))
+    (should (equal (dorg-session--query-key omitted nil)
+                   (dorg-session--query-key sensitive nil)))
+    (should-not (equal (dorg-session--query-key sensitive nil)
+                       (dorg-session--query-key insensitive nil)))))
+
+(ert-deftest dorg-test-xeq5v-warm-session-keeps-case-mode-results-distinct ()
+  "One warm session never reuses sensitive rows for an insensitive query."
+  (dorg-test-session--with-file
+      "* Work
+:PROPERTIES:
+:DORG_ID: 101
+:END:
+* work
+:PROPERTIES:
+:DORG_ID: 102
+:END:
+"
+      (:file file)
+    (let ((session (dorg-session-open file)))
+      (unwind-protect
+          (cl-flet ((ids (query)
+                      (mapcar (lambda (row) (plist-get row :heading-id))
+                              (dorg-session-query session query))))
+            (should (equal '(101) (ids '(title "Work"))))
+            (should (equal '(101 102)
+                           (ids '(title "Work" :case insensitive))))
+            (should (equal '(101) (ids '(title "Work")))))
+        (dorg-session-close session)))))
+
+(ert-deftest dorg-test-session-context-digest-invalidates-warm-query-cache ()
+  "External context changes rerun a warm query without a source edit."
+  (dorg-test-session--with-file dorg-test-session--sample (:file file)
+    (let ((dorg--extensions nil) (value "one") (resolves 0))
+      (dorg-register-extension
+       'demo :schema "SELECT 1" :version 1
+       :query-context (lambda (_source)
+                        (cl-incf resolves)
+                        (list :values (list :value value)))
+       :fields (list (list :name 'demo/value :type 'string :cardinality 'one
+                           :context '(:value) :dependencies nil
+                           :eval (lambda (context _read) (plist-get context :value)))))
+      (let ((session (dorg-session-open file))
+            (query '(pipe (select (field demo/value)))))
+        (unwind-protect
+            (progn
+              (should (equal (plist-get (car (dorg-session-query session query)) :values)
+                             '(("demo/value" . "one"))))
+              (should (equal (plist-get (car (dorg-session-query session query)) :values)
+                             '(("demo/value" . "one"))))
+              (setq value "two")
+              (should (equal (plist-get (car (dorg-session-query session query)) :values)
+                             '(("demo/value" . "two"))))
+              ;; The resolver runs once per invocation, including the warm probe.
+              (should (= resolves 3)))
+          (dorg-session-close session))))))
+
 (ert-deftest dorg-test-session-open-close-plain ()
   "Opening a plain-org file yields a live session; close is idempotent."
   (dorg-test-session--with-file dorg-test-session--sample (:file file)
@@ -203,6 +279,165 @@ identical query must NOT invoke it again while the source is unchanged."
               (dorg-session-query s '(id 200))
               (should (= 2 calls))))
         (dorg-session-close s)))))
+
+(ert-deftest dorg-test-session-extension-plan-invalidates-replaced-field ()
+  "A same-version field implementation replacement bypasses warm rows.
+The unchanged second call proves ordinary warm reuse; changing only the
+registered evaluator must execute again without changing file or context."
+  (dorg-test-session--with-file dorg-test-session--sample (:file file)
+    (let ((dorg--extensions nil)
+          (calls 0)
+          (original (symbol-function 'dorg-ql-select))
+          (query '(pipe (select (field demo/value)))))
+      (dorg-register-extension
+       'demo :schema "SELECT 1" :version 1
+       :fields (list (list :name 'demo/value :type 'string :cardinality 'one
+                           :dependencies nil
+                           :eval (lambda (_context _read) "before"))))
+      (let ((session (dorg-session-open file)))
+        (unwind-protect
+            (cl-letf (((symbol-function 'dorg-ql-select)
+                       (lambda (&rest args)
+                         (cl-incf calls)
+                         (apply original args))))
+              (should (equal (plist-get (car (dorg-session-query session query)) :values)
+                             '(("demo/value" . "before"))))
+              ;; No source/context or registration change: this is a cache hit.
+              (dorg-session-query session query)
+              (should (= calls 1))
+              ;; The version intentionally stays 1.  A registration epoch or
+              ;; version key alone would miss this implementation replacement.
+              (dorg-register-extension
+               'demo :schema "SELECT 1" :version 1
+               :fields (list (list :name 'demo/value :type 'string :cardinality 'one
+                                   :dependencies nil
+                                   :eval (lambda (_context _read) "after"))))
+              (should (equal (plist-get (car (dorg-session-query session query)) :values)
+                             '(("demo/value" . "after"))))
+              (should (= calls 2))
+              (dorg-unregister-extension 'demo)
+              (should-error (dorg-session-query session query) :type 'dorg-ql-error)
+              (should (= calls 2)))
+          (dorg-session-close session))))))
+
+(ert-deftest dorg-test-session-extension-plan-observes-type-and-cardinality ()
+  "The same warm query uses a replacement descriptor's public wire shape."
+  (dorg-test-session--with-file dorg-test-session--sample (:file file)
+    (let ((dorg--extensions nil)
+          (query '(pipe (select (field demo/value)))))
+      (dorg-register-extension
+       'demo :schema "SELECT 1" :version 1
+       :fields (list (list :name 'demo/value :type 'string :cardinality 'one
+                           :dependencies nil
+                           :eval (lambda (_context _read) "one"))))
+      (let ((session (dorg-session-open file)))
+        (unwind-protect
+            (progn
+              (should (equal (plist-get (car (dorg-session-query session query)) :values)
+                             '(("demo/value" . "one"))))
+              (dorg-register-extension
+               'demo :schema "SELECT 1" :version 1
+               :fields (list (list :name 'demo/value :type 'boolean :cardinality 'many
+                                   :dependencies nil
+                                   :eval (lambda (_context _read)
+                                           (list t :json-false)))))
+              (should (equal (plist-get (car (dorg-session-query session query)) :values)
+                             '(("demo/value" . [t :json-false])))))
+          (dorg-session-close session))))))
+
+(ert-deftest dorg-test-session-entry-keeps-pre-callback-registration-identity ()
+  "A callback replacement cannot label its old rows with the new registration."
+  (dorg-test-session--with-file dorg-test-session--sample (:file file)
+    (let ((dorg--extensions nil)
+          (replaced nil)
+          (calls 0)
+          digests
+          (original (symbol-function 'dorg-ql-select))
+          (key-function (symbol-function 'dorg-session--query-key))
+          (query '(pipe (select (field demo/value)))))
+      (dorg-register-extension
+       'demo :schema "SELECT 1" :version 1
+       :query-context
+       (lambda (_invocation)
+         (unless replaced
+           (setq replaced t)
+           (dorg-register-extension
+            'demo :schema "SELECT 1" :version 1
+            :query-context (lambda (_invocation) '(:values (:phase before)))
+            :fields (list (list :name 'demo/value :type 'string :cardinality 'one
+                                :context '(:phase) :dependencies nil
+                                :eval (lambda (_context _read) "after")))))
+         '(:values (:phase before)))
+       :fields (list (list :name 'demo/value :type 'string :cardinality 'one
+                           :context '(:phase) :dependencies nil
+                           :eval (lambda (_context _read) "before"))))
+      (let ((session (dorg-session-open file)))
+        (unwind-protect
+            (cl-letf (((symbol-function 'dorg-ql-select)
+                       (lambda (&rest args)
+                         (cl-incf calls)
+                         (apply original args)))
+                      ((symbol-function 'dorg-session--query-key)
+                       (lambda (form digest)
+                         (push digest digests)
+                         (funcall key-function form digest))))
+              ;; This invocation planned "before" before its context callback
+              ;; installed "after", so its cache entry must retain before's
+              ;; registration identity and the second call must rerun.
+              (should (equal (plist-get (car (dorg-session-query session query)) :values)
+                             '(("demo/value" . "before"))))
+              (should (equal (plist-get (car (dorg-session-query session query)) :values)
+                             '(("demo/value" . "after"))))
+              ;; The replacement keeps the identical context requirement and
+              ;; bundle, so context-digest cannot explain this cache miss.
+              (should (= 2 (length digests)))
+              (should (equal (car digests) (cadr digests)))
+              (should (= calls 2)))
+          (dorg-session-close session))))))
+
+(ert-deftest dorg-test-session-entry-post-callback-identity-mutation-is-stale ()
+  "Mutating capture to re-read after a callback demonstrably serves old rows."
+  (dorg-test-session--with-file dorg-test-session--sample (:file file)
+    (let ((dorg--extensions nil)
+          (replaced nil)
+          (query '(pipe (select (field demo/value))))
+          (prepare (symbol-function 'dorg-ql--prepare-query)))
+      (dorg-register-extension
+       'demo :schema "SELECT 1" :version 1
+       :query-context
+       (lambda (_invocation)
+         (unless replaced
+           (setq replaced t)
+           (dorg-register-extension
+            'demo :schema "SELECT 1" :version 1
+            :query-context (lambda (_ignored) '(:values (:phase before)))
+            :fields (list (list :name 'demo/value :type 'string :cardinality 'one
+                                :context '(:phase) :dependencies nil
+                                :eval (lambda (_context _read) "after")))))
+         '(:values (:phase before)))
+       :fields (list (list :name 'demo/value :type 'string :cardinality 'one
+                           :context '(:phase) :dependencies nil
+                           :eval (lambda (_context _read) "before"))))
+      (let ((session (dorg-session-open file)))
+        (unwind-protect
+            (cl-letf (((symbol-function 'dorg-ql--prepare-query)
+                       (lambda (&rest args)
+                         (let ((prepared (apply prepare args)))
+                           ;; Deliberate bad mutation: this is exactly the
+                           ;; forbidden post-callback registry read.
+                           (setf (plist-get prepared :extension-identities)
+                                 (mapcar (lambda (entry)
+                                           (cons (car entry)
+                                                 (dorg-get-extension (car entry))))
+                                         (plist-get prepared :extension-identities)))
+                           prepared))))
+              (should (equal (plist-get (car (dorg-session-query session query)) :values)
+                             '(("demo/value" . "before"))))
+              ;; The mutated first entry is labelled "after", so its second
+              ;; call reuses "before": a nonvacuous stale-row witness.
+              (should (equal (plist-get (car (dorg-session-query session query)) :values)
+                             '(("demo/value" . "before")))))
+          (dorg-session-close session))))))
 
 ;;; ─── Freshness: out-of-process edit ───────────────────────────────────
 

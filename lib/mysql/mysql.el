@@ -462,17 +462,17 @@ Handles splitting payloads larger than 0xFFFFFF."
                             (unibyte-string (mysql-conn-sequence-id conn)))))
         (setf (mysql-conn-sequence-id conn)
               (logand (1+ (mysql-conn-sequence-id conn)) #xff))
-        (mysql--send-string proc header)
-        (mysql--send-string proc (substring payload offset (+ offset #xffffff)))
+        (mysql--send-string
+         proc (concat header (substring payload offset (+ offset #xffffff))))
         (cl-incf offset #xffffff)))
     (let* ((remaining (- total offset))
            (header (concat (mysql--int-le-bytes remaining 3)
                            (unibyte-string (mysql-conn-sequence-id conn)))))
       (setf (mysql-conn-sequence-id conn)
             (logand (1+ (mysql-conn-sequence-id conn)) #xff))
-      (mysql--send-string proc header)
-      (when (> remaining 0)
-        (mysql--send-string proc (substring payload offset))))))
+      ;; A separate short header write can wait for a delayed TCP ACK before
+      ;; the peer receives the payload.  Send each complete fragment at once.
+      (mysql--send-string proc (concat header (substring payload offset))))))
 
 ;;;; Authentication helpers
 
@@ -884,18 +884,18 @@ represent every value the type exists to keep exact."
     (pcase type
       ((or 1 2 3 8 9)   (string-to-number value))  ;; integers
       ((or 4 5)         (string-to-number value))  ;; float/double
-      ((or 0 246)       (decode-coding-string value 'utf-8))  ;; decimal/newdecimal
+      ((or 0 246)       (decode-coding-string value 'utf-8-unix))  ;; decimal/newdecimal
       (13               (string-to-number value))  ;; year
       ((or 7 12)        (mysql--parse-datetime value))
       (10               (mysql--parse-date value))
       (11               (mysql--parse-time value))
       (16               (mysql--parse-bit value))
       (245
-       (let ((s (decode-coding-string value 'utf-8)))
+       (let ((s (decode-coding-string value 'utf-8-unix)))
          (json-parse-string s)))
       (_ (if (mysql--binary-string-column-p column)
              value
-           (decode-coding-string value 'utf-8))))))
+           (decode-coding-string value 'utf-8-unix))))))
 
 (defun mysql--parse-value (value type-or-column)
   "Parse string VALUE according to TYPE-OR-COLUMN.
@@ -1770,12 +1770,12 @@ protocol."
     (cond
      ((= type mysql-type-bit) (mysql--parse-bit value))
      ((memq type (list mysql-type-decimal mysql-type-newdecimal))
-      (decode-coding-string value 'utf-8))
+      (decode-coding-string value 'utf-8-unix))
      ((= type mysql-type-json)
-      (let ((text (decode-coding-string value 'utf-8)))
+      (let ((text (decode-coding-string value 'utf-8-unix)))
         (json-parse-string text)))
      ((mysql--binary-string-column-p column) value)
-     (t (decode-coding-string value 'utf-8)))))
+     (t (decode-coding-string value 'utf-8-unix)))))
 
 (defun mysql--decode-binary-value (packet pos column)
   "Decode a binary value from PACKET at POS using COLUMN metadata.

@@ -49,6 +49,9 @@
 ;; stack.  `dorg-repo' sorts after `dorg-registry' in the `*.el' lint batch,
 ;; so the stub is needed for a warning-clean compile.
 (declare-function dorg-repo-ensure-root "dorg-repo")
+(declare-function dorg-repo-ensure-schema "dorg-repo")
+(declare-function dorg-repo-root-id "dorg-repo")
+(declare-function dorg-repo--binding-error "dorg-repo")
 
 (autoload 'dorg-mode "dorg-mode" nil t)
 
@@ -73,7 +76,8 @@ slot."
 ;; KEEP (mutable-state): binding registry, setq/push-mutated; must persist across calls.
 (defvar dorg--registry nil
   "Alist of (ABS-ORG-FILE . `dorg-registration') mappings.
-Holds ONLY explicit Dolt bindings created by `dorg-bind-dolt'.
+Holds ONLY explicit Dolt bindings created by `dorg-bind-dolt' or
+`dorg-bind-existing-dolt'.
 A buffer with no entry is classified transiently (never stored) by
 `dorg--classify-registration': a `#+DORG_DOLT_DIR:' keyword buffer to
 a Dolt registration with a nil root_id, any other file to plain-org.")
@@ -102,6 +106,47 @@ confirmation behavior."
     registration))
 
 ;;; Public API
+
+(defun dorg-bind-existing-dolt (file dolt-dir)
+  "Bind FILE to an already-valid Dolt repository at DOLT-DIR.
+Unlike `dorg-bind-dolt', this programmatic safe-reader entry never
+initializes a repository, migrates schema, allocates a root, edits the Org
+buffer, or enables `dorg-mode'.  It requires an existing DOLT-DIR containing
+an existing `.dolt' directory, verifies ordinary core and registered-extension
+compatibility, and resolves FILE to an existing valid root before storing a
+registration.  A missing store signals `dorg-binding-error' reason
+`missing-store'; an unbound FILE signals `path-mismatch'."
+  ;; Loading defines the typed binding condition before the missing-store
+  ;; preflight can signal it.  It does not itself start SQL transport.
+  (require 'dorg-repo)
+  (let* ((abs-file (dorg--canonical-existing-case (file-truename file)))
+         (abs-dir (file-name-as-directory
+                   (dorg--canonical-existing-case (file-truename dolt-dir))))
+         (dolt-meta (expand-file-name ".dolt" abs-dir)))
+    ;; Use `file-directory-p' for both checks: a regular file named `.dolt'
+    ;; is not a repository and must not reach SQL transport.
+    (unless (and (file-directory-p abs-dir)
+                 (file-directory-p dolt-meta))
+      (dorg-repo--binding-error
+       'missing-store
+       (format "dorg: no existing Dolt store at %s" abs-dir)
+       :dolt-dir abs-dir :file abs-file))
+    ;; This ordinary compatibility gate is read-only and checks core plus all
+    ;; registered extensions; explicit migration remains a separate operation.
+    (dorg-repo-ensure-schema abs-dir)
+    (let ((root-id (dorg-repo-root-id abs-dir abs-file)))
+      (unless root-id
+        ;; Keep an unbound source distinct from `missing-root', which denotes
+        ;; a malformed persisted binding returned by `dorg-repo-root-id'.
+        (dorg-repo--binding-error
+         'path-mismatch
+         (format "dorg: %s is not bound in existing store %s" abs-file abs-dir)
+         :dolt-dir abs-dir :file abs-file))
+      (dorg--store-registration
+       abs-file
+       (make-dorg-registration
+        :backend (dorg-backend-dolt abs-dir root-id)
+        :file abs-file)))))
 
 (defun dorg-bind-dolt (file dolt-dir)
   "Bind FILE to the Dolt repository at DOLT-DIR.
@@ -269,7 +314,7 @@ per key, untrimmed, or nil when neither is present in the preamble."
     (or (cdr (assoc dorg-dolt-dir-keyword alist))
         (cdr (assoc "DORG_DIR" alist)))))
 
-(defun dorg--buffer-dolt-dir (&optional buffer)
+(defun dorg--buffer-dolt-dir (&optional buffer file)
   "Return the Dolt directory declared by BUFFER's file keyword, or nil.
 Prefers the `#+DORG_DOLT_DIR:' keyword and falls back to the
 legacy `#+DORG_DIR:' keyword during the soft-migration window.
@@ -283,7 +328,7 @@ documentation that mentions `#+DORG_DOLT_DIR:' cannot flip the file to a
 bogus Dolt binding.  The path is resolved relative to the buffer's file
 when it is not absolute; leading/trailing whitespace is stripped."
   (let* ((buf (or buffer (current-buffer)))
-         (file (buffer-file-name buf))
+         (file (or file (buffer-file-name buf)))
          (raw (when-let ((value (dorg--preamble-dolt-keyword buf)))
                 (string-trim value))))
     (when (and raw (not (string-empty-p raw)))
@@ -291,7 +336,7 @@ when it is not absolute; leading/trailing whitespace is stripped."
           (expand-file-name raw (file-name-directory file))
         (expand-file-name raw)))))
 
-(defun dorg--classify-registration (&optional buffer)
+(defun dorg--classify-registration (&optional buffer file)
   "Return the `dorg-registration' for BUFFER's file by PURE classification.
 This is a read-only SOURCE classifier: it never initializes a repo,
 migrates a schema, allocates or looks up a root row, runs any SQL, or
@@ -308,10 +353,10 @@ Callers that need a concrete backing store (a real Dolt root_id) must use
 `dorg--ensure-registration' instead — this classifier deliberately leaves
 the keyword-Dolt root_id nil so a read path can never bind."
   (let* ((buf (or buffer (current-buffer)))
-         (file (buffer-file-name buf)))
+         (file (or file (buffer-file-name buf))))
     (when file
       (or (cdr (assoc (file-truename file) dorg--registry))
-          (when-let ((dolt-dir (dorg--buffer-dolt-dir buf)))
+          (when-let ((dolt-dir (dorg--buffer-dolt-dir buf file)))
             (make-dorg-registration
              :backend (dorg-backend-dolt
                        (file-name-as-directory (file-truename dolt-dir))
@@ -347,9 +392,56 @@ semantics.  Passive/read paths must use `dorg--classify-registration'."
            :backend (dorg-backend-plain-org)
            :file (file-truename file))))))
 
-(defun dorg-current-registration (&optional buffer)
-  "Return the full `dorg-registration' for BUFFER's file, or nil.
-BUFFER defaults to the current buffer.  This is the public,
+(defun dorg--call-with-file-preamble-buffer (file function)
+  "Call FUNCTION with a non-visiting Org buffer for FILE, then kill it.
+The ordinary file decoder reads FILE once from byte zero.  The canonical
+preamble reader below is the only Org parser consumer and narrows itself to
+the header, so no custom byte decoder or headline parser can diverge from Org
+semantics.  Cleanup belongs here so every error path kills the scratch buffer."
+  (let ((buffer (generate-new-buffer " *dorg-preamble*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (let ((enable-local-variables nil)
+                (enable-local-eval nil))
+            ;; `delay-mode-hooks' suppresses both `org-mode-hook' and the
+            ;; generic major-mode hooks.  A classifier must not activate an
+            ;; interactive user's globalized minor modes in its scratch.  Do
+            ;; this while the owned reader is empty: `org-mode' must never
+            ;; initialize a whole projection or follow its SETUPFILE.
+            (delay-mode-hooks
+              (org-mode))
+            (insert-file-contents file))
+          (funcall function buffer))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(defun dorg--current-file-registration (source)
+  "Purely classify file SOURCE without turning a scratch reader into a visit."
+  (let* ((expanded (expand-file-name source))
+         ;; A modified visiting buffer remains authoritative even if the file
+         ;; was deleted after Emacs opened it.
+         ;; `find-buffer-visiting' keys by the expanded file name.  Prefer
+         ;; the live buffer before any filesystem check: unsaved edits and a
+         ;; deleted backing file are still the caller's authoritative source.
+         (visiting (find-buffer-visiting expanded)))
+    (if visiting
+        (dorg--classify-registration visiting)
+      (cond
+       ((not (file-exists-p expanded))
+        (signal 'file-missing (list "File is missing" expanded)))
+       ((not (file-readable-p expanded))
+        ;; Preserve the ordinary permission/read failure class; a present,
+        ;; inaccessible source is not a missing source.
+        (signal 'file-error (list "File is unreadable" expanded))))
+      (let ((file (file-truename expanded)))
+        (dorg--call-with-file-preamble-buffer
+         file (lambda (buffer) (dorg--classify-registration buffer file)))))))
+
+(defun dorg-current-registration (&optional source)
+  "Return the full `dorg-registration' for buffer or file SOURCE, or nil.
+SOURCE defaults to the current buffer.  A string is expanded against
+`default-directory' and canonicalized with `file-truename'; a missing or
+unreadable file signals its ordinary file error.  This is the public,
 read-only accessor for the complete registration record (its
 backend descriptor and registered file), for callers that need more than
 `dorg-registered-backend' or `dorg-registered-dolt-dir' expose
@@ -363,13 +455,15 @@ Resolution is PURE source classification (`dorg--classify-registration'):
      is created;
   3. a transient, non-stored plain-org registration for any other
      file-backed buffer.
-Returns nil only when BUFFER has no backing file.
+Returns nil only when a buffer SOURCE has no backing file.
 
 This accessor performs NO mutation: it never initializes a repo,
 migrates schema, allocates a root, or stores a binding.  To create a
 binding use `dorg-bind-dolt' (the sole public binding entry point).
 Treat the returned struct as read-only."
-  (dorg--classify-registration buffer))
+  (if (stringp source)
+      (dorg--current-file-registration source)
+    (dorg--classify-registration source)))
 
 (defun dorg-registered-dolt-dir (&optional buffer)
   "Return the Dolt dir registered for BUFFER's file, or nil.

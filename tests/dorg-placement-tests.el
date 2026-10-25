@@ -251,9 +251,9 @@ a direct INSERT into the `heading_properties' VIEW is rejected by Dolt."
     (dorg-test--with-temp-db dolt-dir
       (dorg-sql-batch dolt-dir
         (list
-         "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (1, 1, NULL, X'01', 0, FALSE, NULL, 0)"
+         "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (1, 1, NULL, X'01', 0, FALSE, NULL, 0)"
          ;; 101 already corrupt: promoted to level1/parent=root but owned.
-         "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (101, 1, 1, X'02', 1, FALSE, 'Owned child', 0)"
+         "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (101, 1, 1, X'02', 1, FALSE, 'Owned child', 0)"
          "INSERT INTO dorg_files (root_id, relative_path) VALUES (1, 'beads.org')"))
       ;; SECTION_OF via the real drawer/property tables, NOT the view.
       (dorg-test-placement--seed-property dolt-dir 101 '(("SECTION_OF" . "100")))
@@ -265,6 +265,32 @@ a direct INSERT into the `heading_properties' VIEW is rejected by Dolt."
         (should diagnostics)
         (should (eq 'promoted-orphan
                     (dorg-placement-diagnostic-classification (car diagnostics))))))))
+
+(ert-deftest dorg-test-level-offset-placement-context-effective ()
+  "Only a direct root child one level down is classified, never by offset alone.
+Owned 101 sits under the root at offset 1 and is classified.  Owned 201 also
+has offset 1, but under 200, a level-2 heading, so it is at level 3 and is
+not a top-level placement.  GUARD: green before offsets existed too."
+  (skip-unless dorg-test--dolt-available)
+  (dorg-test-placement--with-fixture-ext
+    (dorg-test--with-temp-db dolt-dir
+      (dorg-sql-batch dolt-dir
+        (list
+         "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (1, 1, NULL, X'01', 0, FALSE, NULL, 0)"
+         "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (101, 1, 1, X'02', 1, FALSE, 'Owned root child', 0)"
+         "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (200, 1, 1, X'01', 2, FALSE, 'Gapped parent', 0)"
+         "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (201, 1, 200, X'01', 1, FALSE, 'Owned nested child', 0)"
+         "INSERT INTO dorg_files (root_id, relative_path) VALUES (1, 'beads.org')"))
+      (dorg-test-placement--seed-property dolt-dir 101 '(("SECTION_OF" . "100")))
+      (dorg-test-placement--seed-property dolt-dir 201 '(("SECTION_OF" . "100")))
+      (dorg-commit dolt-dir "seed root and nested owned children")
+      (let ((diagnostics nil))
+        (cl-letf (((symbol-function 'dorg-placement-diagnostic-emit)
+                   (lambda (d) (push d diagnostics))))
+          (dorg-render dolt-dir))
+        (should (equal '(101)
+                       (mapcar #'dorg-placement-diagnostic-heading-id
+                               diagnostics)))))))
 
 (provide 'dorg-placement-tests)
 ;;; dorg-placement-tests.el ends here

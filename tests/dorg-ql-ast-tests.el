@@ -33,6 +33,39 @@ Asserts the canonical pipeline envelope `(:pipe (:source :all) (:filter EXPR))'.
 
 ;;; ─── AST envelope ─────────────────────────────────────────────────────
 
+(ert-deftest dorg-test-ql-ast-select-columns ()
+  "Projection keeps expression nodes and explicit output names."
+  (should
+   (equal (dorg-ql-normalize
+           '(pipe (where (= (field todo) "TODO"))
+                  (select (field title) (as (property "BEAD_ID") id))))
+          '(:pipe (:source :all) (:filter (:cmp todo = "TODO" :case sensitive))
+                  (:select (:column "title" (:field title))
+                           (:column "id" (:property "BEAD_ID")))))))
+
+(ert-deftest dorg-test-ql-ast-select-rejects-ambiguous-or-invalid-columns ()
+  "Bad projection cannot silently overwrite columns or widen selection."
+  (dolist (query '((pipe (select))
+                   (pipe (select (field unknown)))
+                   (pipe (select (field title extra)))
+                   (pipe (select (as (field title))))
+                   (pipe (select (as (field title) nil)))
+                   (pipe (select (as (field title) . bad)))
+                   (pipe (select (field title) (as (field todo) title)))
+                   (pipe (select (property "x") (as (field title) "x")))
+                   (pipe (select (field title)) (where (id 1)))
+                   (pipe (select (field title)) (select (field id)))
+                   (pipe (where (select (field title))))))
+    (should-error (dorg-ql-normalize query) :type 'dorg-ql-error)))
+
+(ert-deftest dorg-test-ql-ast-one-before-select ()
+  "The cardinality wrapper asserts heading count before final projection."
+  (should
+   (equal (dorg-ql-normalize '(one (pipe (where (id 7))
+                                       (select (field title)))))
+          '(:pipe (:source :all) (:filter (:id = 7)) (:one)
+                  (:select (:column "title" (:field title)))))))
+
 (ert-deftest dorg-test-ql-ast-top-level-predicate-wraps-in-pipe ()
   "A top-level predicate normalizes to a pipe over the :all source."
   (should (equal (dorg-ql-normalize '(id 7))
@@ -43,7 +76,7 @@ Asserts the canonical pipeline envelope `(:pipe (:source :all) (:filter EXPR))'.
   (should (equal (dorg-ql-normalize
                   '(pipe (where (tag "x")) (traverse children ancestors) (unique)))
                  '(:pipe (:source :all)
-                         (:filter (:tag = "x"))
+                         (:filter (:tag = "x" :case sensitive))
                          (:traverse children ancestors)
                          (:unique)))))
 
@@ -54,7 +87,7 @@ Asserts the canonical pipeline envelope `(:pipe (:source :all) (:filter EXPR))'.
                  '(:pipe (:source :all)
                          (:filter (:id = 1))
                          (:traverse parent)
-                         (:filter (:tag = "t"))))))
+                         (:filter (:tag = "t" :case sensitive))))))
 
 ;;; ─── (one QUERY) cardinality wrapper ──────────────────────────────────
 ;; AC-2 (tracked-case): the PUBLIC surface of `(one QUERY)' is a top-level
@@ -72,7 +105,7 @@ Asserts the canonical pipeline envelope `(:pipe (:source :all) (:filter EXPR))'.
   (should (equal (dorg-ql-normalize
                   '(one (pipe (where (tag "x")) (traverse children))))
                  '(:pipe (:source :all)
-                         (:filter (:tag = "x"))
+                         (:filter (:tag = "x" :case sensitive))
                          (:traverse children)
                          (:one)))))
 
@@ -96,17 +129,51 @@ Asserts the canonical pipeline envelope `(:pipe (:source :all) (:filter EXPR))'.
 (ert-deftest dorg-test-ql-ast-alias-property ()
   "(property KEY VALUE) lowers to an equality property node."
   (should (equal (dorg-test-ql-ast--filter '(property "CATEGORY" "red"))
-                 '(:property "CATEGORY" = "red"))))
+                 '(:property "CATEGORY" = "red" :case sensitive))))
 
 (ert-deftest dorg-test-ql-ast-alias-title ()
   "(title TITLE) lowers to a title field comparison."
   (should (equal (dorg-test-ql-ast--filter '(title "Hello"))
-                 '(:cmp title = "Hello"))))
+                 '(:cmp title = "Hello" :case sensitive))))
 
 (ert-deftest dorg-test-ql-ast-alias-tag ()
   "(tag TAG) lowers to a tag membership node."
   (should (equal (dorg-test-ql-ast--filter '(tag "work"))
-                 '(:tag = "work"))))
+                 '(:tag = "work" :case sensitive))))
+
+(ert-deftest dorg-test-85e9w-ql-ast-extension-member-is-one-typed-leaf ()
+  "The bounded extension membership reader has one exact normalized shape."
+  (should
+   (equal
+    (dorg-test-ql-ast--filter
+     '(extension-member demo assignee-at 1 ("alice" "")))
+    '(:extension-member demo assignee-at 1 ("alice" "")))))
+
+(ert-deftest dorg-test-85e9w-ql-ast-extension-member-composes-in-booleans ()
+  "Membership is an ordinary boolean leaf, not a top-level execution branch."
+  (should
+   (equal
+    (dorg-test-ql-ast--filter
+     '(or (extension-member demo assignee-at 1 ("alice"))
+          (and (exists (property "PAUSED"))
+               (extension-member demo assignee-at 1 (""))
+               (extension-member demo assignee-at 2 ("alice")))))
+    '(:or
+      (:extension-member demo assignee-at 1 ("alice"))
+      (:and (:property "PAUSED" exists nil)
+            (:extension-member demo assignee-at 1 (""))
+            (:extension-member demo assignee-at 2 ("alice")))))))
+
+(ert-deftest dorg-test-85e9w-ql-ast-extension-member-refuses-malformed-forms ()
+  "Malformed membership never normalizes into a broad or empty query."
+  (dolist (query '((extension-member demo assignee-at 0 ("alice"))
+                   (extension-member demo assignee-at 1 ())
+                   (extension-member demo assignee-at 1 ("alice" 7))
+                   (extension-member "demo" assignee-at 1 ("alice"))
+                   (extension-member demo "assignee-at" 1 ("alice"))
+                   (extension-member demo assignee-at 1 "alice")
+                   (extension-member demo assignee-at 1 ("alice") :extra)))
+    (should-error (dorg-ql-normalize query) :type 'dorg-ql-error)))
 
 (ert-deftest dorg-test-ql-ast-alias-timestamp-windows ()
   "Planning/body/logbook aliases lower to :timestamp :overlaps nodes."
@@ -182,7 +249,7 @@ WINDOW-FORM)' and `(property-ts WINDOW-FORM [NAME])' --- not only explicit
 (ert-deftest dorg-test-ql-ast-field-comparisons ()
   "Prefix field operators and equality atoms normalize value types."
   (should (equal (dorg-test-ql-ast--filter '(contains (field title) "foo"))
-                 '(:cmp title contains "foo")))
+                 '(:cmp title contains "foo" :case sensitive)))
   (should (equal (dorg-test-ql-ast--filter '(> (field level) "2"))
                  '(:cmp level > 2)))
   (should (equal (dorg-test-ql-ast--filter '(field commented t))
@@ -199,9 +266,9 @@ WINDOW-FORM)' and `(property-ts WINDOW-FORM [NAME])' --- not only explicit
 (ert-deftest dorg-test-ql-ast-property-operators ()
   "Prefix property forms cover equality, string ops, and existence."
   (should (equal (dorg-test-ql-ast--filter '(= (property "K") "v"))
-                 '(:property "K" = "v")))
+                 '(:property "K" = "v" :case sensitive)))
   (should (equal (dorg-test-ql-ast--filter '(prefix (property "K") "v"))
-                 '(:property "K" prefix "v")))
+                 '(:property "K" prefix "v" :case sensitive)))
   (should (equal (dorg-test-ql-ast--filter '(exists (property "K")))
                  '(:property "K" exists nil)))
   (should (equal (dorg-test-ql-ast--filter '(missing (property "K")))
@@ -210,9 +277,9 @@ WINDOW-FORM)' and `(property-ts WINDOW-FORM [NAME])' --- not only explicit
 (ert-deftest dorg-test-ql-ast-tag-operators ()
   "Prefix tag forms cover operators and existence."
   (should (equal (dorg-test-ql-ast--filter '(= (tag) "work"))
-                 '(:tag = "work")))
+                 '(:tag = "work" :case sensitive)))
   (should (equal (dorg-test-ql-ast--filter '(suffix (tag) "x"))
-                 '(:tag suffix "x")))
+                 '(:tag suffix "x" :case sensitive)))
   (should (equal (dorg-test-ql-ast--filter '(exists (tag)))
                  '(:tag exists nil))))
 
@@ -221,11 +288,11 @@ WINDOW-FORM)' and `(property-ts WINDOW-FORM [NAME])' --- not only explicit
   (should (equal (dorg-test-ql-ast--filter '(keyword "EXPORT_FILE_NAME"))
                  '(:keyword "EXPORT_FILE_NAME" exists nil)))
   (should (equal (dorg-test-ql-ast--filter '(keyword "EXPORT_FILE_NAME" "alpha"))
-                 '(:keyword "EXPORT_FILE_NAME" = "alpha")))
+                 '(:keyword "EXPORT_FILE_NAME" = "alpha" :case sensitive)))
   (should (equal (dorg-test-ql-ast--filter '(= (keyword "EXPORT_FILE_NAME") "alpha"))
-                 '(:keyword "EXPORT_FILE_NAME" = "alpha")))
+                 '(:keyword "EXPORT_FILE_NAME" = "alpha" :case sensitive)))
   (should (equal (dorg-test-ql-ast--filter '(contains (keyword "EXPORT_FILE_NAME") "alp"))
-                 '(:keyword "EXPORT_FILE_NAME" contains "alp")))
+                 '(:keyword "EXPORT_FILE_NAME" contains "alp" :case sensitive)))
   (should (equal (dorg-test-ql-ast--filter '(missing (keyword "EXPORT_FILE_NAME")))
                  '(:keyword "EXPORT_FILE_NAME" missing nil))))
 
@@ -249,15 +316,16 @@ WINDOW-FORM)' and `(property-ts WINDOW-FORM [NAME])' --- not only explicit
 (ert-deftest dorg-test-ql-ast-boolean-nodes ()
   "and/or/not lower to their AST nodes with normalized operands."
   (should (equal (dorg-test-ql-ast--filter '(and (tag "a") (tag "b")))
-                 '(:and (:tag = "a") (:tag = "b"))))
+                 '(:and (:tag = "a" :case sensitive) (:tag = "b" :case sensitive))))
   (should (equal (dorg-test-ql-ast--filter '(or (id 1) (id 2)))
                  '(:or (:id = 1) (:id = 2))))
   (should (equal (dorg-test-ql-ast--filter '(not (tag "x")))
-                 '(:not (:tag = "x"))))
+                 '(:not (:tag = "x" :case sensitive))))
   ;; Nesting recurses through the predicate normalizer.
   (should (equal (dorg-test-ql-ast--filter
                   '(and (tag "u") (not (property "DONE" "t"))))
-                 '(:and (:tag = "u") (:not (:property "DONE" = "t"))))))
+                 '(:and (:tag = "u" :case sensitive)
+                         (:not (:property "DONE" = "t" :case sensitive))))))
 
 (ert-deftest dorg-test-ql-ast-boolean-arity ()
   "Boolean combinators enforce their arity."
@@ -390,6 +458,109 @@ is 2026-06-01..2026-06-07)."
   ;; An unrecognized window form still errors --- normalization never widens.
   (should-error (dorg-ql-normalize '(timestamp scheduled :overlaps (bogus 1)))
                 :type 'dorg-ql-error))
+
+;;; ─── Explicit literal case mode (xeq5v) ───────────────────────────────
+
+(ert-deftest dorg-test-xeq5v-case-normalizes-once ()
+  "Every eligible string leaf carries one canonical `:case' mode.
+Omission and explicit `sensitive' are deliberately byte-identical; this is
+the AST/cache identity contract, not merely an evaluator default."
+  (dolist (entry
+           '(((title "Work")
+              (:cmp title = "Work" :case sensitive))
+             ((title "Work" :case sensitive)
+              (:cmp title = "Work" :case sensitive))
+             ((contains (field title) "work" :case insensitive)
+              (:cmp title contains "work" :case insensitive))
+             ((= (property "CATEGORY") "Work" :case insensitive)
+              (:property "CATEGORY" = "Work" :case insensitive))
+             ((prefix (keyword "CAPTION") "Draft" :case insensitive)
+              (:keyword "CAPTION" prefix "Draft" :case insensitive))
+             ((!=(tag) "ARCHIVE" :case insensitive)
+              (:tag != "ARCHIVE" :case insensitive))))
+    (should (equal (dorg-test-ql-ast--filter (car entry)) (cadr entry)))))
+
+(ert-deftest dorg-test-xeq5v-case-option-refusals ()
+  "Malformed or inapplicable `:case' tails refuse during normalization."
+  (dolist (query
+           '((title "x" :case folded)
+             (title "x" :case insensitive :case sensitive)
+             (title "x" :case)
+             (field id 1 :case insensitive)
+             (field priority "A" :case insensitive)
+             (property "K" "V" :case insensitive extra)
+             (exists (property "K") :case insensitive)
+             (timestamp scheduled :overlaps (on "2026-01-01") :case insensitive)))
+    (should-error (dorg-ql-normalize query) :type 'dorg-ql-error)))
+
+;;; ─── contains-any reader sugar ──────────────────────────────────────
+
+(ert-deftest dorg-test-ql-ast-contains-any-is-or-of-contains ()
+  "`contains-any' normalizes to exactly the long OR of `contains' leaves.
+The sugar adds no AST operator: the filter is `equal' to the long form's,
+needle order and duplicates included, for both explicit case modes."
+  (dolist (mode '(sensitive insensitive))
+    (should (equal (dorg-test-ql-ast--filter
+                    `(contains-any (field title) ("ontology" "researcher" "roles" "roles")
+                                   :case ,mode))
+                   (dorg-test-ql-ast--filter
+                    `(or (contains (field title) "ontology" :case ,mode)
+                         (contains (field title) "researcher" :case ,mode)
+                         (contains (field title) "roles" :case ,mode)
+                         (contains (field title) "roles" :case ,mode)))))
+    (should (equal (dorg-test-ql-ast--filter
+                    `(contains-any (field title) ("b" "a") :case ,mode))
+                   `(:or (:cmp title contains "b" :case ,mode)
+                         (:cmp title contains "a" :case ,mode))))))
+
+(ert-deftest dorg-test-ql-ast-contains-any-default-case-is-contains-default ()
+  "Without `:case', every leaf takes exactly the plain `contains' default."
+  (let ((default (dorg-test-ql-ast--filter '(contains (field title) "x"))))
+    (should (equal (dorg-test-ql-ast--filter '(contains-any (field title) ("x")))
+                   (list :or default)))
+    (should (equal (dorg-test-ql-ast--filter '(contains-any (field title) ("x" "y")))
+                   (dorg-test-ql-ast--filter '(or (contains (field title) "x")
+                                                  (contains (field title) "y")))))))
+
+(ert-deftest dorg-test-ql-ast-contains-any-empty-needle-is-contains-empty ()
+  "An empty needle is legal and means what (contains EXPR \"\") means."
+  (should (equal (dorg-test-ql-ast--filter '(contains-any (field title) ("")))
+                 (list :or (dorg-test-ql-ast--filter '(contains (field title) ""))))))
+
+(ert-deftest dorg-test-ql-ast-contains-any-shares-contains-operands ()
+  "Every operand `contains' accepts is accepted, with the same leaf shape."
+  (dolist (operand '((property "COLOR") (keyword "AUTHOR") (tag)))
+    (should (equal (dorg-test-ql-ast--filter
+                    `(contains-any ,operand ("a" "b") :case insensitive))
+                   (dorg-test-ql-ast--filter
+                    `(or (contains ,operand "a" :case insensitive)
+                         (contains ,operand "b" :case insensitive)))))))
+
+(ert-deftest dorg-test-ql-ast-contains-any-empty-list-refused-like-or ()
+  "An empty needle list is the same typed invalid query as an empty (or)."
+  (let ((empty-or (should-error (dorg-ql-normalize '(or)) :type 'dorg-ql-error))
+        (empty-any (should-error (dorg-ql-normalize '(contains-any (field title) ()))
+                                 :type 'dorg-ql-error)))
+    (should (eq 'invalid-query (dorg-error-reason empty-or)))
+    (should (eq (dorg-error-reason empty-or) (dorg-error-reason empty-any)))))
+
+(ert-deftest dorg-test-ql-ast-contains-any-refuses-malformed-forms ()
+  "Arity, needle-list shape, needle type and case tail fail before any source."
+  (dolist (query '((contains-any (field title))
+                   (contains-any (field title) "ontology")
+                   (contains-any (field title) ("a" . "b"))
+                   (contains-any (field title) ("a" 1))
+                   (contains-any (field title) ("a") :case folded)
+                   (contains-any (field title) ("a") :case insensitive :case sensitive)
+                   (contains-any (field level) ("1"))
+                   (contains-any (field bogus) ("a"))))
+    (should-error (dorg-ql-normalize query) :type 'dorg-ql-error))
+  ;; The insensitive raw-byte literal refusal is the plain contains refusal.
+  (let ((raw (unibyte-string #xc3)))
+    (should-error (dorg-ql-normalize `(contains (field title) ,raw :case insensitive))
+                  :type 'dorg-ql-error)
+    (should-error (dorg-ql-normalize `(contains-any (field title) (,raw) :case insensitive))
+                  :type 'dorg-ql-error)))
 
 (provide 'dorg-ql-ast-tests)
 ;;; dorg-ql-ast-tests.el ends here

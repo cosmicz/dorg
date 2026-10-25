@@ -1,6 +1,6 @@
 #+title: Contributing
 
-DOrg =0.1.0= defines the first public release.  Released tags and
+Released tags and
 [[file:CHANGELOG.org][CHANGELOG.org]] define shipped compatibility; unreleased
 source revisions do not.  Dolt is authoritative for Dolt-backed sources.
 Their buffers are read-only projections, and writes use the typed mutation
@@ -13,7 +13,7 @@ per-module tables document the repository structure.
 * Getting Started
 
 1. Fork and clone the repository
-2. Run ~make test~ to ensure everything passes
+2. Run ~make test~ for the representative checks; use ~make test-full~ for full certification
 3. Create a feature branch (~feature/your-feature~ or ~fix/your-fix~)
 
 * Development
@@ -21,9 +21,10 @@ per-module tables document the repository structure.
 ** Running Tests
 
 #+begin_src sh
-make test                                  # Run all tests
-make test SELECT="^dorg-test-parse"  # Run specific tests
-make test SELECT="^dorg-test-project-"    # Check docs/module/test maps
+make test                                  # Representative test suite
+make test-full                             # Full test suite
+make test SELECT="^dorg-test-parse"          # Run specific tests
+make test SELECT="^dorg-test-project-"       # Check docs/module/test maps
 make compile                               # Byte-compile
 make lint                                  # Run static checks
 make clean                                 # Clean artifacts
@@ -38,11 +39,10 @@ make clean                                 # Clean artifacts
 
 ** Adding a Module
 
-Add the source file and matching focused tests, then document the module's
-purpose and dependency edges in the public
-[[file:docs/api.org::*Module dependency map][module reference]].  Run the
-focused checks first, then the required full suite and ~make lint~ before
-submitting the change.
+Follow [[file:DEVELOPMENT.org::*Adding A Module][Adding A Module]] for the
+source/test maps, test-runner registration and module reference.  That guide
+is the canonical checklist; do not maintain a second list here.  Run focused
+checks first, then the full suite and ~make lint~ for code changes.
 
 ** Commit Messages
 
@@ -52,6 +52,11 @@ submitting the change.
 
 * Submitting Changes
 
-1. Ensure all tests pass (~make test~)
-2. Byte-compile cleanly (~make compile~)
+1. For code changes, ensure the full suite passes (~make test-full~)
+2. For code changes, byte-compile cleanly (~make compile~)
 3. Open a pull request with a clear description
+
+Documentation-only changes use Org structure/link review, ~git diff --check~
+and the relevant documentation guards.  They do not require the code full
+suite.  Execute documented examples separately on disposable data and retain
+the source revision and observed results.

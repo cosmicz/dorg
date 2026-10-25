@@ -1,14 +1,15 @@
 #+title: DOrg API Reference
 
 #+begin_quote
-*DOrg 0.1.0 API.*  This document describes the first public API surface.
+*Current DOrg API.*  Released tags and the changelog identify shipped versions.
 Whole-file reconciliation and its conflict runtime are not part of that
 surface.
 #+end_quote
 
 This document is the canonical reference for the dorg public command
-API: the one command surface (=query= + =mutate=) shared verbatim across
-Elisp, the =bin/dorg= CLI, and ~dorg serve~.
+API: the query and mutation languages used by Elisp, the =bin/dorg= CLI
+and ~dorg serve~.  Source arguments and result serialization differ by entry
+point; those contracts are specified below.
 
 Inline markup convention in the DOrg docs: ~code~ denotes syntax (Elisp
 forms, symbols, keywords, function names, JSON fields, commands/options, and
@@ -16,14 +17,15 @@ SQL fragments); =verbatim= denotes literal non-code text such as file paths,
 exact strings, environment settings, and externally displayed values.
 
 The per-module Elisp symbol tables and the internal module dependency
-diagram are a contributor reference, not part of the public API; they are
-retained below in the [[*Module dependency map][module reference]] (the
-dependency map and per-module symbol tables).
+diagram are a contributor reference, not part of the public API unless
+explicitly identified as public below.  They are retained in the
+[[*Module dependency map][module reference]] (the dependency map and per-module
+symbol tables).
 
-* Surface parity (0.1)
+* Surface parity
 
 The same command language is reachable from three surfaces.  Their
-coverage for 0.1, by capability:
+current coverage, by capability:
 
 | Capability                        | Elisp API | CLI (=bin/dorg=) | Interactive (Emacs)          |
 |-----------------------------------+-----------+------------------+------------------------------|
@@ -35,12 +37,18 @@ coverage for 0.1, by capability:
 | Doctor                            | yes       | yes              | yes                          |
 | Server lifecycle                  | yes       | yes (+ =rebind=) | yes (+ =compact-check=)      |
 | Refresh / materialize             | yes       | n/a              | yes                          |
+| Managed clocks                    | yes       | no               | opt-in Org clock adapter     |
 
-Two asymmetries are deliberate 0.1 disclosures rather than oversights:
-interactive mutation currently exposes a single typed verb (the broader
-interactive surface, including a capture-style node editor, is planned
-post-0.1), and history has no CLI verb yet.  Downstream programs should
-target the Elisp API or the CLI, which carry the full command language.
+Interactive mutation helpers cover less than the general mutation API;
+managed clock actions additionally use the opt-in Org adapter.  History has
+no CLI verb.  Downstream programs use the Elisp API or CLI for the general
+query/mutation languages; clocks use the Elisp owner API.
+
+The executable plain-Org/Dolt capability contract is maintained only in
+=tests/dorg-api-tests.el= as =dorg-test-api--capability-matrix=.  It records
+the source kind, identity policy, supported/refused/pending status, independent
+postimage or typed refusal pair, and its controls; this document intentionally
+does not duplicate that test-side table.
 
 Related references:
 
@@ -48,11 +56,11 @@ Related references:
 - [[file:cli.org][docs/cli.org]] -- =bin/dorg= command-line interface
 - [[file:backend-extension.org][docs/backend-extension.org]] -- backend descriptor and extension migration contracts
 - [[file:configuration.org][docs/configuration.org]] -- user options, hooks, and the read-only projection/typed-write boundary
-- [[file:query.org][docs/query.org]] -- query API and composable v2 DSL reference (the query verb + shared selector sublanguage)
+- [[file:query.org][docs/query.org]] -- query API and composable DSL reference (the query verb + shared selector sublanguage)
 - [[file:mutate.org][docs/mutate.org]] -- the mutate DSL, typed patch IR v2, and the typed execution boundary
 - [[file:import.org][docs/import.org]] -- explicit administrative bootstrap/recovery ingest
 
-* DOrg 0.1.0 Public Command API
+* Public Command API
 
 DOrg exposes one core query/mutation command surface with two verbs — =query=
 (read) and =mutate= (write) — usable from three transports:
@@ -74,7 +82,7 @@ The two verbs share *one selector sublanguage*.  The read-side
 mutation target language: ~(on (where QUERY) ACTION...)~ selects exactly
 the headings ~(query (where QUERY))~ would return, then mutates them.
 Query and mutate are deliberately *not* merged into a single unrestricted
-transformation language in the DOrg 0.1.0 design; selection and mutation remain
+transformation language; selection and mutation remain
 auditable, separately specified steps joined only by the shared selector.
 
 *Selection is heading-granular.*  Both verbs select *headings*: every
@@ -84,15 +92,16 @@ The resulting target set may mix integer ids and extern keys under a
 ~(:property K)~ binding: K-bearing hits use K; keyless hits with an existing
 =DORG_ID= use that id.  Sub-heading entities (properties, keyword occurrences,
 planning, items) are addressed only relative to a host, never selected
-independently, and there is no row/field projection in the DOrg 0.1.0
-surface.  The level-0 =document= host is outside the query domain;
+independently.  Reads can end in =select= to project named scalar columns
+from the selected headings; mutation target queries reject =select=.  The
+level-0 =document= host is outside the query domain;
 document-owned file-level keywords are edited only by naming =document= directly
 (~(on document …)~), never via ~(where …)~.
 
 ** Read entry hierarchy
 
 ~dorg-ql-select~ is the canonical public read engine entry point.  It
-validates one atomic or composable v2 query form, resolves the source/backend
+validates one atomic or composable query form, resolves the source/backend
 adapter, runs the read against plain-org, Dolt, or model-list storage, and
 returns the canonical result plists:
 
@@ -100,12 +109,19 @@ returns the canonical result plists:
 (:heading-id ID :marker MARKER-OR-NIL :title TITLE :properties ALIST)
 #+end_src
 
+With terminal =select=, each row instead carries =:heading-id=, =:marker=
+and an ordered =:values= alist with opaque string column names.  This keeps
+heading identity separate from projected values.  See
+[[file:query.org][query projection]] for forms and types.
+
 Other read-facing functions are purpose wrappers over that engine, not
 competing read engines:
 
 | Entry point                                   | Purpose |
 |-----------------------------------------------+---------|
 | ~dorg-ql-select~                              | Canonical read engine: query validation, source/backend dispatch, and result plist shape. |
+| ~dorg-ql-select-snapshot~                     | One-invocation internal envelope: rows, generic source identity, Dolt root when applicable, typed data snapshot, and extension-context digest. |
+| ~dorg-ql-snapshot-public~                     | Pure public projection of one snapshot: strips markers while retaining opaque string columns and common source/root/snapshot/context/results/count data. |
 | ~dorg-command-run-query~                      | UI-free machine boundary: calls ~dorg-ql-select~, returns the same results, and preserves typed ~dorg-ql-error~ conditions/data.  Interactive commands use a message-only =user-error= adapter; CLI/serve map the typed condition to their envelope. |
 | ~dorg-session-query~                          | Warm-lifetime wrapper: refreshes a session when stale, reuses a token-keyed result cache, calls the same query engine, and projects host-safe results by default. |
 | ~dorg-find-heading-by-id~                     | Convenience sugar for ~(id ID)~; returns the ~dorg-ql-select~ result shape. |
@@ -171,7 +187,7 @@ to Dolt directly.
 ;; Insert one raw line at the front of the first exact-name generic drawer.
 (dorg-api-execute
  '(on (id 100)
-      (insert (drawer-line "LOGBOOK" (occurrence 1)) (before-first) "- note"))
+      (insert (drawer-line "LOGBOOK") (before-first) "- note"))
  :mode 'apply)
 #+end_src
 
@@ -181,7 +197,7 @@ dorg mutate '(on (id 100) (set (property "STATUS") "DONE"))' --dry-run
 dorg mutate '(on (id 100) (set (property "STATUS") "DONE"))' --apply
 #+end_src
 
-#+begin_example
+#+begin_example http
 # HTTP
 POST /mutate?mode=dry-run
 (on (where (property "STATUS" "OPEN")) (set (property "STATUS") "DONE"))
@@ -206,7 +222,7 @@ may compose the same action as:
 
 #+begin_src emacs-lisp
 (on (key ID)
-    (insert (drawer-line "LOGBOOK" (occurrence 1))
+    (insert (drawer-line "LOGBOOK")
             (before-first) RAW-LINE))
 #+end_src
 
@@ -215,25 +231,33 @@ the action syntax.
 
 ** Source descriptors
 
-Every command resolves a *source* — a storage binding, never a domain
-object.  The accepted forms are shared with the mutation engine
+The source names storage, not a domain object.  Entry points currently
+accept different source representations.  For ~dorg-api-execute~ and
+mutation intent construction, the accepted forms are
 ([[file:mutate.org][docs/mutate.org]], /Source descriptors/):
 
 | =SOURCE=                       | Resolves to                             |
 |--------------------------------+-----------------------------------------|
-| =nil=                          | the current buffer's registered backend |
+| =nil=                          | the current buffer's backend |
 | a buffer (object or name)      | that buffer's registered backend        |
 | ~(:buffer BUFFER)~             | a registered live buffer                |
 | ~(:file PATH)~                 | an explicit plain-org file              |
 | ~(:dolt-dir DIR :root-id ID)~  | an explicit Dolt root                   |
 
-On the CLI these are the =-f/--file= and =--dolt-dir= / =--root-id= flags;
+~dorg-ql-select~ accepts nil (current buffer), a buffer, a nonempty list of
+heading models, or an ephemeral Dolt ~dorg-registration~.  It does not accept
+mutation descriptor plists.  An empty list is nil and therefore means the
+current buffer, not an empty model source.  ~dorg-session-open~ accepts a
+buffer or file path.  Keep these entry-specific contracts explicit in
+consumer adapters.
+
+On the CLI source selection uses =-f/--file= and =--dolt-dir= / =--root-id= flags;
 over HTTP they are request parameters.  For CLI =mutate=,
 =--dolt-dir DIR --root-id ID= selects the explicit Dolt root directly;
 =--dolt-dir= without =--root-id= keeps the existing file-backed forced
 binding path, and =--root-id= without =--dolt-dir= is a usage error.  A
-source with no DOrg registration / backing storage is rejected
-(=invalid-target=).
+plain file needs no registration: plain-org is its default backend.
+Queries use a file/buffer binding; =--root-id= is not a query source shortcut.
 
 *** Identity-stability contract
 
@@ -288,7 +312,7 @@ The public operations are ~dorg-api-make-mutation-intent~,
 ~dorg-api-mutation-intent-form~ and ~dorg-api-mutation-intent-options~, and
 the functional ~dorg-api-mutation-intent-with~.  Construction accepts exactly
 ~:source~, ~:base~, ~:expected-targets~, ~:allow-broad~, ~:save~,
-~:message~, and ~:op-id~.  Mode is supplied only to ~dorg-api-execute~;
+~:message~, ~:op-id~, and ~:lock-timeout~.  Mode is supplied only to ~dorg-api-execute~;
 supplying construction options beside an existing intent is =malformed=.
 Derive a new value instead.
 
@@ -315,19 +339,22 @@ closed; see [[Index projectors (~:extension-inputs~ retired)]]).
 
 ** Elisp execution options
 
-~dorg-api-execute~ accepts two apply-oriented Elisp options in addition to the
-mode and safety options.  The API forwards either key only when the caller
-supplies it; omission leaves the engine's backend default intact.
+~dorg-api-execute~ accepts three apply-oriented Elisp options in addition to the
+mode and safety options.  Each option takes effect only when the caller
+supplies it; omission uses the default described below.
 
 | Option            | Effect |
 |-------------------+--------|
 | ~:save BOOL~      | For an apply against a live plain-org buffer, =t= persists the changed buffer through DOrg's atomic save path; nil or omission leaves it modified and unsaved.  An explicit ~(:file PATH)~ source is atomically rewritten by apply itself.  Dolt does not use this option. |
 | ~:message STRING~ | Supplies the Dolt commit message for apply.  Omission (or nil) uses the engine default.  It has no plain-org persistence effect. |
+| ~:lock-timeout SECONDS~ | Bounds a saved local plain-Org writer-gate wait.  Must be finite and nonnegative.  Omission uses the fixed DOrg default. |
 
-Neither option can turn a dry-run into a write: ~:mode 'dry-run~ always takes
+None of these options can turn a dry-run into a write: ~:mode 'dry-run~ always takes
 the plan path and neither saves a file nor creates a Dolt commit.  The
 file-backed CLI apply supplies ~:save t~ internally; ~:save~ and ~:message~
-are not separate public CLI flags.
+are not separate public CLI flags.  The CLI exposes =--lock-timeout= and a
+read-only =dorg lock inspect PATH= operator command.  The saved-file gate and
+its limits are specified in [[file:mutate.org][Mutation]].
 
 ** Mode contract (dry-run vs apply)
 
@@ -345,7 +372,7 @@ read-only and takes no mode.
   safety gates (base token, expected-target-set, broad-write threshold).
 
 Planning *is* =mutate --dry-run=.  There is no separate public =plan=
-command and no persisted/executable plan artifact in DOrg 0.1.0.
+command and no persisted/executable plan artifact in the mutation command API.
 
 ** Response envelope
 
@@ -362,9 +389,12 @@ without the leading colon: ~:heading-id~ -> ="heading-id"=,
 ~:base-commit~ -> ="base-commit"=, ~:dolt-dir~ -> ="dolt-dir"=.  Snake
 case and camelCase are not public wire keys.
 
-The =query= data payload is ~(:command query :results [HIT...] :count N)~.
-Each =HIT= contains serializable ~:heading-id~, ~:title~, and ~:properties~
-fields.  Live markers remain an Elisp-only detail and are not serialized.
+The =query= data payload carries =:command query=, =:source=, =:root=,
+=:snapshot=, =:context-digest=, =:results= and =:count= from one invocation.
+Default rows contain =:heading-id=, =:title= and =:properties=; projected rows
+contain =:heading-id= and =:values=.  Live markers are not serialized.
+Ranked BM25 uses the distinct search snapshot described in
+[[file:query.org][query.org]].
 
 The =mutate= data payload is:
 
@@ -404,6 +434,31 @@ preview containing only the stable fields, deliberately without an advancing hea
 Consumers comparing dry-run with apply compare the stable scope fields, not
 the apply-only freshness token.
 
+** Compact receipts and retired derived-model responses
+
+An op-id Dolt apply stores a compact operation receipt atomically with its data:
+=op_id=, immutable =gen_id=, =intent_digest= and =ts=.  Same-op-id/same-intent
+retry returns the original ~:new-token~, echoed ~:op-id~ and ~:idempotent t~
+without replaying data SQL.  Different intent remains terminal
+=idempotency-key-mismatch=.  Generation-safe recovery requires exactly one
+added transition for the quoted generation id; missing or ambiguous history
+fails closed.  Pruned current evidence cannot promise retained idempotency.
+
+~:return-candidate-models~ is retired.  Its presence, including an explicit nil,
+is =malformed= with ~:option :return-candidate-models~ through the existing
+closed option domain at construction, functional replacement and raw execute.
+Raw execute still checks mode first.  Unrelated unknown raw keywords retain
+their historical ignored behavior, domain order and first-value handling.
+There is no accepted-and-ignored request or new retired-option registry.
+
+~:candidate-models~ and ~:postimages~ are no longer mutation response fields.
+Replay neither reads a derived payload nor reconstructs a model.  The receipt
+table and its nullable legacy column stay unchanged; historical column bytes are ignored,
+not rewritten.  Full pre-commit core/item/owner/extension parity still gates every
+commit.  A caller needing state must use an existing exact-revision read with an
+explicit root/id scope and the returned commit, not infer moved/deleted or
+unchanged requested scope from current HEAD.
+
 ** Index projectors (~:extension-inputs~ retired)
 
 The per-execution ~:extension-inputs~ caller-payload channel is *retired*.
@@ -429,6 +484,53 @@ table, an unsafe identifier, or a malformed effect *fails closed* before
 persistence.  The generated SQL commits in the SAME Dolt transaction as the core
 mutation (atomic; a stale-CAS replan discards the prior effects and re-derives
 from the replacement candidate).
+
+*Root aggregates (accumulators).*  A projector whose derived state includes a
+root-wide aggregate, such as a document frequency or a corpus total, need not
+derive the whole root.  It declares the aggregate table in ~:read-tables~ with
+~:accumulate (KEY-COLUMN …)~, its complete key including its scope column.  It
+then returns *accumulator effects* for that table instead of rows:
+~(:table NAME :accumulate KEY-ALIST :add ((COLUMN . INTEGER) …) :xor ((COLUMN
+. HEX64) …) :initial ((COLUMN . VALUE) …) :prune-zero COLUMN)~.  Integers under
+addition and 256-bit lowercase-hex digests under xor are commutative,
+associative and invertible, so folding any sequence of deltas from the
+identity is order-free and incremental state equals a fresh rebuild.
+
+Accumulators never reach SQL.  At plan time DOrg reads exactly the touched
+keys' rows AS OF the plan base (one keyed revision read per table, never the
+live head or working set).  It folds the deltas into ordinary literal row
+effects (~:delete~ + ~:insert~ for a stored key, a lone ~:insert~ for a new
+one), revalidates them, and hands them to the same SQL generator, commit
+proof and drift audit as every other effect.  A new key is born from the
+identity plus ~:initial~; a ~:prune-zero~ column reaching zero
+deletes its row; an unchanged row emits nothing; a negative count fails
+closed.  The commit lands only while the in-gate HEAD still equals the plan
+base, so a moved base replans with fresh priors.  A table takes either
+accumulator or row effects, never both.  Every effect of an accumulator
+extension, row effects included, must address a root its context establishes
+(the root, or a cross-root move's source and destination); any other root
+fails closed with ~root-outside-context~ before a prior is read.
+
+Exactly one accumulator table is the extension's completeness ~:marker~, with
+its required non-scope keys per root (~t~ when the key is the scope column
+alone), declared at registration.  Each touched root is then judged in one of
+three states:
+- *built*: every required marker row is present, and the root folds;
+- *unbuilt*: none is present.  If the root had headings at the base, the
+  extension's effects for it are dropped and its index stays wholly absent,
+  never partial; if it was empty, its first write births every required
+  marker row;
+- *inconsistent*: some required rows are present but not all.  The mutation
+  fails closed with ~derived-index-inconsistent~ naming
+  ~dorg-ext-rebuild-index~.  This is the only state in which a derived index
+  blocks a write.
+
+| Caller | Priors read at | Guard |
+|--------+----------------+-------|
+| mutation, cross-root mutation, dry-run | plan base (=:plan-base=) | in-gate HEAD = plan base, else replan |
+| import | captured head | HEAD = base and a clean working set |
+| rebuild audit and repair | none (fold from absent after the DOrg-owned clears) | repair at HEAD |
+| policy upgrade | n/a | refuses every non-insert effect, accumulators included |
 
 *Affected owner partitions.*  A Dolt index-context also exposes
 ~dorg-ext-index-context-owner-partitions~ for extensions that derive
@@ -579,7 +681,7 @@ rollback law/.
 
 ** Migration from =set=
 
-DOrg 0.1.0 does not expose the pre-release =dorg set= CLI command or the
+DOrg does not expose the pre-release =dorg set= CLI command or the
 =POST /set= route; use =mutate=.  The interactive Emacs helper
 ~dorg-set-property~ (see the [[*=dorg-command.el=][=dorg-command.el= module
 reference]]) is kept as a one-property typed mutation convenience, not as the
@@ -595,7 +697,7 @@ dorg mutate '(on (id 100) (set (property "STATUS") "DONE"))' --apply
 
 ** Convenience aliases
 
-DOrg 0.1.0 provides the *per-predicate CLI read commands* ~dorg id~ / =dorg
+DOrg provides the *per-predicate CLI read commands* ~dorg id~ / =dorg
 property= / ~dorg tag~ / ~dorg title~ as thin convenience aliases over
 ~dorg query '(<predicate>)'~: each maps to the query verb with the
 corresponding selector predicate, e.g. ~dorg id 100~ ≡ =dorg query '(id
@@ -736,10 +838,29 @@ and CLI spelling are in [[file:import.org][docs/import.org]].
 | Symbol                    | Description                          |
 |---------------------------+--------------------------------------|
 | ~dorg-bind-dolt~          | Bind a file to a Dolt repo (plain-org is the default) |
+| ~dorg-bind-existing-dolt~ | Bind a file only to an existing valid Dolt root, without initialization or Org UI edits |
 | ~dorg-unregister~         | Remove a Dolt binding                |
 | ~dorg-registered-dolt-dir~ | Look up dolt dir for a buffer       |
 | ~dorg-registered-backend~ | Return the ~dorg-backend~ descriptor for a buffer |
-| ~dorg-current-registration~ | Return the full (read-only) ~dorg-registration~ for a buffer |
+| ~dorg-current-registration~ | Return the full (read-only) ~dorg-registration~ for a buffer or file |
+| ~make-dorg-registration~ | Construct an ephemeral query binding from =:backend=, =:file= and optional =:identity= without visiting a file or changing the registry |
+
+An ephemeral Dolt registration is a supported source for ~dorg-ql-select~
+and ~dorg-ql-select-snapshot~. Supply the actual source file and an existing
+root resolved through ~dorg-repo-root-id~; constructing the record does not
+resolve, create, or validate a file/root binding. Treat registrations returned
+by ~dorg-current-registration~ as read-only; construct a separate record when
+an invocation needs its own binding.
+
+~dorg-bind-existing-dolt~ is the public programmatic safe-reader alternative
+when a caller needs a stored registry binding for an already-existing store.
+It requires both the supplied directory and its =.dolt= entry to be
+directories, checks ordinary core and registered-extension compatibility, and
+resolves an existing valid root before changing the in-memory registry.  It
+does not initialize, migrate, create a root, commit, alter the Org buffer, or
+enable ~dorg-mode~.  Missing stores signal ~dorg-binding-error~ reason
+=missing-store=; a file with no stored root signals =path-mismatch=.  A
+malformed stored root retains the distinct =missing-root= reason.
 
 * =dorg-backend.el=
 
@@ -759,18 +880,22 @@ descriptor slots.  Backend dispatch is by kind predicates plus options.  See
 backend descriptor and extension migration contracts.
 
 * =dorg-ql.el=
+:PROPERTIES:
+:CUSTOM_ID: query-library-api
+:END:
 
-| Symbol            | Description                                       |
-|-------------------+---------------------------------------------------|
-| ~dorg-ql-select~  | Run one validated query (atomic or v2) over a source |
-| ~dorg-ql-error~   | Typed query failure: =invalid-query= or =unsupported= |
+| Symbol                     | Description                                       |
+|----------------------------+---------------------------------------------------|
+| ~dorg-ql-select~           | Run one validated query (atomic or composable) over a source |
+| ~dorg-ql-select-snapshot~  | Return one source-bound =:rows= / =:source= / =:root= / typed =:snapshot= / =:context-digest= envelope |
+| ~dorg-ql-snapshot-public~  | Project one snapshot to shared JSON-ready query data with opaque string row keys |
+| ~dorg-ql-error~            | Typed query failure: =invalid-query= or =unsupported= |
 
 ~dorg-ql-select~ takes a ~dorg-ql~ query form and an optional source.
 The query may be a historical atomic predicate (kept as an alias) or a
-composable v2 form.  ~dorg-ql-select~ validates the form up front and
-dispatches both surfaces: atomic predicates keep their historical
-execution path, while v2 forms lower through ~dorg-ql-normalize~ to one
-backend-neutral normalized AST.  The full DSL — =pipe=/=where=/=traverse=,
+composable form.  ~dorg-ql-select~ validates the form up front and
+dispatches both surfaces through ~dorg-ql-normalize~ to one backend-neutral
+normalized AST.  The full DSL — =pipe=/=where=/=traverse=,
 the boolean combinators, =field=, and structured =timestamp= windows — is
 documented in [[file:query.org][docs/query.org]]; the rest of this
 section describes the atomic surface and the shared dispatch/result
@@ -780,14 +905,74 @@ are exact and
 non-inherited; =ID= is an integer or numeric string.  The source selects
 the adapter: =nil= or a buffer dispatches via the buffer's registered
 backend (plain-org or Dolt); a non-empty list of ~dorg-heading~ structs
-uses the model adapter.  For v2, that model-list is an ordered forest:
+uses the model adapter. An ephemeral ~dorg-registration~ with a Dolt backend
+dispatches directly to its supplied store/root, without a buffer visit or
+registry lookup. For composable queries, that model-list is an ordered forest:
 filter-only pipelines run over the supplied order, while traversal and
 =unique= require unique non-nil heading ids and signal ~dorg-ql-error~ if
 the identity contract is violated.  Results are plists with keys
 ~:heading-id~, ~:marker~, ~:title~, and ~:properties~ — plain-org results
-carry live markers, model and Dolt results carry =nil= markers.
+carry live markers, model and Dolt results carry =nil= markers.  Terminal
+=select= replaces =:title= and =:properties= with the ordered =:values=
+alist described in [[*Read entry hierarchy][Read entry hierarchy]].
 Unknown predicates, wrong arity, and wrong argument types signal
 ~dorg-ql-error~; invalid forms never fall back to a broad scan.
+
+String comparisons may end in =~:case sensitive= or =~:case insensitive=;
+omitting the option is exactly =~:case sensitive=.  The option applies only
+to string values (including title/todo, property and keyword values, tag
+values, and declared string extension fields).  Insensitive mode uses
+per-character standard-case equivalence and, for Dolt, the documented
+residual route rather than a database collation.  See [[file:query.org][the
+query grammar]] for the supported forms and literal Unicode contract.
+
+~dorg-ql-select-snapshot~ is the transport-facing counterpart for a buffer
+or an ephemeral Dolt registration. It captures a Dolt revision before
+extension context or data reads,
+then returns =(:rows ROWS :source SOURCE :root ROOT-ID :snapshot SNAPSHOT
+:context-digest DIGEST)=. =SOURCE= identifies backend kind and canonical file
+when present (plus the Dolt store); =SNAPSHOT= is =(:kind dolt :head COMMIT)=
+or =(:kind plain-org :content-sha256 SHA256)= for the exact text evaluated.
+~dorg-ql-snapshot-public~ is the pure shared CLI data boundary. The context
+digest identifies independently versioned workflow/configuration inputs; it is
+not a substitute for the data snapshot.
+
+An in-process consumer can query an existing Dolt root without opening or
+materializing its Org projection:
+
+#+begin_src emacs-lisp
+(require 'dorg-ql)
+(require 'dorg-repo)
+(let* ((file (file-truename "/path/to/project/document.org"))
+       (store (file-truename "/path/to/project/.dorg/dorg"))
+       (root (or (dorg-repo-root-id store file)
+                 (user-error "No DOrg root bound to %s" file)))
+       (source (make-dorg-registration
+                :backend (dorg-backend-dolt store root)
+                :file file)))
+  (dorg-ql-snapshot-public
+   (dorg-ql-select-snapshot
+    '(pipe (select (field title) (field todo))) source)))
+#+end_src
+
+~dorg-repo-root-id~ is a read-only lookup and refuses ambiguous or malformed
+bindings; QL resolves a classification-only nil root at its captured revision
+and refuses its =nil= result with ~dorg-bind-dolt~ recovery. The descriptor
+names that explicitly resolved root. ~:file~ supplies source identity and the base
+for relative extension configuration links, so retain the actual file even
+though the query does not visit it. Load any required extension before the
+query. All selected data and local extension-context reads then use the one
+revision captured by ~dorg-ql-select-snapshot~; independently versioned
+configuration remains identified by the context digest.
+
+Plain Org queries use a buffer containing the source text and its actual
+~buffer-file-name~. A caller may own a temporary Org buffer for that purpose
+and release it after converting the result with ~dorg-ql-snapshot-public~;
+the converted result contains no live markers. Keep this read buffer unchanged
+during the query and never save it. Backend classification uses its binding
+and source text: a projection carrying =#+DORG_DOLT_DIR:= is classified as
+Dolt. The file-descriptor plists
+accepted by the command and mutation APIs are not query SOURCE forms.
 
 ~dorg-ql-error~ carries ~(MESSAGE PLIST)~.  The closed top-level reason set
 is exactly =invalid-query= and =unsupported=: grammar, arity, value, and
@@ -820,9 +1005,9 @@ reusing the one parser and window predicate so all three backends produce
 identical matches.  A query on any other backend signals ~dorg-ql-error~
 rather than silently widening or emptying the result.
 
-The composable v2 DSL (=pipe=/=where=/=traverse=, boolean combinators,
+The composable DSL (=pipe=/=where=/=traverse=, boolean combinators,
 =field=, structured =timestamp= windows) lowers to the same normalized
-AST and dispatches through ~dorg-ql-select~.  v2 forms run on model-list,
+AST and dispatches through ~dorg-ql-select~.  Composable forms run on model-list,
 plain-org, and Dolt sources.  See
 [[file:query.org][docs/query.org]] for the full grammar.  Fuzzy
 matching, updates, and Clime commands remain out of scope for this core.
@@ -843,14 +1028,14 @@ adapter.
 
 Normalized v2 AST and Lisp reader for ~dorg-ql~: the single public
 parsing layer that lowers both the historical atomic forms (kept as
-compatibility aliases) and the composable v2 reader forms into one
+compatibility aliases) and the composable reader forms into one
 backend-neutral AST.
 
 | Symbol              | Description                                              |
 |---------------------+---------------------------------------------------------|
 | ~dorg-ql-normalize~ | Normalize a public ~dorg-ql~ query into the backend-neutral v2 AST |
 
-See [[file:query.org][docs/query.org]] for the query DSL and composable v2 grammar.
+See [[file:query.org][docs/query.org]] for the query DSL and composable grammar.
 
 * =dorg-find.el=
 
@@ -884,7 +1069,7 @@ Query commands run a ~dorg-ql~ form against the current buffer through
 buffer; =RET= or =mouse-1= navigates to a heading (a live marker for
 plain-org, otherwise an in-buffer =DORG_ID= search).  ~dorg-query~ accepts
 the full grammar ~dorg-ql-select~ accepts: atomic predicates on any
-backend and composable v2 forms on model-list, plain-org, and Dolt
+backend and composable forms on model-list, plain-org, and Dolt
 sources.  Its minibuffer prompt still suggests an atomic form as the
 common case.
 
@@ -905,7 +1090,7 @@ module exposes a query facade plus the narrow typed property convenience:
 
 | Function                | Role    | Contract                                   |
 |-------------------------+---------+--------------------------------------------|
-| ~dorg-command-run-query~ | query   | Run one ~dorg-ql~ query form against a buffer (atomic predicate or composable v2 form); returns ~dorg-ql-select~ result plists WITHOUT touching =*dorg-query*= and preserves typed ~dorg-ql-error~ data for machine callers |
+| ~dorg-command-run-query~ | query   | Run one ~dorg-ql~ query form against a buffer (atomic predicate or composable form); returns ~dorg-ql-select~ result plists WITHOUT touching =*dorg-query*= and preserves typed ~dorg-ql-error~ data for machine callers |
 | ~dorg-set-property~      | mutate  | Execute one canonical typed property mutation; plain Org remains modified/unsaved, Dolt commits once then exact-refreshes the established view |
 
 The general public noninteractive write surface is the *source-generic
@@ -960,7 +1145,7 @@ table derive from this one inventory.
 
 | Symbol                                     | Description                                      |
 |--------------------------------------------+--------------------------------------------------|
-| ~dorg-mutate-grammar-productions~          | The exact 17-production semantic grammar        |
+| ~dorg-mutate-grammar-productions~          | The current semantic grammar inventory   |
 | ~dorg-mutate-grammar-targets~              | Direct and query-scoped target semantics        |
 | ~dorg-mutate-grammar-heading-fields~       | Intrinsic field domains, clearing, and projection metadata |
 | ~dorg-mutate-grammar-insert-heading-clauses~ | Insert-heading clause domains, cardinality, IR, and projection metadata |
@@ -998,6 +1183,13 @@ bead (or whole root) and restore a bead/root to a chosen prior commit.
 | ~dorg-history-restore-at-point~ | Restore the scope to the commit at point (durable DB write) |
 | ~dorg-restore-to-commit~        | Restore a bead/root to its state as of a commit |
 | ~dorg-history-mode~             | Major mode for browsing/restoring bead/root history |
+
+Restore brings back headline fields, bodies, deleted headings and level
+offsets.  A re-created heading keeps its target offset (a skipped level
+survives) and returns at its target sibling position.  A heading whose offset
+alone differs under the same parent is moved in place to its target offset.
+Parent and sibling-order differences are not restored.  A restore whose
+result Org cannot represent is refused before it writes.
 
 * =dorg-parse.el=
 
@@ -1098,8 +1290,8 @@ They do not mutate buffers or publish lifecycle state.
 | Symbol                   | Description                              |
 |--------------------------+------------------------------------------|
 | ~dorg-init~              | Create repo, apply schema, initial commit |
-| ~dorg-repo-ensure-schema~ | Migrate repo to current schema version  |
-| ~dorg-migrate-schema~     | Explicitly run a supported post-release migration |
+| ~dorg-repo-ensure-schema~ | Check ordinary schema compatibility without writes |
+| ~dorg-migrate-schema~     | Explicitly run a managed-server operator schema migration |
 | ~dorg-repo-encode-relative-path~ | Encode one canonical source relative to its Dolt store |
 | ~dorg-repo-decode-relative-path~ | Validate/decode one persisted store-relative locator |
 | ~dorg-repo-root-candidates~ | Return every exact file/root binding candidate, refusing malformed stored locators |
@@ -1108,7 +1300,7 @@ They do not mutate buffers or publish lifecycle state.
 | ~dorg-rebind-file~        | Exact-base metadata-only file rebind with sanitized receipt |
 | ~dorg-binding-error~      | Typed binding/root refusal under ~dorg-error~ |
 | ~dorg-binding-error-data~ | Structured metadata carried by a binding refusal |
-| ~dorg-binding-error-reason~ | Stable reason: =path-mismatch=, =ambiguous-locator=, =invalid-locator=, =missing-root=, or =locator-collision= |
+| ~dorg-binding-error-reason~ | Stable reason: =missing-store=, =path-mismatch=, =ambiguous-locator=, =invalid-locator=, =missing-root=, or =locator-collision= |
 
 * =dorg-doctor.el=
 
@@ -1120,17 +1312,17 @@ They do not mutate buffers or publish lifecycle state.
 
 | Symbol                    | Description                            |
 |---------------------------+----------------------------------------|
-| ~dorg-sortkey-midpoint~   | Fractional key between two sort keys   |
-| ~dorg-sortkey-midpoint-limited~ | Midpoint that signals ~dorg-sortkey-exhausted~ at the storage cliff instead of returning an overlong candidate |
-| ~dorg-sortkey-from-integer~ | Convert integer [1,255] to sort key  |
+| ~dorg-sortkey-first-key~  | Canonical first key of an empty group  |
+| ~dorg-sortkey-step-after~ | Constant-width key one step after any stored key (tail placement) |
+| ~dorg-sortkey-step-before~ | Constant-width key one step before any stored key (head placement) |
+| ~dorg-sortkey-bounds~     | Integer interval strictly between two stored keys of any length |
+| ~dorg-sortkey-spread~     | COUNT evenly spaced keys inside an interval, avoiding occupied keys |
+| ~dorg-sortkey-encode~ / ~dorg-sortkey-int16~ | 16-byte key ↔ unsigned integer coordinate |
+| ~dorg-sortkey-from-integer~ | Explicit small key from an integer (imports, fixtures) |
 | ~dorg-sortkey-to-hex~     | Sort key → hex string for display      |
 | ~dorg-sortkey-from-hex~   | Hex string → sort key                  |
 | ~dorg-sortkey-max-bytes~  | Schema storage maximum (64 bytes, the =VARBINARY(64)= column width) |
-| ~dorg-sortkey-rebalance-threshold~ | Allocation threshold (64 bytes) at which midpoint allocation triggers sibling rebalance |
-| ~dorg-sortkey-exhausted~  | Error condition signalled when midpoint allocation reaches the storage budget |
-
-The storage contract is documented in
-[[file:schema.org][docs/schema.org]] (Sort-key Storage Contract).
+| ~dorg-sortkey-exhausted~  | Error condition: the requested interval has no room, or a step leaves the domain |
 
 * =dorg-timestamp.el=
 
@@ -1163,6 +1355,36 @@ Each accessor returns ~dorg-timestamp~ values (or nil).
 ~dorg-heading-logbook-entries~ returns ~dorg-logbook-entry~ structs with
 read-only accessors ~dorg-logbook-entry-kind~ (=state-change=, =note=,
 or =logbook=), =-timestamp=, =-raw=, =-from-state=, and =-to-state=.
+
+** Public low-level model readers
+
+These Dolt readers are public low-level APIs, implemented in
+=dorg-model-load.el=.  Prefer the query/render facades for selection and
+rendered views; use these readers when typed heading/item models are needed.
+Both return a hash table from numeric heading ID to ~dorg-heading~, with
+items populated as model objects.
+
+| Symbol | Arguments | Scope |
+|--------+-----------+-------|
+| ~dorg-model-load-headings~ | ~(dolt-dir root-id ids &optional as-of headline-only query-fn levels)~ | Explicit IDs within the root, or the whole root when ~ids~ is nil. |
+| ~dorg-model-load-tree~ | ~(dolt-dir root-id &optional as-of)~ | Explicit whole-root convenience; delegates to ~dorg-model-load-headings~ with nil IDs. |
+
+*Nil IDs mean the whole root, not an empty selection.*  Consumers hydrating
+query results must short-circuit an empty ID list before calling the loader.
+For example, this preserves the hash-table result shape and performs no
+loader SQL for an empty selection:
+
+#+begin_src emacs-lisp
+(if ids
+    (dorg-model-load-headings dolt-dir root-id ids revision)
+  (make-hash-table :test #'eql))
+#+end_src
+
+For snapshot-coherent hydration, ~revision~ is the exact Dolt commit captured
+by the query.  Pass that same commit as ~as-of~; omitting it reads current
+state and does not preserve the query snapshot.  ~headline-only~ skips
+item/body/drawer/planning payloads and leaves each heading's items nil, for
+example when loading breadcrumb ancestors.
 
 * =dorg-dolt-server.el=
 
@@ -1305,7 +1527,7 @@ do not depend on the private validation primitive.
 | ~dorg-unregister-extension~  | Remove an extension                      |
 | ~dorg-get-extension~         | Look up a registered extension           |
 | ~dorg-registered-extensions~ | List all registered extensions           |
-| ~dorg-repo-ensure-extensions~ | Install/upgrade registered extensions in a repo |
+| ~dorg-repo-ensure-extensions~ | Retired existing-store installer; signals ~dorg-schema-migration-required~ and points to ~dorg-migrate-schema~ |
 | ~dorg-ext-index-context-owner-partitions~ | Read affected identity-owner partitions from an index context |
 | ~dorg-ext-owner-partition-root-id~ | Read an owner partition's root id |
 | ~dorg-ext-owner-partition-owner-id~ | Read an owner partition's owner heading id |
@@ -1327,12 +1549,95 @@ in [[file:backend-extension.org][docs/backend-extension.org]] and
 | Symbol | Description |
 |--------+-------------|
 | ~dorg-ext-rebuild-index~ | Audit or atomically repair one declared extension index scope at an exact Dolt revision |
+| ~dorg-ext-rebuild-audit-store~ | Read-only whole-store ownership audit of every declared derived row at an exact Dolt revision |
+| ~dorg-ext-rebuild-plan-policy-upgrade~ | Read-only plan of an explicit OLD-to-NEW derived-policy transition frozen at a revision |
+| ~dorg-ext-rebuild-apply-policy-upgrade~ | Re-derive and atomically apply one policy-upgrade plan, returning a self-contained receipt |
+| ~dorg-ext-rebuild-invert-policy-upgrade~ | Exactly restore the pre-upgrade derived rows from a successful forward receipt |
 
 This Dolt-only administrative entry point takes an extension, root id,
 =:dolt-dir=, =:revision=, and =:mode= (=audit= or =repair=).  It uses the
 registered projector rather than accepting rows or SQL.  See
 [[file:backend-extension.org][backend-extension.org]] for its full-snapshot
 context and scope-column contract.
+
+=dorg-ext-rebuild-audit-store= takes an extension plus =:dolt-dir=,
+=:revision= and =:identity=; it has no root argument and no repair mode.  At
+the supplied committed revision it returns a read-only ownership census for
+every declared derived table.  Its =:tables= entries retain full row alists and
+multiplicity, classifying every observed row as canonical-root owned,
+stored-only-root owned, orphan, ambiguous, or undeclared scope.  =:clean= is
+only an ownership-census result, not a projected-value correctness claim.
+Callers must treat =:complete nil= (with =:errors=) as non-clean and must not
+infer a zero count for an unread table.
+
+The three policy-upgrade functions are a deliberate migration of derivation
+policy, not ordinary repair: plan takes a closed request with content-addressed
+OLD and NEW producer identities resolved through the extension's
+=:producer-resolver=, apply accepts only a plan and re-derives it before
+writing, and invert accepts only the forward receipt and restores the exact
+pre-upgrade derived rows.  See
+[[file:backend-extension.org::*Explicit derived-policy upgrade and exact inverse][backend-extension.org]]
+for the classification, receipt and reconciliation contract.
+
+* Managed clock lifecycle
+
+Require =dorg-clock= to use the persisted clock API; the Org UI adapter is a
+separate opt-in package.  Clocks have one named Dolt authority and scope.  A
+plain-Org file can identify a task, but cannot own the clock ledger.
+
+| Entry point | Contract |
+|-------------+----------|
+| ~dorg-api-make-owner-intent FAMILY REQUEST &rest OPTIONS~ | Construct an immutable request for a registered metadata family; clock callers use ~dorg-clock-make-intent~. |
+| ~dorg-clock-make-intent ACTION &rest ARGUMENTS~ | Construct an immutable =start=, =stop=, =switch=, =correct=, =cancel= or =adopt= request. |
+| ~dorg-api-execute INTENT :mode MODE~ | Validate/preview (=dry-run=) or persist (=apply=) through the metadata owner; no execution-time source, scope, time or task override. |
+| ~dorg-clock-read SCOPE-ID &rest OPTIONS~ | Read the scope and intervals from =:source=, at a required =:observed-at= UTC instant and optional =:snapshot=; never start/stop a clock or create task identity. |
+| ~dorg-clock-render-interval START-UTC END-UTC ZONE~ | Render a completed interval as an Org CLOCK line; UTC seconds remain authoritative. |
+
+Requests carry an explicit source, base, operation ID, scope/interval IDs,
+expected active interval, integer UTC epoch seconds and IANA time zone.
+Action-specific fields include the canonical task reference, correction or
+adoption data.  The owner enforces active-interval consistency and validates
+records before committing.  A lost response must retain the exact immutable
+request for reconciliation/retry; creating a fresh operation ID could create a
+second operation.  Generic property edits cannot bypass this protocol.
+
+The =DORG_CLOCK_= properties are canonical data; Org CLOCK text is a derived
+projection.  Adopting a legacy line is explicit and pins its task, source
+revision and raw bytes.  Ambiguous wall times and indistinguishable duplicate
+lines are refused, rather than guessed.  See
+[[file:configuration.org::*Managed clocks (opt-in Emacs)][the optional Emacs adapter]]
+for local indicators, dirty-buffer deferral and the differences from stock Org
+clock hooks and idle handling.
+
+* Managed clock task references
+
+~dorg-clock-task-ref SOURCE HEADING-ID~ returns a typed value with =:kind=,
+=:heading-id= and =:canonical=.  A Dolt task also has =:store-id= and
+=:root-id=; its canonical form is
+=dolt:v1:<32-lowercase-hex-store-id>:<root-id>:<heading-id>=.  A plain task
+has =:root-identity=, read from the file's =#+DORG_STORE_ID:= root keyword;
+its form is =plain:v1:<base64-root-identity>:<heading-id>=.  Both heading IDs
+are stable =DORG_ID= values.  ~dorg-clock-task-ref-decode CANONICAL~ returns
+the same typed value, or nil for a malformed string.  Paths locate sources but
+are never compared as identity.  Copies of one Dolt store preserve its ID;
+=:fork= deliberately changes it.
+
+New Dolt stores receive a random 128-bit =store-id= row in =dorg_meta= during
+~dorg-init~.  ~dorg-api-identify-store DOLT-DIR~ identifies an older store
+once, refusing an existing ID.  Passing =:fork t= replaces the ID and records
+the prior value under =store-id:prior:<new-id>= in the same commit.  This door
+requires a clean Dolt working set so it cannot commit unrelated pending changes.  The CLI
+exposes this as =dorg dolt identify DIR [--fork]=.  An unidentified Dolt store
+or plain root returns =(:kind unresolved :reason store-unidentified ...)=
+without a canonical string; clocking that task is refused.  Clock reads and
+task-reference encoding never create identity.  For a plain file, its author or
+importer writes =#+DORG_STORE_ID:= directly in the file; typed DOrg mutation
+continues to refuse writes to every =DORG_*= keyword.  Changing unrelated plain-file
+bytes leaves its task reference unchanged.  Adoption separately pins the exact
+source revision and raw CLOCK occurrence.  A claim on an adopted line uses its
+task reference, heading ID and raw CLOCK bytes; moving the line to a different
+occurrence cannot adopt it twice.  Byte-identical CLOCK lines in one heading
+are ambiguous and must be resolved in the source before adoption.
 
 * Module index — modules without their own section
 
@@ -1344,14 +1649,16 @@ documented.  Modules marked /internal/ export no supported public API.
 |--------+---------------------------|
 | =dorg-api.el= | Canonical public entry points (~dorg-api-execute~, ~dorg-api-normalize~, mutation intent); documented throughout this file and [[file:mutate.org][docs/mutate.org]] |
 | =dorg-app.el= | Host of the generated =bin/dorg= CLI; command surface documented in [[file:cli.org][docs/cli.org]] |
+| =dorg-bm25.el= | DOrg-owned BM25 profile, derived lexical projection, and bounded ranked-read SQL; documented in [[file:query.org][docs/query.org]] |
 | =dorg-envelope.el= | /internal/ — command-boundary JSON envelopes |
 | =dorg-error.el= | /internal/ — shared typed error definitions consumed by the modules above |
+| =dorg-extension-bm25.el= | Conventional opt-in loader for the DOrg BM25 extension |
 | =dorg-ext-read.el= | /internal/ — warm read-plane snapshot/cache behind =dorg-ext.el= |
 | =dorg-freshness.el= | /internal/ — shared content-hash primitive for freshness tokens |
 | =dorg-git.el= | /internal/ — generic git primitives |
 | =dorg-git-sync.el= | /internal/ — plain-org git sync-branch adapter (publication) |
 | =dorg-keywords.el= | /internal/ — root keyword read primitive |
-| =dorg-model-load.el= | /internal/ — bounded loaders behind =dorg-model.el= |
+| =dorg-model-load.el= | Implementation of the [[*Public low-level model readers][public low-level model readers]]; helper functions remain internal |
 | =dorg-projection.el= | Buffer projection-view lifecycle; public ~dorg-materialized-view-scope~ documented under [[*Materialized views and rendering][Materialized views and rendering]] |
 | =dorg-ql-core.el= | /internal/ — QL engine core behind =dorg-ql.el= |
 | =dorg-ql-dolt.el= | /internal/ — QL Dolt adapter |

@@ -20,23 +20,36 @@
 
 ;;; Code:
 
-(defconst dorg-schema-version 6
+(require 'dorg-error)
+
+(defconst dorg-schema-version 8
   "Current schema version.")
+
+(defconst dorg-schema-mutation-log-ddl
+  "CREATE TABLE dorg_mutation_log (
+  op_id          VARCHAR(255) PRIMARY KEY,
+  gen_id         VARCHAR(64) NOT NULL UNIQUE,
+  intent_digest  VARCHAR(64) NOT NULL,
+  ts             BIGINT NOT NULL,
+  postimages_v1  TEXT NULL
+)"
+  "Versioned core DDL for exactly-once mutation receipts.")
 
 ;;; ─── Schema-version skew ─────────────────────────────────────────────
 ;;
 ;; A dorg installation and the live Dolt repo it opens can drift in
 ;; schema version.  The hazard is asymmetric: a repo NEWER than the dorg
 ;; reading it cannot be made compatible by migrating (dorg never
-;; downgrades), and auto-migrating an OLDER repo UP is a one-way upgrade
+;; downgrades), and migrating an OLDER repo UP is a one-way upgrade
 ;; that locks out every co-installed dorg still pinned below the new
 ;; version (e.g. a CLI's vendored `lib/dorg' submodule).  These errors
-;; and the `dorg-schema-auto-migrate' policy make the skew fail early and
-;; actionably instead of mid-write, and keep the upgrade from being
+;; and the explicit `dorg-migrate-schema' operator entry make the skew fail
+;; early and actionably instead of mid-write, and keep upgrades from being
 ;; silent.  See `dorg-repo-check-schema-compat'.
 
 (define-error 'dorg-schema-incompatible
-  "dorg schema version is incompatible with this dorg")
+  "dorg schema version is incompatible with this dorg"
+  'dorg-error)
 
 (define-error 'dorg-schema-repo-newer
   "dorg repo schema is newer than this dorg supports"
@@ -47,22 +60,19 @@
   'dorg-schema-incompatible)
 
 (defcustom dorg-schema-auto-migrate t
-  "Whether opening an OLDER Dolt repo auto-migrates it to the current schema.
+  "Obsolete compatibility variable; ordinary open never migrates.
 
-When non-nil (the default), `dorg-repo-ensure-schema' upgrades a repo
-whose recorded schema version is below `dorg-schema-version', emitting a
-`display-warning' first so the one-way upgrade is never silent.  The
-upgrade LOCKS OUT any older co-installed dorg (e.g. a CLI's vendored
-`lib/dorg') from writing the repo until it too is upgraded.
-
-When nil, such a repo is left untouched and `dorg-repo-ensure-schema'
-signals `dorg-schema-migration-required'.  Shared, multi-installation
-deployments — a fleet of CLIs writing one tracker — should set this nil
-so no single process silently upgrades the shared repo out from under the
-others; migrate explicitly with `dorg-migrate-schema' once every
-installation is current."
+Changing this value does not authorize schema writes.  Existing stores whose
+core or registered extension metadata is not current signal
+`dorg-schema-migration-required' on ordinary access.  Operators migrate
+deliberately with `dorg-migrate-schema' after registering the required
+extensions."
   :type 'boolean
   :group 'dorg)
+
+(make-obsolete-variable 'dorg-schema-auto-migrate
+                        "ordinary access never migrates; use dorg-migrate-schema explicitly"
+                        "0.1.1")
 
 (defcustom dorg-schema-diagnostics-show-source-path nil
   "When non-nil, schema version-skew diagnostics append this dorg's source path.
@@ -92,12 +102,13 @@ identifying WHICH dorg installation is stale."
   `key`   VARCHAR(100) PRIMARY KEY,
   value   TEXT
 )"
+    ,dorg-schema-mutation-log-ddl
     "CREATE TABLE headings (
   id              BIGINT PRIMARY KEY,
   root_id         BIGINT NOT NULL,
   parent_id       BIGINT NULL,
   sort_key        VARBINARY(64) NOT NULL,
-  level           INT NOT NULL,
+  level_offset    INT NOT NULL,
   todo_keyword    VARCHAR(32) NULL,
   priority        CHAR(1) NULL,
   commented       BOOLEAN NOT NULL DEFAULT FALSE,
@@ -181,18 +192,21 @@ FROM property_entries pe
 JOIN drawer_items di ON pe.drawer_item_id = di.item_id
 JOIN heading_items hi ON di.item_id = hi.id
 WHERE di.name = 'PROPERTIES'"
-    "INSERT INTO dorg_meta (`key`, value) VALUES ('schema_version', '6')")
+    "INSERT INTO dorg_meta (`key`, value) VALUES ('schema_version', '8')")
   "SQL DDL statements for fresh dorg repos (always reflects latest schema version).
 A list of individual SQL statements executed via `dorg-sql-batch'.
 Existing repos are migrated incrementally via `dorg-schema-migrations'.")
 
-(defconst dorg-schema-migrations nil
+(defconst dorg-schema-migrations
+  '((6 . dorg-repo--v6-to-v7-receipt-schema)
+    (7 . dorg-repo--v7-to-v8-level-offset))
   "Alist of (FROM-VERSION . STATEMENTS) for incremental schema migrations.
 Each entry migrates from FROM-VERSION to FROM-VERSION+1.
 STATEMENTS is a list of SQL strings, or a repository-owned function that
-returns them when the migration depends on bounded store context.  The first
-public release starts at schema v6, so no pre-release migration entries ship;
-this empty runner remains for future v6 -> v7+ migrations.")
+returns them when the migration depends on bounded store context.  Such a
+function may instead return (:statements STATEMENTS :validate FN), where FN is
+run inside the step transaction before its Dolt commit (see
+`dorg-repo--apply-schema-step-on-lease').")
 
 (provide 'dorg-schema)
 ;;; dorg-schema.el ends here

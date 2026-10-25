@@ -17,6 +17,7 @@
 (require 'dorg-parse)
 (require 'dorg-history)
 (require 'dorg-import)
+(require 'dorg-ql-model)
 (require 'dorg-sql-gen)
 (require 'dorg-test-helpers)
 
@@ -67,6 +68,39 @@
   "Return non-nil when FUNCTION in FILE calls CALLEE."
   (when-let ((form (dorg-test-model--read-defun-form file function)))
     (dorg-test-model--form-calls-p (cddr form) callee)))
+
+;;; Canonical owned metadata registry
+
+(ert-deftest dorg-test-model-owned-metadata-family-is-case-insensitive ()
+  "The closed registry recognizes Org's case-insensitive property spelling."
+  (let ((family (dorg-owned-metadata-family "dorg_clock_start")))
+    (should (equal "DORG_CLOCK_" (car family)))
+    (should (eq 'dorg-clock-metadata-owner (nth 1 family)))
+    (should (= 1 (nth 2 family)))))
+
+(ert-deftest dorg-test-model-owned-metadata-canonical-key-rejects-case-and-accumulation ()
+  "Recognition is broad for refusal; storage accepts only canonical keys."
+  (should (dorg-owned-metadata-canonical-key-p "DORG_CLOCK_START"))
+  (dolist (name '("dorg_clock_start" "DORG_CLOCK_start" "DORG_CLOCK_START+"))
+    (should (dorg-owned-metadata-key-p name))
+    (should-not (dorg-owned-metadata-canonical-key-p name))))
+
+(ert-deftest dorg-test-model-owned-metadata-family-rejects-overlap-and-system-cover ()
+  "The immutable registry cannot admit ambiguous or system-covering prefixes."
+  (should-error
+   (dorg-owned-metadata--validate-families
+    '(("DORG_CLOCK_" one 1 nil) ("DORG_CLOCK_EVENT_" two 1 nil))))
+  (should-error
+   (dorg-owned-metadata--validate-families
+    '(("DORG_" owner 1 nil)))))
+
+(ert-deftest dorg-test-model-owned-metadata-three-field-tuple-refuses-typed ()
+  "A registry entry without an explicit feature field is invalid."
+  (let ((err (should-error
+              (dorg-owned-metadata--validate-families
+               '(("DORG_OTHER_" owner 1)))
+              :type 'dorg-owned-metadata-registry-error)))
+    (should (eq 'invalid-family (dorg-error-reason err)))))
 
 ;;; Shared model child ordering helper
 
@@ -151,6 +185,33 @@
       (should (< (string-match ":DORG_ID:" rendered)
                  (string-match ":FOO:" rendered))))))
 
+(ert-deftest dorg-test-q60zv-model-body-view-excludes-only-leading-metadata ()
+  "The canonical body view keeps structured body items and exact blank runs."
+  (let ((heading
+         (make-dorg-heading
+          :id 1001
+          :items
+          (list
+           (dorg-planning-item :scheduled "<2026-01-02 Fri>")
+           (dorg-drawer-item :name "PROPERTIES" :properties '(("DORG_ID" . "1001")))
+           (dorg-text-item :text "Start." :post-blank 1)
+           (dorg-keyword-item :keyword "KEY" :value "value")
+           (dorg-drawer-item :name "PROPERTIES" :properties '(("KEY" . "value")))
+           (dorg-drawer-item :name "LOGBOOK" :lines '("- note"))
+           (dorg-text-item :text "Last" :post-blank 0)))))
+    (should
+     (equal "Start.\n\n#+KEY: value\n:PROPERTIES:\n:KEY: value\n:END:\n:LOGBOOK:\n- note\n:END:\nLast\n"
+            (dorg-model-body-view heading)))))
+
+(ert-deftest dorg-test-q60zv-model-body-view-counts-overlapping-literals ()
+  "Literal counting is case-sensitive and resolves ambiguity before mapping."
+  (should (equal '(:count 2)
+                 (dorg-model-body-view-literal-match "aaa" "aa")))
+  (should (equal '(:count 1 :begin 2 :end 5)
+                 (dorg-model-body-view-literal-match "αβOLDγ" "OLD")))
+  (should (equal '(:count 0)
+                 (dorg-model-body-view-literal-match "OLD" "old"))))
+
 ;;; Render Methods — Heading
 
 (ert-deftest dorg-test-model-render-heading-simple ()
@@ -161,7 +222,7 @@
 (ert-deftest dorg-test-model-render-heading-todo-priority-tags ()
   "Heading with TODO, priority, and tags renders correctly."
   (let ((h (make-dorg-heading
-            :id 1 :level 1 :title "Task"
+            :id 1 :level 1 :level-offset 1 :title "Task"
             :todo "TODO" :priority "A" :tags '("work" "urgent"))))
     (let ((line (dorg-model--render-heading h)))
       (should (string-match-p "^\\* TODO" line))
@@ -171,7 +232,7 @@
 
 (ert-deftest dorg-test-model-render-heading-commented ()
   "Heading with COMMENT flag renders COMMENT keyword."
-  (let ((h (make-dorg-heading :id 1 :level 1 :title "Secret" :commented t)))
+  (let ((h (make-dorg-heading :id 1 :level 1 :level-offset 1 :title "Secret" :commented t)))
     (should (string-match-p "COMMENT" (dorg-model--render-heading h)))))
 
 ;;; Render Methods — Full Tree
@@ -179,9 +240,9 @@
 (ert-deftest dorg-test-model-render-tree-basic ()
   "Rendering a tree with root + child produces org text."
   (let* ((child (make-dorg-heading
-                 :id 2 :parent-id 1 :level 1 :title "Child"
+                 :id 2 :parent-id 1 :level 1 :level-offset 1 :title "Child"
                  :items (list (dorg-text-item :text "Body text.\n"))))
-         (root (make-dorg-heading :id 1 :level 0))
+         (root (make-dorg-heading :id 1 :level 0 :level-offset 0))
          (headings (list root child)))
     (let ((text (dorg-model-render-tree headings)))
       (should (string-match-p "^\\* Child" text))
@@ -192,10 +253,10 @@
 (ert-deftest dorg-test-model-render-tree-with-dorg-keywords ()
   "DORG_* keyword items on root appear in rendered output."
   (let* ((root (make-dorg-heading
-                :id 1 :level 0
+                :id 1 :level 0 :level-offset 0
                 :items (list (dorg-keyword-item :keyword "DORG_DOLT_DIR" :value "/tmp/db")
                              (dorg-keyword-item :keyword "DORG_HASH" :value "abc123"))))
-         (child (make-dorg-heading :id 2 :parent-id 1 :level 1 :title "H"))
+         (child (make-dorg-heading :id 2 :parent-id 1 :level 1 :level-offset 1 :title "H"))
          (headings (list root child)))
     (let ((text (dorg-model-render-tree headings)))
       (should (string-match-p "^#\\+DORG_DOLT_DIR: /tmp/db" text))
@@ -225,9 +286,9 @@ freshly synthesized local drawer carrying its :DORG_ID:, while the body
 drawer's own content — including a literal :DORG_ID: — is preserved in
 place.  Regression: the old renderer injected identity into the body
 drawer (mis-locating identity) and dropped that drawer's content."
-  (let* ((root (make-dorg-heading :id 1 :level 0))
+  (let* ((root (make-dorg-heading :id 1 :level 0 :level-offset 0))
          (child (make-dorg-heading
-                 :id 999 :parent-id 1 :level 1 :title "H"
+                 :id 999 :parent-id 1 :level 1 :level-offset 1 :title "H"
                  :items (list
                          (dorg-text-item :text "body text here\n")
                          (dorg-drawer-item
@@ -268,9 +329,9 @@ drawer (mis-locating identity) and dropped that drawer's content."
 A leading planning line followed by a PROPERTIES drawer keeps that drawer
 as the heading's local identity drawer — :DORG_ID: is injected into it (no
 second synthesized drawer), after the planning line."
-  (let* ((root (make-dorg-heading :id 1 :level 0))
+  (let* ((root (make-dorg-heading :id 1 :level 0 :level-offset 0))
          (child (make-dorg-heading
-                 :id 999 :parent-id 1 :level 1 :title "T"
+                 :id 999 :parent-id 1 :level 1 :level-offset 1 :title "T"
                  :items (list
                          (dorg-planning-item :scheduled "<2026-04-09 Thu>")
                          (dorg-drawer-item :name "PROPERTIES"
@@ -306,9 +367,9 @@ second synthesized drawer), after the planning line."
 Only ONE synthesized local identity drawer is emitted (before the first
 body item); every later body PROPERTIES-shaped drawer keeps its own
 content and is free of the heading :DORG_ID:."
-  (let* ((root (make-dorg-heading :id 1 :level 0))
+  (let* ((root (make-dorg-heading :id 1 :level 0 :level-offset 0))
          (child (make-dorg-heading
-                 :id 999 :parent-id 1 :level 1 :title "H"
+                 :id 999 :parent-id 1 :level 1 :level-offset 1 :title "H"
                  :items (list
                          (dorg-text-item :text "intro\n")
                          (dorg-drawer-item :name "PROPERTIES" :lines '(":A: 1"))
@@ -368,9 +429,9 @@ generic drawer's own lines (including a literal :DORG_ID:) survive.
 
 Regression: the name+position resolver injected identity into this
 raw-lines drawer, dropping its content."
-  (let* ((root (make-dorg-heading :id 1 :level 0))
+  (let* ((root (make-dorg-heading :id 1 :level 0 :level-offset 0))
          (child (make-dorg-heading
-                 :id 999 :parent-id 1 :level 1 :title "H"
+                 :id 999 :parent-id 1 :level 1 :level-offset 1 :title "H"
                  :items (list
                          (dorg-drawer-item
                           :name "PROPERTIES"
@@ -394,7 +455,7 @@ raw-lines drawer, dropping its content."
 (ert-deftest dorg-test-sql-gen-skips-dorg-keywords ()
   "SQL generation skips DORG_* keyword items."
   (let* ((h (make-dorg-heading
-             :id 100 :level 0
+             :id 100 :level 0 :level-offset 0
              :items (list (dorg-keyword-item :keyword "DORG_DOLT_DIR" :value "/tmp")
                           (dorg-keyword-item :keyword "TITLE" :value "My Doc")
                           (dorg-keyword-item :keyword "DORG_HASH" :value "abc"))))
@@ -449,10 +510,10 @@ raw-lines drawer, dropping its content."
         (dorg-commit dolt-dir "v1"))
       (let ((commit1 (dorg-head-commit dolt-dir))
             (root-id (alist-get 'id (car (dorg-sql dolt-dir
-                       "SELECT id FROM headings WHERE level = 0 AND parent_id IS NULL")))))
+                       "SELECT id FROM headings WHERE level_offset = 0 AND parent_id IS NULL")))))
         ;; Update title for v2
         (dorg-sql dolt-dir
-          (format "UPDATE headings SET title = 'Changed' WHERE root_id = %d AND level = 1"
+          (format "UPDATE headings SET title = 'Changed' WHERE root_id = %d AND level_offset = 1"
                   root-id))
         (dorg-commit dolt-dir "v2")
         ;; Load at commit1 — should see "Original"
@@ -533,6 +594,285 @@ raw-lines drawer, dropping its content."
               (should (= (dorg-item-id item) db-id)))
             (should (dorg-item-sort-key item))))))))
 
+;;; Selected-slice detail hydration
+
+(defun dorg-test-model--seed-detail-hydration-fixture (dolt-dir)
+  "Seed a small root with property, line-drawer, and text-only headings."
+  (dorg-sql-batch
+   dolt-dir
+   '("INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, title) VALUES (100, 100, NULL, X'00', 0, 'Root')"
+     "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, title) VALUES (101, 100, 100, X'01', 1, 'With drawers')"
+     "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, title) VALUES (102, 100, 100, X'02', 1, 'Text only')"
+     "INSERT INTO heading_items (id, heading_id, sort_key, kind, post_blank) VALUES (1001, 101, X'01', 'drawer', 0)"
+     "INSERT INTO drawer_items (item_id, name) VALUES (1001, 'PROPERTIES')"
+     "INSERT INTO property_entries (drawer_item_id, ordinal, prop_key, prop_value, raw_line) VALUES (1001, 1, 'OWNER', 'alice', ':OWNER: alice')"
+     "INSERT INTO property_entries (drawer_item_id, ordinal, prop_key, prop_value, raw_line) VALUES (1001, 2, 'STATE', 'ready', ':STATE: ready')"
+     "INSERT INTO heading_items (id, heading_id, sort_key, kind, post_blank) VALUES (1002, 101, X'02', 'drawer', 0)"
+     "INSERT INTO drawer_items (item_id, name) VALUES (1002, 'LOGBOOK')"
+     "INSERT INTO drawer_lines (drawer_item_id, ordinal, line_raw) VALUES (1002, 1, '- Note one')"
+     "INSERT INTO drawer_lines (drawer_item_id, ordinal, line_raw) VALUES (1002, 2, 'CLOCK: [2026-09-10 Thu]')"
+     "INSERT INTO heading_items (id, heading_id, sort_key, kind, post_blank) VALUES (1003, 102, X'01', 'text', 0)"
+     "INSERT INTO text_items (item_id, text_raw) VALUES (1003, 'body text\n')"))
+  (dorg-commit dolt-dir "detail hydration fixture")
+  '(:root 100 :with-drawers 101 :text-only 102
+    :property-drawer 1001 :line-drawer 1002))
+
+(defun dorg-test-model--captured-load (dolt-dir root-id ids &optional as-of
+                                                headline-only)
+  "Load ROOT-ID/IDS while returning (MODEL . QUERIES)."
+  (let ((queries nil)
+        (orig (symbol-function 'dorg-sql)))
+    (cl-letf (((symbol-function 'dorg-sql)
+               (lambda (dir sql &rest args)
+                 (push sql queries)
+                 (apply orig dir sql args))))
+      (cons (dorg-model-load-headings dolt-dir root-id ids as-of headline-only)
+            (nreverse queries)))))
+
+(defun dorg-test-model--detail-sql-p (sql)
+  "Return non-nil when SQL reads drawer detail tables."
+  (string-match-p "FROM \\(drawer_lines\\|property_entries\\)" sql))
+
+(defun dorg-test-model--drawer-items (heading)
+  "Return HEADING's drawer items."
+  (cl-remove-if-not (lambda (item) (cl-typep item 'dorg-drawer-item))
+                    (dorg-heading-items heading)))
+
+(ert-deftest dorg-test-model-load-selected-slice-bounds-detail-sql ()
+  "Selected-slice detail reads use returned drawer item ids, not root joins."
+  (if (not dorg-test--dolt-available)
+      (ert-skip "dolt not installed")
+    (dorg-test--with-temp-db dolt-dir
+      (let* ((ids (dorg-test-model--seed-detail-hydration-fixture dolt-dir))
+             (root (plist-get ids :root))
+             (hid (plist-get ids :with-drawers))
+             (loaded (dorg-test-model--captured-load dolt-dir root (list hid)))
+             (model (car loaded))
+             (queries (cdr loaded))
+             (detail (cl-remove-if-not #'dorg-test-model--detail-sql-p queries))
+             (heading (gethash hid model))
+             (drawers (dorg-test-model--drawer-items heading)))
+        (should (= 2 (length detail)))
+        (dolist (sql detail)
+          (should (string-match-p "drawer_item_id IN" sql))
+          (should-not (string-match-p "JOIN headings" sql))
+          (should-not (string-match-p "JOIN heading_items" sql)))
+        (should (equal '(("OWNER" . "alice") ("STATE" . "ready"))
+                       (dorg-drawer-item-properties
+                        (cl-find "PROPERTIES" drawers
+                                 :key #'dorg-drawer-item-name
+                                 :test #'equal))))
+        (should (equal '("- Note one" "CLOCK: [2026-09-10 Thu]")
+                       (dorg-drawer-item-lines
+                        (cl-find "LOGBOOK" drawers
+                                 :key #'dorg-drawer-item-name
+                                 :test #'equal))))))))
+
+(ert-deftest dorg-test-model-load-selected-largest-fixture-measures-detail-sql ()
+  "Harness check: record tiny-fixture detail SQL length and timing."
+  (if (not dorg-test--dolt-available)
+      (ert-skip "dolt not installed")
+    (dorg-test--with-temp-db dolt-dir
+      (let* ((ids (dorg-test-model--seed-detail-hydration-fixture dolt-dir))
+             (root (plist-get ids :root))
+             (slice (list root
+                          (plist-get ids :with-drawers)
+                          (plist-get ids :text-only)))
+             (measurements nil))
+        (dorg-model-load-headings
+         nil root slice nil nil
+         (lambda (sql)
+           (let ((start (current-time)))
+             (prog1 (dorg-sql dolt-dir sql)
+               (when (dorg-test-model--detail-sql-p sql)
+                 (push (list :table (if (string-match-p "drawer_lines" sql)
+                                        "drawer_lines"
+                                      "property_entries")
+                             :bytes (string-bytes sql)
+                             :elapsed (float-time
+                                       (time-subtract (current-time) start)))
+                       measurements))))))
+        (setq measurements
+              (sort measurements
+                    (lambda (a b)
+                      (string< (plist-get a :table)
+                               (plist-get b :table)))))
+        (message "selected-slice detail measurement harness: %S"
+                 measurements)
+        (should (= 2 (length measurements)))
+        (dolist (m measurements)
+          (should (member (plist-get m :table)
+                          '("drawer_lines" "property_entries")))
+          (should (> (plist-get m :bytes) 0))
+          (should (>= (plist-get m :elapsed) 0.0)))))))
+
+(ert-deftest dorg-test-model-load-selected-missing-ids-skip-detail-sql ()
+  "A non-empty selected slice with no matching headings never reads details."
+  (if (not dorg-test--dolt-available)
+      (ert-skip "dolt not installed")
+    (dorg-test--with-temp-db dolt-dir
+      (let* ((ids (dorg-test-model--seed-detail-hydration-fixture dolt-dir))
+             (loaded (dorg-test-model--captured-load
+                      dolt-dir (plist-get ids :root) '(999999)))
+             (model (car loaded))
+             (queries (cdr loaded)))
+        (should (= 0 (hash-table-count model)))
+        (should (= 3 (length queries)))
+        (should-not (cl-some #'dorg-test-model--detail-sql-p queries))))))
+
+(ert-deftest dorg-test-model-load-selected-no-drawers-skips-detail-sql ()
+  "Selected headings with no drawer items skip drawer detail reads."
+  (if (not dorg-test--dolt-available)
+      (ert-skip "dolt not installed")
+    (dorg-test--with-temp-db dolt-dir
+      (let* ((ids (dorg-test-model--seed-detail-hydration-fixture dolt-dir))
+             (root (plist-get ids :root))
+             (hid (plist-get ids :text-only))
+             (loaded (dorg-test-model--captured-load dolt-dir root (list hid)))
+             (model (car loaded))
+             (queries (cdr loaded))
+             (heading (gethash hid model)))
+        (should heading)
+        (should (cl-some (lambda (item) (cl-typep item 'dorg-text-item))
+                         (dorg-heading-items heading)))
+        (should (= 3 (length queries)))
+        (should-not (cl-some #'dorg-test-model--detail-sql-p queries))))))
+
+(ert-deftest dorg-test-model-load-whole-root-keeps-detail-join-shape ()
+  "The ids=nil whole-root path keeps its existing root-scoped detail joins."
+  (if (not dorg-test--dolt-available)
+      (ert-skip "dolt not installed")
+    (dorg-test--with-temp-db dolt-dir
+      (let* ((ids (dorg-test-model--seed-detail-hydration-fixture dolt-dir))
+             (loaded (dorg-test-model--captured-load
+                      dolt-dir (plist-get ids :root) nil))
+             (model (car loaded))
+             (detail (cl-remove-if-not #'dorg-test-model--detail-sql-p
+                                       (cdr loaded))))
+        (should (= 3 (hash-table-count model)))
+        (should (= 2 (length detail)))
+        (dolist (sql detail)
+          (should (string-match-p "JOIN heading_items" sql))
+          (should (string-match-p "JOIN headings" sql))
+          (should-not (string-match-p "drawer_item_id IN" sql)))))))
+
+(ert-deftest dorg-test-model-load-selected-detail-as-of-pins-detail-table ()
+  "AS-OF selected-slice loads prove historical detail rows, not just headings."
+  (if (not dorg-test--dolt-available)
+      (ert-skip "dolt not installed")
+    (dorg-test--with-temp-db dolt-dir
+      (let* ((ids (dorg-test-model--seed-detail-hydration-fixture dolt-dir))
+             (root (plist-get ids :root))
+             (hid (plist-get ids :with-drawers))
+             (prop-id (plist-get ids :property-drawer))
+             (line-id (plist-get ids :line-drawer))
+             (commit1 (dorg-head-commit dolt-dir)))
+        (dorg-sql dolt-dir
+                  (format
+                   (concat "UPDATE property_entries SET prop_value = 'done',"
+                           " raw_line = ':STATE: done'"
+                           " WHERE drawer_item_id = %d AND prop_key = 'STATE'")
+                   prop-id))
+        (dorg-sql dolt-dir
+                  (format
+                   (concat "UPDATE drawer_lines SET line_raw = '- Note changed'"
+                           " WHERE drawer_item_id = %d AND ordinal = 1")
+                   line-id))
+        (dorg-commit dolt-dir "change detail rows")
+        (let* ((old (gethash hid
+                             (dorg-model-load-headings
+                              dolt-dir root (list hid) commit1)))
+               (current (gethash hid
+                                 (dorg-model-load-headings
+                                  dolt-dir root (list hid))))
+               (old-props (dorg-drawer-item-properties
+                           (cl-find "PROPERTIES"
+                                    (dorg-test-model--drawer-items old)
+                                    :key #'dorg-drawer-item-name
+                                    :test #'equal)))
+               (current-props (dorg-drawer-item-properties
+                               (cl-find "PROPERTIES"
+                                        (dorg-test-model--drawer-items current)
+                                        :key #'dorg-drawer-item-name
+                                        :test #'equal)))
+               (old-lines (dorg-drawer-item-lines
+                           (cl-find "LOGBOOK"
+                                    (dorg-test-model--drawer-items old)
+                                    :key #'dorg-drawer-item-name
+                                    :test #'equal)))
+               (current-lines (dorg-drawer-item-lines
+                               (cl-find "LOGBOOK"
+                                        (dorg-test-model--drawer-items current)
+                                        :key #'dorg-drawer-item-name
+                                        :test #'equal))))
+          (should (equal "ready" (cdr (assoc "STATE" old-props))))
+          (should (equal "done" (cdr (assoc "STATE" current-props))))
+          (should (equal '("- Note one" "CLOCK: [2026-09-10 Thu]")
+                         old-lines))
+          (should (equal '("- Note changed" "CLOCK: [2026-09-10 Thu]")
+                         current-lines)))))))
+
+(ert-deftest dorg-test-model-load-selected-detail-uses-query-fn ()
+  "Selected-slice detail reads route through QUERY-FN, never direct `dorg-sql'."
+  (if (not dorg-test--dolt-available)
+      (ert-skip "dolt not installed")
+    (dorg-test--with-temp-db dolt-dir
+      (let* ((ids (dorg-test-model--seed-detail-hydration-fixture dolt-dir))
+             (root (plist-get ids :root))
+             (hid (plist-get ids :with-drawers))
+             (orig (symbol-function 'dorg-sql))
+             (queries nil)
+             (direct-sql 0))
+        (cl-letf (((symbol-function 'dorg-sql)
+                   (lambda (&rest _)
+                     (setq direct-sql (1+ direct-sql))
+                     (error "dorg-sql must not be called directly"))))
+          (dorg-model-load-headings
+           nil root (list hid) nil nil
+           (lambda (sql)
+             (push sql queries)
+             (funcall orig dolt-dir sql))))
+        (should (= 0 direct-sql))
+        (should (= 5 (length queries)))
+        (should (= 2 (length (cl-remove-if-not
+                              #'dorg-test-model--detail-sql-p queries))))))))
+
+(ert-deftest dorg-test-model-load-drawer-id-loss-degrades-property-drawer ()
+  "Mutation witness: losing one property drawer id changes the loaded model."
+  (if (not dorg-test--dolt-available)
+      (ert-skip "dolt not installed")
+    (dorg-test--with-temp-db dolt-dir
+      (let* ((ids (dorg-test-model--seed-detail-hydration-fixture dolt-dir))
+             (root (plist-get ids :root))
+             (hid (plist-get ids :with-drawers))
+             (prop-id (plist-get ids :property-drawer))
+             (real-derive (symbol-function 'dorg-model-load--drawer-item-ids))
+             (good (gethash hid
+                            (dorg-model-load-headings dolt-dir root (list hid))))
+             (good-props
+              (dorg-drawer-item-properties
+               (cl-find "PROPERTIES"
+                        (dorg-test-model--drawer-items good)
+                        :key #'dorg-drawer-item-name
+                        :test #'equal))))
+        (cl-letf (((symbol-function 'dorg-model-load--drawer-item-ids)
+                   (lambda (item-rows)
+                     (remove prop-id (funcall real-derive item-rows)))))
+          (let* ((bad (gethash hid
+                               (dorg-model-load-headings
+                                dolt-dir root (list hid))))
+                 (bad-drawer
+                  (cl-find "PROPERTIES"
+                           (dorg-test-model--drawer-items bad)
+                           :key #'dorg-drawer-item-name
+                           :test #'equal)))
+            (should (equal '(("OWNER" . "alice") ("STATE" . "ready"))
+                           good-props))
+            (should-not (equal good-props
+                               (dorg-drawer-item-properties bad-drawer)))
+            (should (null (dorg-drawer-item-properties bad-drawer)))
+            (should (null (dorg-drawer-item-lines bad-drawer)))))))))
+
 ;;; Item UPDATE SQL Generation
 ;;
 ;; Red specs for same-kind detail-table UPDATE helpers used by item-level
@@ -605,7 +945,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
 (ert-deftest dorg-test-model-scheduled-timestamp ()
   "SCHEDULED planning raw parses to a `dorg-timestamp'."
   (let* ((h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-planning-item
                            :scheduled "<2026-04-14 Tue>"
                            :deadline "<2026-04-15 Wed>"
@@ -625,7 +965,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
 (ert-deftest dorg-test-model-planning-timestamp-missing ()
   "Missing planning fields return nil without signaling."
   (let ((h (make-dorg-heading
-            :id 1 :level 1 :title "T"
+            :id 1 :level 1 :level-offset 1 :title "T"
             :items (list (dorg-planning-item :scheduled "<2026-04-14 Tue>")))))
     (should (dorg-heading-scheduled-timestamp h))
     (should-not (dorg-heading-deadline-timestamp h))
@@ -634,14 +974,14 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
 (ert-deftest dorg-test-model-planning-timestamp-unparsable ()
   "Unparsable planning raw returns nil, not a partial result."
   (let ((h (make-dorg-heading
-            :id 1 :level 1 :title "T"
+            :id 1 :level 1 :level-offset 1 :title "T"
             :items (list (dorg-planning-item :scheduled "not a timestamp")))))
     (should-not (dorg-heading-scheduled-timestamp h))))
 
 (ert-deftest dorg-test-model-planning-no-planning-item ()
   "Heading without a planning item returns nil for all planning helpers."
   (let ((h (make-dorg-heading
-            :id 1 :level 1 :title "T"
+            :id 1 :level 1 :level-offset 1 :title "T"
             :items (list (dorg-text-item :text "Body.\n")))))
     (should-not (dorg-heading-scheduled-timestamp h))
     (should-not (dorg-heading-deadline-timestamp h))
@@ -652,7 +992,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
 (ert-deftest dorg-test-model-active-timestamps-order ()
   "Active body timestamps are returned in document order."
   (let* ((h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-text-item :text "First <2026-01-01 Thu>.\n")
                           (dorg-text-item :text "Then <2026-02-02 Mon> and <2026-03-03 Tue>.\n"))))
          (tss (dorg-heading-active-timestamps h)))
@@ -664,7 +1004,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
 (ert-deftest dorg-test-model-active-timestamps-range ()
   "An active date range yields a single timestamp with end-date."
   (let* ((h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-text-item
                            :text "Span <2026-01-01 Thu>--<2026-01-05 Mon> here.\n"))))
          (tss (dorg-heading-active-timestamps h)))
@@ -675,7 +1015,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
 (ert-deftest dorg-test-model-active-timestamps-excludes-inactive ()
   "Inactive timestamps and malformed text are excluded from body scan."
   (let* ((h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-text-item
                            :text "Done [2026-01-01 Thu], live <2026-02-02 Mon>, junk <nope>.\n"))))
          (tss (dorg-heading-active-timestamps h)))
@@ -685,7 +1025,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
 (ert-deftest dorg-test-model-active-timestamps-rejects-mixed-range ()
   "A mixed active/inactive range does not leak its active endpoint."
   (let* ((h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-text-item
                            :text "Mixed <2026-01-01 Thu>--[2026-01-05 Mon] end.\n"))))
          (tss (dorg-heading-active-timestamps h)))
@@ -694,7 +1034,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
 (ert-deftest dorg-test-model-active-timestamps-ignores-non-text ()
   "Body scan ignores planning lines, drawers, and keywords."
   (let* ((h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-planning-item :scheduled "<2026-01-01 Thu>")
                           (dorg-keyword-item :keyword "CAPTURED" :value "<2026-02-02 Mon>")
                           (dorg-drawer-item :name "LOGBOOK" :lines '("<2026-03-03 Tue>"))
@@ -706,7 +1046,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
 (ert-deftest dorg-test-model-active-timestamps-empty ()
   "Heading with no active body timestamps returns nil."
   (let ((h (make-dorg-heading
-            :id 1 :level 1 :title "T"
+            :id 1 :level 1 :level-offset 1 :title "T"
             :items (list (dorg-text-item :text "Plain body, no dates.\n")))))
     (should (null (dorg-heading-active-timestamps h)))))
 
@@ -715,7 +1055,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
 (ert-deftest dorg-test-model-property-timestamps-shape-and-order ()
   "Property timestamps return ordered (:property NAME :timestamp TS) plists."
   (let* ((h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item
                            :name "PROPERTIES"
                            :properties '(("CREATED" . "[2026-01-01 Thu]")
@@ -732,7 +1072,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
 (ert-deftest dorg-test-model-property-timestamps-skips-unparsable ()
   "Unparsable property values are skipped without signaling."
   (let* ((h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item
                            :name "PROPERTIES"
                            :properties '(("X" . "garbage") ("Y" . "also bad"))))))
@@ -742,7 +1082,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
 (ert-deftest dorg-test-model-property-timestamps-only-properties-drawer ()
   "Only PROPERTIES drawers are scanned, not generic drawers."
   (let* ((h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item
                            :name "LOGBOOK"
                            :lines '(":WHEN: <2026-01-01 Thu>"))))))
@@ -753,7 +1093,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
 (ert-deftest dorg-test-model-timestamp-accessors-non-mutating ()
   "Timestamp accessors do not mutate heading slots, items, or render output."
   (let* ((h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-planning-item :scheduled "<2026-04-14 Tue>")
                           (dorg-text-item :text "Body <2026-05-05 Tue>.\n")
                           (dorg-drawer-item
@@ -777,7 +1117,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
   "State-change LOGBOOK lines capture kind, from/to state, raw, and timestamp."
   (let* ((line "- State \"DONE\"       from \"TODO\"       [2026-01-02 Fri 10:00]")
          (h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item :name "LOGBOOK" :lines (list line)))))
          (entries (dorg-heading-logbook-entries h)))
     (should (= (length entries) 1))
@@ -795,7 +1135,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
   "State-change line without a from clause yields nil from-state."
   (let* ((line "- State \"TODO\"       [2026-01-01 Thu 09:00]")
          (h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item :name "LOGBOOK" :lines (list line)))))
          (entries (dorg-heading-logbook-entries h)))
     (should (= (length entries) 1))
@@ -807,7 +1147,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
   "Note LOGBOOK lines classify as note with an inactive timestamp."
   (let* ((line "- Note taken on [2026-02-02 Mon 14:30] \\\\")
          (h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item :name "LOGBOOK" :lines (list line)))))
          (entries (dorg-heading-logbook-entries h)))
     (should (= (length entries) 1))
@@ -821,7 +1161,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
   "Generic LOGBOOK lines fall back to `logbook' kind and keep the raw line."
   (let* ((line "Clocked some work [2026-03-03 Tue 11:11]")
          (h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item :name "LOGBOOK" :lines (list line)))))
          (entries (dorg-heading-logbook-entries h)))
     (should (= (length entries) 1))
@@ -833,7 +1173,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
   "An inactive range yields a single entry with end-date populated."
   (let* ((line "- Clock [2026-01-01 Thu]--[2026-01-05 Mon]")
          (h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item :name "LOGBOOK" :lines (list line)))))
          (entries (dorg-heading-logbook-entries h)))
     (should (= (length entries) 1))
@@ -850,7 +1190,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
                   "- Junk [nope] and <bad>"
                   "- No timestamp at all"))
     (let* ((h (make-dorg-heading
-               :id 1 :level 1 :title "T"
+               :id 1 :level 1 :level-offset 1 :title "T"
                :items (list (dorg-drawer-item :name "LOGBOOK" :lines (list line))))))
       (should (null (dorg-heading-logbook-entries h))))))
 
@@ -858,7 +1198,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
   "Multiple inactive tokens on one line yield ordered entries sharing class."
   (let* ((line "- State \"DONE\" from \"TODO\" [2026-01-01 Thu] redone [2026-01-02 Fri]")
          (h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item :name "LOGBOOK" :lines (list line)))))
          (entries (dorg-heading-logbook-entries h)))
     (should (= (length entries) 2))
@@ -873,7 +1213,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
 (ert-deftest dorg-test-model-logbook-document-order ()
   "Entries preserve drawer, line, and token order across multiple drawers."
   (let* ((h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item
                            :name "LOGBOOK"
                            :lines '("- Note taken on [2026-01-01 Thu]"
@@ -893,7 +1233,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
 (ert-deftest dorg-test-model-logbook-ignores-non-logbook ()
   "Only LOGBOOK drawers are scanned; other content is ignored."
   (let* ((h (make-dorg-heading
-             :id 1 :level 1 :title "[2026-09-09 Wed] in title"
+             :id 1 :level 1 :level-offset 1 :title "[2026-09-09 Wed] in title"
              :items (list (dorg-planning-item :closed "[2026-01-01 Thu]")
                           (dorg-text-item :text "Body [2026-02-02 Mon].\n")
                           (dorg-keyword-item :keyword "CAPTURED" :value "[2026-03-03 Tue]")
@@ -908,7 +1248,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
 (ert-deftest dorg-test-model-logbook-empty ()
   "Heading with no LOGBOOK activity returns nil."
   (let ((h (make-dorg-heading
-            :id 1 :level 1 :title "T"
+            :id 1 :level 1 :level-offset 1 :title "T"
             :items (list (dorg-drawer-item :name "LOGBOOK" :lines nil)))))
     (should (null (dorg-heading-logbook-entries h)))))
 
@@ -917,7 +1257,7 @@ drawer's property_entries rows, never drawer_lines or the whole heading."
   (let* ((lines '("- State \"DONE\" from \"TODO\" [2026-01-02 Fri]"
                   "- Note taken on [2026-01-03 Sat]"))
          (h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item :name "LOGBOOK" :lines lines))))
          (before-hash (dorg-heading-compute-items-hash h))
          (before-render (dorg-model-render-heading-section h)))
@@ -932,7 +1272,7 @@ AC1: kind clock, duration captured from `=>  H:MM', inactive range
 timestamp with start/end dates, from/to-state nil, raw preserved."
   (let* ((line "CLOCK: [2026-01-01 Thu 10:00]--[2026-01-01 Thu 11:30] =>  1:30")
          (h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item :name "LOGBOOK" :lines (list line)))))
          (entries (dorg-heading-logbook-entries h)))
     (should (= (length entries) 1))
@@ -951,7 +1291,7 @@ timestamp with start/end dates, from/to-state nil, raw preserved."
   "A leading-whitespace CLOCK line is still classified as `clock' (anchor `[ \\t]*')."
   (let* ((line "  CLOCK: [2026-01-01 Thu 10:00]--[2026-01-01 Thu 11:30] =>  1:30")
          (h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item :name "LOGBOOK" :lines (list line)))))
          (entries (dorg-heading-logbook-entries h)))
     (should (= (length entries) 1))
@@ -963,7 +1303,7 @@ timestamp with start/end dates, from/to-state nil, raw preserved."
 AC2."
   (let* ((line "CLOCK: [2026-01-01 Thu 10:00]")
          (h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item :name "LOGBOOK" :lines (list line)))))
          (entries (dorg-heading-logbook-entries h)))
     (should (= (length entries) 1))
@@ -978,7 +1318,7 @@ AC2."
 AC3 non-vacuity guard: `Clocked some work [ts]' stays generic `logbook',
 and State/Note lines keep their kinds with nil duration."
   (let* ((h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item
                            :name "LOGBOOK"
                            :lines '("Clocked some work [2026-03-03 Tue 11:11]"
@@ -993,7 +1333,7 @@ and State/Note lines keep their kinds with nil duration."
   "Only `clock' entries carry a duration; every other kind is nil.
 AC4."
   (let* ((h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item
                            :name "LOGBOOK"
                            :lines '("- State \"DONE\" from \"TODO\" [2026-01-02 Fri]"
@@ -1017,7 +1357,7 @@ not mutate drawer lines, item hash, or rendered output."
                   "- State \"DONE\" from \"TODO\" [2026-01-02 Fri]"
                   "CLOCK: [2026-01-03 Sat 08:00]--[2026-01-03 Sat 09:15] =>  1:15"))
          (h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item :name "LOGBOOK" :lines lines))))
          (before-hash (dorg-heading-compute-items-hash h))
          (before-render (dorg-model-render-heading-section h))
@@ -1117,7 +1457,7 @@ AC2: single note entry whose `body' is the continuation lines joined by
                   "  First body line."
                   "  Second body line."))
          (h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item :name "LOGBOOK" :lines lines))))
          (entries (dorg-heading-logbook-entries h)))
     (should (= (length entries) 1))
@@ -1133,7 +1473,7 @@ AC2: single note entry whose `body' is the continuation lines joined by
 AC2."
   (let* ((line "- Note taken on [2026-02-02 Mon 14:30]")
          (h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item :name "LOGBOOK" :lines (list line)))))
          (entries (dorg-heading-logbook-entries h)))
     (should (= (length entries) 1))
@@ -1146,7 +1486,7 @@ AC3: the timestamped continuation line does NOT become its own entry."
   (let* ((lines '("- Note taken on [2026-02-02 Mon 14:30] \\\\"
                   "  Saw it first on [2026-01-15 Thu] in the logs."))
          (h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item :name "LOGBOOK" :lines lines))))
          (entries (dorg-heading-logbook-entries h)))
     (should (= (length entries) 1))
@@ -1163,7 +1503,7 @@ entry; kinds are (note state-change)."
                   "  Body line."
                   "- State \"DONE\" from \"TODO\" [2026-02-03 Tue 10:00]"))
          (h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item :name "LOGBOOK" :lines lines))))
          (entries (dorg-heading-logbook-entries h)))
     (should (equal (mapcar #'dorg-logbook-entry-kind entries)
@@ -1183,7 +1523,7 @@ CLOCK: text into the note body."
                   "  Body line."
                   "CLOCK: [2026-01-05 Mon 09:00]--[2026-01-05 Mon 10:00] =>  1:00"))
          (h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item :name "LOGBOOK" :lines lines))))
          (entries (dorg-heading-logbook-entries h)))
     (should (equal (mapcar #'dorg-logbook-entry-kind entries)
@@ -1206,7 +1546,7 @@ column-0 sibling entry terminates it."
                   "  - sub item two"
                   "- State \"DONE\" from \"TODO\" [2026-02-03 Tue 10:00]"))
          (h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item :name "LOGBOOK" :lines lines))))
          (entries (dorg-heading-logbook-entries h)))
     (should (equal (mapcar #'dorg-logbook-entry-kind entries)
@@ -1221,7 +1561,7 @@ AC5."
                   "CLOCK: [2026-01-05 Mon 09:00]--[2026-01-05 Mon 10:00] =>  1:00"
                   "Clocked some work [2026-03-03 Tue 11:11]"))
          (h (make-dorg-heading
-             :id 1 :level 1 :title "T"
+             :id 1 :level 1 :level-offset 1 :title "T"
              :items (list (dorg-drawer-item :name "LOGBOOK" :lines lines))))
          (entries (dorg-heading-logbook-entries h)))
     (should (equal (mapcar #'dorg-logbook-entry-kind entries)
@@ -1306,15 +1646,15 @@ control keyword `TITLE' DOES change the hash, so the assertion is
 non-vacuous: reverting the predicate to case-sensitive would let the
 lowercase item leak into the hash and the equality would fail RED."
   (let* ((base (make-dorg-heading
-                :id 1 :level 1 :title "H"
+                :id 1 :level 1 :level-offset 1 :title "H"
                 :items (list (dorg-text-item :text "body\n"))))
          (with-protected (make-dorg-heading
-                          :id 1 :level 1 :title "H"
+                          :id 1 :level 1 :level-offset 1 :title "H"
                           :items (list (dorg-text-item :text "body\n")
                                        (dorg-keyword-item :keyword "dorg_id"
                                                           :value "leak"))))
          (with-normal (make-dorg-heading
-                       :id 1 :level 1 :title "H"
+                       :id 1 :level 1 :level-offset 1 :title "H"
                        :items (list (dorg-text-item :text "body\n")
                                     (dorg-keyword-item :keyword "TITLE"
                                                        :value "x"))))
@@ -1330,11 +1670,11 @@ item, but DOES for an ordinary keyword — proving `dorg-item--db-local-p'
 filters case-insensitively at the SQL boundary (non-vacuous control)."
   (let* ((idgen (let ((n 1000)) (lambda () (cl-incf n))))
          (protected (make-dorg-heading
-                     :id 1 :level 1 :title "H"
+                     :id 1 :level 1 :level-offset 1 :title "H"
                      :items (list (dorg-keyword-item :keyword "dorg_id"
                                                      :value "leak"))))
          (normal (make-dorg-heading
-                  :id 1 :level 1 :title "H"
+                  :id 1 :level 1 :level-offset 1 :title "H"
                   :items (list (dorg-keyword-item :keyword "MYKW"
                                                   :value "v"))))
          (sql-prot (dorg-sql-gen-heading-items-sql protected idgen))
@@ -1374,6 +1714,44 @@ would leave the spy unfired -> RED."
           (should (> fired 0)))
       (advice-remove 'dorg-protected-keyword-p 'dorg-test--dxjnl-spy))))
 
+(ert-deftest dorg-test-model-history-restore-retains-owned-drawer-property ()
+  "Restore forwards a registered family to typed validation, not silent drop.
+
+System DORG metadata remains omitted.  The unavailable clock property must
+survive serialization so the later typed boundary can refuse the whole restore."
+  (let* ((item (dorg-drawer-item
+                :name "PROPERTIES"
+                :properties '(("OWNER" . "me")
+                              ("DORG_CLOCK_START" . "2026-10-14T08:00:00Z")
+                              ("DORG_HASH" . "internal"))))
+         (value (dorg-history--item-to-value item)))
+    (should (equal 'drawer (plist-get value :kind)))
+    (should (equal '(("OWNER" . "me")
+                     ("DORG_CLOCK_START" . "2026-10-14T08:00:00Z"))
+                   (plist-get value :properties)))))
+
+(ert-deftest dorg-test-ay3q8-system-metadata-contract-is-unchanged ()
+  "System keys stay db-local for hashes, SQL, QL and history restore.
+
+The registry adds a second DORG_ class; it must not turn DORG_ID, DORG_HASH,
+or DORG_WINDOW into ordinary persisted keyword content."
+  (dolist (key '("DORG_ID" "DORG_HASH" "DORG_WINDOW"))
+    (let* ((item (dorg-keyword-item :keyword key :value "system"))
+           (heading (make-dorg-heading :id 1 :level 1 :level-offset 1
+                                       :title "H" :items (list item))))
+      (should (dorg-item--db-local-p item))
+      (should-not (dorg-heading-compute-items-hash heading))
+      (should-not (dorg-sql-gen-heading-items-sql heading (lambda () 1)))
+      (should-not (dorg-ql--model-keywords heading))))
+  (let* ((drawer (dorg-drawer-item
+                  :name "PROPERTIES"
+                  :properties '(("OWNER" . "me")
+                                ("DORG_ID" . "1")
+                                ("DORG_HASH" . "system")
+                                ("DORG_WINDOW" . "system"))))
+         (value (dorg-history--item-to-value drawer)))
+    (should (equal '(("OWNER" . "me")) (plist-get value :properties)))))
+
 ;;; ─── Item-Level Plan (moved by tracked-regression) ──────────────────────────
 ;;
 ;; Red specs for `dorg-model-plan-items', the pure LCS/positional item
@@ -1404,6 +1782,244 @@ would leave the spy unfired -> RED."
 (defun dorg-test--ops-of (tag ops)
   "Return the subset of OPS whose tag is TAG."
   (cl-remove-if-not (lambda (op) (eq (car op) tag)) ops))
+
+(defun dorg-test-model--materialize-text-plan (ops next-id)
+  "Materialize text-item OPS as DB-bound rows starting ids at NEXT-ID.
+Return (ROWS . NEXT-ID-AFTER).  This is the test-side commit image used to
+feed one planner result into the next iteration without touching a database."
+  (let (rows)
+    (dolist (op ops)
+      (pcase (car op)
+        ((or :keep :update)
+         (let ((old (nth 1 op))
+               (new (nth 2 op))
+               (key (nth 3 op)))
+           (push (dorg-text-item :id (dorg-item-id old)
+                                 :sort-key key
+                                 :text (dorg-text-item-text new)
+                                 :post-blank (dorg-item-post-blank new))
+                 rows)))
+        (:insert
+         (let ((new (nth 1 op))
+               (key (nth 2 op)))
+           (push (dorg-text-item :id next-id
+                                 :sort-key key
+                                 :text (dorg-text-item-text new)
+                                 :post-blank (dorg-item-post-blank new))
+                 rows)
+           (cl-incf next-id)))
+        (:delete nil)))
+    (cons (nreverse rows) next-id)))
+
+(defun dorg-test-model--parsed-text-copy (item)
+  "Return ITEM's semantic text as a parser-shaped item without DB identity."
+  (dorg-text-item :text (dorg-text-item-text item)
+                  :post-blank (dorg-item-post-blank item)))
+
+(ert-deftest dorg-test-model-item-tail-allocation-clears-observed-sql-cliff ()
+  "Item append crosses the observed raw cliff without reaching the SQL guard.
+The fixture carries each full planner result into the next iteration.  Released
+DOrg eventually allocates a 65-byte tail key in the raw item planner and this
+test errors from `dorg-sql-gen--sort-key-hex'.  The repaired path completes 600
+added items, preserves identity/content/order, and uses 16-byte boundary keys.
+The seed is excluded from ADDED, which is reported but never the test oracle."
+  (let ((rows (list (dorg-text-item :id 1
+                                    :sort-key (unibyte-string #x80)
+                                    :text "item-0")))
+        (next-id 2)
+        (added 0)
+        (new-tail-keys nil))
+    (dotimes (iteration 600)
+      (let* ((new-items (append (mapcar #'dorg-test-model--parsed-text-copy rows)
+                                (list (dorg-text-item
+                                       :text (format "item-%d" (1+ iteration))))))
+             (ops (dorg-model-plan-items rows new-items))
+             (insert (car (dorg-test--ops-of :insert ops)))
+             (tail-key (nth 2 insert))
+             (db-heading (make-dorg-heading :id 100 :items rows))
+             (new-heading (make-dorg-heading :id 100 :items new-items))
+             (lower-id next-id))
+        (condition-case err
+            (dorg-sql-gen--lower-item-plan
+             new-heading db-heading
+             (lambda () (prog1 lower-id (cl-incf lower-id))))
+          (error
+           (message "sortkey item cliff observed: added=%d bytes=%d"
+                    (1+ iteration) (length tail-key))
+           (signal (car err) (cdr err))))
+        (push tail-key new-tail-keys)
+        (pcase-let ((`(,materialized . ,next)
+                     (dorg-test-model--materialize-text-plan ops next-id)))
+          (setq rows materialized
+                next-id next
+                added (1+ added)))))
+    (should (= added 600))
+    (should (= (length rows) 601))
+    (should (equal (mapcar #'dorg-text-item-text rows)
+                   (cl-loop for i from 0 to 600 collect (format "item-%d" i))))
+    (should (= (length (delete-dups (mapcar #'dorg-item-id rows))) 601))
+    (should (dorg-sortkey-ordered-p (mapcar #'dorg-item-sort-key rows)))
+    (should (cl-every (lambda (key) (= (length key) 16)) new-tail-keys))))
+
+(ert-deftest dorg-test-model-aged-item-normalization-is-idempotent ()
+  "An aged complete item list normalizes once and is byte-stable on replay.
+The requested append changes the image and preserves the reused row identity.
+Replanning the normalized committed image with identical semantic content must
+produce exactly the same keys, not a second normalization."
+  (let* ((aged-key (make-string dorg-sortkey-max-bytes #xff))
+         (before (list (dorg-text-item :id 10 :sort-key aged-key :text "old")))
+         (requested (list (dorg-text-item :text "old")
+                          (dorg-text-item :text "new")))
+         (first-ops (dorg-model-plan-items before requested))
+         (first-image (car (dorg-test-model--materialize-text-plan first-ops 11)))
+         (first-keys (mapcar #'dorg-item-sort-key first-image))
+         (replay-input (mapcar #'dorg-test-model--parsed-text-copy first-image))
+         (replay-ops (dorg-model-plan-items first-image replay-input))
+         (replay-image (car (dorg-test-model--materialize-text-plan replay-ops 12)))
+         (replay-keys (mapcar #'dorg-item-sort-key replay-image)))
+    (should-not (equal (mapcar #'dorg-item-sort-key before) first-keys))
+    (should (equal (mapcar #'dorg-item-id first-image) '(10 11)))
+    (should (equal (mapcar #'dorg-text-item-text first-image) '("old" "new")))
+    (should (dorg-sortkey-ordered-p first-keys))
+    (should (cl-every (lambda (key) (= (length key) 16)) first-keys))
+    (should (equal replay-keys first-keys))))
+
+(defun dorg-test-model--facts (keys)
+  "Return a facts vector of (ID . KEY) for KEYS with ids 1.."
+  (apply #'vector (cl-loop for k in keys for id from 1 collect (cons id k))))
+
+(defun dorg-test-model--window-ordered-p (facts plan index count)
+  "Non-nil when applying PLAN to FACTS at INDEX yields a strictly ordered list."
+  (let* ((rekeys (plist-get plan :rekeys))
+         (keys (cl-loop for cell across facts
+                        collect (or (cdr (assq (car cell) rekeys)) (cdr cell))))
+         (final (append (cl-subseq keys 0 (1+ index))
+                        (plist-get plan :keys)
+                        (cl-subseq keys (1+ index)))))
+    (and (= (length (plist-get plan :keys)) count)
+         (dorg-sortkey-ordered-p final))))
+
+(ert-deftest dorg-test-model-plan-gap-fast-paths ()
+  "Tail and head placement step at constant width; interior placement spreads."
+  (let* ((a (dorg-sortkey-from-integer 10))
+         (c (dorg-sortkey-from-integer 20))
+         (tail (dorg-model-plan-gap a nil 3))
+         (head (dorg-model-plan-gap nil a 3))
+         (mid (dorg-model-plan-gap a c 2))
+         (fresh (dorg-model-plan-gap nil nil 2)))
+    (should (dorg-sortkey-ordered-p (append (list a) tail)))
+    (should (dorg-sortkey-ordered-p (append head (list a))))
+    (should (dorg-sortkey-ordered-p (append (list a) mid (list c))))
+    (should (equal (car fresh) (dorg-sortkey-first-key)))
+    (should (dorg-sortkey-ordered-p fresh))
+    (should (cl-every (lambda (k) (= (length k) 16)) (append tail head mid fresh)))
+    (should (null (dorg-model-plan-gap a c 0)))))
+
+(ert-deftest dorg-test-model-plan-gap-skips-vacated-keys ()
+  "A step or spread never lands on a key the batch vacated (delete-then-append)."
+  (let* ((a (dorg-sortkey-first-key))
+         (b (dorg-sortkey-step-after a))
+         (occupied (make-hash-table :test 'equal)))
+    (puthash b t occupied)
+    (should (equal (car (dorg-model-plan-gap a nil 1)) b))
+    (should (string< b (car (dorg-model-plan-gap a nil 1 occupied))))
+    (let* ((c (dorg-sortkey-step-after b))
+           (plain (car (dorg-model-plan-gap a c 1))))
+      (puthash plain t occupied)
+      (let ((nudged (car (dorg-model-plan-gap a c 1 occupied))))
+        (should-not (equal plain nudged))
+        (should (string< a nudged))
+        (should (string< nudged c))))))
+
+(ert-deftest dorg-test-model-plan-gap-exhausts-without-room ()
+  "Adjacent prefix keys have no interior key: the gap signals, it never widens."
+  (should-error (dorg-model-plan-gap (dorg-sortkey-from-hex "41")
+                                     (dorg-sortkey-from-hex "4100") 1)
+                :type 'dorg-sortkey-exhausted))
+
+(ert-deftest dorg-test-model-plan-window-rekeys-only-the-dense-cluster ()
+  "W2: a fan whose keys share a 16-byte prefix rekeys at most the cluster, never N.
+Rows 1-3 sit far apart; rows 4-9 share one 16-byte prefix with 1-byte tails;
+rows 10-12 sit far apart again.  Inserting inside the cluster rekeys cluster
+rows only, keeps every new key disjoint from every old key, and preserves order."
+  (let* ((prefix (dorg-sortkey-encode (ash 1 100)))
+         (cluster (cl-loop for b from 1 to 6
+                           collect (concat prefix (unibyte-string (* 40 b)))))
+         (keys (append (list (dorg-sortkey-encode (ash 1 90))
+                             (dorg-sortkey-encode (ash 1 91))
+                             (dorg-sortkey-encode (ash 1 92)))
+                       cluster
+                       (list (dorg-sortkey-encode (ash 1 110))
+                             (dorg-sortkey-encode (ash 1 111))
+                             (dorg-sortkey-encode (ash 1 112)))))
+         (facts (dorg-test-model--facts keys))
+         (index 5)                       ; between cluster rows 4 and 5 (ids 5,6)
+         (plan (dorg-model-plan-window facts index 1))
+         (rekeyed-ids (mapcar #'car (plist-get plan :rekeys)))
+         (old (make-hash-table :test 'equal)))
+    (should (dorg-sortkey-ordered-p keys))
+    (dolist (k keys) (puthash k t old))
+    (should (dorg-test-model--window-ordered-p facts plan index 1))
+    ;; Only cluster rows (ids 4..9) may be rekeyed, and not all of them.
+    (should rekeyed-ids)
+    (should (cl-every (lambda (id) (<= 4 id 9)) rekeyed-ids))
+    (should (< (length rekeyed-ids) (length keys)))
+    ;; New and rekeyed keys are disjoint from every old key and 16 bytes wide.
+    (dolist (k (append (plist-get plan :keys) (mapcar #'cdr (plist-get plan :rekeys))))
+      (should-not (gethash k old))
+      (should (= (length k) 16)))))
+
+(ert-deftest dorg-test-model-plan-window-append-at-tail-and-head ()
+  "A window placed at either open end stays ordered and rekeys nothing dense."
+  (let* ((keys (list (dorg-sortkey-encode (ash 1 100))
+                     (dorg-sortkey-encode (ash 1 101))))
+         (facts (dorg-test-model--facts keys)))
+    (dolist (case (list (cons 1 2) (cons -1 3)))
+      (let ((plan (dorg-model-plan-window facts (car case) (cdr case))))
+        (should (null (plist-get plan :rekeys)))
+        (should (dorg-test-model--window-ordered-p facts plan (car case) (cdr case)))))))
+
+(ert-deftest dorg-test-model-plan-window-normalises-a-legacy-adjacent-pair ()
+  "Two legacy keys with no interior key are rekeyed together with the new key."
+  (let* ((facts (dorg-test-model--facts (list (dorg-sortkey-from-hex "41")
+                                              (dorg-sortkey-from-hex "4100"))))
+         (plan (dorg-model-plan-window facts 0 1)))
+    (should (dorg-test-model--window-ordered-p facts plan 0 1))
+    (should (cl-every (lambda (k) (= (length k) 16))
+                      (mapcar #'cdr (plist-get plan :rekeys))))))
+
+(ert-deftest dorg-test-model-plan-window-honours-vacated-keys ()
+  "Keys the batch vacated inside the interval are never reused by a window."
+  (let* ((facts (dorg-test-model--facts (list (dorg-sortkey-encode (ash 1 100))
+                                              (dorg-sortkey-encode (ash 1 101)))))
+         (plain (car (plist-get (dorg-model-plan-window facts 0 1) :keys)))
+         (occupied (make-hash-table :test 'equal)))
+    (puthash plain t occupied)
+    (let ((again (car (plist-get (dorg-model-plan-window facts 0 1 occupied) :keys))))
+      (should-not (equal plain again))
+      (should (string< (cdr (aref facts 0)) again))
+      (should (string< again (cdr (aref facts 1)))))))
+
+(ert-deftest dorg-test-model-heading-placement-sites-delegate-to-owner ()
+  "Every enumerated heading final-position site delegates allocation to the owner.
+This is a source-level retirement guard for census A: the mutation layer may
+apply planned keys, but it must not call the raw sort-key allocation functions
+from the placement/rekey sites named in the b7ph5 map."
+  (let ((direct-callees '(dorg-sortkey-step-after
+                          dorg-sortkey-step-before
+                          dorg-sortkey-spread
+                          dorg-sortkey-first-key
+                          dorg-sortkey-from-integer))
+        (sites '(dorg-mutate--ps-allocate-keys
+                 dorg-mutate--ps-insert-heading
+                 dorg-mutate--ps-move
+                 dorg-mutate--ps-delete-heading
+                 dorg-mutate--dolt-cross-root-simulate)))
+    (dolist (site sites)
+      (let ((form (dorg-test-model--read-defun-form "dorg-mutate.el" site)))
+        (should form)
+        (dolist (callee direct-callees)
+          (should-not (dorg-test-model--form-calls-p form callee)))))))
 
 (ert-deftest dorg-test-model-plan-items-lcs-anchor-insert ()
   "LCS anchors keep IDs; a middle insert adds exactly one item (AC3).

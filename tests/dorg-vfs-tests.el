@@ -18,6 +18,7 @@
 (require 'dorg-render)
 (require 'dorg-dolt)
 (require 'dorg-vfs)
+(require 'dorg-mutate)
 (require 'dorg-test-helpers)
 
 (defvar dorg-test--dolt-available)  ;; defined in dorg-dolt-tests.el
@@ -44,7 +45,7 @@
 (defun dorg-test-vfs--a-node-id (dolt-dir)
   "Return some level>0 heading id in DOLT-DIR."
   (alist-get 'id (car (dorg-sql dolt-dir
-                                "SELECT id FROM headings WHERE level > 0 ORDER BY id LIMIT 1"))))
+                                "SELECT id FROM headings WHERE level_offset > 0 ORDER BY id LIMIT 1"))))
 
 ;;; ─── Parser units (no Dolt) ─────────────────────────────────────────
 
@@ -222,6 +223,19 @@ content; a @REF-pinned modtime stays stable across the HEAD advance."
     (should (equal (file-remote-p "/dorg:/abs/db:/" 'method) "dorg"))
     (should (equal (file-remote-p "/dorg:/abs/db:/" 'host) "/abs/db"))
     (should-not (vc-registered "/dorg:/abs/db:/"))))
+
+(ert-deftest dorg-test-vfs-name-does-not-enter-plain-writer-gate ()
+  "The remote-looking /dorg: name retains Dolt dispatch without a file gate."
+  (dorg-test-vfs--with-handler
+    (let* ((path "/dorg:/abs/db:/100")
+           (source (dorg-mutate--source-make
+                    :kind 'dolt :file path :dolt-dir "/abs/db/" :root-id 100)))
+      (should (file-remote-p path))
+      (cl-letf (((symbol-function 'dorg-file-lock-call)
+                 (lambda (&rest _) (ert-fail "VFS must not enter file gate"))))
+        (should (eq :dolt
+                    (dorg-mutate--with-saved-plain-file-gate
+                     source 'apply '(:save t) (lambda () :dolt))))))))
 
 ;;; ─── Regression guard (AC4) — real paths are untouched ──────────────
 

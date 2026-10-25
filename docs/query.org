@@ -1,11 +1,11 @@
 #+title: DOrg Query API — the dorg-ql selector DSL
 
 #+begin_quote
-*DOrg 0.1.0 query surface.*  This document describes the first public query
-interface.
+*Current DOrg query surface.*  The query grammar follows the package
+release; it has no independent point-release selector.
 #+end_quote
 
-This page is the user-facing reference for the *composable v2* ~dorg-ql~
+This page is the user-facing reference for the *composable* ~dorg-ql~
 query language: its reader forms, the normalized AST they lower to, the
 timestamp/window vocabulary, traversal and result-order semantics, and
 the =bin/dorg= CLI surface.
@@ -21,19 +21,18 @@ the source-generic primitive mutation API that a query's ~:heading-id~
 results can feed into explicit mutations — see [[file:mutate.org][docs/mutate.org]].
 
 #+begin_quote
-*DOrg 0.1.0 query surface.*  This page specifies the current query DSL:
+*Reader contract.*  This page specifies the current query DSL:
 operator-headed comparisons (~(OP (field …) V)~), the ~(keyword …)~
 predicate, and the removal of the middle-operator forms and the
 ~:at-or-above~ / ~:below~ operators.  The reader change and the keyword
-predicate is part of the DOrg 0.1.0 design; the normalized AST and
-backend lowering are unchanged.
+predicate are shared by the backend adapters.
 #+end_quote
 
 * Mental model
 
 The real contract is a *backend-neutral normalized AST*, not the surface
 syntax.  ~dorg-ql-normalize~ is the single parsing layer: it lowers both
-the compact atomic predicates and the operator-headed v2 reader forms
+the compact atomic predicates and the operator-headed reader forms
 into one AST that every adapter — model-list, plain-org, and Dolt —
 consumes; the model-list evaluator ~dorg-ql--model-eval~ is the semantic
 baseline the buffer adapters reproduce.  The surface syntax is a *reader*
@@ -60,8 +59,17 @@ A normalized query is always a pipeline whose first step is the source:
 Each subsequent =STEP= is one of, *in order*:
 
 #+begin_src emacs-lisp
-(:filter EXPR)        (:traverse REL...)        (:unique)
+(:filter EXPR)
+(:traverse REL...)
+(:unique)
+(:rank-bm25 QUERY :profile PROFILE :top-k K)
+(:select (:column NAME EXPR)...)
 #+end_src
+
+=select= must be terminal.  Ranking permits only pushable =where= steps
+before it and an optional =select= after it; it cannot mix with traversal,
+=unique= or the =one= wrapper.  Normalization of =one= also inserts an
+internal =:one= cardinality check, before any terminal projection.
 
 Steps stay ordered — filters and traversals may interleave — so the
 pipeline is a flat ordered list, preserving the outside-in mental model.
@@ -73,10 +81,10 @@ Filter =EXPR= nodes:
 #+begin_src emacs-lisp
 (:and EXPR...)  (:or EXPR...)  (:not EXPR)
 (:id OP INTEGER)
-(:cmp FIELD OP VALUE)
-(:property KEY OP VALUE)              ; VALUE nil for exists/missing
-(:keyword KEY OP VALUE)              ; VALUE nil for exists/missing; heading-scoped (root excluded)
-(:tag OP VALUE)                       ; VALUE nil for exists/missing
+(:cmp FIELD OP VALUE :case MODE)      ; string fields only
+(:property KEY OP VALUE :case MODE)   ; VALUE nil for exists/missing
+(:keyword KEY OP VALUE :case MODE)    ; VALUE nil for exists/missing; heading-scoped (root excluded)
+(:tag OP VALUE :case MODE)            ; VALUE nil for exists/missing
 (:timestamp SOURCE REL (START . END)) ; START/END are (YEAR MONTH DAY) or nil
 #+end_src
 
@@ -95,7 +103,8 @@ predicate reaches the mutate surface only through =(on (where PREDICATE)
 …)= (see [[file:mutate.org][docs/mutate.org]]).  Each lowers to the same normalized AST as the
 prefix operator forms below:
 
-#+begin_example
+#+name: dorg-query-atomic-forms
+#+begin_example text
 (id ID)                      exact DORG_ID match (integer or numeric string)
 (field FIELD VALUE)          scalar heading field equals VALUE (e.g. (field todo "DONE"))
 (property KEY VALUE)         exact, non-inherited PROPERTIES match
@@ -113,13 +122,14 @@ prefix operator forms below:
 
 The timestamp aliases also accept a single convenience window form in
 place of their =FROM TO= bounds — e.g. ~(deadline (this-week))~ or
-~(closed (on "2026-07-01"))~ — exactly the window syntax the v2
+~(closed (on "2026-07-01"))~ — exactly the window syntax the composable
 =timestamp= form accepts (see [[*Window inputs][Window inputs]]).
 
-** Composable v2 forms
+** Composable forms
 
-#+begin_example
-(pipe STEP...)               outside-in stream; STEP = (where P) | (traverse REL...) | (unique)
+#+name: dorg-query-composable-forms
+#+begin_example text
+(pipe STEP...)               outside-in stream; STEP = (where P) | (traverse REL...) | (unique) | (rank-bm25 QUERY :profile PROFILE :top-k K) | (select COLUMN...)
 (where PREDICATE)            keep headings matching PREDICATE
 (traverse RELATION...)       walk tree edges (union of RELATIONs)
 (unique)                     de-duplicate by heading id, preserving order
@@ -131,11 +141,93 @@ place of their =FROM TO= bounds — e.g. ~(deadline (this-week))~ or
 (key VALUE)                  identity predicate; matches the heading whose policy identity = VALUE
 
 (OP EXPR VALUE)              operator-headed compare; OP ∈ = != < <= > >= contains prefix suffix
+(contains-any EXPR (VALUE...)) any VALUE contained; sugar for (or (contains EXPR VALUE)...)
 (exists EXPR)                EXPR present
 (missing EXPR)               EXPR absent
                              EXPR := (property KEY) | (keyword KEY) | (tag)
 (timestamp SOURCE REL WINDOW) structured-timestamp window match
 #+end_example
+
+** Literal case mode
+
+Every string comparison (=, =!=, =contains=, =prefix=, and =suffix=) accepts
+one optional trailing pair, =:case sensitive= or =:case insensitive=:
+
+#+name: dorg-query-case-forms
+#+begin_example emacs-lisp
+(contains (field title) "meeting" :case insensitive)
+(= (property "CATEGORY") "Work" :case sensitive)
+(prefix (keyword "CAPTION") "Draft" :case insensitive)
+(!= (tag) "ARCHIVE" :case insensitive)
+#+end_example
+
+Omitting the pair is exactly =:case sensitive=.  The option applies to
+=title=/=todo=, ordinary string extension fields, property and keyword
+*values*, and tag values.  It never applies to property/keyword names, ids,
+identity fields, numeric/boolean/priority/timestamp comparisons, or existence
+tests; malformed, duplicate, or unsupported options signal =dorg-ql-error=
+before source access.
+
+~(contains-any EXPR (VALUE...) [:case MODE])~ is reader sugar for
+~(or (contains EXPR VALUE [:case MODE]) ...)~, with the VALUEs in the given
+order and duplicates kept; it adds no AST node.  It accepts every EXPR that
+=contains= accepts.  The one optional =:case= pair applies to every leaf, and
+omitting it is exactly the =contains= default, =:case sensitive=.  An empty
+VALUE list is the same =invalid-query= error as an empty ~(or)~.  An empty
+VALUE is legal and, like ~(contains EXPR "")~, matches every present value.
+
+#+name: dorg-query-contains-any-case-form
+#+begin_example emacs-lisp
+(contains-any (field title) ("ontology" "researcher" "roles") :case insensitive)
+#+end_example
+
+Insensitive matching uses DOrg's literal, per-character integer =upcase=
+under Emacs's standard case table, then performs the same string operation.
+It is not whole-string/full casefold expansion, locale-sensitive collation,
+accent folding, Unicode normalization, stemming, or regexp matching.  Thus
+=Σ= matches both =σ= and =ς=, and =ẞ= matches =ß=, while =ß= does not match
+=SS= and precomposed =é= does not match =e= plus a combining accent.  Original
+stored/display spelling is unchanged.
+
+On Dolt, sensitive equality retains its bounded SQL point path, and every
+sensitive =title= comparison is lowered to SQL whose answer equals the shared
+matcher's: binary equality, =INSTR= for =contains=, and binary =LEFT=/=RIGHT=
+over the needle's character count for =prefix=/=suffix=.  A NULL title makes
+each such comparison false before any enclosing =and=, =or= or =not= applies,
+so, exactly as in the shared matcher, ~(not (contains (field title) "x"))~
+matches a heading with no title.  Dolt's =LOCATE= folds case even over binary
+operands and its =LEFT=/=RIGHT= count characters, so neither the usual MySQL
+spelling nor a byte length is used; no =LIKE= is involved, so =%=, =_= and
+backslash are literal.  String extension fields use the same lowering.
+
+Insensitive leaves are never lowered to SQL: SQL =UPPER=/=LOWER= or a
+generic case-insensitive collation is not an equivalent implementation of
+this character contract.  When a selection's insensitive leaves compare
+=title=, and each of its other leaves reads only the heading row (id, TODO
+keyword, sensitive title) or tests property existence, Dolt answers it with
+two statements at the captured revision.  The first scans the root's headings
+for id, title and one flag per other leaf, and the original boolean
+expression is evaluated on each row with the shared matcher.  The second is
+the ordinary ordered projection of the matching ids, so extension columns
+and requested properties may still be selected.  No heading models, bodies
+or unrequested properties are read; no match issues no projection read, and
+~(one ...)~ is still checked.  The scan is linear in the root's headings.
+
+Any other insensitive selection takes the root-scoped residual planner and
+shared matcher.  That includes a selection that also filters on an
+extension field or a membership, which keeps its refusal.  The residual
+route hydrates headline/tag data and requested properties/keywords only; it
+does not hydrate every body, create normalized stored copies, or use a
+separate post-filter.
+
+These are receipts, not thresholds; host timing is not part of the
+contract.  On the 3000-heading fixture with one mixed-case title match the
+insensitive read measured 0.61 seconds with no heading models and no
+body reads.  On a 3000-item tracker fixture (9000 headings) the reported
+three-term search guarded by property existence measured, warm, 2.57
+seconds through the residual planner before this change, and 0.17 seconds
+(sensitive) and 1.39 seconds (insensitive, with an extension projection,
+previously refused) after it, on a heavily loaded host.
 
 If the top-level query is a predicate (not a =pipe=), it is treated as
 ~(pipe (where PREDICATE))~ over all headings in the registered
@@ -181,7 +273,8 @@ what to compare, =VALUE= is the literal.  One uniform operator vocabulary
 applies to everything comparable; there are *no* field-specific
 operators.  =EXPR= is one of:
 
-#+begin_example
+#+name: dorg-query-value-forms
+#+begin_example text
 (field FIELD)     a scalar heading field (table below)
 (property KEY)    the PROPERTIES-drawer value for KEY
 (keyword KEY)     the host's #+KEY: keyword value
@@ -227,7 +320,7 @@ prefix form of the ~(id N)~ atom.
 
 ** property, keyword, and tag
 
-#+begin_example
+#+begin_example text
 (property KEY VALUE)                    equality atom
 (= (property KEY) VALUE)                equality (prefix form of the atom)
 (exists (property KEY)) (missing (property KEY))
@@ -282,7 +375,8 @@ atomic timestamp aliases accept the same vocabulary in place of their
 
 Convenience forms:
 
-#+begin_example
+#+name: dorg-query-window-forms
+#+begin_example text
 (between FROM TO)   inclusive [FROM, TO]
 (on X)              the single date X
 (before X)          open FROM, on-or-before X
@@ -346,10 +440,170 @@ implicit final pass for traversals that can produce duplicates.
 
 ** Result shape and selection granularity
 
-Each result is a plist with exactly ~:heading-id~, ~:marker~, ~:title~,
+Without a ~select~ step, each result is a plist with ~:heading-id~, ~:marker~, ~:title~,
 and ~:properties~ — the same stable shape ~dorg-find~ produces.
 Plain-org results carry *live markers*; model-list and Dolt results carry
 =nil= markers.  An empty match returns =nil=.
+
+A terminal ~(select EXPR...)~ chooses the returned columns. Expressions are
+~(field NAME)~, ~(property KEY)~, or ~(as EXPR NAME)~. Field names and property
+keys supply default column names; duplicate names and unknown fields are
+errors. For example:
+
+#+name: dorg-query-projection-forms
+#+begin_src emacs-lisp
+(pipe (where (= (field todo) "TODO"))
+      (select (field title) (as (property "BEAD_ID") id)))
+#+end_src
+
+Selected library results carry ~:values~, an ordered alist with string column
+names, alongside internal ~:heading-id~ and ~:marker~ navigation metadata.
+Missing scalars are ~nil~; boolean false is ~:json-false~. Filtering may use
+fields that are not returned. Projection preserves heading cardinality and
+order; ~(one QUERY)~ checks cardinality before projecting. No pipeline step
+may follow ~select~. Session serialization retains values and strips markers.
+Mutation target queries refuse ~select~ so display aliases cannot replace
+target identity.
+
+** Extension projection and invocation consistency
+
+An extension declares query fields with =:name=, =:type=, =:cardinality=,
+dependency, and backend evaluators. A scalar field has cardinality =one=; a
+=many= field projects an ordered vector for each selected heading (and JSON
+=[]= rather than =null= when empty). Dolt collection plans use a keyed batch
+result =(heading_id ordinal value)=, so collection rows
+cannot duplicate or reorder heading results. Collection fields are projection
+values, not predicate operands.
+
+Before an extension field executes, its extension may supply =:query-context=.
+The callback receives an invocation plist containing the source, root,
+captured revision, and a revision-bound =:read= capability. On Dolt, HEAD is
+captured first and both the resolver and query statements use that exact
+revision. The returned =:values= are copied, validated as host-safe data, and
+digested once for the invocation. Mutable resolver state cannot alter a warm
+result after capture. A field's =:context= keyword list is enforced: its
+evaluator receives only those captured keys, and its =:dependencies= may name
+only stored built-in heading fields or a string-named property.
+
+=dorg-ql-select-snapshot= returns =:rows= together with a generic =:source=,
+the Dolt =:root= when applicable, typed =:snapshot=, and =:context-digest=.
+Source names the backend kind and canonical file when present (and the Dolt
+store for Dolt); a snapshot is either =(:kind dolt :head COMMIT)= or
+=(:kind plain-org :content-sha256 SHA256)= for the exact text evaluated. A
+plain source modified during evaluation is refused rather than receiving a
+hash for different rows. =dorg-ql-snapshot-public= is the shared pure query
+data boundary for CLI wrappers: it removes internal markers while keeping
+requested string column/property names verbatim. The JSON =dorg query=
+response preserves source, snapshot, root, and context digest alongside
+results and count. The identity comparison codec prefixes stored keys with its
+version (currently
+=v2:=). It uses per-character integer upper-casing under the standard Emacs
+case table before UTF-8 hex encoding; raw-byte/non-Unicode identities are
+refused rather than colliding with Unicode text. Extension schemas that persist
+such keys must record that version and migrate before a codec change. Standalone
+callers load an extension by its
+conventional =dorg-extension-NAME= feature (the CLI form is
+=dorg query --extension NAME …=); core does not require any named extension.
+
+In-process callers can supply an ephemeral Dolt registration to the snapshot
+query to read an existing store/root without visiting the materialized Org
+file. The public backend constructor and read-only root lookup supply this
+binding; retain its actual source file for identity and relative configuration.
+See [[file:api.org::#query-library-api][the query API source contract and example]].
+
+*Ranked BM25 snapshots.*  A terminal
+=(rank-bm25 QUERY :profile PROFILE :top-k K)= pipeline step (optionally
+followed by one final =select=) produces the
+separate =dorg-ql-search-snapshot= envelope, not ordinary
+=dorg-ql-select= rows.  Its =:command= is =search=; it preserves the captured
+source/root/Dolt snapshot and reports =:profile=, =:index-generation=,
+=:corpus-generation=, ordered =:matches= (heading id, title, and rounded
+score), and =:count=.  A final =select= adds a =:values= alist to each
+already-ranked match and hydrates only the bounded top-K ids.  V1 accepts
+=sensitive= or =insensitive= profile and
+top-k 1..100.  At most 32 tokenizer terms are accepted; tokens are runs of
+Unicode alphanumerics or underscore, punctuation separates them, and tokens
+longer than 256 characters are dropped.  Sensitive matching is literal
+codepoint matching; insensitive matching uses DOrg's standard-case rule.  No
+Unicode normalization, diacritic folding, stemming, stop-word removal, scan,
+or alternative ranker is implicit.
+
+Rank follows zero or more SQL-pushable =where= filters and is otherwise
+terminal except for that one final =select=.  Filters therefore
+narrow candidate documents before score and top-k; ties sort by canonical
+heading id.  V1 documents are a heading title plus directly-owned text items,
+excluding descendants, planning, drawers, keywords and metadata.  The indexed
+Dolt profile uses k1=1.2, b=.75, independent title weight 2 and body weight 1.
+An installed index with no manifest for the root signals the typed
+=derived-index-unbuilt= outcome naming =dorg-ext-rebuild-index=; a missing
+schema or an incompatible or unreadable manifest signals the typed
+=search-index-unavailable= QL outcome.  Plain-org and model sources are
+unsupported rather than silently substituted.  An all-OOV query returns an
+empty, provenance-carrying search snapshot.
+
+*Lexical measurement corpus.*  The committed deterministic generator
+=dorg-test-bm25--public-corpus= defines three CC0-1.0 synthetic partitions of
+1,000 headings each.  It contains repeated and rare terms, identifier-like
+tokens, punctuation, and Unicode without copying user, tracker, or filesystem
+content.  Its public-safety control is part of the normal test namespace.
+
+BM25 is an opt-in per-store extension: ordinary stores do not register or
+migrate its derived tables merely because another store in the Emacs process
+uses lexical search.  Installing it (=dorg-migrate-schema=) does not build an
+index; =dorg-ext-rebuild-index= builds one root at an exact revision.
+
+An ordinary mutation maintains the index from the documents it changes and
+nothing else.  Each changed document's rows are replaced under its root.
+Each touched term's document frequency, and each profile's corpus size,
+field lengths and corpus generation, change by deltas that DOrg folds
+against the rows stored at the plan base (see the accumulator contract in
+[[file:api.org][docs/api.org]]).  No whole-root image is loaded or derived,
+and a document whose title and direct text are unchanged, as in a pure
+in-root move or a property edit, contributes nothing.
+
+The per-root manifest, one row per profile, marks a root's index as built.
+- A root that has headings but no manifest is *unbuilt*.  Edits proceed and
+  its index stays wholly absent, never partial; search answers it with the
+  typed =derived-index-unbuilt= detail naming =dorg-ext-rebuild-index=.
+- A root with no headings at the base births its manifest on its first edit.
+- A root holding some but not all profile manifests is *inconsistent*.  An
+  edit fails closed with =derived-index-inconsistent= naming the rebuild,
+  the only case in which the derived index blocks a write.
+
+=corpus_generation= is the 256-bit xor of per-document SHA-256 digests over a
+tagged, length-delimited encoding of heading id, title and direct body, written
+as 64 lowercase hex digits (all zeros for an empty root).  It is order-free,
+changes on every document create, edit and delete, is unchanged by a pure
+in-root move, and equals a fresh rebuild's value.  It is a freshness
+identity, not integrity evidence.  =:index-generation= is derived from it in
+the search envelope.  Schema version 3 clears version-2 derived rows on
+migration, so every root is unbuilt until rebuilt.
+
+Ranked reads are unchanged.  The first stage seeks postings by
+=(root_id, profile, term)= at the captured Dolt revision; later bounded
+statements fetch only those candidate headings, their document lengths, and
+the query terms' df rows.  This prevents a revision-database optimizer from
+turning a term query into a corpus scan.
+
+These are receipts, not thresholds.  On a 3,000-document generated corpus
+(load1 8 to 12), one edit took 9.2--9.4 seconds warm before this maintenance
+path: about 92% projection, fetching about 6,000 headings and making about
+24,000 tokenizer calls.  With it, a title edit took 0.20 s, a body edit 0.23 s
+and a delete 0.26 s warm (0.6--1.1 s for a process's first edit), fetching 3
+headings and making 8 tokenizer calls (4 for a delete).  The keyed prior reads
+took 12--16 ms for up to 50 touched terms and about 170 ms for 500.  A
+two-term ranked read was unchanged at about 1.35 s cold and 1.0 s warm.
+Exact rebuild equivalence remains the correctness control.
+
+The larger observation is deliberately separate from release correctness:
+
+#+begin_example sh
+DORG_BM25_CORPUS_BENCH=1 make test SELECT='^dorg-perf-search-bm25-public-corpus-observation$'
+#+end_example
+
+It records logical posting size plus rebuild, cold-read, and warm-read times,
+while asserting only the expected rare-token result set.  Timing is evidence
+for tuning and capacity planning, never a pass/fail threshold.
 
 *Selection is heading-granular — uniformly.*  The unit of selection is
 the heading: every predicate (~(keyword …)~ included) matches a real
@@ -361,8 +615,8 @@ Thus mutate ~:targets~ / ~:expected-targets~ may mix extern keys and integer
 ids without changing query membership.  Sub-heading entities — properties,
 keyword occurrences, planning, drawer items, body text, LOGBOOK entries — are
 *not* independently selectable; they are addressed only *relative to a host*
-(see [[file:mutate.org][docs/mutate.org]]).  There is no row/field/aggregate
-reporting projection in DOrg 0.1.0.
+(see [[file:mutate.org][docs/mutate.org]]). The current projection is per-heading;
+aggregation is a future extension of the same query plan.
 
 The level-0 document host is *outside* the query domain: no predicate
 matches it and it never appears in query results or in a ~(where …)~
@@ -373,7 +627,7 @@ name only those headings through their policy-projected identities.
 
 * Backend support and error semantics
 
-| Source                       | Atomic predicates | v2 composable forms       |
+| Source                       | Atomic predicates | Composable forms       |
 |------------------------------+----------------+------------------------------|
 | plain-org buffer             | yes            | yes (plain-org executor)     |
 | Dolt buffer                  | yes            | yes (Dolt planner)           |
@@ -386,7 +640,7 @@ are all lowered natively.  A (backend, predicate) pair with no native
 lowering signals ~dorg-ql-error~ ("not supported on <backend> backend")
 rather than silently widening or emptying the result.
 
-Composable v2 forms run on model-list, plain-org, and Dolt sources.  A
+Composable forms run on model-list, plain-org, and Dolt sources.  A
 model-list source is an *ordered forest* of ~dorg-heading~ structs: input
 order is result order, and traversal resolves only headings present in the
 supplied list.  Filter-only model-list pipelines do not require ids to be
@@ -403,9 +657,9 @@ and invalid relations all signal ~dorg-ql-error~ with top-level reason
 timestamp whose complement cannot be bounded) uses =unsupported=.  These are
 the only two top-level query reasons; callers inspect them with
 ~dorg-error-reason~ / ~dorg-error-data~ rather than parsing messages.  Bad
-forms are validated up front, before any registration lookup, so they fail
-the same way regardless of backing storage — and never fall back to a broad
-scan.
+forms are validated before content reads; ~(key V)~ may first consult the
+source registration and identity policy, and invalid forms never fall back to
+a broad scan.
 
 * CLI
 
@@ -424,14 +678,17 @@ dorg query '(pipe (where (deadline (this-week))) (traverse children))' -f tasks.
 # Atomic predicate (equality shorthand):
 dorg query '(tag "work")' -f tasks.org
 
-# JSON output is a strict array for 0, 1, and N results:
+# The JSON envelope keeps data.results an array for 0, 1, and N results:
 dorg query '(>= (field priority) "B")' -f tasks.org --json
 #+end_src
 
 Text output prints one ="<heading-id>\t<title>"= line per hit.  =--json=
-emits a strict JSON array (=[]=, =[obj]=, =[obj …]=) where each hit is
-={heading-id, title, properties}= — never a bare object or empty output
-for a result set.
+emits the shared =ok/data/error= envelope.  Its =data= object contains
+=source=, =root=, =snapshot=, =context-digest=, =results= and =count=.
+=data.results= is always an array (=[]=, =[obj]=, =[obj …]=).  Without
+~select~, each row is ={heading-id, title, properties}=; with ~select~,
+each row contains exactly the requested columns.  Internal markers are
+omitted.  Query failures use the envelope's =error= member.
 
 * Planning examples
 

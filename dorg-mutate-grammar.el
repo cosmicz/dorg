@@ -103,7 +103,7 @@
     (keyword-occurrence :clearing delete
                         :spelling "(delete (keyword KEY (occurrence N)))")
     (keyword-sequence :clearing delete
-                      :spelling "(delete (keywords KEY))")
+                      :spelling "(delete (keyword KEY (all)))")
     (heading :clearing empty-assignment
              :spelling "documented nil, empty string, or empty list by FIELD")
     (planning :clearing empty-assignment
@@ -119,7 +119,7 @@
     :broad-write threshold-gated)
   "Safety metadata shared by non-structural public productions.")
 
-(defconst dorg-mutate-grammar-productions
+(defconst dorg-mutate-grammar--base-productions
   `((:id set-property :family property :verb set
      :template "(set (property KEY) VALUE)"
      :example (on (id 100) (set (property "STATUS") "DONE"))
@@ -133,53 +133,6 @@
      :ir (:op delete :target-kind :property)
      :collection-address [KEY] :cardinality singleton
      :missing no-op :positions (:none) :clearing canonical
-     :safety ,dorg-mutate-grammar--common-safety)
-    (:id replace-keywords :family keyword-sequence :verb replace-sequence
-     :template "(replace (keywords KEY) VALUE...)"
-     :example (on document (replace (keywords "SEQ_TODO") "TODO" "DONE"))
-     :ir (:op replace :target-kind :keywords)
-     :collection-address [KEY] :cardinality whole-sequence
-     :missing materialize :positions (:none) :clearing delete-only
-     :safety ,dorg-mutate-grammar--common-safety)
-    (:id delete-keywords :family keyword-sequence :verb delete
-     :template "(delete (keywords KEY))"
-     :example (on document (delete (keywords "SEQ_TODO")))
-     :ir (:op delete :target-kind :keywords)
-     :collection-address [KEY] :cardinality whole-sequence
-     :missing no-op :positions (:none) :clearing canonical
-     :safety ,dorg-mutate-grammar--common-safety)
-    (:id replace-keyword :family keyword-occurrence :verb replace-element
-     :template "(replace (keyword KEY (occurrence N)) VALUE)"
-     :example (on document
-                  (replace (keyword "REVIEWERS" (occurrence 2)) "a,b"))
-     :ir (:op replace :target-kind :keyword)
-     :collection-address [KEY] :cardinality one-occurrence
-     :missing error :positions (:none) :clearing delete-only
-     :safety ,dorg-mutate-grammar--common-safety)
-    (:id delete-keyword :family keyword-occurrence :verb delete
-     :template "(delete (keyword KEY (occurrence N)))"
-     :example (on document (delete (keyword "REVIEWERS" (occurrence 1))))
-     :ir (:op delete :target-kind :keyword)
-     :collection-address [KEY] :cardinality one-occurrence
-     :missing error :positions (:none) :clearing canonical
-     :safety ,dorg-mutate-grammar--common-safety)
-    (:id insert-keyword :family keyword-occurrence :verb insert
-     :template "(insert (keyword KEY) POSITION VALUE)"
-     :example (on document
-                  (insert (keyword "REVIEWERS") (before-first) "carol"))
-     :ir (:op insert :target-kind :keywords)
-     :collection-address [KEY] :cardinality one-new-occurrence
-     :missing create-at-host-end :positions (:before-first :after-last)
-     :clearing unsupported :safety ,dorg-mutate-grammar--common-safety)
-    (:id insert-drawer-line :family drawer-line :verb insert
-     :template "(insert (drawer-line NAME (occurrence 1)) POSITION RAW-LINE)"
-     :example (on (id 100)
-                  (insert (drawer-line "AUDIT" (occurrence 1))
-                          (before-first) "- State DONE"))
-     :ir (:op insert :target-kind :drawer-lines)
-     :collection-address [NAME "(occurrence 1)"]
-     :cardinality one-new-line :missing create-or-error
-     :positions (:before-first :after-last) :clearing unsupported
      :safety ,dorg-mutate-grammar--common-safety)
     (:id set-heading :family heading-field :verb set
      :template "(set (heading FIELD) VALUE)"
@@ -195,30 +148,8 @@
      :collection-address [FIELD] :cardinality singleton
      :missing error :positions (:none) :clearing nil-assignment
      :safety ,dorg-mutate-grammar--common-safety)
-    (:id insert-text :family text :verb insert
-     :template "(insert (text) POSITION TEXT)"
-     :example (on (id 100) (insert (text) (after-last) "new"))
-     :ir (:op insert :target-kind :texts)
-     :collection-address [] :cardinality one-new-element
-     :missing create-at-host-end :positions (:before-first :after-last)
-     :clearing unsupported :safety ,dorg-mutate-grammar--common-safety)
-    (:id replace-text :family text :verb replace-element
-     :template "(replace (text (occurrence 1)) TEXT)"
-     :example (on (id 100) (replace (text (occurrence 1)) "new"))
-     :ir (:op replace :target-kind :text)
-     :collection-address [] :cardinality first-occurrence-only
-     :missing error :positions (:none) :clearing unsupported
-     :safety ,dorg-mutate-grammar--common-safety)
-    (:id replace-items :family items :verb replace-sequence
-     :template "(replace (items) ITEM...)"
-     :example (on (id 100) (replace (items) (text "new")))
-     :ir (:op replace :target-kind :items)
-     :collection-address [] :cardinality whole-non-empty-sequence
-     :missing error :positions (:none) :clearing unsupported-public
-     :safety (:base when-supplied :expected-targets when-where
-              :broad-write full-ordered-item-sequence))
     (:id move :family tree :verb move
-     :template "(move (subtree) (under TGT [ANCHOR]))"
+     :template "(move (subtree) (under TGT [ANCHOR] [OFFSET]))"
      :example (on (id 42)
                   (move (subtree) (under (id 7) (after (id 9)))))
      :ir (:op move :target-kind :subtree)
@@ -249,7 +180,246 @@
      :clearing not-applicable
      :safety (:base when-supplied :expected-targets not-applicable
               :broad-write bounded-constructor-subtree)))
-  "Canonical semantic inventory of public mutation productions.")
+  "The eight non-sequence source rows for the public mutation inventory.")
+
+(defconst dorg-mutate-sequence-cells
+  `((:id replace-keyword-all :noun :keyword :root t :legal t :op replace :select (:all)
+     :payload :values :cardinality whole-sequence :missing materialize
+     :family keyword-sequence :verb replace-sequence
+     :template "(replace (keyword KEY (all)) VALUE...)"
+     :example (on document (replace (keyword "SEQ_TODO" (all)) "TODO" "DONE"))
+     :collection-address [KEY] :positions (:none) :clearing delete-only
+     :safety ,dorg-mutate-grammar--common-safety)
+    (:id delete-keyword-all :noun :keyword :root t :legal t :op delete :select (:all)
+     :payload nil :cardinality whole-sequence :missing no-op
+     :family keyword-sequence :verb delete
+     :template "(delete (keyword KEY (all)))"
+     :example (on document (delete (keyword "SEQ_TODO" (all))))
+     :collection-address [KEY] :positions (:none) :clearing canonical
+     :safety ,dorg-mutate-grammar--common-safety)
+    (:id replace-keyword :noun :keyword :root t :legal t :op replace :select (:occurrence N)
+     :payload :value :cardinality one-occurrence :missing error
+     :family keyword-occurrence :verb replace-element
+     :template "(replace (keyword KEY (occurrence N)) VALUE)"
+     :example (on document (replace (keyword "REVIEWERS" (occurrence 2)) "a,b"))
+     :collection-address [KEY] :positions (:none) :clearing delete-only
+     :safety ,dorg-mutate-grammar--common-safety)
+    (:id delete-keyword :noun :keyword :root t :legal t :op delete :select (:occurrence N)
+     :payload nil :cardinality one-occurrence :missing error
+     :family keyword-occurrence :verb delete-element
+     :template "(delete (keyword KEY (occurrence N)))"
+     :example (on document (delete (keyword "REVIEWERS" (occurrence 1))))
+     :collection-address [KEY] :positions (:none) :clearing canonical
+     :safety ,dorg-mutate-grammar--common-safety)
+    (:id insert-keyword :noun :keyword :root t :legal t :op insert :select nil
+     :payload :value :cardinality one-new-occurrence :missing create-at-host-end
+     :family keyword-occurrence :verb insert
+     :template "(insert (keyword KEY) POSITION VALUE)"
+     :example (on document (insert (keyword "REVIEWERS") (before-first) "carol"))
+     :collection-address [KEY] :positions (:before-first :after-last :before :after)
+     :clearing unsupported :safety ,dorg-mutate-grammar--common-safety)
+    (:id replace-text :noun :text :root nil :legal t :op replace :select (:occurrence N)
+     :payload :value :cardinality one-occurrence :missing error
+     :family text :verb replace-element
+     :template "(replace (text (occurrence N)) TEXT)"
+     :example (on (id 100) (replace (text (occurrence 2)) "new"))
+     :collection-address [] :positions (:none) :clearing unsupported
+     :safety ,dorg-mutate-grammar--common-safety)
+    (:id replace-body-literal :noun :body :root nil :legal t :op replace
+     :select (:literal OLD) :payload :value :cardinality one-unique-range
+     :missing error :family body-literal :verb replace-range
+     :template "(replace (body (literal OLD)) NEW)"
+     :example (on (id 100) (replace (body (literal "old words")) "new"))
+     :collection-address [] :positions (:none) :clearing unsupported
+     :safety ,dorg-mutate-grammar--common-safety)
+    (:id delete-text :noun :text :root nil :legal t :op delete :select (:occurrence N)
+     :payload nil :cardinality one-occurrence :missing error
+     :family text :verb delete-element
+     :template "(delete (text (occurrence N)))"
+     :example (on (id 100) (delete (text (occurrence 2))))
+     :collection-address [] :positions (:none) :clearing canonical
+     :safety ,dorg-mutate-grammar--common-safety)
+    (:id insert-text :noun :text :root nil :legal t :op insert :select nil
+     :payload :value :cardinality one-new-element :missing create-at-host-end
+     :family text :verb insert
+     :template "(insert (text) POSITION TEXT)"
+     :example (on (id 100) (insert (text) (after-last) "new"))
+     :collection-address [] :positions (:before-first :after-last :before :after)
+     :clearing unsupported :safety ,dorg-mutate-grammar--common-safety)
+    (:id replace-item-all :noun :item :root nil :legal t :op replace :select (:all)
+     :payload :items :cardinality whole-non-empty-sequence :missing materialize
+     :family items :verb replace-sequence
+     :template "(replace (item (all)) ITEM...)"
+     :example (on (id 100) (replace (item (all)) (text "new")))
+     :collection-address [] :positions (:none) :clearing unsupported-public
+     :safety (:base when-supplied :expected-targets when-where
+              :broad-write full-ordered-item-sequence))
+    (:id replace-item :noun :item :root nil :legal t :op replace :select (:occurrence N)
+     :payload :item :cardinality one-occurrence :missing error
+     :family items :verb replace-element
+     :template "(replace (item (occurrence N)) ITEM)"
+     :example (on (id 100) (replace (item (occurrence 2)) (text "new")))
+     :collection-address [] :positions (:none) :clearing delete-only
+     :safety ,dorg-mutate-grammar--common-safety)
+    (:id delete-item :noun :item :root nil :legal t :op delete :select (:occurrence N)
+     :payload nil :cardinality one-occurrence :missing error
+     :family items :verb delete-element
+     :template "(delete (item (occurrence N)))"
+     :example (on (id 100) (delete (item (occurrence 2))))
+     :collection-address [] :positions (:none) :clearing canonical
+     :safety ,dorg-mutate-grammar--common-safety)
+    (:id insert-item :noun :item :root nil :legal t :op insert :select nil
+     :payload :item :cardinality one-new-element :missing create-at-host-end
+     :family items :verb insert
+     :template "(insert (item) POSITION ITEM)"
+     :example (on (id 100) (insert (item) (after-last) (text "new")))
+     :collection-address [] :positions (:before-first :after-last :before :after)
+     :clearing unsupported :safety ,dorg-mutate-grammar--common-safety)
+    (:id insert-drawer-line :noun :drawer-line :root nil :legal t :op insert :select nil
+     :payload :value :cardinality one-new-line :missing create-or-error
+     :family drawer-line :verb insert
+     :template "(insert (drawer-line NAME) POSITION RAW-LINE)"
+     :example (on (id 100) (insert (drawer-line "AUDIT") (before-first) "- State DONE"))
+     :collection-address [NAME] :positions (:before-first :after-last :before :after)
+     :clearing unsupported :safety ,dorg-mutate-grammar--common-safety)
+    (:id replace-drawer-line-all :noun :drawer-line :root nil :legal t :op replace :select (:all)
+     :payload :values :cardinality whole-non-empty-sequence :missing materialize
+     :family drawer-line :verb replace-sequence
+     :template "(replace (drawer-line NAME (all)) RAW-LINE...)"
+     :example (on (id 100) (replace (drawer-line "AUDIT" (all)) "- done"))
+     :collection-address [NAME] :positions (:none) :clearing delete-only
+     :safety ,dorg-mutate-grammar--common-safety)
+    (:id delete-drawer-line-all :noun :drawer-line :root nil :legal t :op delete :select (:all)
+     :payload nil :cardinality whole-sequence :missing no-op
+     :family drawer-line :verb delete
+     :template "(delete (drawer-line NAME (all)))"
+     :example (on (id 100) (delete (drawer-line "AUDIT" (all))))
+     :collection-address [NAME] :positions (:none) :clearing canonical
+     :safety ,dorg-mutate-grammar--common-safety)
+    (:id replace-drawer-line :noun :drawer-line :root nil :legal t :op replace :select (:occurrence N)
+     :payload :value :cardinality one-occurrence :missing error
+     :family drawer-line :verb replace-element
+     :template "(replace (drawer-line NAME (occurrence N)) RAW-LINE)"
+     :example (on (id 100) (replace (drawer-line "AUDIT" (occurrence 2)) "- done"))
+     :collection-address [NAME] :positions (:none) :clearing delete-only
+     :safety ,dorg-mutate-grammar--common-safety)
+    (:id delete-drawer-line :noun :drawer-line :root nil :legal t :op delete :select (:occurrence N)
+     :payload nil :cardinality one-occurrence :missing error
+     :family drawer-line :verb delete-element
+     :template "(delete (drawer-line NAME (occurrence N)))"
+     :example (on (id 100) (delete (drawer-line "AUDIT" (occurrence 2))))
+     :collection-address [NAME] :positions (:none) :clearing canonical
+     :safety ,dorg-mutate-grammar--common-safety)
+    ;; The NO cells are deliberately data, not fallback parser failures.  API
+    ;; lowering and v2 validation report their shared `unsupported-selector'
+    ;; detail from these rows.
+    (:noun :text :root nil :op replace :select (:all) :legal nil)
+    (:noun :text :root nil :op delete :select (:all) :legal nil)
+    (:noun :item :root nil :op delete :select (:all) :legal nil))
+  "Closed v0.2 sequence cell table, including the three public NO cells.")
+
+(defun dorg-mutate-sequence-cell (noun operation select)
+  "Return the v0.2 sequence cell for NOUN, OPERATION and SELECT, or nil.
+SELECT is a normalized selector shape: `(:all)', `(:occurrence N)', or nil
+for inserts.  An occurrence cell matches every positive occurrence number."
+  (cl-find-if
+   (lambda (cell)
+     (and (eq noun (plist-get cell :noun))
+          (eq operation (plist-get cell :op))
+          (let ((declared (plist-get cell :select)))
+            (or (equal declared select)
+                (and (eq (car-safe declared) :occurrence)
+                     (eq (car-safe select) :occurrence))
+                (and (eq (car-safe declared) :literal)
+                     (eq (car-safe select) :literal))))))
+   dorg-mutate-sequence-cells))
+
+(defun dorg-mutate-grammar--sequence-production (cell)
+  "Project one legal sequence CELL into the public grammar inventory."
+  (list :id (plist-get cell :id) :family (plist-get cell :family)
+        :verb (plist-get cell :verb) :template (plist-get cell :template)
+        :example (plist-get cell :example)
+        :ir (list :op (plist-get cell :op) :target-kind (plist-get cell :noun))
+        :collection-address (plist-get cell :collection-address)
+        :cardinality (plist-get cell :cardinality)
+        :missing (plist-get cell :missing)
+        :positions (plist-get cell :positions) :clearing (plist-get cell :clearing)
+        :safety (plist-get cell :safety)))
+
+(defconst dorg-mutate-grammar--production-layout
+  '(set-property
+    delete-property
+    replace-keyword-all
+    delete-keyword-all
+    replace-keyword
+    delete-keyword
+    insert-keyword
+    insert-drawer-line
+    replace-drawer-line-all
+    delete-drawer-line-all
+    replace-drawer-line
+    delete-drawer-line
+    set-heading
+    set-planning
+    insert-text
+    replace-text
+    replace-body-literal
+    delete-text
+    replace-item-all
+    replace-item
+    delete-item
+    insert-item
+    move
+    delete-heading
+    delete-subtree
+    insert-heading)
+  "Ratified public display order; membership remains owned by cells and base rows.")
+
+(defun dorg-mutate-grammar--build-productions (cells base layout)
+  "Build public productions from sequence CELLS, non-sequence BASE and LAYOUT.
+LAYOUT specifies presentation order only.  This validates that each listed ID
+has exactly one semantic owner and that all legal cells and base rows appear."
+  (let ((seen (make-hash-table :test #'eq))
+        (legal-cells (cl-remove-if-not (lambda (cell) (plist-get cell :legal)) cells))
+        productions)
+    (dolist (cell legal-cells)
+      (unless (plist-get cell :id)
+        (error "Legal sequence cell has no :id: %S" cell)))
+    (dolist (entry (append legal-cells base))
+      (let ((id (plist-get entry :id)))
+        (unless id
+          (error "Production owner has no :id: %S" entry))
+        (when (gethash id seen)
+          (error "Duplicate owner for production %S" id))
+        (puthash id t seen)))
+    (setq seen (make-hash-table :test #'eq))
+    (dolist (id layout)
+      (when (gethash id seen)
+        (error "Duplicate production layout ID %S" id))
+      (puthash id t seen)
+      (let ((cell (cl-find id cells :key (lambda (entry) (plist-get entry :id))))
+            (base-production
+             (cl-find id base :key (lambda (entry) (plist-get entry :id)))))
+        (cond
+         ((and cell base-production)
+          (error "Production %S has both cell and base owners" id))
+         (cell
+          (unless (plist-get cell :legal)
+            (error "Production layout references non-legal cell %S" id))
+          (push (dorg-mutate-grammar--sequence-production cell) productions))
+         (base-production (push base-production productions))
+         (t (error "Production layout references missing ID %S" id)))))
+    (dolist (entry (append legal-cells base))
+      (unless (gethash (plist-get entry :id) seen)
+        (error "Semantic production omitted from layout: %S" (plist-get entry :id))))
+    (nreverse productions)))
+
+(defconst dorg-mutate-grammar-productions
+  (dorg-mutate-grammar--build-productions
+   dorg-mutate-sequence-cells
+   dorg-mutate-grammar--base-productions
+   dorg-mutate-grammar--production-layout)
+  "Canonical public grammar inventory, projected from its sole semantic owners.")
 
 (defconst dorg-mutate-grammar--family-labels
   '((property . "Property")

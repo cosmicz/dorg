@@ -90,6 +90,129 @@ resolved lazily only on a cache miss, never on the warm hot path."
         (should (= strict 0))
         (should (= attach 0))))))
 
+(ert-deftest dorg-test-10z7y-generation-fingerprint-revalidates-each-warm-read ()
+  "A C1 member drift evicts the warm entry; an equal fingerprint does not.
+The fingerprint seam is deliberately independent of SQL/HEAD: this control
+proves validation observes the source generation without product queries."
+  (dorg-test-lease--env dd
+    (let* ((key (dorg-dolt-server--canonical-dir dd))
+           (old '(:directory (:device 1 :inode 2)
+                 :native (:pid 10 :port 3307) :source-hash "old"))
+           (current old)
+           (opened 0)
+           (head-calls 0))
+      (puthash key (dorg-sql--make-conn-entry :conn 'warm :port 3307
+                                              :identity (list :db "db" :uuid nil)
+                                              :generation old :validated t)
+               dorg-sql--connections)
+      (cl-letf (((symbol-function 'dorg-sql--generation-fingerprint)
+                 (lambda (_d) current))
+                ((symbol-function 'dorg-head-commit)
+                 (lambda (&rest _) (cl-incf head-calls) "forbidden"))
+                ((symbol-function 'mysql-connect)
+                 (lambda (&rest _) (cl-incf opened) 'fresh)))
+        (should (eq (dorg-sql--get-connection dd) 'warm))
+        (setq current '(:directory (:device 1 :inode 2)
+                        :native (:pid 10 :port 3307) :source-hash "new"))
+        (should (eq (dorg-sql--get-connection dd) 'fresh))
+        (should (= opened 1))
+        (should (= head-calls 0))))))
+
+(ert-deftest dorg-test-10z7y-generation-drift-refuses-stale-lease-write ()
+  "C2: a plan leased on A cannot issue SQL after B becomes visible.
+The assertion is before `mysql-query': removing the generation check would make
+the batch reach the replacement connection and fail this exact no-write row."
+  (dorg-test-lease--env dd
+    (let ((current '(:directory (:device 1 :inode 2)
+                     :native (:pid 10 :port 3307) :source-hash "A"))
+          (queries 0))
+      (cl-letf (((symbol-function 'dorg-sql--generation-fingerprint)
+                 (lambda (_d) current))
+                ((symbol-function 'mysql-query)
+                 (lambda (&rest _) (cl-incf queries) 'result)))
+        (let ((lease (dorg-sql--acquire-lease dd)))
+          (unwind-protect
+              (progn
+                ;; B replaces A after the mutation was planned/leased.
+                (setq current '(:directory (:device 3 :inode 4)
+                                :native (:pid 11 :port 3308) :source-hash "B"))
+                (should-error (dorg-sql--lease-batch
+                               lease '("INSERT INTO headings VALUES (1)") "stale")
+                              :type 'dorg-sql-lease-generation-drift)
+                (should (= queries 0)))
+            (dorg-sql--release-lease lease t)))))))
+
+(ert-deftest dorg-test-10z7y-legacy-lease-stamps-generation-on-first-use ()
+  "G2: a pre-generation active lease remains usable until a later drift."
+  (dorg-test-lease--env dd
+    (let* ((key (dorg-dolt-server--canonical-dir dd))
+           (generation '(:directory (:device 1 :inode 2)
+                         :native (:pid 10 :port 3307) :source-hash "A"))
+           (lease (dorg-sql--make-lease :dolt-dir dd :conn 'legacy
+                                        :phase :active :owner 'legacy)))
+      (puthash key lease dorg-sql--leases)
+      (cl-letf (((symbol-function 'dorg-sql--generation-fingerprint)
+                 (lambda (_d) generation)))
+        (dorg-sql--lease-assert-current-generation lease)
+        (should (equal generation (dorg-sql--lease-generation lease)))))))
+
+(ert-deftest dorg-test-10z7y-generation-members-reopen-and-hot-reuse ()
+  "T3: each fingerprint member reopens once; an unchanged warm read spawns none."
+  (dorg-test-lease--env dd
+    (let* ((key (dorg-dolt-server--canonical-dir dd))
+           (base '(:directory (:device 1 :inode 2)
+                  :native (:pid 10 :port 3307) :source-hash "A"))
+           (current base)
+           (opened 0)
+           (strict 0))
+      (puthash key (dorg-sql--make-conn-entry :conn 'warm :port 3307
+                                              :identity (list :db "db" :uuid nil)
+                                              :generation base :validated t)
+               dorg-sql--connections)
+      (cl-letf (((symbol-function 'dorg-sql--generation-fingerprint)
+                 (lambda (_d) current))
+                ((symbol-function 'dorg-dolt-server--strict-port)
+                 (lambda (_d) (cl-incf strict) 3307))
+                ((symbol-function 'mysql-connect)
+                 (lambda (&rest _) (intern (format "fresh-%d" (cl-incf opened)))))
+                ((symbol-function 'make-process)
+                 (lambda (&rest _) (error "hot generation check spawned")))
+                ((symbol-function 'call-process)
+                 (lambda (&rest _) (error "hot generation check spawned")))
+                ((symbol-function 'process-file)
+                 (lambda (&rest _) (error "hot generation check spawned"))))
+        ;; No strict resolution or process on an unchanged public warm boundary.
+        (should (eq (dorg-sql--get-connection dd) 'warm))
+        (should (= strict 0))
+        (dolist (next
+                 (list
+                  '(:directory (:device 3 :inode 4)
+                    :native (:pid 10 :port 3307) :source-hash "A")
+                  '(:directory (:device 3 :inode 4)
+                    :native (:pid 11 :port 3308) :source-hash "A")
+                  '(:directory (:device 3 :inode 4)
+                    :native (:pid 11 :port 3308) :source-hash "B")))
+          (setq current next)
+          (dorg-sql--get-connection dd))
+        (should (= opened 3))
+        (should (= strict 3))))))
+
+(ert-deftest dorg-test-10z7y-generation-hash-reads-only-bound-buffer ()
+  "A loaded matching source contributes its preamble hash without HEAD SQL."
+  (dorg-test-lease--env dd
+    (let* ((file (make-temp-file "dorg-10z7y-" nil ".org"))
+           (buffer (find-file-noselect file))
+           (dorg--registry nil) (canon (file-name-as-directory dd)))
+      (unwind-protect
+          (progn
+            (with-current-buffer buffer (insert "#+DORG_HASH: alpha\n* Root\n") (org-mode))
+            (setq dorg--registry (list (cons (file-truename file)
+                                            (make-dorg-registration :backend (dorg-backend-dolt canon 1) :file file))))
+            (cl-letf (((symbol-function 'dorg-dolt-server--canonical-dir) (lambda (_dir) canon))
+                      ((symbol-function 'dorg-head-commit) (lambda (&rest _) (error "HEAD used"))))
+              (should (equal "alpha" (dorg-sql--bound-source-hash dd)))))
+        (kill-buffer buffer) (delete-file file)))))
+
 (ert-deftest dorg-test-lease-modelA-uuid-drift-reopens ()
   "A2/A5: an entry whose captured sql-server UUID no longer matches
 `sql-server.info' (a silent same-port instance swap) is evicted and reopened on
@@ -459,6 +582,34 @@ lease region begins, yielding a working lease on the rediscovered port."
         (should-not (gethash (dorg-dolt-server--canonical-dir dd)
                              dorg-sql--connections))))))
 
+(ert-deftest dorg-test-0l5rj-lease-broken-carries-only-closed-cause-class ()
+  "Broken leases retain a closed cause class without copying error prose."
+  (let ((lease (dorg-sql--make-lease :dolt-dir "/private/store"
+                                      :conn 'fixture-connection
+                                      :port 3307
+                                      :phase :active))
+        (cases '(((mysql-timeout "private timeout prose") . mysql-timeout)
+                 ((mysql-connection-error "private connection prose")
+                  . mysql-connection-error)
+                 ((mysql-protocol-error "private protocol prose")
+                  . mysql-protocol-error)
+                 ((error "private dead socket prose") . dead-connection)
+                 ((user-error "private unknown prose") . other))))
+    (cl-letf (((symbol-function 'dorg-sql--lease-conn-live-p)
+               (lambda (_lease) nil)))
+      (dolist (case cases)
+        (let* ((source (car case))
+               (expected (cdr case))
+               (err (condition-case caught
+                        (dorg-sql--raise-lease-broken lease source)
+                      (dorg-sql-lease-broken caught)))
+               (fields (cddr err)))
+          (should (eq expected (plist-get fields :cause-class)))
+          (should (memq (plist-get fields :cause-class)
+                        '(mysql-timeout mysql-connection-error
+                          mysql-protocol-error dead-connection other)))
+          (should-not (string-match-p "private" (prin1-to-string fields))))))))
+
 (ert-deftest dorg-test-lease-no-replay-after-first-statement ()
   "A4: a batch whose connection drops mid-run aborts without replaying any
 statement or opening a replacement session."
@@ -506,6 +657,93 @@ a live-conn SQL fault, `should-error' would see `dorg-sql-lease-broken', not
 
 ;;; ─── Integration: whole lease path on a real per-store sql-server ───────
 
+(defun dorg-test-10z7y--start-raw-server (dolt-dir tag)
+  "Start one test-owned raw sql-server for DOLT-DIR and return (PROCESS . PORT)."
+  (let* ((port (dorg-dolt-server--free-port))
+         (log (make-temp-file (format "dorg-10z7y-%s-" tag) nil ".log"))
+         (proc (dorg-dolt-server--spawn-logged
+                (format "dorg-10z7y-%s" tag)
+                (list "sql-server" "--host" "127.0.0.1"
+                      "--port" (number-to-string port) "--data-dir" dolt-dir)
+                log)))
+    (set-process-query-on-exit-flag proc nil)
+    (dorg-dolt-server--wait-ready port 30 proc)
+    (unless (dorg-dolt-server--port-healthy-p port 5)
+      (dorg-dolt-server--kill-process proc)
+      (error "10z7y raw server did not become healthy: %s" log))
+    (cons proc port)))
+
+(defun dorg-test-10z7y--stop-raw-server (server)
+  "Stop test-owned raw SERVER, a (PROCESS . PORT) pair."
+  (when (and server (process-live-p (car server)))
+    (dorg-dolt-server--kill-process (car server))))
+
+(ert-deftest dorg-test-10z7y-store-swap-reconnects-warm-client ()
+  "C2/T2: a warm reader follows raw A->B and B->A store swaps.
+A remains live while B is started outside DOrg's launcher, reproducing the
+incident shape.  The separate lease control proves an A-planned write refuses
+before SQL after B is visible."
+  (cond
+   ((not dorg-test--dolt-available) (ert-skip "dolt not installed"))
+   ((not (dorg-sql--mysql-available-p))
+    (ert-skip "mysql.el unavailable — strict server path needs it")))
+  (let ((root (dorg-test--make-owned-temp-dir "dorg-10z7y-" "store-swap"))
+        (dorg-dolt-server--attached-ports (make-hash-table :test 'equal))
+        (dorg-sql--connections (make-hash-table :test 'equal))
+        (dorg-sql--leases (make-hash-table :test 'equal))
+        (a-server nil) (b-server nil))
+    (unwind-protect
+        (let* ((live (expand-file-name "store" root))
+               (prior (expand-file-name "prior-A" root))
+               (prior-b (expand-file-name "prior-B" root))
+               (a (dorg-test--copy-repo root "store"))
+               (b (dorg-test--copy-repo root "replacement"))
+               (dorg-sql-transport 'server)
+               (dorg-dolt-server-autostart nil))
+          (dorg-sql--with-cli-seam a
+            (dorg-sql-batch a
+                            '("CREATE TABLE generation_marker (id INT PRIMARY KEY, label TEXT)"
+                              "INSERT INTO generation_marker VALUES (1, 'A')")
+                            "seed A"))
+          (dorg-sql--with-cli-seam b
+            (dorg-sql-batch b
+                            '("CREATE TABLE generation_marker (id INT PRIMARY KEY, label TEXT)"
+                              "INSERT INTO generation_marker VALUES (1, 'B')")
+                            "seed B"))
+          (setq a-server (dorg-test-10z7y--start-raw-server a "A"))
+          (should (equal "A" (alist-get 'label
+                                        (car (dorg-sql live
+                                                        "SELECT label FROM generation_marker")))))
+          (let ((a-port (cdr a-server)))
+            ;; A keeps serving the renamed inode while an external/raw B starts
+            ;; at the original pathname and publishes its native info.
+            (rename-file live prior)
+            (rename-file b live)
+            (setq b-server (dorg-test-10z7y--start-raw-server live "B"))
+            (should (process-live-p (car a-server)))
+            (should-not (= a-port (cdr b-server)))
+            ;; This is the C2 assertion: the established A connection must be
+            ;; evicted, not merely survive until a ping happens to fail.
+            (should (equal "B" (alist-get 'label
+                                            (car (dorg-sql live
+                                                            "SELECT label FROM generation_marker")))))
+            (should (= (cdr b-server)
+                       (dorg-sql--conn-entry-port
+                        (gethash (dorg-dolt-server--canonical-dir live)
+                                 dorg-sql--connections))))
+            ;; Reverse direction: B stops, the still-live A inode returns to
+            ;; the pathname, and the next public read follows it.
+            (dorg-test-10z7y--stop-raw-server b-server)
+            (setq b-server nil)
+            (rename-file live prior-b)
+            (rename-file prior live)
+            (should (equal "A" (alist-get 'label
+                                            (car (dorg-sql live
+                                                            "SELECT label FROM generation_marker")))))))
+      (dorg-test-10z7y--stop-raw-server b-server)
+      (dorg-test-10z7y--stop-raw-server a-server)
+      (dorg-test--delete-owned-root root))))
+
 (ert-deftest dorg-test-lease-integration-lease-roundtrip ()
   "End-to-end: acquire a lease, write via lease-batch and read via lease-exec on
 one exact server session, refuse ordinary SQL during the hold, and reuse the
@@ -526,7 +764,7 @@ warm connection after release.  Requires dolt + mysql.el; skips otherwise."
                 (dorg-sql--with-lease (lease dolt-dir)
                   (dorg-sql--lease-batch
                    lease
-                   (list "INSERT INTO headings (id, root_id, parent_id, sort_key, level, title) VALUES (1, 1, NULL, X'01', 0, 'Root')")
+                   (list "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, title) VALUES (1, 1, NULL, X'01', 0, 'Root')")
                    "lease insert")
                   (let ((rows (dorg-sql--lease-exec
                                lease "SELECT id, title FROM headings WHERE id = 1")))

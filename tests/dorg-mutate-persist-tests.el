@@ -122,6 +122,512 @@ or `dorg-api-error', or `:no-error' when THUNK returns normally."
      (let ((data (dorg-api-error-data err)))
        (cons (plist-get data :reason) (plist-get data :detail))))))
 
+(ert-deftest dorg-test-persist-saved-public-apply-holds-file-gate-at-rename ()
+  "A saved public apply holds the canonical sibling gate through rename."
+  (dorg-test-persist--with-dir dir
+    (let* ((file (dorg-test-persist--make-file dir))
+           (lock (expand-file-name
+                  (concat "." (file-name-nondirectory file) ".dorg-write.lock")
+                  dir))
+           (rename (symbol-function 'dorg-mutate--persist-rename))
+           (observed nil))
+      (cl-letf (((symbol-function 'dorg-mutate--persist-rename)
+                 (lambda (tmp target)
+                   (setq observed (file-symlink-p lock))
+                   (funcall rename tmp target))))
+        (should (eq t (plist-get (dorg-test-persist--apply file) :ok))))
+      (should (string-prefix-p "dorg-lock-v1:" observed))
+      (should-not (file-symlink-p lock)))))
+
+(ert-deftest dorg-test-persist-direct-commit-refuses-without-held-gate ()
+  "A direct saved plain commit cannot bypass the held file gate."
+  (dorg-test-persist--with-dir dir
+    (let* ((file (dorg-test-persist--make-file dir))
+           (before (dorg-test-persist--slurp file))
+           (baseline (dorg-mutate--persist-file-fingerprint file))
+           (committed (list nil)))
+      (should (equal '(invariant . file-gate-not-held)
+                     (dorg-test-persist--reason+detail
+                      (lambda ()
+                        (dorg-mutate--plain-org-commit
+                         file (string-as-unibyte "different bytes\n")
+                         baseline committed)))))
+      (should-not (car committed))
+      (should (equal before (dorg-test-persist--slurp file)))
+      (should-not (dorg-test-persist--temp-siblings dir)))))
+
+(ert-deftest dorg-test-persist-gate-wrapper-resolves-only-needed-source ()
+  "Dry-run and Dolt calls resolve once in the body, without gate preflight."
+  (dorg-test-persist--with-dir dir
+    (let* ((file (dorg-test-persist--make-file dir))
+           (plain (list :file file))
+           (dolt (list :dolt-dir dir :root-id 1))
+           (real (symbol-function 'dorg-mutate--resolve-source))
+           (resolutions 0))
+      (cl-letf (((symbol-function 'dorg-mutate--resolve-source)
+                 (lambda (source)
+                   (setq resolutions (1+ resolutions))
+                   (funcall real source)))
+                ((symbol-function 'dorg-file-lock-call)
+                 (lambda (&rest _) (ert-fail "non-plain path entered file gate"))))
+        (should (eq 'plain-org
+                    (dorg-mutate-source-kind
+                     (dorg-mutate--with-saved-plain-file-gate
+                      plain 'dry-run nil (lambda () (dorg-mutate--resolve-source plain))))))
+        (should (= 1 resolutions))
+        (setq resolutions 0)
+        (should (eq 'dolt
+                    (dorg-mutate-source-kind
+                     (dorg-mutate--with-saved-plain-file-gate
+                      dolt 'apply nil (lambda () (dorg-mutate--resolve-source dolt))))))
+        (should (= 1 resolutions))
+        (let* ((buffer (find-file-noselect file))
+               (registration
+                (make-dorg-registration
+                 :backend (dorg-backend-dolt dir 1)
+                 :file (file-truename file)))
+               (dorg--registry
+                (cons (cons (file-truename file) registration) dorg--registry)))
+          (unwind-protect
+              (progn
+                (setq resolutions 0)
+                (should (eq 'dolt
+                            (dorg-mutate-source-kind
+                             (dorg-mutate--with-saved-plain-file-gate
+                              buffer 'apply nil
+                              (lambda () (dorg-mutate--resolve-source buffer))))))
+                (should (= 1 resolutions)))
+            (when (buffer-live-p buffer)
+              (kill-buffer buffer))))))))
+
+(ert-deftest dorg-test-persist-live-holder-is-typed-without-owner-identity ()
+  "A held file gate gives a bounded public refusal without owner details."
+  (dorg-test-persist--with-dir dir
+    (let* ((file (dorg-test-persist--make-file dir))
+           (before (dorg-test-persist--slurp file))
+           (lock (dorg-file-lock-path file)))
+      (dorg-file-lock-call
+       lock 0
+       (lambda (_record)
+         (let ((result (dorg-test-persist--reason+detail
+                        (lambda ()
+                          (dorg-test-persist--apply file :lock-timeout 0)))))
+           (should (equal '(contended . live-holder) result))
+           (should (equal before (dorg-test-persist--slurp file))))))
+      (should-not (file-symlink-p lock)))))
+
+(ert-deftest dorg-test-persist-file-only-save-nil-and-direct-engine-contend ()
+  "A file-only source joins the gate even with :save nil or direct engine entry."
+  (dorg-test-persist--with-dir dir
+    (let* ((file (dorg-test-persist--make-file dir))
+           (source (list :file file))
+           (patches (dorg-api-normalize
+                     '(on (id 100) (set (property "A") "A")) source))
+           (before (dorg-test-persist--slurp file)))
+      (dorg-file-lock-call
+       (dorg-file-lock-path file) 0
+       (lambda (_record)
+         (should (equal '(contended . live-holder)
+                        (dorg-test-persist--reason+detail
+                         (lambda ()
+                           (dorg-test-persist--apply
+                            file :save nil :lock-timeout 0)))))
+         (should (equal '(contended . live-holder)
+                        (dorg-test-persist--reason+detail
+                         (lambda ()
+                           (dorg-mutate--apply-patches-internal
+                            source patches nil nil :lock-timeout 0)))))
+         (should (equal before (dorg-test-persist--slurp file))))))))
+
+(ert-deftest dorg-test-persist-contended-modified-visitor-keeps-exact-bytes ()
+  "A refused saved apply preserves a modified visitor and the destination."
+  (dorg-test-persist--with-dir dir
+    (let* ((file (dorg-test-persist--make-file dir))
+           (disk (dorg-test-persist--slurp file))
+           (buf (find-file-noselect file)))
+      (dorg-test-persist--apply file)
+      (let ((before (with-current-buffer buf (buffer-string))))
+        (should (buffer-modified-p buf))
+        (dorg-file-lock-call
+         (dorg-file-lock-path file) 0
+         (lambda (_record)
+           (should (equal '(contended . live-holder)
+                          (dorg-test-persist--reason+detail
+                           (lambda ()
+                             (dorg-api-execute
+                              '(on (id 200) (set (property "OWNER") "bob"))
+                              :mode 'apply :source (list :file file)
+                              :save t :lock-timeout 0)))))))
+        (should (equal before (with-current-buffer buf (buffer-string))))
+        (should (buffer-modified-p buf))
+        (should (equal disk (dorg-test-persist--slurp file)))))))
+
+(ert-deftest dorg-test-persist-other-file-writes-while-one-gate-held ()
+  "A held gate covers one canonical file, leaving another file independent."
+  (dorg-test-persist--with-dir dir
+    (let ((first (dorg-test-persist--make-file dir "first.org"))
+          (second (dorg-test-persist--make-file dir "second.org")))
+      (dorg-file-lock-call
+       (dorg-file-lock-path first) 0
+       (lambda (_record)
+         (should (eq t (plist-get (dorg-test-persist--apply second)
+                                  :ok)))
+         (should (string-match-p ":STATUS:[ \t]+DONE"
+                                 (dorg-test-persist--slurp second))))))))
+
+(ert-deftest dorg-test-persist-retargeted-source-alias-refuses-before-commit ()
+  "Retargeting a source symlink after key selection leaves both files intact."
+  (dorg-test-persist--with-dir dir
+    (let* ((first (dorg-test-persist--make-file dir "first.org"))
+           (second (dorg-test-persist--make-file dir "second.org"))
+           (alias (expand-file-name "alias.org" dir))
+           (before-first (dorg-test-persist--slurp first))
+           (before-second (dorg-test-persist--slurp second))
+           (write-temp (symbol-function 'dorg-mutate--persist-write-temp)))
+      (make-symbolic-link first alias)
+      (cl-letf (((symbol-function 'dorg-mutate--persist-write-temp)
+                 (lambda (&rest args)
+                   (prog1 (apply write-temp args)
+                     (delete-file alias)
+                     (make-symbolic-link second alias)))))
+        (should (equal '(stale . source-retargeted)
+                       (dorg-test-persist--reason+detail
+                        (lambda () (dorg-test-persist--apply alias))))))
+      (should (equal before-first (dorg-test-persist--slurp first)))
+      (should (equal before-second (dorg-test-persist--slurp second)))
+      (should (equal (file-truename second) (file-truename alias)))
+      (should-not (dorg-test-persist--temp-siblings dir)))))
+
+(ert-deftest dorg-test-persist-saved-visiting-symlink-keeps-buffer-coherent ()
+  "A saved alias visitor commits to its target and returns a reusable base."
+  (dorg-test-persist--with-dir dir
+    (let* ((file (dorg-test-persist--make-file dir))
+           (alias (expand-file-name "alias.org" dir)))
+      (make-symbolic-link file alias)
+      (let* ((buf (find-file-noselect alias))
+             (first (dorg-test-persist--apply alias :save t))
+             (base (plist-get first :new-token)))
+        (should (plist-get first :ok))
+        (should (file-symlink-p alias))
+        (should-not (buffer-modified-p buf))
+        (should (verify-visited-file-modtime buf))
+        (should (string-match-p ":STATUS:[ \t]+DONE"
+                                (dorg-test-persist--slurp file)))
+        (should
+         (plist-get
+          (dorg-api-execute '(on (id 200) (set (property "OWNER") "bob"))
+                            :mode 'apply :source (list :file alias)
+                            :base base :save t)
+          :ok))
+        (should (string-match-p ":OWNER:[ \t]+bob"
+                                (dorg-test-persist--slurp file)))))))
+
+(ert-deftest dorg-test-persist-nested-gates-reenter-only-same-held-file ()
+  "A held token permits same-file nesting and refuses a second file."
+  (dorg-test-persist--with-dir dir
+    (let ((first (dorg-test-persist--make-file dir "first.org"))
+          (second (dorg-test-persist--make-file dir "second.org")))
+      (should
+       (eq :inner
+           (dorg-mutate--with-saved-plain-file-gate
+            (list :file first) 'apply nil
+            (lambda ()
+              (should
+               (equal (file-symlink-p (dorg-file-lock-path first))
+                      (cadr dorg-mutate--held-plain-file-lock)))
+              (let ((err (should-error
+                          (dorg-mutate--with-saved-plain-file-gate
+                           (list :file second) 'apply nil #'ignore)
+                          :type 'dorg-mutate-error)))
+                (should (eq 'invariant (dorg-mutate-error-reason err)))
+                (should (eq 'nested-file-gate
+                            (plist-get (dorg-mutate-error-data err) :detail))))
+              (dorg-mutate--with-saved-plain-file-gate
+               (list :file first) 'apply nil (lambda () :inner))))))
+      (should-not (file-symlink-p (dorg-file-lock-path first)))
+      (should-not (file-symlink-p (dorg-file-lock-path second))))))
+
+(ert-deftest dorg-test-persist-saved-critical-section-does-not-yield ()
+  "A pending timer never runs while a saved plain writer holds its gate."
+  (dorg-test-persist--with-dir dir
+    (let* ((file (dorg-test-persist--make-file dir))
+           (real (symbol-function 'dorg-file-lock-call))
+           (armed 0)
+           (fired nil)
+           (held-at-fire nil)
+           (timer nil))
+      (unwind-protect
+          (progn
+            (cl-letf (((symbol-function 'dorg-file-lock-call)
+                       (lambda (lock timeout fn)
+                         (funcall real lock timeout
+                                  (lambda (record)
+                                    (setq armed (1+ armed))
+                                    (setq timer
+                                          (run-at-time
+                                           0 nil
+                                           (lambda ()
+                                             (setq fired t
+                                                   held-at-fire
+                                                   (and dorg-mutate--held-plain-file-lock
+                                                        t)))))
+                                    (funcall fn record))))))
+              (should (plist-get (dorg-test-persist--apply file) :ok)))
+            (sit-for 0.05)
+            (should (= 1 armed))
+            (should fired)
+            (should-not held-at-fire))
+        (when timer (cancel-timer timer))))))
+
+(ert-deftest dorg-test-persist-case-variant-alias-contends-on-folding-volume ()
+  "A verified case-folded local volume makes case variants share one gate."
+  (dorg-test-persist--with-dir dir
+    (let* ((file (dorg-test-persist--make-file dir "Case.org"))
+           (variant (expand-file-name "case.org" dir)))
+      (unless (file-equal-p file variant)
+        (ert-skip "fixture volume is case-sensitive"))
+      (dorg-file-lock-call
+       (dorg-file-lock-path file) 0
+       (lambda (_record)
+         (should (equal '(contended . live-holder)
+                        (dorg-test-persist--reason+detail
+                         (lambda ()
+                           (dorg-test-persist--apply
+                            variant :lock-timeout 0))))))))))
+
+(ert-deftest dorg-test-persist-relative-alias-shares-absolute-file-gate ()
+  "Relative and absolute descriptors select the same canonical file gate."
+  (dorg-test-persist--with-dir dir
+    (let* ((file (dorg-test-persist--make-file dir))
+           (default-directory dir))
+      (dorg-file-lock-call
+       (dorg-file-lock-path file) 0
+       (lambda (_record)
+         (should (equal '(contended . live-holder)
+                        (dorg-test-persist--reason+detail
+                         (lambda ()
+                           (dorg-test-persist--apply
+                            "beads.org" :lock-timeout 0))))))))))
+
+(ert-deftest dorg-test-persist-remote-plain-save-refuses-before-fs-access ()
+  "A remote plain saved source gets a typed refusal before truename or I/O."
+  (let* ((remote "/dorg-test-remote:source.org")
+         (operations nil)
+         (handler (lambda (operation &rest _args)
+                    (if (eq operation 'file-remote-p)
+                        "/dorg-test-remote:"
+                      (push operation operations)
+                      (error "Unexpected remote source operation: %s"
+                             operation))))
+         (file-name-handler-alist
+          (cons (cons "\\`/dorg-test-remote:" handler)
+                file-name-handler-alist))
+         (source (dorg-mutate--source-make :kind 'plain-org :file remote)))
+    (should (file-remote-p remote))
+    (should (equal '(unsupported . remote-file-gate)
+                   (dorg-test-persist--reason+detail
+                    (lambda ()
+                      (dorg-mutate--with-saved-plain-file-gate
+                       source 'apply nil #'ignore)))))
+    (should-not operations)))
+
+(ert-deftest dorg-test-persist-invalid-lock-timeout-is-typed ()
+  "An explicit invalid timeout is a typed refusal before a saved edit."
+  (dorg-test-persist--with-dir dir
+    (let* ((file (dorg-test-persist--make-file dir))
+           (before (dorg-test-persist--slurp file)))
+      (dolist (timeout '(-1 "3" nil))
+        (should (equal '(invalid-target . lock-timeout)
+                       (dorg-test-persist--reason+detail
+                        (lambda ()
+                          (dorg-test-persist--apply
+                           file :lock-timeout timeout)))))
+        (should (equal before (dorg-test-persist--slurp file)))))))
+
+(ert-deftest dorg-test-persist-dry-run-and-unsaved-buffer-skip-file-gate ()
+  "A dry run and an unsaved visitor edit proceed while a writer gate is held."
+  (dorg-test-persist--with-dir dir
+    (let* ((file (dorg-test-persist--make-file dir))
+           (buf (find-file-noselect file))
+           (lock (dorg-file-lock-path file)))
+      (dorg-file-lock-call
+       lock 0
+       (lambda (_record)
+         (should (eq t (plist-get
+                        (dorg-api-execute
+                         '(on (id 100) (set (property "STATUS") "DONE"))
+                         :mode 'dry-run :source (list :file file))
+                        :ok)))
+         (should (eq t (plist-get (dorg-test-persist--apply file)
+                                  :ok)))
+         (should (buffer-modified-p buf))))
+      (should-not (file-symlink-p lock)))))
+
+(defun dorg-test-persist--wait-for-file (path &optional seconds)
+  "Wait up to SECONDS for PATH, pumping child output; return its presence."
+  (let ((deadline (+ (float-time) (or seconds 15))))
+    (while (and (not (file-exists-p path)) (< (float-time) deadline))
+      (accept-process-output nil 0.05))
+    (file-exists-p path)))
+
+(defun dorg-test-persist--write-child
+    (script file key result &optional ready release base timeout started)
+  "Write a fresh child SCRIPT applying KEY on FILE to RESULT.
+When READY and RELEASE are non-nil, pause immediately before commit.
+BASE and TIMEOUT configure a waiting writer; STARTED marks its attempt."
+  (let* ((form `(on (id 100) (set (property ,key) ,key)))
+         (apply-form
+          `(progn
+             ,(when started `(with-temp-file ,started (insert "started")))
+             (condition-case err
+                 (let ((response (dorg-api-execute
+                                  ',form :mode 'apply :source (list :file ,file)
+                                  :lock-timeout ,(or timeout 0.2)
+                                  ,@(when base (list :base `',base)))))
+                   (with-temp-file ,result
+                     (prin1 (list :status 'ok :ack (plist-get response :ok))
+                            (current-buffer))))
+               (dorg-error
+                (with-temp-file ,result
+                  (prin1 (list :status 'refused
+                               :reason (dorg-error-reason err)
+                               :detail (plist-get (dorg-error-data err) :detail))
+                         (current-buffer)))))))
+         (body
+          (if ready
+              `(let ((rename (symbol-function 'dorg-mutate--persist-rename)))
+                 (cl-letf (((symbol-function 'dorg-mutate--persist-rename)
+                            (lambda (tmp target)
+                              (with-temp-file ,ready (insert "ready"))
+                              (let ((deadline (+ (float-time) 15)))
+                                (while (and (not (file-exists-p ,release))
+                                            (< (float-time) deadline))
+                                  (sleep-for 0.02)))
+                              (unless (file-exists-p ,release)
+                                (error "test release barrier expired"))
+                              (funcall rename tmp target))))
+                   ,apply-form))
+            apply-form)))
+    (with-temp-file script
+      (insert ";;; -*- lexical-binding: t; -*-\n"
+              "(require 'cl-lib)\n(require 'dorg-api)\n"
+              (prin1-to-string body) "\n"))))
+
+(defun dorg-test-persist--read-child-result (path)
+  "Read the one result plist in PATH without reader evaluation."
+  (with-temp-buffer
+    (insert-file-contents path)
+    (read (current-buffer))))
+
+(ert-deftest dorg-test-persist-two-process-alias-contention-and-serial-success ()
+  "Two saved writers via target and symlink cannot both ACK a lost update."
+  (dorg-test-persist--with-dir dir
+    (let* ((file (dorg-test-persist--make-file dir))
+           (alias (expand-file-name "alias.org" dir))
+           (ready (expand-file-name "ready" dir))
+           (release (expand-file-name "release" dir))
+           (a-script (expand-file-name "a.el" dir))
+           (b-script (expand-file-name "b.el" dir))
+           (a-result (expand-file-name "a.result" dir))
+           (b-result (expand-file-name "b.result" dir))
+           (emacs (expand-file-name invocation-name invocation-directory))
+           (root (file-name-directory (locate-library "dorg-mutate")))
+           (a-buffer (generate-new-buffer " *dorg-lock-child-a*"))
+           (b-buffer (generate-new-buffer " *dorg-lock-child-b*"))
+           (a nil) (b nil))
+      (make-symbolic-link file alias)
+      (dorg-test-persist--write-child a-script file "A" a-result ready release)
+      (dorg-test-persist--write-child b-script alias "B" b-result)
+      (unwind-protect
+          (progn
+            (setq a (make-process :name "dorg-lock-a" :buffer a-buffer
+                                  :command (list emacs "-Q" "-L" root "--batch"
+                                                 "-l" a-script)))
+            (should (dorg-test-persist--wait-for-file ready))
+            (should (file-symlink-p (dorg-file-lock-path file)))
+            (setq b (make-process :name "dorg-lock-b" :buffer b-buffer
+                                  :command (list emacs "-Q" "-L" root "--batch"
+                                                 "-l" b-script)))
+            (should (dorg-test-persist--wait-for-file b-result))
+            (should (equal '(:status refused :reason contended
+                            :detail live-holder)
+                           (dorg-test-persist--read-child-result b-result)))
+            (should-not (string-match-p ":B:" (dorg-test-persist--slurp file)))
+            (with-temp-file release (insert "release"))
+            (should (dorg-test-persist--wait-for-file a-result))
+            (should (equal '(:status ok :ack t)
+                           (dorg-test-persist--read-child-result a-result)))
+            (should (string-match-p ":A:[ \t]+A" (dorg-test-persist--slurp file)))
+            (should-not (string-match-p ":B:" (dorg-test-persist--slurp file)))
+            ;; The same alias succeeds after A releases.  Both ACKed edits
+            ;; survive and the symlink still points at the canonical target.
+            (delete-file b-result)
+            (setq b (make-process :name "dorg-lock-b-serial" :buffer b-buffer
+                                  :command (list emacs "-Q" "-L" root "--batch"
+                                                 "-l" b-script)))
+            (should (dorg-test-persist--wait-for-file b-result))
+            (should (equal '(:status ok :ack t)
+                           (dorg-test-persist--read-child-result b-result)))
+            (should (file-symlink-p alias))
+            (should (string-match-p ":A:[ \t]+A" (dorg-test-persist--slurp file)))
+            (should (string-match-p ":B:[ \t]+B" (dorg-test-persist--slurp file)))
+            (should-not (dorg-test-persist--temp-siblings dir)))
+        (when (process-live-p a) (delete-process a))
+        (when (process-live-p b) (delete-process b))
+        (kill-buffer a-buffer)
+        (kill-buffer b-buffer)))))
+
+(ert-deftest dorg-test-persist-waiting-public-base-refuses-after-holder-commit ()
+  "A waiter validates its explicit base after acquiring the released gate."
+  (dorg-test-persist--with-dir dir
+    (let* ((file (dorg-test-persist--make-file dir))
+           (preview (dorg-api-execute
+                     '(on (id 100) (set (property "B") "B"))
+                     :mode 'dry-run :source (list :file file)))
+           (base (plist-get preview :base))
+           (ready (expand-file-name "a.ready" dir))
+           (release (expand-file-name "a.release" dir))
+           (started (expand-file-name "b.started" dir))
+           (a-script (expand-file-name "a.el" dir))
+           (b-script (expand-file-name "b.el" dir))
+           (a-result (expand-file-name "a.result" dir))
+           (b-result (expand-file-name "b.result" dir))
+           (emacs (expand-file-name invocation-name invocation-directory))
+           (root (file-name-directory (locate-library "dorg-mutate")))
+           (a-buffer (generate-new-buffer " *dorg-base-child-a*"))
+           (b-buffer (generate-new-buffer " *dorg-base-child-b*"))
+           (a nil) (b nil))
+      (dorg-test-persist--write-child a-script file "A" a-result ready release)
+      (dorg-test-persist--write-child
+       b-script file "B" b-result nil nil base 3 started)
+      (unwind-protect
+          (progn
+            (setq a (make-process :name "dorg-base-a" :buffer a-buffer
+                                  :command (list emacs "-Q" "-L" root "--batch"
+                                                 "-l" a-script)))
+            (should (dorg-test-persist--wait-for-file ready))
+            (setq b (make-process :name "dorg-base-b" :buffer b-buffer
+                                  :command (list emacs "-Q" "-L" root "--batch"
+                                                 "-l" b-script)))
+            (should (dorg-test-persist--wait-for-file started))
+            (sleep-for 0.1)
+            (should-not (file-exists-p b-result))
+            (with-temp-file release (insert "release"))
+            (should (dorg-test-persist--wait-for-file a-result))
+            (should (dorg-test-persist--wait-for-file b-result))
+            (should (equal '(:status ok :ack t)
+                           (dorg-test-persist--read-child-result a-result)))
+            (should (equal '(:status refused :reason stale
+                            :detail base-revision)
+                           (dorg-test-persist--read-child-result b-result)))
+            (should (string-match-p ":A:[ \t]+A" (dorg-test-persist--slurp file)))
+            (should-not (string-match-p ":B:" (dorg-test-persist--slurp file)))
+            (should-not (dorg-test-persist--temp-siblings dir)))
+        (when (and a (process-live-p a)) (delete-process a))
+        (when (and b (process-live-p b)) (delete-process b))
+        (kill-buffer a-buffer)
+        (kill-buffer b-buffer)))))
+
 (defun dorg-test-persist--replace-equal-stat (file)
   "Replace FILE with same-size different bytes and restore its mtime.
 Returns the replacement bytes.  After this, stat (size+mtime) is
@@ -546,6 +1052,38 @@ corrupt bytes with no refusal."
     (should-not (multibyte-string-p bytes))
     (should (equal "café ☕\n" (decode-coding-string bytes 'utf-8-unix)))))
 
+(ert-deftest dorg-test-persist-file-refuses-mixed-eol-entry-bytes ()
+  "A file whose raw EOL bytes cannot round-trip refuses before any write.
+
+The source deliberately mixes CRLF and LF.  Decoding selects one EOL
+conversion, so re-encoding would rewrite an untouched line.  The file-source
+entry guard must therefore return `(stale . stale-at-entry)', retain the exact
+raw bytes, and leave no persistence temp sibling.
+
+RED reason: without `dorg-mutate--persist-decode-faithful'\''s raw-byte
+comparison the apply proceeds and normalizes one of the two line endings."
+  (dorg-test-persist--with-dir dir
+    (let* ((file (expand-file-name "mixed-eol.org" dir))
+           ;; CRLF dominates, so detection chooses DOS; the final bare LF is
+           ;; then the byte whose normalization must make entry fail closed.
+           (raw (string-to-unibyte
+                 "* TODO Alpha\r\n:PROPERTIES:\r\n:DORG_ID: 100\r\n:END:\r\nbody alpha\n")))
+      (let ((coding-system-for-write 'no-conversion))
+        (write-region raw nil file nil 'silent))
+      (let ((before (dorg-test-persist--slurp file)))
+        (should (equal raw before))
+        ;; This is the earliest raw-file gate, before a parser is allowed to
+        ;; interpret mixed-EOL text.  A public target lookup may itself be
+        ;; unable to recognize a mixed-EOL drawer; that earlier `missing'
+        ;; refusal would not prove this byte-fidelity branch.
+        (should (equal '(stale . stale-at-entry)
+                       (dorg-test-persist--reason+detail
+                        (lambda ()
+                          (dorg-mutate--persist-decode-faithful
+                           (dorg-mutate--persist-file-read file))))))
+        (should (equal before (dorg-test-persist--slurp file)))
+        (should-not (dorg-test-persist--temp-siblings dir))))))
+
 (ert-deftest dorg-test-persist-file-baseline-tied-to-single-read ()
   "The file-source commit baseline is the fingerprint of the SAME single read
 that produced the decoded work text — NOT a separate disk read.  When that one
@@ -636,25 +1174,25 @@ and swallowed."
       (should (equal before (dorg-test-persist--slurp file)))
       (should-not (dorg-test-persist--temp-siblings dir)))))
 
-(ert-deftest dorg-test-persist-file-non-roundtrip-raw-refused ()
-  "A file whose EXACT on-disk bytes cannot byte-round-trip under their coding
-\(here CRLF, whose normalized re-encode is unix) is refused (stale .
-stale-at-entry) BEFORE any mutation rather than silently rewriting every line
-ending; the file survives byte-identical.
-RED reason (text-level round-trip only): decode(encode text)==text holds for a
-CRLF file (EOL is canonicalized into the text), so the executor would re-encode
-and rewrite all line endings."
+(ert-deftest dorg-test-persist-file-crlf-nonconstructor-write-preserves-eol ()
+  "A generic existing-property write retains CRLF bytes.
+This is deliberately not a constructor path: the detected undecided-DOS
+coding must survive every plain-file persistence caller.  It turns RED if the
+detected EOL is normalized to unix before the faithful encoder runs."
   (dorg-test-persist--with-dir dir
     (let* ((file (expand-file-name "crlf.org" dir))
            (raw (concat "* TODO Alpha\r\n:PROPERTIES:\r\n:DORG_ID: 100\r\n"
                         ":END:\r\nbody\r\n")))
       (let ((coding-system-for-write 'no-conversion))
         (write-region raw nil file nil 'silent))
-      (let ((before (dorg-test-persist--slurp file)))
-        (should (equal '(stale . stale-at-entry)
-                       (dorg-test-persist--reason+detail
-                        (lambda () (dorg-test-persist--apply file)))))
-        (should (equal before (dorg-test-persist--slurp file)))))))
+      (let ((response (dorg-test-persist--apply file))
+            (after (dorg-test-persist--slurp file)))
+        (should (plist-get response :ok))
+        (should (string-match-p ":STATUS:" after))
+        ;; Any surviving bare LF proves the complete disk image was rewritten
+        ;; with mixed or unix endings instead of detected CRLF.
+        (should-not (string-match-p "\n"
+                                    (replace-regexp-in-string "\r\n" "" after)))))))
 
 (ert-deftest dorg-test-persist-save-nil-touches-no-destination-seam ()
   "A live-buffer `:save nil' apply performs NO destination I/O: EVERY persist

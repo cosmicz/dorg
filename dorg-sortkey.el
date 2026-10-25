@@ -1,4 +1,4 @@
-;;; dorg-sortkey.el --- Fractional sort key operations -*- lexical-binding: t; -*-
+;;; dorg-sortkey.el --- Fixed-width fractional sort keys -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026
 
@@ -6,199 +6,71 @@
 
 ;;; Commentary:
 
-;; Sort keys are unibyte strings representing positions in a
-;; VARBINARY(64) column.  They compare lexicographically with
-;; `string<' and are emitted as SQL hex literals (X'01ff' etc).
+;; Sort keys are unibyte strings stored in a VARBINARY(64) column.
+;; They compare lexicographically with `string<' and are emitted as
+;; SQL hex literals (X'01ff' etc).
 ;;
-;; The midpoint algorithm computes a key strictly between two
-;; neighbors, extending the byte length only when adjacent keys
-;; have no room at the current depth.  This gives O(log N)
-;; key growth for repeated bisection.
+;; Allocation works in one fixed-width coordinate domain: every key
+;; this module allocates is exactly `dorg-sortkey-boundary-width' (16)
+;; bytes, read as a big-endian unsigned integer.  Equal-width unsigned
+;; order is bytewise lexicographic order, so integer arithmetic on the
+;; domain is order arithmetic on the column.
 ;;
-;; Public API:
-;; - `dorg-sortkey-midpoint'         — key strictly between A and B
-;; - `dorg-sortkey-midpoint-limited' — midpoint that signals on exhaustion
-;; - `dorg-sortkey-from-integer'     — convert 1-based integer to key
-;; - `dorg-sortkey-to-hex'           — emit SQL hex literal
-;; - `dorg-sortkey-from-hex'         — parse hex string to unibyte key
+;; Stored keys of any other length up to `dorg-sortkey-max-bytes'
+;; remain valid neighbours: earlier allocators produced 1..64-byte
+;; keys, and `dorg-sortkey-bounds' derives the integer interval
+;; strictly between two arbitrary-length keys from their 16-byte
+;; prefixes.  Every key allocated inside that interval sorts strictly
+;; between the original byte strings; the proof is in the docstring of
+;; `dorg-sortkey-bounds'.  Legacy keys migrate to the fixed width only
+;; when a rebalance touches them; nothing rewrites them on its own.
 ;;
-;; Storage budget: keys live in a VARBINARY(64) column (see
-;; `dorg-schema.el').  Repeated bisection of a narrow gap grows the
-;; byte length, so a newly allocated midpoint can approach the column
-;; limit.  `dorg-sortkey-midpoint-limited' refuses to allocate at the
-;; boundary and signals `dorg-sortkey-exhausted', letting callers
-;; rebalance the affected sibling group instead of writing an overlong
-;; or truncated key.
+;; Entry points:
+;; - `dorg-sortkey-first-key'   — the canonical centre for an empty group
+;; - `dorg-sortkey-step-after'  — pure tail allocation, one step up
+;; - `dorg-sortkey-step-before' — pure head allocation, one step down
+;; - `dorg-sortkey-bounds'      — open integer interval between two keys
+;; - `dorg-sortkey-spread'      — COUNT evenly spaced keys inside an interval
+;; - `dorg-sortkey-from-integer' — explicit small keys (imports, fixtures)
+;; - `dorg-sortkey-to-hex' / `dorg-sortkey-from-hex' — SQL hex literals
+;;
+;; Steps are multiples of `dorg-sortkey-boundary-step' (2^64), so from
+;; the centre the tail has 2^63-1 steps of headroom (the DOrg ID
+;; domain, see `dorg-test-sortkey-boundary-capacity-covers-id-domain')
+;; and every step leaves 64 bits of room below it for interior
+;; placement.  `dorg-sortkey-exhausted' is signalled only when the
+;; requested interval cannot hold the requested keys — the caller
+;; widens its window — or when a step would leave the domain, which
+;; fails closed rather than wrap, truncate or widen the column.
 
 ;;; Code:
 
 (require 'cl-lib)
 
-;;; Storage Limits
+;;; Constants
 
 (defconst dorg-sortkey-max-bytes 64
-  "Maximum sort-key length in bytes.
-Matches the VARBINARY(64) storage contract for the sort_key columns
-in `dorg-schema.el'.  Keys longer than this cannot be stored without
-truncation or error.")
+  "Maximum stored sort-key length in bytes.
+Matches the VARBINARY(64) storage contract for the sort_key columns in
+`dorg-schema.el'.  `dorg-sql-gen--sort-key-hex' refuses anything longer.")
 
-(defconst dorg-sortkey-rebalance-threshold 64
-  "Byte length at which a newly allocated midpoint triggers rebalance.
-A fresh midpoint candidate whose length reaches this threshold is
-treated as exhausted: it sits at the storage cliff edge and must not
-be assigned.  Callers rebalance the sibling group instead.  Existing
-keys read from the DB up to `dorg-sortkey-max-bytes' remain valid.")
+(defconst dorg-sortkey-boundary-width 16
+  "Byte width of every key this module allocates.")
+
+(defconst dorg-sortkey-boundary-step (ash 1 64)
+  "Numeric step used by head and tail allocation.")
+
+(defconst dorg-sortkey-boundary-center (ash 1 127)
+  "Canonical first key of an empty group.
+This is exactly the 16-byte zero-padding of the legacy X'80' key.")
+
+(defconst dorg-sortkey-boundary-max (1- (ash 1 128))
+  "Maximum unsigned value in the allocation domain.")
 
 (define-error 'dorg-sortkey-exhausted
-  "Sort-key midpoint allocation reached the storage budget")
+  "Sort-key allocation has no room in the requested interval")
 
-;;; Midpoint Algorithm
-
-(defun dorg-sortkey-midpoint (a b)
-  "Return a unibyte string strictly between A and B.
-A and B are unibyte strings compared lexicographically.
-A = nil means \"before everything\", B = nil means \"after everything\".
-Signals an error if A >= B (when both are non-nil)."
-  (cond
-   ;; Both nil — return a default key
-   ((and (null a) (null b))
-    (unibyte-string #x80))
-   ;; A is nil — return something before B
-   ((null a)
-    (dorg-sortkey--before b))
-   ;; B is nil — return something after A
-   ((null b)
-    (dorg-sortkey--after a))
-   ;; Both present
-   (t
-    (unless (string< a b)
-      (error "dorg-sortkey-midpoint: A must be < B, got A=%s B=%s"
-             (dorg-sortkey-to-hex a) (dorg-sortkey-to-hex b)))
-    (dorg-sortkey--between a b))))
-
-(defun dorg-sortkey-midpoint-limited (a b)
-  "Return a key strictly between A and B, signalling on exhaustion.
-Like `dorg-sortkey-midpoint', but when the allocated key reaches
-`dorg-sortkey-rebalance-threshold' bytes it signals
-`dorg-sortkey-exhausted' (with the candidate length as data) instead
-of returning a key at the storage cliff edge.  Callers should rebalance
-the affected sibling group on this signal.
-
-Argument and ordering errors from `dorg-sortkey-midpoint' propagate
-unchanged — only the boundary condition raises `dorg-sortkey-exhausted'."
-  (let ((key (dorg-sortkey-midpoint a b)))
-    (if (>= (length key) dorg-sortkey-rebalance-threshold)
-        (signal 'dorg-sortkey-exhausted (list (length key)))
-      key)))
-
-(defun dorg-sortkey--before (b)
-  "Return a key before B.
-If B's first byte > 1, halve it.  Otherwise prepend and halve."
-  (let ((b0 (aref b 0)))
-    (if (> b0 1)
-        (unibyte-string (/ b0 2))
-      ;; B starts with \x01 or \x00 — extend: midpoint of "" and B
-      ;; at depth 1+
-      (let ((extended-b (dorg-sortkey--pad b (1+ (length b)))))
-        (dorg-sortkey--between (make-string (length extended-b) 0)
-                               extended-b)))))
-
-(defun dorg-sortkey--after (a)
-  "Return a key after A.
-Increment the trailing byte if room, otherwise extend with \\x80."
-  (let* ((len (length a))
-         (last-byte (aref a (1- len))))
-    (if (< last-byte #xff)
-        ;; Room to increment — midpoint between A and A-with-last-byte-FF
-        (let ((result (copy-sequence a)))
-          (aset result (1- len)
-                (+ last-byte (/ (- #xff last-byte) 2)
-                   (if (= (- #xff last-byte) 1) 1 0)))
-          ;; Ensure we actually moved past A
-          (if (string< a result)
-              result
-            ;; Edge: last-byte is #xfe — extend
-            (concat a (unibyte-string #x80))))
-      ;; Last byte is #xff — extend
-      (concat a (unibyte-string #x80)))))
-
-(defun dorg-sortkey--between (a b)
-  "Return a key strictly between A and B, both non-nil, A < B.
-Works byte-by-byte, extending depth when adjacent."
-  (let* ((max-len (max (length a) (length b)))
-         (pa (dorg-sortkey--pad a max-len))
-         (pb (dorg-sortkey--pad b max-len))
-         (result nil)
-         (found nil)
-         (i 0))
-    ;; Walk shared prefix, find first differing position
-    (while (and (< i max-len) (not found))
-      (let ((ba (aref pa i))
-            (bb (aref pb i)))
-        (if (= ba bb)
-            ;; Same byte — emit and continue
-            (progn (push ba result) (cl-incf i))
-          ;; Different — compute midpoint
-          (let ((mid (/ (+ ba bb) 2)))
-            (if (> mid ba)
-                ;; Room between — take midpoint
-                (progn (push mid result) (setq found t))
-              ;; Adjacent bytes (bb = ba+1) — emit ba and recurse deeper
-              (push ba result)
-              (cl-incf i)
-              ;; Now we need midpoint between a[i..] (padded with 0x00)
-              ;; and b[i..] (padded with 0x00, but b diverged so it's
-              ;; effectively 0x00..0x00 from b's perspective since bb > ba+1
-              ;; is impossible here)
-              ;; Actually: a = ...ba XX YY, b = ...(ba+1) 00 00
-              ;; We emitted ba, now need between a[i:] and "\xff..."
-              ;; because anything starting with ba and then > a[i:] but
-              ;; starting with ba is < b (which starts with ba+1)
-              (let* ((remaining-len (max 1 (- max-len i)))
-                     (sub-a (dorg-sortkey--pad
-                             (if (< i (length a))
-                                 (substring a i)
-                               "")
-                             remaining-len))
-                     ;; Upper bound is all 0x00 from b's side, but in
-                     ;; our prefix context that means anything up to \xff..\xff
-                     (sub-b (make-string remaining-len #xff))
-                     (sub-mid (dorg-sortkey--between-bytes sub-a sub-b)))
-                (dolist (byte sub-mid) (push byte result))
-                (setq found t)))))))
-    (unless found
-      ;; All bytes equal up to max-len — extend: midpoint between
-      ;; pa+\x00 and pb+\x00 but pa < pb only at extension
-      ;; This means they were equal at max-len but a < b, so a must
-      ;; be shorter.  Extend with \x80.
-      (push #x80 result))
-    (apply #'unibyte-string (nreverse result))))
-
-(defun dorg-sortkey--between-bytes (a b)
-  "Return list of bytes for a key between unibyte strings A and B.
-A < B must hold.  Returns a list of byte values."
-  (let ((len (max (length a) (length b)))
-        (result nil)
-        (found nil)
-        (i 0))
-    (let ((pa (dorg-sortkey--pad a len))
-          (pb (dorg-sortkey--pad b len)))
-      (while (and (< i len) (not found))
-        (let ((ba (aref pa i))
-              (bb (aref pb i)))
-          (if (= ba bb)
-              (progn (push ba result) (cl-incf i))
-            (let ((mid (/ (+ ba bb) 2)))
-              (if (> mid ba)
-                  (progn (push mid result) (setq found t))
-                ;; Adjacent — emit ba, extend
-                (push ba result)
-                (cl-incf i)
-                (push #x80 result)
-                (setq found t)))))))
-    (unless found
-      (push #x80 result))
-    (nreverse result)))
+;;; Coordinate transform
 
 (defun dorg-sortkey--pad (s len)
   "Pad unibyte string S with null bytes to LEN.  Truncates if longer."
@@ -208,23 +80,36 @@ A < B must hold.  Returns a list of byte values."
      ((> slen len) (substring s 0 len))
      (t (concat s (make-string (- len slen) 0))))))
 
-;;; Conversion Utilities
+(defun dorg-sortkey-int16 (key)
+  "Return the 16-byte prefix of KEY, zero-padded if shorter, as an integer.
+This is a coordinate, not key identity: a key longer than the width shares
+the coordinate of its first 16 bytes, and a shorter key shares it with its
+zero padding.  `dorg-sortkey-bounds' accounts for both."
+  (let ((n 0)
+        (padded (dorg-sortkey--pad key dorg-sortkey-boundary-width)))
+    (dotimes (index dorg-sortkey-boundary-width)
+      (setq n (+ (ash n 8) (aref padded index))))
+    n))
 
-(defun dorg-sortkey-width-for-count (count)
-  "Return minimum byte width needed to encode COUNT ordinals (1..COUNT)."
-  (cond ((<= count 255) 1)
-        ((<= count 65535) 2)
-        ((<= count 16777215) 3)
-        (t 4)))
+(defun dorg-sortkey-encode (n)
+  "Encode unsigned integer N as an exactly 16-byte sort key.
+Signals `dorg-sortkey-exhausted' outside the domain."
+  (unless (and (integerp n) (<= 0 n dorg-sortkey-boundary-max))
+    (signal 'dorg-sortkey-exhausted (list n)))
+  (let ((bytes nil)
+        (x n))
+    (dotimes (_ dorg-sortkey-boundary-width)
+      (push (logand x #xff) bytes)
+      (setq x (ash x -8)))
+    (apply #'unibyte-string bytes)))
 
 (defun dorg-sortkey-from-integer (n &optional width)
-  "Convert positive integer N to a big-endian unibyte sort key.
-WIDTH is the number of bytes; auto-computed from N when nil.
-All siblings in a group should use the same WIDTH for correct
-`string<' ordering."
+  "Convert positive integer N to a big-endian unibyte sort key of WIDTH bytes.
+WIDTH defaults to the smallest width that holds N.  This is the constructor
+for small explicit keys (import ordinals, fixtures); allocation never uses it."
   (unless (and (integerp n) (>= n 1))
     (error "dorg-sortkey-from-integer: N must be positive, got %S" n))
-  (let ((w (or width (dorg-sortkey-width-for-count n))))
+  (let ((w (or width (max 1 (ceiling (/ (log (1+ n)) (log 256)))))))
     (unless (<= n (1- (ash 1 (* w 8))))
       (error "dorg-sortkey-from-integer: N=%d does not fit in %d bytes" n w))
     (let ((bytes nil))
@@ -232,6 +117,93 @@ All siblings in a group should use the same WIDTH for correct
         (push (logand n #xff) bytes)
         (setq n (ash n -8)))
       (apply #'unibyte-string bytes))))
+
+;;; Bounds
+
+(defun dorg-sortkey-bounds (left right)
+  "Return (LO . HI), the integers whose keys sort strictly between LEFT and RIGHT.
+LEFT and RIGHT are stored keys of any length, or nil for an open end.  LO is
+the smallest coordinate whose 16-byte key sorts after LEFT and HI the largest
+whose key sorts before RIGHT; LO > HI means the interval is empty.
+
+Proof.  Let p be the 16-byte prefix of LEFT, zero-padded when LEFT is shorter.
+A 16-byte key K with int(K) > int(p) first differs from p at a byte i < 16
+where K[i] > p[i].  If i lies inside LEFT, K[i] > LEFT[i] and K sorts after
+LEFT; if i lies in the padding, K agrees with the whole of LEFT and is longer,
+which also sorts after.  K = p itself is excluded because it is a proper
+prefix of a longer LEFT.  For RIGHT: when RIGHT is longer than 16 bytes, p is
+a proper prefix of RIGHT and sorts before it, so int(K) <= int(p) suffices;
+otherwise p is RIGHT zero-padded, which sorts at or after RIGHT, so K needs
+int(K) < int(p).  Hence every key in [LO, HI] sorts strictly between the
+original byte strings, whatever their lengths."
+  (cons (if left (1+ (dorg-sortkey-int16 left)) 1)
+        (cond ((null right) dorg-sortkey-boundary-max)
+              ((> (length right) dorg-sortkey-boundary-width)
+               (dorg-sortkey-int16 right))
+              (t (1- (dorg-sortkey-int16 right))))))
+
+;;; Head and tail steps
+
+(defun dorg-sortkey-first-key ()
+  "Return the canonical first key of an empty group."
+  (dorg-sortkey-encode dorg-sortkey-boundary-center))
+
+(defun dorg-sortkey-step-after (left)
+  "Return the first step-aligned key strictly after stored key LEFT.
+The result is exactly 16 bytes.  Signals `dorg-sortkey-exhausted' when the
+step would leave the domain."
+  (let* ((lo (car (dorg-sortkey-bounds left nil)))
+         (step dorg-sortkey-boundary-step)
+         (n (* step (/ (+ lo step -1) step))))
+    (when (> n dorg-sortkey-boundary-max)
+      (signal 'dorg-sortkey-exhausted (list n)))
+    (dorg-sortkey-encode n)))
+
+(defun dorg-sortkey-step-before (right)
+  "Return the last step-aligned key strictly before stored key RIGHT.
+The result is exactly 16 bytes.  Signals `dorg-sortkey-exhausted' when the
+step would leave the domain."
+  (let* ((hi (cdr (dorg-sortkey-bounds nil right)))
+         (step dorg-sortkey-boundary-step))
+    (when (< hi 0)
+      (signal 'dorg-sortkey-exhausted (list hi)))
+    (dorg-sortkey-encode (* step (/ hi step)))))
+
+;;; Spread
+
+(defun dorg-sortkey-spread (count lo hi &optional occupied)
+  "Return COUNT strictly increasing 16-byte keys evenly spaced inside [LO, HI].
+OCCUPIED is a hash set (test `equal') of keys the result must not equal; a
+candidate that hits an occupied key moves up one unit at a time.  With M
+occupied keys inside the interval the spacing is at least M + 2 units, so at
+most M moves are ever needed and the moved key still sorts strictly below the
+next candidate and inside the interval.  Occupied keys outside the interval
+cost nothing.  Signals `dorg-sortkey-exhausted' when the interval
+cannot hold COUNT keys at that spacing.  COUNT of zero returns nil."
+  (unless (and (integerp count) (>= count 0))
+    (error "dorg-sortkey-spread: COUNT must be non-negative, got %S" count))
+  (when (> count 0)
+    (let* ((cap (1+ (- hi lo)))
+           (inside 0)
+           (margin (progn
+                     (when occupied
+                       (maphash (lambda (key _)
+                                  (when (<= lo (dorg-sortkey-int16 key) hi)
+                                    (cl-incf inside)))
+                                occupied))
+                     (+ 2 inside)))
+           (gap (and (> cap 0) (/ cap (1+ count)))))
+      (when (or (null gap) (< gap margin))
+        (signal 'dorg-sortkey-exhausted (list count cap)))
+      (cl-loop for i from 1 to count
+               collect (let* ((n (+ lo (* i gap)))
+                              (key (dorg-sortkey-encode n)))
+                         (while (and occupied (gethash key occupied))
+                           (setq n (1+ n)
+                                 key (dorg-sortkey-encode n)))
+                         key)))))
+
+;;; Conversion utilities
 
 (defun dorg-sortkey-to-hex (key)
   "Return SQL hex literal for unibyte string KEY.  E.g. X'01ff'."

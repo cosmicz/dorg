@@ -1,0 +1,8 @@
+* Task
+:PROPERTIES:
+:DORG_ID: 1001
+:END:
+#+K: first
+A
+#+K: second
+B

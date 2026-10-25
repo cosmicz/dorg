@@ -123,7 +123,7 @@
           (let* ((reg (dorg--classify-registration))
                  (root-id (dorg-backend-root-id (dorg-registration-backend reg)))
                  (rows (dorg-sql dolt-dir
-                         (format "SELECT title FROM headings WHERE root_id = %d AND level > 0"
+                         (format "SELECT title FROM headings WHERE root_id = %d AND level_offset > 0"
                                  root-id))))
             (should (= (length rows) 1))
             (should (equal (alist-get 'title (car rows))

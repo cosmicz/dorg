@@ -46,6 +46,8 @@
 
 (define-error 'dorg-error "dorg operation failed")
 
+(define-error 'dorg-owner-refusal "DOrg metadata owner refused" 'dorg-error)
+
 (define-error 'dorg-seam-install-error
   "DOrg dependency seam installation refused"
   'dorg-error)

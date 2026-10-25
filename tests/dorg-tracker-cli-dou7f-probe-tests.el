@@ -95,7 +95,7 @@ the public API, rather than inferring it from grammar text."
      :capabilities '(dolt)
      :read-tables '((:name "dou7f_probe" :key-column "heading_id"))
      :project #'dorg-test-dou7f--project)
-    (dorg-repo-ensure-extensions dolt-dir)
+    (dorg-migrate-schema dolt-dir)
     (dorg-commit dolt-dir "install dou7f probe extension")
     (let* ((root
             (dorg-test-dou7f--seed
@@ -124,7 +124,7 @@ the public API, rather than inferring it from grammar text."
                   (set (heading todo) "IMPL")
                   (set (property "BEAD_ASSIGNED") "driver")
                   (set (property "BEAD_BRANCH_ORIGIN") "SPEC")
-                  (insert (drawer-line "LOGBOOK" (occurrence 1))
+                  (insert (drawer-line "LOGBOOK")
                           (before-first) "- State \\\"IMPL\\\" from \\\"REVIEW\\\""))
               (on (id ,notes)
                   (insert (text) (after-last) "Appended note."))
@@ -182,7 +182,7 @@ and extension projection must commit together exactly once."
      :capabilities '(dolt)
      :read-tables '((:name "dou7f_probe" :key-column "heading_id"))
      :project #'dorg-test-dou7f--project)
-    (dorg-repo-ensure-extensions dolt-dir)
+    (dorg-migrate-schema dolt-dir)
     (dorg-commit dolt-dir "install dou7f rich probe extension")
     (let* ((dorg-api-broad-write-threshold 1)
            (root (dorg-test-dou7f--seed

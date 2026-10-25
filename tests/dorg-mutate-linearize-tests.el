@@ -86,9 +86,9 @@ is a genuinely independent session for cross-session GET_LOCK exclusion proof."
 
 (defun dorg-test-lin--commit-evidence (lease op-id gen-id digest ts)
   "Commit ONE evidence row (OP-ID GEN-ID DIGEST TS) on LEASE; return the new HEAD.
-Ensures the table exists, then commits the INSERT so the row lands on HEAD; the
-returned hash is the commit that ADDED the row."
-  (dorg-sql--ensure-mutation-log lease)
+The fixture's v7 fresh schema already owns receipt storage; this helper never
+installs it on an ordinary lease.  The returned hash is the commit that ADDED
+the row."
   (dorg-sql--lease-batch
    lease (list (dorg-sql--mutation-log-insert-sql op-id gen-id digest ts))
    (format "evidence %s" op-id))
@@ -119,6 +119,40 @@ OPTS are extra keyword args (e.g. :op-id, :base) forwarded verbatim."
 
 (defvar dorg-test-lin--lost-response-rollbacks 0
   "Child-process count of ROLLBACK statements in the 21mx9 witness.")
+
+(defvar dorg-test-lin--captured-statements nil
+  "Dynamically collected SQL strings from a focused statement-capture scope.")
+
+(defun dorg-test-lin--capture-mysql-query (orig conn sql)
+  "Record SQL sent through `mysql-query', then call ORIG."
+  (push sql dorg-test-lin--captured-statements)
+  (funcall orig conn sql))
+
+(defmacro dorg-test-lin--with-statement-capture (&rest body)
+  "Run BODY and return its value plus all SQL it sends to the leased executor.
+
+`mysql-query' is the single server-transport bottom for both lease probes and
+transaction batches.  Capturing it once distinguishes a permitted
+information-schema SELECT from forbidden receipt-schema DDL and data DML
+without double-counting probe statements.
+The return value is `(:value VALUE :statements STATEMENTS)'."
+  (declare (indent 0) (debug body))
+  `(let ((dorg-test-lin--captured-statements nil))
+     (advice-add 'mysql-query :around
+                 #'dorg-test-lin--capture-mysql-query)
+     (unwind-protect
+         (list :value (progn ,@body)
+               :statements (nreverse dorg-test-lin--captured-statements))
+       (advice-remove 'mysql-query #'dorg-test-lin--capture-mysql-query))))
+
+(defun dorg-test-lin--captured-write-statement-p (sql)
+  "Return non-nil when captured SQL performs or commits a data/schema write."
+  (string-match-p
+   (concat "\\`[[:space:]]*"
+           "\\(?:ALTER\\|BEGIN\\|CALL[[:space:]]+DOLT_\\(?:ADD\\|COMMIT\\)"
+           "\\|COMMIT\\|CREATE\\|DELETE\\|DROP\\|INSERT\\|REPLACE"
+           "\\|ROLLBACK\\|START[[:space:]]+TRANSACTION\\|UPDATE\\)\\b")
+   (replace-regexp-in-string "[[:space:]\n\r\t]+" " " sql)))
 
 (defun dorg-test-lin--lose-first-dolt-commit-response (orig sql conn)
   "Run ORIG SQL on CONN, then lose the first DOLT_COMMIT response.
@@ -276,6 +310,380 @@ and any stray `-tests.el' at the root are filtered out."
   (seq-remove
    (lambda (f) (string-match-p "\\(-tests\\|-autoloads\\|-pkg\\)\\.el\\'" f))
    (directory-files dorg-test-lin--repo-root t "\\.el\\'")))
+
+(ert-deftest dorg-test-dzx00-static-ordinary-receipt-access-never-installs-schema ()
+  "Ordinary production paths cannot own receipt-table DDL.
+
+The receipt table and postimage column are core-versioned storage, owned by
+fresh init and the explicit operator migration.  The two ordinary callers are
+the gate-first op-id preflight and planning-failure settled reconciliation;
+neither may install receipt storage.  This deliberately source-only audit is
+name-independent: only the fresh-schema declaration and v6->v7 resolver may
+contain receipt CREATE/ALTER/DROP SQL."
+  (let ((files (dorg-test-lin--production-el-files)))
+    (should
+     (equal '(("dorg-repo.el" . 1) ("dorg-schema.el" . 1))
+            (sort
+             (delq nil
+                   (mapcar
+                    (lambda (file)
+                      (with-temp-buffer
+                        (insert-file-contents file)
+                        (let ((count 0))
+                          (while (re-search-forward
+                                  "\\(CREATE\\|ALTER\\|DROP\\).*dorg_mutation_log" nil t)
+                            (setq count (1+ count)))
+                          (and (> count 0)
+                               (cons (file-name-nondirectory file) count)))))
+                    files))
+             (lambda (a b) (string< (car a) (car b))))))))
+
+(ert-deftest dorg-test-dzx00-ordinary-op-id-apply-captures-no-receipt-ddl ()
+  "Public op-id apply sees receipt reads but no receipt DDL on server transport."
+  (skip-unless (and dorg-test--dolt-available dorg-test--server-port))
+  (dorg-test--with-temp-db dolt-dir
+    (let* ((root (dorg-test-lin--seed dolt-dir "* Alpha\n"))
+           (src (dorg-test-lin--src dolt-dir root))
+           (alpha (dorg-test-lin--id dolt-dir "Alpha"))
+           (capture
+            (dorg-test-lin--with-statement-capture
+              (dorg-test-lin--api-apply
+               src `(on (id ,alpha) (set (property "DZ") "one"))
+               :op-id "dzx00-capture")))
+           (statements (plist-get capture :statements)))
+      (should (plist-get (plist-get capture :value) :ok))
+      ;; Non-vacuity: server capture is active and includes receipt discovery.
+      (should (cl-some (lambda (sql)
+                         (string-match-p "information_schema.tables" sql))
+                       statements))
+      (should-not (cl-some (lambda (sql)
+                             (string-match-p
+                              "\\(CREATE\\|ALTER\\|DROP\\).*dorg_mutation_log" sql))
+                           statements)))))
+
+(ert-deftest dorg-test-dzx00-mismatched-op-id-exit-leaves-no-receipt-ddl ()
+  "A genuine early mismatch preserves data, receipt, HEAD and clean working set.
+The former oversize-payload trigger retires with derived payload persistence;
+this keeps its no-DDL/error-exit contract without manufacturing a capacity cap."
+  (skip-unless (and dorg-test--dolt-available dorg-test--server-port))
+  (dorg-test--with-temp-db dolt-dir
+    (let* ((root (dorg-test-lin--seed dolt-dir "* Alpha\n"))
+           (src (dorg-test-lin--src dolt-dir root))
+           (alpha (dorg-test-lin--id dolt-dir "Alpha"))
+           (first (dorg-test-lin--api-apply
+                   src `(on (id ,alpha) (set (property "DZ") "one"))
+                   :op-id "dzx00-mismatch"))
+           (head (dorg-head-commit dolt-dir))
+           (receipt-query
+            (concat "SELECT op_id AS op_id, gen_id AS gen_id,"
+                    " intent_digest AS intent_digest, ts AS ts"
+                    " FROM dorg_mutation_log WHERE op_id = 'dzx00-mismatch'"))
+           (receipt (dorg-sql dolt-dir receipt-query))
+           (capture
+            (dorg-test-lin--with-statement-capture
+              (condition-case err
+                  (dorg-test-lin--api-apply
+                   src `(on (id ,alpha) (set (property "DZ") "different"))
+                   :op-id "dzx00-mismatch")
+                (dorg-mutate-error err))))
+           (statements (plist-get capture :statements)))
+      (should (plist-get first :ok))
+      (should (equal head (plist-get first :new-token)))
+      (should (= 1 (length receipt)))
+      (should (eq 'idempotency-key-mismatch
+                  (dorg-mutate-error-reason (plist-get capture :value))))
+      ;; A real, nonempty server stream proves discovery/lookup preceded refusal.
+      (should (cl-some (lambda (sql)
+                        (string-match-p "information_schema.tables" sql))
+                      statements))
+      (should (cl-some (lambda (sql)
+                        (string-match-p "SELECT gen_id, intent_digest" sql))
+                      statements))
+      (should-not (cl-some #'dorg-test-lin--captured-write-statement-p statements))
+      (should (equal head (dorg-head-commit dolt-dir)))
+      (should (equal "one" (dorg-test-lin--prop dolt-dir alpha "DZ")))
+      (should (equal receipt (dorg-sql dolt-dir receipt-query)))
+      (should (null (dorg-sql dolt-dir "SELECT table_name FROM dolt_status LIMIT 1")))
+      (should-not (cl-some (lambda (sql)
+                             (string-match-p
+                              "\\(CREATE\\|ALTER\\|DROP\\).*dorg_mutation_log" sql))
+                           statements)))))
+
+(ert-deftest dorg-test-fhhwd-large-public-batch-keeps-compact-receipt-and-validation ()
+  "512 real identity owners exceed the retired tuple size without a payload.
+All owner proofs delegate to the real validator; neither receipt nor validation
+is doubled.  This owned-fixture witness is material and must run only via Arc."
+  (skip-unless (and dorg-test--dolt-available dorg-test--server-port))
+  (dorg-test--with-temp-db dolt-dir
+    (let* ((owners 512)
+           (contents
+            (mapconcat (lambda (n)
+                         (format (concat "* FHHWD-%d\n:PROPERTIES:\n"
+                                         ":BEAD_ID: owner-%d\n:END:\n") n n))
+                       (number-sequence 1 owners) ""))
+           (root (dorg-test-lin--seed dolt-dir contents))
+           (src (append (dorg-test-lin--src dolt-dir root)
+                        '(:identity (:property "BEAD_ID"))))
+           (ids (mapcar (lambda (row) (alist-get 'id row))
+                        (dorg-sql dolt-dir
+                                  "SELECT id AS id FROM headings WHERE title LIKE 'FHHWD-%' ORDER BY id")))
+           (form `(batch ,@(mapcar
+                            (lambda (id)
+                              `(on (id ,id) (set (property "FHHWD") "changed")))
+                            ids)))
+           ;; Exact retired tuple grammar/field lengths, not a payload stub.
+           ;; These are top-level, nondeleted owners; hash contents do not
+           ;; alter the serialized byte count of fixed-width hex strings.
+           (old-bytes
+            (let ((print-level nil) (print-length nil) (print-circle nil))
+              (string-bytes
+               (prin1-to-string
+                (mapcar (lambda (id)
+                          (list root id nil (make-string 40 ?0)
+                                (make-string 64 ?0) nil)) ids)))))
+           (before (dorg-test-lin--commit-count dolt-dir))
+           (validator (symbol-function 'dorg-mutate--postimage-assert-partitions))
+           (validated nil)
+           capture)
+      (should (= owners (length ids)))
+      (should (> old-bytes 65535))
+      (cl-letf (((symbol-function 'dorg-mutate--postimage-assert-partitions)
+                 (lambda (read specs &rest args)
+                   (push (length specs) validated)
+                   (apply validator read specs args))))
+        (setq capture
+              (dorg-test-lin--with-statement-capture
+                (dorg-test-lin--api-apply src form :op-id "fhhwd-large"
+                                        :allow-broad t))))
+      (let* ((result (plist-get capture :value))
+             (commit (plist-get result :new-token))
+             (rows (dorg-sql dolt-dir
+                             (concat "SELECT op_id AS op_id, gen_id AS gen_id,"
+                                     " intent_digest AS intent_digest, ts AS ts,"
+                                     " postimages_v1 AS postimages_v1"
+                                     " FROM dorg_mutation_log WHERE op_id = 'fhhwd-large'")))
+             (receipt (car rows)))
+        (should (plist-get result :ok))
+        (should commit)
+        (should (equal (list owners) validated))
+        (should (= (1+ before) (dorg-test-lin--commit-count dolt-dir)))
+        (should (= owners
+                   (length (dorg-sql dolt-dir
+                                    (concat "SELECT heading_id FROM heading_properties"
+                                            " WHERE prop_key = 'FHHWD' AND prop_value = 'changed'")))))
+        (should (= 1 (length rows)))
+        (should (equal "fhhwd-large" (alist-get 'op_id receipt)))
+        (should (stringp (alist-get 'gen_id receipt)))
+        (should (stringp (alist-get 'intent_digest receipt)))
+        (should-not (alist-get 'postimages_v1 receipt))
+        (should-not (plist-member result :postimages))
+        (should-not (plist-member result :candidate-models))
+        (let* ((retry-capture
+                (dorg-test-lin--with-statement-capture
+                  (dorg-test-lin--api-apply src form :op-id "fhhwd-large"
+                                          :allow-broad t)))
+               (retry (plist-get retry-capture :value))
+               (statements (plist-get retry-capture :statements)))
+          (should (plist-get retry :idempotent))
+          (should (equal commit (plist-get retry :new-token)))
+          (should-not (cl-some #'dorg-test-lin--captured-write-statement-p statements))
+          (should-not (cl-some (lambda (sql)
+                                (string-match-p "SELECT postimages_v1" sql)) statements)))
+        (should (= (1+ before) (dorg-test-lin--commit-count dolt-dir)))
+        (should (null (dorg-sql dolt-dir "SELECT table_name FROM dolt_status LIMIT 1")))
+        (message "FHHWD owners=%d retired-payload-bytes=%d compact-row-bytes=%d"
+                 owners old-bytes (string-bytes (prin1-to-string receipt)))))))
+
+(ert-deftest dorg-test-fhhwd-old-payload-is-preserved-but-ignored-on-public-retry ()
+  "Historical column bytes remain inert; compact recovery ignores their format."
+  (skip-unless (and dorg-test--dolt-available dorg-test--server-port))
+  (dorg-test--with-temp-db dolt-dir
+    (let* ((root (dorg-test-lin--seed dolt-dir "* Alpha\n"))
+           (src (dorg-test-lin--src dolt-dir root))
+           (alpha (dorg-test-lin--id dolt-dir "Alpha"))
+           (form `(on (id ,alpha) (set (property "FHHWD-OLD") "one")))
+           (first (dorg-test-lin--api-apply src form :op-id "fhhwd-old"))
+           (original (plist-get first :new-token))
+           ;; Deliberately not a valid old tuple.  No parser should remain.
+           (payload "historical opaque bytes: #.not-a-replay-program")
+           (receipt-query
+            (concat "SELECT op_id AS op_id, gen_id AS gen_id,"
+                    " intent_digest AS intent_digest, ts AS ts,"
+                    " postimages_v1 AS postimages_v1"
+                    " FROM dorg_mutation_log WHERE op_id = 'fhhwd-old'")))
+      (should (plist-get first :ok))
+      (should original)
+      (dorg-sql-batch dolt-dir
+                      (list (format (concat "UPDATE dorg_mutation_log"
+                                            " SET postimages_v1 = %s"
+                                            " WHERE op_id = 'fhhwd-old'")
+                                    (dorg-sql-quote payload))))
+      (dorg-commit dolt-dir "fixture: preserve historic payload bytes")
+      (let* ((head (dorg-head-commit dolt-dir))
+             (receipt (dorg-sql dolt-dir receipt-query))
+             (capture (dorg-test-lin--with-statement-capture
+                        (dorg-test-lin--api-apply src form :op-id "fhhwd-old")))
+             (retry (plist-get capture :value))
+             (statements (plist-get capture :statements)))
+        (should (equal payload (alist-get 'postimages_v1 (car receipt))))
+        (should (plist-get retry :ok))
+        (should (plist-get retry :idempotent))
+        (should (equal original (plist-get retry :new-token)))
+        (should-not (plist-member retry :postimages))
+        (should-not (plist-member retry :candidate-models))
+        (should (cl-some (lambda (sql)
+                          (string-match-p "SELECT gen_id, intent_digest" sql))
+                        statements))
+        (should-not (cl-some (lambda (sql)
+                              (string-match-p "SELECT postimages_v1" sql)) statements))
+        (should-not (cl-some #'dorg-test-lin--captured-write-statement-p statements))
+        (should (equal head (dorg-head-commit dolt-dir)))
+        (should (equal "one" (dorg-test-lin--prop dolt-dir alpha "FHHWD-OLD")))
+        (should (equal receipt (dorg-sql dolt-dir receipt-query)))
+        (should (null (dorg-sql dolt-dir "SELECT table_name FROM dolt_status LIMIT 1")))))))
+
+(ert-deftest dorg-test-dzx00-public-v6-receipt-migration-preserves-retry ()
+  "Public v6 migration preserves receipt rows and exact op-id recovery.
+
+The owned fixture begins at fresh v7, so receipt storage is a positive control.
+It then models the known v6 four-column receipt shape, with a real committed
+row, before invoking only the public `dorg-migrate-schema' entry.  The retry
+must recover its original mutation rather than apply it again."
+  (skip-unless (and dorg-test--dolt-available dorg-test--server-port))
+  (dorg-test--with-temp-db dolt-dir
+    (let* ((root (dorg-test-lin--seed dolt-dir "* Alpha\n"))
+           (src (dorg-test-lin--src dolt-dir root))
+           (alpha (dorg-test-lin--id dolt-dir "Alpha"))
+           (form `(on (id ,alpha) (set (property "DZ-MIGRATE") "one")))
+           (first (dorg-test-lin--api-apply src form :op-id "dzx00-v6-retry"))
+           (commit (plist-get first :new-token))
+           (before
+            (car (dorg-sql
+                  dolt-dir
+                  (concat "SELECT op_id AS op_id, gen_id AS gen_id,"
+                          " intent_digest AS intent_digest, ts AS ts"
+                          " FROM dorg_mutation_log"
+                          " WHERE op_id = 'dzx00-v6-retry'")))))
+      (should (plist-get first :ok))
+      (should commit)
+      (should before)
+      ;; This is the historic, migratable v6 receipt shape, not corruption.
+      ;; A v6 store also predates level offsets, so its headings carry the
+      ;; absolute `level' column; this fixture's rows sit at depth <= 1,
+      ;; where the absolute level equals the offset.
+      (dorg-sql-batch
+       dolt-dir
+       '("ALTER TABLE dorg_mutation_log DROP COLUMN postimages_v1"
+         "ALTER TABLE headings ADD COLUMN level INT NOT NULL DEFAULT 0"
+         "UPDATE headings SET level = level_offset"
+         "ALTER TABLE headings DROP COLUMN level_offset"
+         "UPDATE dorg_meta SET value = '6' WHERE `key` = 'schema_version'"))
+      (dorg-commit dolt-dir "fixture: model v6 receipt schema")
+      (dorg-migrate-schema dolt-dir)
+      (should (equal (number-to-string dorg-schema-version)
+                     (alist-get 'value
+                                (car (dorg-sql dolt-dir
+                                               "SELECT value FROM dorg_meta WHERE `key` = 'schema_version'")))))
+      (should (dorg-sql
+               dolt-dir
+               (concat "SELECT column_name AS column_name"
+                       " FROM information_schema.columns"
+                       " WHERE table_schema = DATABASE()"
+                       " AND table_name = 'dorg_mutation_log'"
+                       " AND column_name = 'postimages_v1'")))
+      (should (equal before
+                     (car (dorg-sql
+                           dolt-dir
+                           (concat "SELECT op_id AS op_id, gen_id AS gen_id,"
+                                   " intent_digest AS intent_digest, ts AS ts"
+                                   " FROM dorg_mutation_log"
+                                   " WHERE op_id = 'dzx00-v6-retry'")))))
+      (let ((retry (dorg-test-lin--api-apply src form :op-id "dzx00-v6-retry")))
+        (should (plist-get retry :ok))
+        (should (plist-get retry :idempotent))
+        (should (equal commit (plist-get retry :new-token)))))))
+
+(ert-deftest dorg-test-dzx00-engine-planning-error-reconciles-settled-op-id ()
+  "A post-normalization engine planning error recovers settled evidence.
+
+Public normalization and intent-digest construction precede this engine seam;
+a public form whose target is already absent is rejected before reaching it.
+This witness therefore supplies the digest-bound engine contract directly,
+then proves that its permitted planning error takes the fresh-lease
+`dorg-mutate--dolt-op-id-settled' path and recovers the recorded commit."
+  (skip-unless (and dorg-test--dolt-available dorg-test--server-port))
+  (dorg-test--with-temp-db dolt-dir
+    (let* ((root (dorg-test-lin--seed dolt-dir "* Alpha\n"))
+           (src (dorg-mutate--resolve-source
+                 (dorg-test-lin--src dolt-dir root)))
+           (op-id "dzx00-settled")
+           (digest "dzx00-settled-digest")
+           (gen-id (dorg-mutate--new-gen-id))
+           (commit
+            (dorg-sql--with-lease (lease dolt-dir)
+              (dorg-test-lin--commit-evidence
+               lease op-id gen-id digest 1726358400)))
+           (count (dorg-test-lin--commit-count dolt-dir))
+           capture)
+      (should commit)
+      (let ((calls 0)
+            (settled (symbol-function 'dorg-mutate--dolt-op-id-settled)))
+        (cl-letf (((symbol-function 'dorg-mutate--dolt-op-id-settled)
+                   (lambda (&rest args)
+                     (cl-incf calls)
+                     (apply settled args))))
+          (setq capture
+                (dorg-test-lin--with-statement-capture
+                  (dorg-mutate--dolt-gated-apply
+                   src (list :op-id op-id :intent-digest digest) nil
+                   (lambda ()
+                     (dorg-mutate--raise
+                      'invalid-target
+                      "fixture post-normalization planning failure"
+                      :source-kind 'dolt
+                      :detail 'fixture-post-normalization))))))
+        (should (= 1 calls)))
+      (let ((result (plist-get capture :value))
+            (statements (plist-get capture :statements)))
+        (should (plist-get result :ok))
+        (should (plist-get result :idempotent))
+        (should (equal op-id (plist-get result :op-id)))
+        (should (equal commit (plist-get result :commit)))
+        (should (cl-some (lambda (sql)
+                           (string-match-p "information_schema\\.tables" sql))
+                         statements))
+        (should-not (cl-some #'dorg-test-lin--captured-write-statement-p
+                             statements)))
+      (should (= count (dorg-test-lin--commit-count dolt-dir))))))
+
+(ert-deftest dorg-test-dzx00-public-op-id-no-op-does-not-create-receipt ()
+  "A public empty plan checks receipts without a commit or receipt row.
+
+An empty public batch normalizes to zero typed patches and therefore reaches
+the op-id empty-plan exit after the read-only receipt lookup.  A same-value
+property set is intentionally not used: it is a real touched-heading UPDATE."
+  (skip-unless (and dorg-test--dolt-available dorg-test--server-port))
+  (dorg-test--with-temp-db dolt-dir
+    (let* ((root (dorg-test-lin--seed dolt-dir "* Alpha\n"))
+           (src (dorg-test-lin--src dolt-dir root))
+           (count (dorg-test-lin--commit-count dolt-dir))
+           (capture
+            (dorg-test-lin--with-statement-capture
+              (dorg-test-lin--api-apply
+               src '(batch) :op-id "dzx00-noop")))
+           (result (plist-get capture :value))
+           (statements (plist-get capture :statements)))
+        (should (plist-get result :ok))
+        (should (equal "dzx00-noop" (plist-get result :op-id)))
+        (should (= count (dorg-test-lin--commit-count dolt-dir)))
+        (should (cl-some (lambda (sql)
+                           (string-match-p "information_schema\\.tables" sql))
+                         statements))
+        (should-not (cl-some #'dorg-test-lin--captured-write-statement-p
+                             statements))
+        (should-not
+         (dorg-sql dolt-dir
+                   "SELECT op_id FROM dorg_mutation_log WHERE op_id = 'dzx00-noop'")))))
 
 (defun dorg-test-lin--child-titles (dolt-dir parent-id)
   "Return the titles of PARENT-ID's direct children ordered by sort_key."
@@ -966,9 +1374,13 @@ an explicit id, and no statement uses a positional predicate."
         (should upd)
         (should (string-match-p (format "WHERE id = %d\\'" c1) upd))
         (should-not (string-match-p (format "id = %d\\b" c2) upd))
-        ;; No positional/ordinal targeting anywhere in the batch.
+        ;; No positional/ordinal targeting anywhere in the batch.  SQL clause
+        ;; keywords are matched as whole uppercase symbols so a column such as
+        ;; `level_offset' is not mistaken for an OFFSET clause.
         (dolist (s ops)
-          (should-not (string-match-p "\\bLIMIT\\b\\|\\bOFFSET\\b\\|ORDER BY" s))))
+          (let ((case-fold-search nil))
+            (should-not (string-match-p
+                         "\\_<LIMIT\\_>\\|\\_<OFFSET\\_>\\|ORDER BY" s)))))
       ;; DELETE keys the doomed row by absolute id.
       (let ((ops (funcall sql (list (dorg-test--delete-patch c2)))))
         (should (seq-some (lambda (s)
@@ -1136,10 +1548,15 @@ merely the two currently-named executors:
 
 1. The direct `DOLT_COMMIT' issuers are EXACTLY the three low-level Dolt commit
    primitives; no typed engine path emits its own commit SQL.
-2. The GATED commit seam `dorg-sql--lease-batch' has EXACTLY TWO production
-   callers — `dorg-mutate--dolt-gated-apply' for typed writes and
-   `dorg-transaction-commit' for exact-base administrative import.  Both acquire
-   `dorg-mutate-call-with-store-gate' before reaching the lease batch.
+2. The GATED commit seam `dorg-sql--lease-batch' has EXACTLY FOUR production
+   callers: `dorg-mutate--dolt-gated-apply' for typed writes,
+   `dorg-transaction-commit' for exact-base administrative import,
+   `dorg-repo-identify-store' for explicit store identity, and the private
+   schema-migration step helper `dorg-repo--apply-schema-step-on-lease'.  The
+   repo identify door owns its gate-held lease to write store-level dorg_meta
+   outside the typed mutation log; the schema helper receives an
+   already-owned lease only from the explicit migration chain rooted at
+   `dorg-migrate-schema'.
 
 NON-VACUITY: a new production defun issuing `DOLT_COMMIT(' directly, or an
 executor reaching the leased batch outside the gate, makes a discovered set
@@ -1152,10 +1569,60 @@ differ from its allowlist and FAILS, naming the offending defun."
     ;; (1) Direct DOLT_COMMIT issuers are exactly the low-level primitives.
     (should (equal '("dorg-commit" "dorg-sql--mysql-batch-on-conn" "dorg-sql-batch")
                    (dorg-test-lin--source-defuns-with "DOLT_COMMIT('" files)))
-    ;; (2) The gated commit seam is reached only from the two gate owners.
+    ;; (2) The gated commit seam is reached only from the gate owners and the
+    ;; approved private schema-migration and store-identification helpers.
     (should (equal '("dorg-mutate--dolt-gated-apply"
+                     "dorg-repo--apply-schema-step-on-lease"
+                     "dorg-repo-identify-store"
                      "dorg-transaction-commit")
                    (dorg-test-lin--source-callers 'dorg-sql--lease-batch files)))
+    (should (equal '("dorg-repo--install-extension-on-lease"
+                     "dorg-repo--migrate-core-on-lease"
+                     "dorg-repo--migrate-extension-on-lease")
+                   (dorg-test-lin--source-callers
+                    'dorg-repo--apply-schema-step-on-lease files)))
+    (should (equal '("dorg-repo--migrate-schema-on-lease")
+                   (dorg-test-lin--source-callers
+                    'dorg-repo--install-extension-on-lease files)))
+    (should (equal '("dorg-repo--migrate-schema-on-lease")
+                   (dorg-test-lin--source-callers
+                    'dorg-repo--migrate-core-on-lease files)))
+    (should (equal '("dorg-repo--migrate-schema-on-lease")
+                   (dorg-test-lin--source-callers
+                    'dorg-repo--migrate-extension-on-lease files)))
+    (should (equal '("dorg-migrate-schema")
+                   (dorg-test-lin--source-callers
+                    'dorg-repo--migrate-schema-on-lease files)))
+    (should (member "dorg-migrate-schema"
+                    (dorg-test-lin--source-callers
+                     'dorg-mutate-call-with-store-gate files)))
+    (should (member "dorg-repo-identify-store"
+                    (dorg-test-lin--source-callers
+                     'dorg-mutate-call-with-store-gate files)))
+    (should (equal '("dorg-api-identify-store")
+                   (dorg-test-lin--source-callers
+                    'dorg-repo-identify-store files)))
+    (let ((tmp (make-temp-file "dorg-lin-schema-step-caller-" nil ".el")))
+      (unwind-protect
+          (progn
+            (with-temp-file tmp
+              (insert ";;; synthetic ungated schema step caller\n"
+                      "(defun dorg-test-bad-schema-step-caller ()\n"
+                      "  (dorg-repo--apply-schema-step-on-lease 'lease"
+                      " \"/tmp/store\" '(\"SELECT 1\") \"bad\"))\n"))
+            (should
+             (member "dorg-test-bad-schema-step-caller"
+                     (dorg-test-lin--source-callers
+                      'dorg-repo--apply-schema-step-on-lease
+                      (cons tmp files))))
+            (should-not
+             (equal '("dorg-repo--install-extension-on-lease"
+                      "dorg-repo--migrate-core-on-lease"
+                      "dorg-repo--migrate-extension-on-lease")
+                    (dorg-test-lin--source-callers
+                     'dorg-repo--apply-schema-step-on-lease
+                     (cons tmp files)))))
+        (ignore-errors (delete-file tmp))))
     ;; The typed engine executors are not direct-commit issuers.
     (let ((direct (dorg-test-lin--source-defuns-with "DOLT_COMMIT('" files)))
       (dolist (ex '("dorg-mutate--dolt-execute" "dorg-mutate--dolt-cross-root-execute"))
@@ -1676,12 +2143,12 @@ load ids at H1 for every re-plan attempt, never reuse H0's slice."
                      (list rid target)))
                   ((symbol-function 'dorg-model-load-headings)
                    (lambda (dir root ids &optional as-of headline-only
-                                query-fn)
+                                query-fn levels)
                      (push (list :root root :ids ids
                                  :as-of as-of :headline-only headline-only)
                            load-heading-calls)
                      (funcall real-load-headings dir root ids
-                              as-of headline-only query-fn)))
+                              as-of headline-only query-fn levels)))
                   ((symbol-function 'dorg-model-load-tree)
                    (lambda (dir root &optional as-of)
                      (push (list :root root :as-of as-of) load-tree-calls)
@@ -2243,7 +2710,7 @@ failure; here the core row is untouched and HEAD does not advance."
        :capabilities '(dolt)
        :read-tables '((:name "demo_fail_proj" :key-column "heading_id"))
        :project #'dorg-test-lin--failing-project)
-      (dorg-repo-ensure-extensions dolt-dir)
+      (dorg-migrate-schema dolt-dir)
       (dorg-commit dolt-dir "install failproj")
       (let* ((rid (dorg-test-lin--seed dolt-dir "* Alpha\n"))
              (src (dorg-test-lin--src dolt-dir rid))
@@ -2460,8 +2927,7 @@ touched.  HEAD-FN replaces leased HEAD reads and BATCH-FN replaces the commit."
              ((symbol-function 'dorg-sql--lease-batch) ,batch-fn)
              ((symbol-function 'dorg-sql--lease-changed-heading-ids)
               (lambda (&rest _) nil))
-             ((symbol-function 'dorg-sql--ensure-mutation-log) (lambda (&rest _) nil))
-             ((symbol-function 'dorg-sql--ensure-mutation-log-postimages)
+             ((symbol-function 'dorg-sql--require-mutation-log-schema)
               (lambda (&rest _) nil))
              ((symbol-function 'dorg-sql--mutation-log-lookup) (lambda (&rest _) nil))
              ((symbol-function 'dorg-sql--mutation-log-insert-sql)
@@ -2694,7 +3160,7 @@ The poison first statement must never occur in the successful second batch."
    (dorg-sql
     dolt-dir
     (concat
-     "SELECT id, root_id, parent_id, HEX(sort_key) AS sort_key, level, "
+     "SELECT id, root_id, parent_id, HEX(sort_key) AS sort_key, level_offset, "
      "todo_keyword, priority, commented, title, post_blank, items_hash "
      "FROM headings ORDER BY id"))
    :tags
@@ -2756,7 +3222,7 @@ the same-session rollback receipt; HEAD and all three core tables must be exact.
                   (format
                    (concat
                     "INSERT INTO headings "
-                    "(id, root_id, parent_id, sort_key, level, title) "
+                    "(id, root_id, parent_id, sort_key, level_offset, title) "
                     "VALUES (99999991, %d, %d, X'%s', 2, 'Collision')")
                    rid parent slot))
                  :make-result (lambda (head) (list :ok t :commit head))
@@ -2796,7 +3262,7 @@ the same-session rollback receipt; HEAD and all three core tables must be exact.
     dolt-dir
     (format
      (concat
-      "SELECT id, root_id, parent_id, HEX(sort_key) AS sort_key, level, "
+      "SELECT id, root_id, parent_id, HEX(sort_key) AS sort_key, level_offset, "
       "todo_keyword, priority, commented, title, post_blank, items_hash "
       "FROM headings WHERE id = %d")
      heading-id))
@@ -2986,6 +3452,125 @@ control for the enabled mixed-scope race."
         (should (equal head1 (dorg-head-commit dolt-dir)))
         (should (equal rows1 (dorg-test-f4la4--core-snapshot dolt-dir)))
         (should (= 0 (dorg-test-f4la4--constraint-violation-count dolt-dir)))))))
+
+;;; 39omw — real public consumed-target replay, separate from dzx00's engine proof
+
+(defun dorg-test-39omw--real-snapshot (dolt-dir)
+  "Capture HEAD, status, core rows, metadata and receipt rows byte-sensitively."
+  (list :head (dorg-head-commit dolt-dir)
+        :status (dorg-sql dolt-dir "SELECT * FROM dolt_status")
+        :core (dorg-test-f4la4--core-snapshot dolt-dir)
+        :metadata (dorg-sql dolt-dir "SELECT * FROM dorg_meta ORDER BY `key`")
+        :receipts (dorg-sql dolt-dir "SELECT * FROM dorg_mutation_log ORDER BY op_id")))
+
+(defmacro dorg-test-39omw--with-consumed-target (bindings &rest body)
+  "Commit a PUBLIC delete on an owned fixture, then bind BINDINGS for replay."
+  (declare (indent 1) (debug (sexp body)))
+  (pcase-let ((`(,dir ,src ,form ,commit ,snapshot) bindings))
+    `(progn
+       (skip-unless (and dorg-test--dolt-available dorg-test--server-port))
+       (dorg-test--with-temp-db ,dir
+         (let* ((root (dorg-test-lin--seed ,dir "* Alpha\n"))
+                (,src (dorg-test-lin--src ,dir root))
+                (alpha (dorg-test-lin--id ,dir "Alpha"))
+                (,form `(on (id ,alpha) (delete (heading))))
+                (before (dorg-head-commit ,dir))
+                (first (dorg-test-lin--api-apply ,src ,form :op-id "39omw-real"))
+                (,commit (plist-get first :new-token))
+                (,snapshot (dorg-test-39omw--real-snapshot ,dir)))
+           (should (plist-get first :ok))
+           (should (stringp ,commit))
+           (should-not (equal before ,commit))
+           (should-not (dorg-test-lin--id ,dir "Alpha"))
+           (should-not (plist-get ,snapshot :status))
+           (should (= 1 (length (plist-get ,snapshot :receipts))))
+           ,@body)))))
+
+(defun dorg-test-39omw--assert-read-only-capture (capture)
+  "Require real receipt discovery in CAPTURE and reject every write/commit."
+  (let ((sql (plist-get capture :statements)))
+    ;; Proves server capture is active; an empty/CLI stream cannot pass.
+    (should (cl-some (lambda (statement)
+                       (string-match-p "information_schema.tables" statement)) sql))
+    (should-not (cl-some #'dorg-test-lin--captured-write-statement-p sql))))
+
+(ert-deftest dorg-test-39omw-real-public-consumed-target-replay-recovers-settled ()
+  "Real raw/opaque public replay recovers the original delete without mutation."
+  (dorg-test-39omw--with-consumed-target (dir src form commit snapshot)
+    (dolist (opaque '(nil t))
+      (let ((initial-errors 0) (settled-calls 0) (downstream-calls 0)
+            (planner (symbol-function 'dorg-mutate--make-plan))
+            (settled (symbol-function 'dorg-mutate--dolt-op-id-settled))
+            (downstream (symbol-function 'dorg-mutate--dolt-gated-apply))
+            capture)
+        (cl-letf (((symbol-function 'dorg-mutate--make-plan)
+                   (lambda (&rest args)
+                     (condition-case err (apply planner args)
+                       (dorg-mutate-error
+                        (should (eq 'invalid-target (dorg-mutate-error-reason err)))
+                        (should (eq 'missing (plist-get (dorg-mutate-error-data err) :detail)))
+                        (cl-incf initial-errors)
+                        (signal (car err) (cdr err))))))
+                  ((symbol-function 'dorg-mutate--dolt-op-id-settled)
+                   (lambda (&rest args)
+                     (cl-incf settled-calls) (apply settled args)))
+                  ((symbol-function 'dorg-mutate--dolt-gated-apply)
+                   (lambda (&rest args)
+                     (cl-incf downstream-calls) (apply downstream args))))
+          (setq capture
+                (dorg-test-lin--with-statement-capture
+                  (if opaque
+                      (dorg-api-execute
+                       (dorg-api-make-mutation-intent form :source src :op-id "39omw-real")
+                       :mode 'apply)
+                    (dorg-test-lin--api-apply src form :op-id "39omw-real")))))
+        (should (= 1 initial-errors))
+        (should (= 1 settled-calls))
+        (should (= 0 downstream-calls))
+        (let ((result (plist-get capture :value)))
+          (should (plist-get result :ok))
+          (should (plist-get result :idempotent))
+          (should (equal "39omw-real" (plist-get result :op-id)))
+          (should (equal commit (plist-get result :new-token))))
+        (dorg-test-39omw--assert-read-only-capture capture)
+        (should (equal snapshot (dorg-test-39omw--real-snapshot dir)))))))
+
+(ert-deftest dorg-test-39omw-real-public-consumed-target-mismatched-intent-refuses ()
+  "Different real normalized intent is mismatch, not merely a missing-target refusal."
+  (dorg-test-39omw--with-consumed-target (dir src form _commit snapshot)
+    (let* ((different `(on ,(cadr form) (delete (subtree))))
+           (resolved (dorg-mutate--resolve-source src))
+           (original-digest (dorg-mutate--intent-digest (dorg-api-normalize form src) resolved))
+           (other-digest (dorg-mutate--intent-digest (dorg-api-normalize different src) resolved)))
+      (should-not (equal original-digest other-digest))
+      (dolist (opaque '(nil t))
+        (let* ((capture
+                (dorg-test-lin--with-statement-capture
+                  (should-error
+                   (if opaque
+                       (dorg-api-execute
+                        (dorg-api-make-mutation-intent different :source src :op-id "39omw-real")
+                        :mode 'apply)
+                     (dorg-test-lin--api-apply src different :op-id "39omw-real"))
+                   :type 'dorg-mutate-error)))
+               (err (plist-get capture :value)))
+          (should (eq 'idempotency-key-mismatch (dorg-mutate-error-reason err)))
+          (should (equal "39omw-real" (plist-get (dorg-mutate-error-data err) :op-id)))
+          (dorg-test-39omw--assert-read-only-capture capture)
+          (should (equal snapshot (dorg-test-39omw--real-snapshot dir))))))))
+
+(ert-deftest dorg-test-39omw-real-public-consumed-target-without-evidence-retains-error ()
+  "An unused op-id against a consumed target preserves its genuine missing error."
+  (dorg-test-39omw--with-consumed-target (dir src form _commit snapshot)
+    (let* ((capture
+            (dorg-test-lin--with-statement-capture
+              (should-error (dorg-test-lin--api-apply src form :op-id "39omw-absent")
+                            :type 'dorg-mutate-error)))
+           (err (plist-get capture :value)))
+      (should (eq 'invalid-target (dorg-mutate-error-reason err)))
+      (should (eq 'missing (plist-get (dorg-mutate-error-data err) :detail)))
+      (dorg-test-39omw--assert-read-only-capture capture)
+      (should (equal snapshot (dorg-test-39omw--real-snapshot dir))))))
 
 (provide 'dorg-mutate-linearize-tests)
 ;;; dorg-mutate-linearize-tests.el ends here

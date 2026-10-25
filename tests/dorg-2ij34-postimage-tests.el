@@ -1,17 +1,12 @@
-;;; dorg-2ij34-postimage-tests.el --- Postimage receipt + transaction proof -*- lexical-binding: t; -*-
+;;; dorg-2ij34-postimage-tests.el --- Full transaction proof -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 
-;; Failure-capable acceptance tests for tracked-regression (Contract C v5):
-;; canonical postimage receipt entries per affected owner partition, the
-;; pre-commit transaction proof in the existing validate-function window,
-;; and pre-transaction digest entitlement in the operational mutation log.
-;; Every test uses a fresh temporary Dolt store; no live store is touched.
-;;
-;; RED discipline: the receipt and validator tests fail on unmodified
-;; trunk in the predicted direction (absent :postimages; sabotage commits
-;; where it must abort).  Boundary controls that legitimately pass at
-;; trunk are labeled as such in their docstrings.
+;; Pre-commit core/item/owner/extension parity, compact idempotency receipts,
+;; exact scoped revision reads and text fidelity.  Derived payload/wire-only
+;; assertions retire; their transaction corruption and identity controls stay.
+;; Material tests use fresh owned fixtures, never live stores.  Pure read-port
+;; and bounded hand-off controls also run directly without a Dolt fixture.
 
 ;;; Code:
 
@@ -37,11 +32,6 @@
    (list :dolt-dir dolt-dir :root-id rid
          :identity '(:property "BEAD_ID"))))
 
-(defun dorg-test-2ij34--entry-for (res owner-id)
-  "Return RES's :postimages entry whose :owner-heading is OWNER-ID."
-  (cl-find owner-id (plist-get res :postimages)
-           :key (lambda (e) (plist-get e :owner-heading))))
-
 (defun dorg-test-2ij34--state (dolt-dir)
   "Return a comparable snapshot of DOLT-DIR's durable state."
   (list :head (dorg-head-commit dolt-dir)
@@ -51,62 +41,58 @@
                                  dolt-dir
                                  "SELECT COUNT(*) AS n FROM dolt_log")))))
 
-;;; ─── AC1 — receipt completeness ─────────────────────────────────────
+;;; ─── Positive identity-owner transformations ─────────────────────────────
 
-(ert-deftest dorg-test-2ij34-receipt-single-owner-entry ()
-  "AC1 RED: a committed apply carries one versioned entry for its owner.
-On trunk :postimages is absent entirely, so this fails there."
+(ert-deftest dorg-test-2ij34-single-owner-apply-keeps-parity-without-wire ()
+  "An identity owner commits its validated state without derived wire fields."
   (skip-unless (and dorg-test--dolt-available dorg-test--server-port))
   (dorg-test-mutate--with-dolt
     (let* ((rid (dorg-test-mutate--seed dolt-dir dorg-test-2ij34--seed 100))
            (src (dorg-test-2ij34--src dolt-dir rid))
            (alpha (dorg-test-mutate--id-by-title dolt-dir "Alpha"))
+           (before (dorg-head-commit dolt-dir))
            (res (dorg-test-mutate--apply-patch-batch
                  src (list (dorg-test-mutate--heading-update-patch
                             alpha :title "Alpha renamed")))))
       (should (plist-get res :ok))
-      (let ((entry (dorg-test-2ij34--entry-for res alpha)))
-        (should entry)
-        (should (equal 1 (plist-get entry :version)))
-        (should (equal rid (plist-get entry :root)))
-        (should (equal alpha (plist-get entry :owner-heading)))
-        (should (plist-member entry :parent-owner-heading))
-        (should (stringp (plist-get entry :candidate-id)))
-        (should (string-match-p "\\`[0-9a-f]\\{40,64\\}\\'"
-                                (plist-get entry :digest)))
-        (should-not (plist-get entry :deleted))))))
+      (should-not (equal before (dorg-head-commit dolt-dir)))
+      (should (= alpha (dorg-test-mutate--id-by-title dolt-dir "Alpha renamed")))
+      (should-not (plist-member res :postimages))
+      (should-not (plist-member res :candidate-models)))))
 
-(ert-deftest dorg-test-2ij34-receipt-multi-owner-batch ()
-  "AC1 RED: a batch touching two owners emits one entry per owner."
+(ert-deftest dorg-test-2ij34-multi-owner-batch-keeps-parity-without-wire ()
+  "A genuine two-owner batch commits both validated transformations."
   (skip-unless (and dorg-test--dolt-available dorg-test--server-port))
   (dorg-test-mutate--with-dolt
     (let* ((rid (dorg-test-mutate--seed dolt-dir dorg-test-2ij34--seed 100))
            (src (dorg-test-2ij34--src dolt-dir rid))
            (alpha (dorg-test-mutate--id-by-title dolt-dir "Alpha"))
            (beta (dorg-test-mutate--id-by-title dolt-dir "Beta"))
+           (before (dorg-head-commit dolt-dir))
            (res (dorg-test-mutate--apply-patch-batch
-                 src (list (dorg-test-mutate--heading-update-patch
-                            alpha :title "Alpha two")
-                           (dorg-test-mutate--heading-update-patch
-                            beta :title "Beta two")))))
+                 src (list (dorg-test-mutate--heading-update-patch alpha :title "Alpha two")
+                           (dorg-test-mutate--heading-update-patch beta :title "Beta two")))))
       (should (plist-get res :ok))
-      (should (dorg-test-2ij34--entry-for res alpha))
-      (should (dorg-test-2ij34--entry-for res beta))
-      (should (= 2 (length (plist-get res :postimages)))))))
+      (should-not (equal before (dorg-head-commit dolt-dir)))
+      (should (= alpha (dorg-test-mutate--id-by-title dolt-dir "Alpha two")))
+      (should (= beta (dorg-test-mutate--id-by-title dolt-dir "Beta two")))
+      (should-not (plist-member res :postimages)))))
 
-(ert-deftest dorg-test-2ij34-receipt-deleted-owner-entry ()
-  "AC1 RED: deleting an owner subtree emits an entry with :deleted t."
+(ert-deftest dorg-test-2ij34-deleted-owner-apply-keeps-absence-proof ()
+  "Deleting an identity owner removes its rows without a wire reconstruction."
   (skip-unless (and dorg-test--dolt-available dorg-test--server-port))
   (dorg-test-mutate--with-dolt
     (let* ((rid (dorg-test-mutate--seed dolt-dir dorg-test-2ij34--seed 100))
            (src (dorg-test-2ij34--src dolt-dir rid))
            (beta (dorg-test-mutate--id-by-title dolt-dir "Beta"))
+           (before (dorg-head-commit dolt-dir))
            (res (dorg-test-mutate--apply-patch-batch
                  src (list (dorg-test-mutate--delete-patch beta t)))))
       (should (plist-get res :ok))
-      (let ((entry (dorg-test-2ij34--entry-for res beta)))
-        (should entry)
-        (should (plist-get entry :deleted))))))
+      (should-not (equal before (dorg-head-commit dolt-dir)))
+      (should-not (dorg-test-mutate--id-by-title dolt-dir "Beta"))
+      (should-not (gethash beta (dorg-model-load-tree dolt-dir rid)))
+      (should-not (plist-member res :postimages)))))
 
 (ert-deftest dorg-test-2ij34-receipt-noop-emits-none ()
   "AC1 boundary control (may pass at trunk): empty net effect emits no
@@ -188,177 +174,32 @@ Uses the demo index projector as the extension row plane."
                         (format "SELECT title FROM demo_ix WHERE heading_id = %d"
                                 alpha))))))))
 
-;;; ─── AC3 — digest entitlement in the operational log ────────────────
+;;; ─── Compact operation evidence ─────────────────────────────────────────
 
-(ert-deftest dorg-test-2ij34-digest-logged-with-evidence-row ()
-  "AC3 RED: an op-id apply stores postimages_v1 with the evidence row,
-matching the digests the receipt reports.  On trunk the column does not
-exist, so this fails."
+(ert-deftest dorg-test-2ij34-compact-evidence-row-omits-derived-payload ()
+  "An identity mutation atomically commits a compact row and NULL legacy payload."
   (skip-unless (and dorg-test--dolt-available dorg-test--server-port))
   (dorg-test-mutate--with-dolt
     (let* ((rid (dorg-test-mutate--seed dolt-dir dorg-test-2ij34--seed 100))
            (src (dorg-test-2ij34--src dolt-dir rid))
            (alpha (dorg-test-mutate--id-by-title dolt-dir "Alpha"))
-           (op-id "test:2ij34:digest-log:1")
+           (op-id "test:compact:identity")
            (res (dorg-api-execute
-                 `(on (id ,alpha) (set (heading title) "Alpha logged"))
-                 :mode 'apply :source src :op-id op-id)))
+                 `(on (id ,alpha) (set (heading title) "Alpha compact"))
+                 :mode 'apply :source src :op-id op-id))
+           (rows (dorg-sql dolt-dir
+                           (format (concat "SELECT op_id AS op_id, gen_id AS gen_id,"
+                                           " intent_digest AS intent_digest, ts AS ts,"
+                                           " postimages_v1 AS postimages_v1"
+                                           " FROM dorg_mutation_log WHERE op_id = %s")
+                                   (dorg-sql-quote op-id)))))
       (should (plist-get res :ok))
-      (let* ((entry (dorg-test-2ij34--entry-for res alpha))
-             (stored (alist-get
-                      'postimages_v1
-                      (car (dorg-sql
-                            dolt-dir
-                            (format "SELECT postimages_v1 FROM dorg_mutation_log WHERE op_id = %s"
-                                    (dorg-sql-quote op-id)))))))
-        (should entry)
-        (should (stringp stored))
-        (should (string-match-p (regexp-quote (plist-get entry :digest))
-                                stored))))))
-
-;;; ─── AC4 — candidate-model wire shape v1 ────────────────────────────
-;; RED baseline for this family is the lane tip AFTER the AC1-AC3
-;; implementation landed: `:return-candidate-models' is an unknown raw
-;; option there (historically ignored), so each test fails on the absent
-;; `:candidate-models' field in its predicted direction.
-
-(defun dorg-test-2ij34--model-for (res owner-id)
-  "Return RES's :candidate-models entry whose :owner-heading is OWNER-ID."
-  (cl-find owner-id (plist-get res :candidate-models)
-           :key (lambda (e) (plist-get e :owner-heading))))
-
-(defconst dorg-test-2ij34--rich-seed
-  (concat "* TODO [#B] Gamma :tagx:tagy:\n"
-          "SCHEDULED: <2026-09-02 Wed>\n"
-          ":PROPERTIES:\n:BEAD_ID: bead-gamma\n:CUSTOM: v1\n:END:\n"
-          ":LOGBOOK:\n- note one\n:END:\n"
-          "gamma body\n"
-          "** COMMENT Delta\n"
-          "delta body\n")
-  "One owner exercising every NODE field class: todo, priority, tags,
-properties (sorted), a planning item, a property-form drawer, a lines
-drawer, text items, a commented child in semantic order.")
-
-(ert-deftest dorg-test-2ij34-wire-candidate-models-returned ()
-  "AC4 RED: `:return-candidate-models t' returns one versioned envelope per
-affected owner, its NODE serialized from the committed readback model."
-  (skip-unless (and dorg-test--dolt-available dorg-test--server-port))
-  (dorg-test-mutate--with-dolt
-    (let* ((rid (dorg-test-mutate--seed dolt-dir dorg-test-2ij34--seed 100))
-           (src (dorg-test-2ij34--src dolt-dir rid))
-           (alpha (dorg-test-mutate--id-by-title dolt-dir "Alpha"))
-           (res (dorg-api-execute
-                 `(on (id ,alpha) (set (heading title) "Alpha wired"))
-                 :mode 'apply :source src :return-candidate-models t)))
-      (should (plist-get res :ok))
-      (let ((entry (dorg-test-2ij34--model-for res alpha)))
-        (should entry)
-        (should (equal 1 (plist-get entry :version)))
-        (should (equal rid (plist-get entry :root)))
-        (should (plist-member entry :parent-owner-heading))
-        (let ((model (plist-get entry :model)))
-          (should (eq 'heading (car-safe model)))
-          (let ((fields (cdr model)))
-            (should (equal alpha (plist-get fields :id)))
-            (should (equal "Alpha wired" (plist-get fields :title)))
-            (should (member '(text "alpha body\n" :post-blank 0) (plist-get fields :items)))
-            (should (equal "bead-alpha"
-                           (cdr (assoc "BEAD_ID"
-                                       (plist-get fields :properties)))))
-            (let ((children (plist-get fields :children)))
-              (should (= 1 (length children)))
-              (should (equal "Design"
-                             (plist-get (cdr (car children)) :title)))
-              (should (member '(text "design body\n" :post-blank 0)
-                              (plist-get (cdr (car children)) :items))))))))))
-
-(ert-deftest dorg-test-2ij34-wire-deleted-owner-model-nil ()
-  "AC4 RED: a deleted owner's wire entry carries :model nil."
-  (skip-unless (and dorg-test--dolt-available dorg-test--server-port))
-  (dorg-test-mutate--with-dolt
-    (let* ((rid (dorg-test-mutate--seed dolt-dir dorg-test-2ij34--seed 100))
-           (src (dorg-test-2ij34--src dolt-dir rid))
-           (beta (dorg-test-mutate--id-by-title dolt-dir "Beta"))
-           (res (dorg-api-execute
-                 `(on (id ,beta) (delete (subtree)))
-                 :mode 'apply :source src :return-candidate-models t)))
-      (should (plist-get res :ok))
-      (let ((entry (dorg-test-2ij34--model-for res beta)))
-        (should entry)
-        (should (plist-member entry :model))
-        (should-not (plist-get entry :model))))))
-
-(ert-deftest dorg-test-2ij34-wire-node-field-completeness ()
-  "AC4 RED (serializer completeness witness): every NODE field class
-round-trips — todo, priority, tags, post-blank shape, commented, sorted
-properties, exact typed item forms of every kind, semantic-order children."
-  (skip-unless (and dorg-test--dolt-available dorg-test--server-port))
-  (dorg-test-mutate--with-dolt
-    (let* ((rid (dorg-test-mutate--seed dolt-dir dorg-test-2ij34--rich-seed 100))
-           (src (dorg-test-2ij34--src dolt-dir rid))
-           (gamma (dorg-test-mutate--id-by-title dolt-dir "Gamma"))
-           (res (dorg-api-execute
-                 `(on (id ,gamma) (set (heading title) "Gamma"))
-                 :mode 'apply :source src :return-candidate-models t
-                 :op-id "test:2ij34:wire-completeness:1"))
-           (entry (dorg-test-2ij34--model-for res gamma))
-           (fields (cdr (plist-get entry :model))))
-      (should (plist-get res :ok))
-      (should entry)
-      (should (equal "TODO" (plist-get fields :todo)))
-      ;; The persisted model carries priority as its cookie letter string;
-      ;; the wire is faithful to the model representation (the contract's
-      ;; CHAR-OR-NIL annotation is an erratum, disclosed for review).
-      (should (equal "B" (plist-get fields :priority)))
-      (should (equal '("tagx" "tagy") (plist-get fields :tags)))
-      (should (integerp (plist-get fields :post-blank)))
-      (should-not (plist-get fields :commented))
-      ;; Properties sorted by name.
-      (let ((props (plist-get fields :properties)))
-        (should (equal props (sort (copy-sequence props)
-                                   (lambda (a b) (string< (car a) (car b))))))
-        (should (equal "v1" (cdr (assoc "CUSTOM" props))))
-        (should (equal "bead-gamma" (cdr (assoc "BEAD_ID" props)))))
-      ;; Exact typed item forms, public-constructor vocabulary.
-      (let ((items (plist-get fields :items)))
-        (should (member '(text "gamma body\n" :post-blank 0) items))
-        (should (member '(planning :scheduled "<2026-09-02 Wed>" :post-blank 0) items))
-        (should (cl-find-if (lambda (i)
-                              (and (eq (car-safe i) 'drawer)
-                                   (equal (nth 1 i) "LOGBOOK")))
-                            items)))
-      ;; Semantic-order children; the COMMENT child keeps :commented t.
-      (let ((children (plist-get fields :children)))
-        (should (= 1 (length children)))
-        (let ((delta (cdr (car children))))
-          (should (equal "Delta" (plist-get delta :title)))
-          (should (plist-get delta :commented))
-          (should (member '(text "delta body\n" :post-blank 0) (plist-get delta :items))))))))
-
-(ert-deftest dorg-test-2ij34-wire-sabotaged-serializer-visible ()
-  "AC4 RED (single-serializer seam): sabotaging the one wire serializer is
-consumer-visible — the returned NODE loses the dropped field, proving the
-public result flows through THAT serializer and no parallel path exists.
-Predicted failure at the RED baseline: the seam function does not exist."
-  (skip-unless (and dorg-test--dolt-available dorg-test--server-port))
-  (dorg-test-mutate--with-dolt
-    (let* ((rid (dorg-test-mutate--seed dolt-dir dorg-test-2ij34--rich-seed 100))
-           (src (dorg-test-2ij34--src dolt-dir rid))
-           (gamma (dorg-test-mutate--id-by-title dolt-dir "Gamma"))
-           (real (symbol-function 'dorg-mutate--postimage-wire-node)))
-      (cl-letf (((symbol-function 'dorg-mutate--postimage-wire-node)
-                 (lambda (heading children)
-                   (let ((node (funcall real heading children)))
-                     (cons (car node)
-                           (let ((fields (copy-sequence (cdr node))))
-                             (cl-remf fields :todo)
-                             fields))))))
-        (let* ((res (dorg-api-execute
-                     `(on (id ,gamma) (set (heading title) "Gamma sab"))
-                     :mode 'apply :source src :return-candidate-models t))
-               (entry (dorg-test-2ij34--model-for res gamma)))
-          (should entry)
-          (should-not (plist-member (cdr (plist-get entry :model)) :todo)))))))
+      (should (= 1 (length rows)))
+      (should (equal op-id (alist-get 'op_id (car rows))))
+      (should (stringp (alist-get 'gen_id (car rows))))
+      (should (stringp (alist-get 'intent_digest (car rows))))
+      (should-not (alist-get 'postimages_v1 (car rows)))
+      (should-not (plist-member res :postimages)))))
 
 (ert-deftest dorg-test-2ij34-validator-aborts-item-row-corruption-intact-hash ()
   "AC2 RED (K#025 B1): item ROWS corrupted while the stored items_hash
@@ -417,26 +258,23 @@ with owner-local Kid (102), identity sibling SrcSib (103).")
                 101 (dorg-test-mutate--heading-address 501)
                 :to-source dst)))))
 
-(ert-deftest dorg-test-2ij34-receipt-cross-root-both-sides ()
-  "AC1 witness (K#025 B1; may pass at the baseline): an identity
-cross-root move emits one entry per affected owner on EACH side — the
-source-side owner entry is :deleted (the owner left that root), the
-destination-side entry is present."
+(ert-deftest dorg-test-2ij34-cross-root-proof-still-covers-both-sides ()
+  "The real validator covers deleted source and present destination owner scope."
   (skip-unless (and dorg-test--dolt-available dorg-test--server-port))
   (dorg-test-mutate--with-dolt
-    (let ((res (dorg-test-2ij34--xroot-apply dolt-dir)))
-      (should (plist-get res :ok))
-      (let ((entries (plist-get res :postimages)))
-        (should (cl-find-if
-                 (lambda (e) (and (equal 100 (plist-get e :root))
-                                  (equal 101 (plist-get e :owner-heading))
-                                  (plist-get e :deleted)))
-                 entries))
-        (should (cl-find-if
-                 (lambda (e) (and (equal 500 (plist-get e :root))
-                                  (equal 101 (plist-get e :owner-heading))
-                                  (not (plist-get e :deleted))))
-                 entries))))))
+    (let ((proof (symbol-function 'dorg-mutate--postimage-assert-partitions))
+          (seen nil))
+      (cl-letf (((symbol-function 'dorg-mutate--postimage-assert-partitions)
+                 (lambda (read specs)
+                   (setq seen (copy-tree specs))
+                   (funcall proof read specs))))
+        (should (plist-get (dorg-test-2ij34--xroot-apply dolt-dir) :ok)))
+      (should (cl-find-if (lambda (spec)
+                           (and (= 100 (nth 0 spec)) (= 101 (nth 1 spec))
+                                (nth 4 spec))) seen))
+      (should (cl-find-if (lambda (spec)
+                           (and (= 500 (nth 0 spec)) (= 101 (nth 1 spec))
+                                (not (nth 4 spec)))) seen)))))
 
 (ert-deftest dorg-test-2ij34-validator-aborts-root-misplacement-cross-root ()
   "AC2 RED (K#025 B1): a cross-root move whose re-homed row is corrupted
@@ -486,95 +324,56 @@ readback query and the honest apply aborts."
                         (format "SELECT title FROM demo_ix WHERE heading_id = %d"
                                 alpha))))))))
 
-;;; ─── AC5 — settled-op replay evidence ───────────────────────────────
+;;; ─── Compact settled replay and explicit revision reads ──────────────────
 
-(ert-deftest dorg-test-2ij34-replay-settled-op-reemits-postimages ()
-  "AC5 RED: replaying a settled op-id re-emits the stored :postimages
-verbatim on the idempotent result."
+(ert-deftest dorg-test-2ij34-replay-settled-op-keeps-original-compact-result ()
+  "Settled replay keeps original commit/op-id without derived response fields."
   (skip-unless (and dorg-test--dolt-available dorg-test--server-port))
   (dorg-test-mutate--with-dolt
     (let* ((rid (dorg-test-mutate--seed dolt-dir dorg-test-2ij34--seed 100))
            (src (dorg-test-2ij34--src dolt-dir rid))
            (alpha (dorg-test-mutate--id-by-title dolt-dir "Alpha"))
            (form `(on (id ,alpha) (set (heading title) "Alpha replayed")))
-           (op-id "test:2ij34:replay-receipt:1")
+           (op-id "test:compact:retry")
            (res1 (dorg-api-execute form :mode 'apply :source src :op-id op-id))
+           (head (dorg-head-commit dolt-dir))
            (res2 (dorg-api-execute form :mode 'apply :source src :op-id op-id)))
-      (should (plist-get res1 :postimages))
+      (should (plist-get res1 :ok))
       (should (plist-get res2 :idempotent))
+      (should (equal op-id (plist-get res2 :op-id)))
       (should (equal (plist-get res1 :new-token) (plist-get res2 :new-token)))
-      (should (equal (plist-get res1 :postimages)
-                     (plist-get res2 :postimages))))))
+      (should (equal head (dorg-head-commit dolt-dir)))
+      (should-not (plist-member res2 :postimages))
+      (should-not (plist-member res2 :candidate-models)))))
 
-(ert-deftest dorg-test-2ij34-replay-models-reconstructed-as-of ()
-  "AC5 RED: an evidence-requesting replay reconstructs candidate models AS
-OF the settled commit over the stored owner scope — NOT from current state.
-A later mutation moves current state away; the replay must return the
-settled title, not the current one."
+(ert-deftest dorg-test-2ij34-replay-commit-supports-explicit-scoped-revision-read ()
+  "A known heading can be loaded explicitly at the ORIGINAL recovered revision.
+Replay does not invent an owner/model scope or restore current HEAD."
   (skip-unless (and dorg-test--dolt-available dorg-test--server-port))
   (dorg-test-mutate--with-dolt
     (let* ((rid (dorg-test-mutate--seed dolt-dir dorg-test-2ij34--seed 100))
            (src (dorg-test-2ij34--src dolt-dir rid))
            (alpha (dorg-test-mutate--id-by-title dolt-dir "Alpha"))
            (form `(on (id ,alpha) (set (heading title) "Alpha v1")))
-           (op-id "test:2ij34:replay-models:1")
-           (res1 (dorg-api-execute form :mode 'apply :source src :op-id op-id
-                                   :return-candidate-models t)))
-      (should (plist-get res1 :ok))
-      ;; Move current state past the settled commit.
-      (should (plist-get
-               (dorg-api-execute
-                `(on (id ,alpha) (set (heading title) "Alpha v2"))
-                :mode 'apply :source src :op-id "test:2ij34:replay-models:2")
-               :ok))
-      (let* ((res2 (dorg-api-execute form :mode 'apply :source src
-                                     :op-id op-id
-                                     :return-candidate-models t))
-             (m1 (dorg-test-2ij34--model-for res1 alpha))
-             (m2 (dorg-test-2ij34--model-for res2 alpha)))
-        (should (plist-get res2 :idempotent))
-        (should (equal (plist-get res1 :new-token) (plist-get res2 :new-token)))
-        (should m1)
-        (should m2)
-        (should (equal "Alpha v1" (plist-get (cdr (plist-get m2 :model)) :title)))
-        (should (equal m1 m2))))))
-
-(ert-deftest dorg-test-2ij34-replay-legacy-row-refuses-evidence ()
-  "AC5 RED: a settled LEGACY evidence row (no postimages_v1 payload) with an
-evidence-requesting caller yields the typed `legacy-evidence-unavailable'
-refusal carrying the settled commit and op identity — never a verified
-success."
-  (skip-unless (and dorg-test--dolt-available dorg-test--server-port))
-  (dorg-test-mutate--with-dolt
-    (let* ((rid (dorg-test-mutate--seed dolt-dir dorg-test-2ij34--seed 100))
-           (src (dorg-test-2ij34--src dolt-dir rid))
-           (alpha (dorg-test-mutate--id-by-title dolt-dir "Alpha"))
-           (form `(on (id ,alpha) (set (heading title) "Alpha legacy")))
-           (op-id "test:2ij34:replay-legacy:1")
+           (op-id "test:compact:revision")
            (res1 (dorg-api-execute form :mode 'apply :source src :op-id op-id)))
       (should (plist-get res1 :ok))
-      ;; Simulate a pre-receipt legacy row: evidence without postimages.
-      (dorg-sql-batch dolt-dir
-                      (list (format
-                             "UPDATE dorg_mutation_log SET postimages_v1 = NULL WHERE op_id = %s"
-                             (dorg-sql-quote op-id)))
-                      "test: simulate legacy evidence row")
-      (let ((err (should-error
-                  (dorg-api-execute form :mode 'apply :source src
-                                    :op-id op-id
-                                    :return-candidate-models t)
-                  :type 'dorg-mutate-error)))
-        (should (eq 'legacy-evidence-unavailable
-                    (dorg-mutate-error-reason err)))
-        (let ((data (dorg-mutate-error-data err)))
-          (should (equal op-id (plist-get data :op-id)))
-          (should (equal (plist-get res1 :new-token)
-                         (plist-get data :commit))))))))
+      (should (plist-get
+               (dorg-api-execute `(on (id ,alpha) (set (heading title) "Alpha v2"))
+                                 :mode 'apply :source src :op-id "test:compact:later") :ok))
+      (let* ((head (dorg-head-commit dolt-dir))
+             (res2 (dorg-api-execute form :mode 'apply :source src :op-id op-id))
+             (loaded (dorg-model-load-headings
+                      dolt-dir rid (list alpha) (plist-get res2 :new-token))))
+        (should (plist-get res2 :idempotent))
+        (should (equal (plist-get res1 :new-token) (plist-get res2 :new-token)))
+        (should (equal "Alpha v1" (dorg-heading-title (gethash alpha loaded))))
+        (should (= alpha (dorg-test-mutate--id-by-title dolt-dir "Alpha v2")))
+        (should (equal head (dorg-head-commit dolt-dir)))
+        (should-not (plist-member res2 :candidate-models))))))
 
 (ert-deftest dorg-test-2ij34-replay-legacy-row-old-caller-unchanged ()
-  "AC5 boundary control (may pass at the RED baseline): a legacy evidence
-row replayed WITHOUT an evidence request keeps the old idempotent result —
-ok, same commit, no postimages, no refusal."
+  "A NULL legacy column has no bearing on compact idempotent recovery."
   (skip-unless (and dorg-test--dolt-available dorg-test--server-port))
   (dorg-test-mutate--with-dolt
     (let* ((rid (dorg-test-mutate--seed dolt-dir dorg-test-2ij34--seed 100))
@@ -596,23 +395,16 @@ ok, same commit, no postimages, no refusal."
         (should (equal (plist-get res1 :new-token) (plist-get res2 :new-token)))
         (should-not (plist-get res2 :postimages))))))
 
-;;; ─── AC6 — static contract pins (no Dolt required) ──────────────────
-;; Pure-struct pins of the contract's closed shapes.  A future edit that
-;; drops, renames, or reorders a receipt/wire field, or changes the
-;; operational payload arity, fails HERE before any consumer drifts.
-
-(defun dorg-test-2ij34--plist-keys (plist)
-  "Return PLIST's keys in order."
-  (cl-loop for (k _v) on plist by #'cddr collect k))
+;;; ─── Pure item grammar and transaction-read-port controls ─────────────────
 
 (defun dorg-test-2ij34--static-partition (&optional title)
   "Return a minimal synthetic owner partition for static pins."
   (let ((base (make-hash-table :test 'eql))
         (cand (make-hash-table :test 'eql)))
-    (puthash 7 (make-dorg-heading :id 7 :parent-id nil :level 1
+    (puthash 7 (make-dorg-heading :id 7 :parent-id nil :level 1 :level-offset 1
                                   :title "before" :post-blank 0)
              base)
-    (puthash 7 (make-dorg-heading :id 7 :parent-id nil :level 1
+    (puthash 7 (make-dorg-heading :id 7 :parent-id nil :level 1 :level-offset 1
                                   :title (or title "after") :post-blank 0)
              cand)
     (dorg-ext-owner-partition-create
@@ -621,82 +413,30 @@ ok, same commit, no postimages, no refusal."
      :affected-ids '(7) :affected-paths nil
      :base-image base :candidate-postimage cand)))
 
-(ert-deftest dorg-test-2ij34-static-receipt-entry-census ()
-  "AC6: the receipt entry's key census is the contract's, exactly."
-  (let ((entry (dorg-mutate--postimage-entry
-                (dorg-test-2ij34--static-partition) "cand-id")))
-    (should (equal '(:version :root :owner-heading :parent-owner-heading
-                     :candidate-id :digest :deleted)
-                   (dorg-test-2ij34--plist-keys entry)))
-    (should (equal 1 (plist-get entry :version)))))
-
-(ert-deftest dorg-test-2ij34-static-digest-tracks-candidate ()
-  "AC6 transformation pin: the digest is a function of the candidate
-canonical — equal partitions digest equal, a changed candidate digests
-differently."
-  (let ((a (dorg-mutate--postimage-digest (dorg-test-2ij34--static-partition)))
-        (b (dorg-mutate--postimage-digest (dorg-test-2ij34--static-partition)))
-        (c (dorg-mutate--postimage-digest
-            (dorg-test-2ij34--static-partition "tampered"))))
-    (should (equal a b))
-    (should-not (equal a c))
-    (should (string-match-p "\\`[0-9a-f]\\{64\\}\\'" a))))
-
-(ert-deftest dorg-test-2ij34-static-wire-node-census ()
-  "AC6: the wire NODE field census is the contract's, exactly."
-  (let* ((h (make-dorg-heading :id 7 :parent-id nil :level 1 :title "t"
-                               :todo "TODO" :priority "A" :tags '("x")
-                               :post-blank 1 :commented nil))
-         (node (dorg-mutate--postimage-wire-node h nil)))
-    (should (eq 'heading (car node)))
-    (should (equal '(:id :title :todo :priority :tags :post-blank
-                     :commented :properties :items :children)
-                   (dorg-test-2ij34--plist-keys (cdr node))))))
-
-(ert-deftest dorg-test-2ij34-static-wire-item-forms ()
-  "AC6: every item class serializes to its public-constructor form, with
-the always-present `:post-blank' tail (K#025 B2)."
-  (should (equal '(text "body" :post-blank 0)
-                 (dorg-mutate--postimage-wire-item
-                  (dorg-text-item :post-blank 0 :text "body"))))
-  (should (equal '(keyword "K" "V" :post-blank 3)
-                 (dorg-mutate--postimage-wire-item
-                  (dorg-keyword-item :post-blank 3 :keyword "K" :value "V"))))
-  (should (equal '(planning :scheduled "<s>" :closed "[c]" :post-blank 0)
-                 (dorg-mutate--postimage-wire-item
-                  (dorg-planning-item :post-blank 0
-                                      :scheduled "<s>" :closed "[c]"))))
-  (should (equal '(drawer "P" ("A" "1") ("B" "2") :post-blank 1)
-                 (dorg-mutate--postimage-wire-item
-                  (dorg-drawer-item :post-blank 1 :name "P"
-                                    :properties '(("A" . "1") ("B" . "2"))))))
-  (should (equal '(drawer "L" :lines ("l1" "l2") :post-blank 0)
-                 (dorg-mutate--postimage-wire-item
-                  (dorg-drawer-item :post-blank 0 :name "L"
-                                    :lines '("l1" "l2"))))))
-
-(ert-deftest dorg-test-2ij34-static-wire-item-grammar-roundtrip ()
-  "AC4 RED (K#026): every wire item form IS the public constructor grammar.
-Table-driven over all four kinds (both drawer discriminants): a model item
-serializes to a wire form, `dorg-api--item-value' accepts that exact form
-and carries `:post-blank' in the normalized value, `dorg-mutate--item-from-value'
-rebuilds the model item from it, and re-serialization is byte-identical —
-ONE grammar, no wire-only parser.  At the K#026 baseline the constructor
-rejects every `:post-blank'-tailed form."
-  (dolist (item (list (dorg-text-item :post-blank 2 :text "body")
-                      (dorg-keyword-item :post-blank 1 :keyword "K" :value "V")
-                      (dorg-planning-item :post-blank 0
-                                          :scheduled "<s>" :closed "[c]")
-                      (dorg-drawer-item :post-blank 1 :name "P"
-                                        :properties '(("A" . "1")))
-                      (dorg-drawer-item :post-blank 0 :name "L"
-                                        :lines '("l1" "l2"))))
-    (let* ((wire (dorg-mutate--postimage-wire-item item))
-           (value (dorg-api--item-value wire))
+(ert-deftest dorg-test-2ij34-static-public-item-grammar-keeps-post-blank ()
+  "The public item grammar preserves all kinds and explicit item spacing.
+No wire serializer participates: constructor forms lower through real API
+normalization and real model construction."
+  (dolist
+      (case
+       (list
+        (cons '(text "body" :post-blank 2)
+              (dorg-text-item :post-blank 2 :text "body"))
+        (cons '(keyword "K" "V" :post-blank 1)
+              (dorg-keyword-item :post-blank 1 :keyword "K" :value "V"))
+        (cons '(planning :scheduled "<s>" :closed "[c]" :post-blank 0)
+              (dorg-planning-item :post-blank 0 :scheduled "<s>" :closed "[c]"))
+        (cons '(drawer "P" ("A" "1") :post-blank 1)
+              (dorg-drawer-item :post-blank 1 :name "P" :properties '(("A" . "1"))))
+        (cons '(drawer "L" :lines ("l1" "l2") :post-blank 0)
+              (dorg-drawer-item :post-blank 0 :name "L" :lines '("l1" "l2")))))
+    (let* ((value (dorg-api--item-value (car case)))
            (rebuilt (dorg-mutate--item-from-value value)))
-      (should (equal (dorg-item-post-blank item)
+      (should (equal (dorg-item-post-blank (cdr case))
                      (plist-get value :post-blank)))
-      (should (equal wire (dorg-mutate--postimage-wire-item rebuilt)))))
+      (should (equal (dorg-item-post-blank (cdr case))
+                     (dorg-item-post-blank rebuilt)))
+      (should (dorg-model--item-semantic-equal-p (cdr case) rebuilt))))
   ;; The extended grammar validates: :post-blank must be a non-negative
   ;; integer, at the API boundary and at the engine boundary alike.
   (should-error (dorg-api--item-value '(text "b" :post-blank -1))
@@ -720,74 +460,18 @@ rejects every `:post-blank'-tailed form."
   (should (dorg-mutate--patch-validate-item-value
            '(:kind text :text "b" :post-blank 2) 'test)))
 
-(ert-deftest dorg-test-2ij34-static-payload-roundtrip ()
-  "AC6: the operational payload round-trips entries exactly; malformed
-payloads parse to nil (legacy semantics), never fabricated evidence."
-  (let* ((entries (list (dorg-mutate--postimage-entry
-                         (dorg-test-2ij34--static-partition)
-                         (make-string 40 ?c))))
-         (payload (dorg-mutate--postimage-log-payload entries)))
-    (should (equal entries
-                   (dorg-mutate--postimage-entries-from-payload payload))))
-  (should-not (dorg-mutate--postimage-entries-from-payload "not a payload ("))
-  (should-not (dorg-mutate--postimage-entries-from-payload "((1 2 3))"))
-  (should-not (dorg-mutate--postimage-log-payload nil))
-  ;; A tampered evidence column carrying a read-time-eval form is malformed
-  ;; input, never evaluated (the reader-census seam law).
-  (should-not (dorg-mutate--postimage-entries-from-payload
-               "#.(setq dorg-test-2ij34--evil t)"))
-  (should-not (boundp 'dorg-test-2ij34--evil)))
-
-(ert-deftest dorg-test-2ij34-static-wire-item-post-blank-carried ()
-  "AC4 RED (K#025 B2): item-level post-blank is persisted, participates in
-the items digest, and MUST cross the wire — two items differing only in
-post-blank serialize to different forms, and the value is explicit."
-  (let ((a (dorg-mutate--postimage-wire-item
-            (dorg-text-item :post-blank 0 :text "b")))
-        (b (dorg-mutate--postimage-wire-item
-            (dorg-text-item :post-blank 2 :text "b"))))
-    (should-not (equal a b))
-    (should (equal '(text "b" :post-blank 0) a))
-    (should (equal '(text "b" :post-blank 2) b)))
-  (should (equal '(drawer "L" :lines ("l1") :post-blank 1)
-                 (dorg-mutate--postimage-wire-item
-                  (dorg-drawer-item :post-blank 1 :name "L" :lines '("l1"))))))
-
-(ert-deftest dorg-test-2ij34-static-payload-rejects-trailing-and-mistyped ()
-  "AC3/AC5 RED (K#025 B3): stored-evidence parsing consumes exactly ONE
-form (trailing bytes are malformed) and validates the closed field types —
-integer roots/owners, integer-or-nil parent, 40-hex candidate-id, 64-hex
-digest, boolean deleted.  Every rejection degrades to legacy semantics."
-  (let ((good (dorg-mutate--postimage-log-payload
-               (list (list :version 1 :root 1 :owner-heading 7
-                           :parent-owner-heading nil
-                           :candidate-id (make-string 40 ?a)
-                           :digest (make-string 64 ?b)
-                           :deleted nil)))))
-    ;; The well-typed payload parses…
-    (should (dorg-mutate--postimage-entries-from-payload good))
-    ;; …but not with trailing bytes after the one form,
-    (should-not (dorg-mutate--postimage-entries-from-payload
-                 (concat good " trailing")))
-    (should-not (dorg-mutate--postimage-entries-from-payload
-                 (concat good "(1)")))
-    ;; …and not with any mistyped closed field.
-    (dolist (bad (list
-                  ;; root as string
-                  (format "((%S 7 nil %S %S nil))" "1"
-                          (make-string 40 ?a) (make-string 64 ?b))
-                  ;; parent-owner as string
-                  (format "((1 7 %S %S %S nil))" "x"
-                          (make-string 40 ?a) (make-string 64 ?b))
-                  ;; candidate-id not 40-hex
-                  (format "((1 7 nil %S %S nil))" "zz"
-                          (make-string 64 ?b))
-                  ;; digest not 64-hex
-                  (format "((1 7 nil %S %S nil))" (make-string 40 ?a) "zz")
-                  ;; deleted non-boolean
-                  (format "((1 7 nil %S %S 5))"
-                          (make-string 40 ?a) (make-string 64 ?b))))
-      (should-not (dorg-mutate--postimage-entries-from-payload bad)))))
+(ert-deftest dorg-test-2ij34-static-item-post-blank-remains-in-validation-hash ()
+  "Two items differing only in spacing remain distinguishable by the core proof."
+  (let* ((a (dorg-text-item :post-blank 0 :text "b"))
+         (b (dorg-text-item :post-blank 2 :text "b"))
+         (ha (make-dorg-heading :id 7 :items (list a)))
+         (hb (make-dorg-heading :id 7 :items (list b))))
+    (should (dorg-model--item-semantic-equal-p a b))
+    (should-not (equal (dorg-item-post-blank a) (dorg-item-post-blank b)))
+    (dorg-heading-compute-items-hash ha)
+    (dorg-heading-compute-items-hash hb)
+    (should-not (equal (dorg-mutate--index-heading-canonical ha)
+                       (dorg-mutate--index-heading-canonical hb)))))
 
 (ert-deftest dorg-test-e3cah-postimage-plan-uses-typed-read-port ()
   "tracked-regression RED: the 2ij34 validator receives a typed read port, not
@@ -803,7 +487,10 @@ while the postimage proof path opts into the closed transaction-read port."
                :candidate-postimage (make-hash-table :test 'eql)
                :owner-partitions (list (dorg-test-2ij34--static-partition))
                :candidate-id (make-string 40 ?c) :base-commit "base"))
-         (validate (plist-get (dorg-mutate--postimage-plan ctx nil) :validate)))
+         (proof (dorg-mutate--postimage-plan ctx nil))
+         (validate (plist-get proof :validate)))
+    (should (equal '(:validate) (cl-loop for (key _value) on proof by #'cddr
+                                        collect key)))
     (should (listp validate))
     (should (eq 'transaction-read-port (plist-get validate :mode)))
     (should (functionp (plist-get validate :function)))))
@@ -844,6 +531,145 @@ and unowned extension tables."
               '(:version 1 :op extension-row-count :table "demo_ix"
                 :where ((heading_id . 1))))
      :type 'dorg-sql-transaction-read-port-error)))
+
+;;; ─── Transaction read port keeps decoder types ────────────────────────
+
+(defun dorg-test-sql--typed-port-rows (sql)
+  "Answer SQL as the metadata-typed MySQL decoder does for one heading.
+Heading 1 has title \"007\", tag \"007\", a text item \"007\", a keyword item
+KEY = \"1.250\", a property drawer with value \"0.50\" and a generic drawer
+line \"042\".  Ids, offsets and counts are integers, NULL columns are nil and
+HEX() results are strings.  Each call returns fresh conses."
+  (copy-tree
+   (cond
+    ((string-match-p "COUNT(\\*)" sql) '(((n . 2))))
+    ((string-match-p "FROM drawer_lines" sql)
+     '(((drawer_item_id . 104) (line_raw . "042"))))
+    ((string-match-p "FROM property_entries" sql)
+     '(((drawer_item_id . 103) (prop_key . "LIMIT") (prop_value . "0.50"))))
+    ((string-match-p "FROM heading_items" sql)
+     '(((item_id . 101) (heading_id . 1) (kind . "text") (post_blank . 0)
+        (item_sort_key . "01") (text_raw . "007") (keyword) (value_raw)
+        (scheduled_raw) (deadline_raw) (closed_raw) (drawer_name))
+       ((item_id . 102) (heading_id . 1) (kind . "keyword") (post_blank . 0)
+        (item_sort_key . "02") (text_raw) (keyword . "KEY") (value_raw . "1.250")
+        (scheduled_raw) (deadline_raw) (closed_raw) (drawer_name))
+       ((item_id . 103) (heading_id . 1) (kind . "drawer") (post_blank . 0)
+        (item_sort_key . "03") (text_raw) (keyword) (value_raw)
+        (scheduled_raw) (deadline_raw) (closed_raw) (drawer_name . "PROPERTIES"))
+       ((item_id . 104) (heading_id . 1) (kind . "drawer") (post_blank . 0)
+        (item_sort_key . "04") (text_raw) (keyword) (value_raw)
+        (scheduled_raw) (deadline_raw) (closed_raw) (drawer_name . "NOTES"))))
+    ((string-match-p "FROM heading_tags" sql)
+     '(((heading_id . 1) (tag . "007"))))
+    ((string-match-p "\\`SELECT id FROM headings" sql) '(((id . 1))))
+    (t '(((id . 1) (parent_id) (sort_key . "01") (level_offset . 0)
+          (todo_keyword) (priority) (commented . 0) (title . "007")
+          (post_blank . 0) (items_hash)))))))
+
+(defconst dorg-test-sql--typed-port-items
+  '("text:0:007" "keyword:0:KEY:1.250" "drawer:0:PROPERTIES:LIMIT=0.50"
+    "drawer:0:NOTES:042")
+  "Content strings of heading 1's items in `dorg-test-sql--typed-port-rows'.")
+
+(defun dorg-test-sql--assert-typed-port (read table)
+  "Invoke all five READ operations on heading 1 and extension TABLE.
+Assert each result keeps the decoder's types: integer ids and count, nil
+NULLs, string HEX, and numeric-looking text that hydrates and deep-copies
+unchanged."
+  (let* ((core (funcall read '(:version 1 :op core-heading-rows
+                               :ids (1) :root-id 1)))
+         (tags (funcall read '(:version 1 :op core-heading-tags :ids (1))))
+         (ids (funcall read '(:version 1 :op core-heading-ids :ids (1))))
+         (image (funcall read '(:version 1 :op owner-model
+                                :root-id 1 :ids (1))))
+         (count (funcall read (list :version 1 :op 'extension-row-count
+                                    :table table :where '((root_id . 1)))))
+         (heading (gethash 1 image)))
+    (should (equal '((id . 1) (parent_id) (sort_key . "01") (level_offset . 0)
+                     (todo_keyword) (priority) (commented . 0) (title . "007")
+                     (post_blank . 0) (items_hash))
+                   (car core)))
+    (should (equal '(((heading_id . 1) (tag . "007"))) tags))
+    (should (equal '(((id . 1))) ids))
+    (should (equal "007" (dorg-heading-title heading)))
+    (should (equal '("007") (dorg-heading-tags heading)))
+    (should (equal dorg-test-sql--typed-port-items
+                   (mapcar #'dorg-item-content-string (dorg-heading-items heading))))
+    (let ((copy (dorg-heading-deep-copy heading)))
+      (should (equal "007" (dorg-heading-title copy)))
+      (should (equal dorg-test-sql--typed-port-items
+                     (mapcar #'dorg-item-content-string (dorg-heading-items copy)))))
+    (should (eql 2 count))))
+
+(ert-deftest dorg-test-sql-transaction-read-port-keeps-decoder-types ()
+  "All five closed read operations return the decoder's typed rows unchanged.
+`dorg-sql--mysql-exec' answers as the metadata-typed MySQL decoder does, so
+the test isolates the read port: a numeric-looking title, tag and owner-model
+text stay strings and deep-copy, and ids and the count stay integers."
+  (cl-letf (((symbol-function 'dorg-sql--mysql-exec)
+             (lambda (sql _conn) (dorg-test-sql--typed-port-rows sql))))
+    (dorg-test-sql--assert-typed-port
+     (dorg-sql--transaction-read-port 'conn '("demo_ix")) "demo_ix")))
+
+(ert-deftest dorg-test-sql-transaction-read-port-count-is-a-native-integer ()
+  "The extension count accepts only a nonnegative integer COUNT(*) result.
+A missing row or column, SQL NULL, a negative, a float or a string is a typed
+refusal; it is never defaulted to zero or converted by its spelling."
+  (dolist (case '(((((n . 0))) . 0) ((((n . 2))) . 2)))
+    (cl-letf (((symbol-function 'dorg-sql--mysql-exec)
+               (lambda (_sql _conn) (copy-tree (car case)))))
+      (should (eql (cdr case)
+                   (funcall (dorg-sql--transaction-read-port 'conn '("demo_ix"))
+                            '(:version 1 :op extension-row-count
+                              :table "demo_ix" :where nil))))))
+  (dolist (rows '(nil (((m . 2))) (((n))) (((n . -1))) (((n . 1.5)))
+                  (((n . "2")))))
+    (cl-letf (((symbol-function 'dorg-sql--mysql-exec)
+               (lambda (_sql _conn) (copy-tree rows))))
+      (let ((err (should-error
+                  (funcall (dorg-sql--transaction-read-port 'conn '("demo_ix"))
+                           '(:version 1 :op extension-row-count
+                             :table "demo_ix" :where nil))
+                  :type 'dorg-sql-transaction-read-port-error)))
+        (should (eq 'bad-count (plist-get (nth 2 err) :reason)))))))
+
+(ert-deftest dorg-test-sql-transaction-read-port-keeps-native-types ()
+  "On pinned Dolt the five read operations keep the server's typed values.
+Seeds numeric-looking title, tag, text, keyword, property and drawer-line
+text, integer ids, NULL columns, a binary sort key and an owned extension
+table, then reads them through the real port on the store's own connection.
+Needs the server transport."
+  (dorg-test-mutate--with-dolt
+    (unless (eq 'mysql (dorg-sql--transport-kind dolt-dir))
+      (ert-skip "the transaction read port needs the server transport"))
+    (dorg-sql-batch
+     dolt-dir
+     (list
+      (concat "INSERT INTO headings (id, root_id, parent_id, sort_key,"
+              " level_offset, title) VALUES (1, 1, NULL, X'01', 0, '007')")
+      "INSERT INTO heading_tags (heading_id, ordinal, tag) VALUES (1, 0, '007')"
+      (concat "INSERT INTO heading_items (id, heading_id, sort_key, kind,"
+              " post_blank) VALUES (101, 1, X'01', 'text', 0),"
+              " (102, 1, X'02', 'keyword', 0), (103, 1, X'03', 'drawer', 0),"
+              " (104, 1, X'04', 'drawer', 0)")
+      "INSERT INTO text_items (item_id, text_raw) VALUES (101, '007')"
+      (concat "INSERT INTO keyword_items (item_id, keyword, value_raw)"
+              " VALUES (102, 'KEY', '1.250')")
+      (concat "INSERT INTO drawer_items (item_id, name)"
+              " VALUES (103, 'PROPERTIES'), (104, 'NOTES')")
+      (concat "INSERT INTO property_entries (drawer_item_id, ordinal, prop_key,"
+              " prop_value, raw_line) VALUES (103, 0, 'LIMIT', '0.50',"
+              " ':LIMIT: 0.50')")
+      (concat "INSERT INTO drawer_lines (drawer_item_id, ordinal, line_raw)"
+              " VALUES (104, 0, '042')")
+      "CREATE TABLE typed_port_ix (root_id BIGINT, payload TEXT)"
+      "INSERT INTO typed_port_ix VALUES (1, '007'), (1, '1.250')"))
+    (dorg-commit dolt-dir "seed typed read port")
+    (dorg-test-sql--assert-typed-port
+     (dorg-sql--transaction-read-port (dorg-sql--get-connection dolt-dir)
+                                      '("typed_port_ix"))
+     "typed_port_ix")))
 
 (ert-deftest dorg-test-e3cah-effect-predicate-lowering-is-shared ()
   "tracked-regression B1 RED: delete generation and proof counts share one lowerer.
@@ -898,14 +724,14 @@ strings are quoted data, including semicolon content."
 (defun dorg-test-nm45t--replace-one (id key text)
   "Return a whole-items replacement for ID preserving identity KEY and TEXT."
   `(on (id ,id)
-       (replace (items)
+       (replace (item (all))
                 (drawer "PROPERTIES" ("BEAD_ID" ,key))
                 (text ,text))))
 
 (defun dorg-test-nm45t--replace-two (id key first second)
   "Return a whole-items replacement for ID with identity KEY and two texts."
   `(on (id ,id)
-       (replace (items)
+       (replace (item (all))
                 (drawer "PROPERTIES" ("BEAD_ID" ,key))
                 (text ,first)
                 (text ,second))))
@@ -914,30 +740,59 @@ strings are quoted data, including semicolon content."
   "Return a typed append of TEXT after ID's last item."
   `(on (id ,id) (insert (text) (after-last) ,text)))
 
+(defvar dorg-test-nm45t--candidate-image nil
+  "Test observation of the REAL same-root attempt, never a public wire field.")
+
 (defun dorg-test-nm45t--apply (src form)
-  "Apply FORM to SRC and request its same-transaction candidate model."
-  (dorg-api-execute form :mode 'apply :source src
-                    :return-candidate-models t))
+  "Apply FORM, observing the real attempt separately from its public result."
+  (let ((builder (symbol-function 'dorg-mutate--dolt-attempt-from-sim)))
+    (setq dorg-test-nm45t--candidate-image nil)
+    (cl-letf (((symbol-function 'dorg-mutate--dolt-attempt-from-sim)
+               (lambda (source patches options sim)
+                 (let ((attempt (funcall builder source patches options sim)))
+                   (setq dorg-test-nm45t--candidate-image
+                         (dorg-ext-index-context-candidate-postimage
+                          (plist-get (plist-get attempt :sim) :index-context)))
+                   attempt))))
+      (dorg-api-execute form :mode 'apply :source src))))
 
-(defun dorg-test-nm45t--wire (dolt-dir root-id owner-id)
-  "Return OWNER-ID's canonical wire model freshly loaded from DOLT-DIR."
-  (dorg-mutate--postimage-wire-tree
-   (dorg-model-load-tree dolt-dir root-id) owner-id))
+(defun dorg-test-nm45t--heading (dolt-dir root-id owner-id)
+  "Load OWNER-ID's real model with explicit ROOT-ID scope."
+  (gethash owner-id (dorg-model-load-tree dolt-dir root-id)))
 
-(defun dorg-test-nm45t--wire-items (wire)
-  "Return WIRE's ordered semantic item forms."
-  (plist-get (cdr wire) :items))
+(defun dorg-test-nm45t--assert-items (heading forms)
+  "Assert exact item content, order and spacing against public constructor FORMS."
+  (should (dorg-heading-p heading))
+  (let ((actual (dorg-heading-items heading))
+        (expected (mapcar (lambda (form)
+                            (dorg-mutate--item-from-value (dorg-api--item-value form)))
+                          forms)))
+    (should (= (length expected) (length actual)))
+    (cl-mapc (lambda (want got)
+               (should (dorg-model--item-semantic-equal-p want got))
+               (should (equal (dorg-item-post-blank want) (dorg-item-post-blank got))))
+             expected actual)))
 
-(defun dorg-test-nm45t--attempt-wire (attempt owner-id)
-  "Return OWNER-ID's candidate wire model from private ATTEMPT."
+(defun dorg-test-nm45t--assert-parity (candidate readback)
+  "Assert canonical metadata plus exact ordered item content and spacing."
+  (should (dorg-heading-p candidate))
+  (should (dorg-heading-p readback))
+  (should (equal (dorg-mutate--index-heading-canonical candidate)
+                 (dorg-mutate--index-heading-canonical readback)))
+  (let ((want (dorg-heading-items candidate))
+        (got (dorg-heading-items readback)))
+    (should (= (length want) (length got)))
+    (cl-mapc (lambda (a b)
+               (should (dorg-model--item-semantic-equal-p a b))
+               (should (equal (dorg-item-post-blank a) (dorg-item-post-blank b))))
+             want got)))
+
+(defun dorg-test-nm45t--attempt-heading (attempt owner-id)
+  "Read OWNER-ID from private ATTEMPT's immutable candidate, not a wire model."
   (let* ((context (plist-get (plist-get attempt :sim) :index-context))
-         (partition
-          (cl-find owner-id
-                   (dorg-ext-index-context-owner-partitions context)
-                   :key #'dorg-ext-owner-partition-owner-id)))
-    (should partition)
-    (dorg-mutate--postimage-wire-tree
-     (dorg-ext-owner-partition-candidate-postimage partition) owner-id)))
+         (heading (gethash owner-id (dorg-ext-index-context-candidate-postimage context))))
+    (should (dorg-heading-p heading))
+    heading))
 
 (defun dorg-test-nm45t--last-text-id (dolt-dir heading-id)
   "Return the last text detail row id belonging to HEADING-ID."
@@ -1011,17 +866,17 @@ asserts the generated SQL includes the exact trailing-newline detail update."
       (dorg-test-nm45t--apply
        src (dorg-test-nm45t--replace-one b "case-b" "alpha body\n"))
       (let* ((before (dorg-head-commit dolt-dir))
-             (res (dorg-test-nm45t--apply
-                   src (dorg-test-nm45t--append b "beta tail")))
-             (candidate (plist-get (dorg-test-2ij34--model-for res b) :model))
-             (fresh (dorg-test-nm45t--wire dolt-dir rid b))
+             (_res (dorg-test-nm45t--apply
+                    src (dorg-test-nm45t--append b "beta tail")))
+             (candidate (gethash b dorg-test-nm45t--candidate-image))
+             (fresh (dorg-test-nm45t--heading dolt-dir rid b))
              (expected '((drawer "PROPERTIES" ("BEAD_ID" "case-b")
                                   :post-blank 0)
                          (text "alpha body\n" :post-blank 1)
                          (text "beta tail" :post-blank 0))))
         (should-not (equal before (dorg-head-commit dolt-dir)))
-        (should (equal expected (dorg-test-nm45t--wire-items candidate)))
-        (should (equal candidate fresh)))
+        (dorg-test-nm45t--assert-items candidate expected)
+        (dorg-test-nm45t--assert-parity candidate fresh))
 
       ;; C: one embedded-newline paragraph, then replacement.
       (dorg-test-nm45t--apply
@@ -1032,9 +887,10 @@ asserts the generated SQL includes the exact trailing-newline detail update."
          src (dorg-test-nm45t--replace-one
               c "case-c" "ALPHA body\nbeta tail\n"))
         (should-not (equal before (dorg-head-commit dolt-dir)))
-        (should (member '(text "ALPHA body\nbeta tail\n" :post-blank 0)
-                        (dorg-test-nm45t--wire-items
-                         (dorg-test-nm45t--wire dolt-dir rid c)))))
+        (dorg-test-nm45t--assert-items
+         (dorg-test-nm45t--heading dolt-dir rid c)
+         '((drawer "PROPERTIES" ("BEAD_ID" "case-c") :post-blank 0)
+           (text "ALPHA body\nbeta tail\n" :post-blank 0))))
 
       ;; D: replace, append, then whole-items replacement.  The final
       ;; paragraph's parser line terminator must reach text_items.text_raw.
@@ -1045,27 +901,25 @@ asserts the generated SQL includes the exact trailing-newline detail update."
       (let* ((form (dorg-test-nm45t--replace-two
                     d "case-d" "ALPHA body" "beta tail\n"))
              (tail-id (dorg-test-nm45t--last-text-id dolt-dir d))
-             (patches (dorg-api-normalize form src))
+             (patches (dorg-mutate--validate-patches (dorg-api-normalize form src)))
              (attempt (dorg-mutate--dolt-build-attempt
-                       src patches '(:return-candidate-models t)))
-             (candidate (dorg-test-nm45t--attempt-wire attempt d))
+                       src patches nil))
+             (candidate (dorg-test-nm45t--attempt-heading attempt d))
              (expected-update
               (format "UPDATE text_items SET text_raw = %s WHERE item_id = %d"
                       (dorg-sql-quote "beta tail\n") tail-id))
-             (before (dorg-head-commit dolt-dir))
-             (res nil))
+             (before (dorg-head-commit dolt-dir)))
         (should (member expected-update (plist-get attempt :sql)))
-        (setq res (dorg-test-nm45t--apply src form))
+        (should (plist-get (dorg-test-nm45t--apply src form) :ok))
         (should-not (equal before (dorg-head-commit dolt-dir)))
-        (let ((readback
-               (plist-get (dorg-test-2ij34--model-for res d) :model)))
-          (should (equal candidate readback))
-          (should (equal readback (dorg-test-nm45t--wire dolt-dir rid d)))
-          (should (equal '((drawer "PROPERTIES" ("BEAD_ID" "case-d")
-                                  :post-blank 0)
-                           (text "ALPHA body" :post-blank 0)
-                           (text "beta tail\n" :post-blank 0))
-                         (dorg-test-nm45t--wire-items readback))))))))
+        (let ((readback (dorg-test-nm45t--heading dolt-dir rid d)))
+          (dorg-test-nm45t--assert-parity candidate readback)
+          (dorg-test-nm45t--assert-parity
+           (gethash d dorg-test-nm45t--candidate-image) readback)
+          (dorg-test-nm45t--assert-items
+           readback '((drawer "PROPERTIES" ("BEAD_ID" "case-d") :post-blank 0)
+                      (text "ALPHA body" :post-blank 0)
+                      (text "beta tail\n" :post-blank 0))))))))
 
 (ert-deftest dorg-test-nm45t-injected-text-mismatch-refuses-atomically ()
   "A proven-valid sequence refuses an injected precommit text mismatch.
@@ -1113,3 +967,193 @@ the refusal therefore exercises parity rather than an intrinsically bad form."
 
 (provide 'dorg-2ij34-postimage-tests)
 ;;; dorg-2ij34-postimage-tests.el ends here
+
+;;; ─── Bounded read wrapper at the proof hand-off ───────────────────────────
+;; The transaction read port refuses any single request whose `:ids' exceed
+;; `dorg-sql-transaction-read-port-max-ids'.  The proof must therefore submit
+;; oversized candidate id sets in bounded chunks through ONE private wrapper
+;; at its hand-off, merging results by op shape, while every request at or
+;; under the cap, every unknown op, and every malformed id set passes through
+;; untouched so the port's own refusals still govern.
+
+(defun dorg-test-2g25t--recording-read (result-fn)
+  "Return (READ . LOG-CELL): READ records each request and answers via RESULT-FN."
+  (let ((log (list nil)))
+    (cons (lambda (request)
+            (push request (car log))
+            (funcall result-fn request))
+          log)))
+
+(defun dorg-test-2g25t--requests (log-cell)
+  "Return the recorded requests of LOG-CELL in call order."
+  (reverse (car log-cell)))
+
+(defun dorg-test-2g25t--rows-for (request)
+  "Answer a row-op REQUEST with one `((id . N))' row per requested id."
+  (mapcar (lambda (id) (list (cons 'id id))) (plist-get request :ids)))
+
+(ert-deftest dorg-test-2g25t-batched-read-chunks-row-ops-at-cap ()
+  "An oversized id set on each row op is split into consecutive chunks of at
+most the cap, every chunk keeps the request's other keys, and the delivered
+rows are the concatenation in input order."
+  (let ((cap dorg-sql-transaction-read-port-max-ids)
+        (ids (number-sequence 1 2500)))
+    (dolist (op '(core-heading-rows core-heading-tags core-heading-ids))
+      (let* ((rec (dorg-test-2g25t--recording-read #'dorg-test-2g25t--rows-for))
+             (read (dorg-mutate--postimage-read-batched (car rec)))
+             (rooted (eq op 'core-heading-rows))
+             (request (if rooted
+                          (list :version 1 :op op :ids ids :root-id 7)
+                        (list :version 1 :op op :ids ids)))
+             (rows (funcall read request))
+             (reqs (dorg-test-2g25t--requests (cdr rec))))
+        (should (= (length reqs) 3))
+        (should (equal (mapcar (lambda (r) (length (plist-get r :ids))) reqs)
+                       (list cap cap (- 2500 (* 2 cap)))))
+        (should (equal (apply #'append (mapcar (lambda (r) (plist-get r :ids)) reqs)) ids))
+        (dolist (r reqs)
+          (should (= 1 (plist-get r :version)))
+          (should (eq op (plist-get r :op)))
+          (should (equal (plist-get r :root-id) (and rooted 7))))
+        (should (equal (mapcar (lambda (row) (alist-get 'id row)) rows) ids))))))
+
+(ert-deftest dorg-test-2g25t-batched-read-merges-owner-model-images ()
+  "An oversized owner-model read returns one image holding every chunk's
+headings under its own id, with the root id preserved on each chunk."
+  (let* ((ids (number-sequence 1 2500))
+         (rec (dorg-test-2g25t--recording-read
+               (lambda (request)
+                 (let ((image (make-hash-table :test 'eql)))
+                   (dolist (id (plist-get request :ids))
+                     (puthash id (make-dorg-heading :id id) image))
+                   image))))
+         (read (dorg-mutate--postimage-read-batched (car rec)))
+         (image (funcall read (list :version 1 :op 'owner-model :root-id 9 :ids ids)))
+         (reqs (dorg-test-2g25t--requests (cdr rec))))
+    (should (hash-table-p image))
+    (should (= (hash-table-count image) 2500))
+    (should (cl-every (lambda (id) (= id (dorg-heading-id (gethash id image)))) ids))
+    (should (= (length reqs) 3))
+    (should (cl-every (lambda (r) (= 9 (plist-get r :root-id))) reqs))))
+
+(ert-deftest dorg-test-2g25t-batched-read-passes-under-cap-requests-unchanged ()
+  "A request at or under the cap reaches the port as the very same object."
+  (let* ((rec (dorg-test-2g25t--recording-read #'dorg-test-2g25t--rows-for))
+         (read (dorg-mutate--postimage-read-batched (car rec)))
+         (request (list :version 1 :op 'core-heading-rows
+                        :ids (number-sequence 1 dorg-sql-transaction-read-port-max-ids)
+                        :root-id 1)))
+    (funcall read request)
+    (let ((reqs (dorg-test-2g25t--requests (cdr rec))))
+      (should (= (length reqs) 1))
+      (should (eq (car reqs) request)))))
+
+(ert-deftest dorg-test-2g25t-batched-read-never-turns-malformed-into-accepted ()
+  "Chunking never converts a request the port refuses into an accepted one.
+Through the REAL port's pure validation (no connection is touched before a
+refusal): an unknown op, a non-integer id, a version the port does not
+serve, unknown keys, an owner-model read without its root id, and an empty
+id set are all still refused with the port's own error, oversized or not.
+The wrapper adds no grammar of its own."
+  (let* ((big (number-sequence 1 2500))
+         (read (dorg-mutate--postimage-read-batched
+                (dorg-sql--transaction-read-port nil))))
+    (dolist (request (list (list :version 1 :op 'extension-rows :ids big :table "x")
+                           (list :version 1 :op 'core-heading-rows
+                                 :ids (append big (list "not-an-id")) :root-id 1)
+                           (list :version 2 :op 'core-heading-rows :ids big :root-id 1)
+                           (list :version 1 :op 'core-heading-tags :ids big :extra t)
+                           (list :version 1 :op 'owner-model :ids big)
+                           (list :version 1 :op 'core-heading-rows :ids nil :root-id 1)))
+      (should-error (funcall read request)
+                    :type 'dorg-sql-transaction-read-port-error))))
+
+(ert-deftest dorg-test-2g25t-later-chunk-survivor-is-still-refused ()
+  "A row the candidate deletes that survives in the SECOND chunk of an
+oversized absence check is still refused by the core proof."
+  (let* ((absent (number-sequence 1 1500))
+         (rec (dorg-test-2g25t--recording-read
+               (lambda (request)
+                 (and (eq 'core-heading-ids (plist-get request :op))
+                      (memq 1300 (plist-get request :ids))
+                      (list (list (cons 'id 1300)))))))
+         (read (dorg-mutate--postimage-read-batched (car rec))))
+    (should-error (dorg-mutate--postimage-assert-core
+                   read (make-hash-table :test 'eql) absent nil)
+                  :type 'dorg-sql-postimage-parity)
+    (should (= (length (dorg-test-2g25t--requests (cdr rec))) 2))))
+
+(ert-deftest dorg-test-2g25t-later-chunk-partition-absence-and-corruption-are-refused ()
+  "Within one owner partition larger than the cap, a heading missing from the
+second chunk and a heading whose readback diverges in the second chunk are
+each refused by the partition proof."
+  (let* ((ids (number-sequence 1 1500))
+         (expected (make-hash-table :test 'eql)))
+    (dolist (id ids)
+      (let ((h (make-dorg-heading :id id :title (format "t%d" id))))
+        (puthash id (cons (dorg-mutate--index-heading-canonical h)
+                          (dorg-mutate--postimage-item-row-canonical h))
+                 expected)))
+    (let ((specs (list (list 100 1 ids expected nil))))
+      (cl-flet ((image-for (request mutate)
+                  (let ((image (make-hash-table :test 'eql)))
+                    (dolist (id (plist-get request :ids))
+                      (let ((h (make-dorg-heading :id id :title (format "t%d" id))))
+                        (funcall mutate id h image)))
+                    image)))
+        ;; absence in the second chunk
+        (let* ((rec (dorg-test-2g25t--recording-read
+                     (lambda (request)
+                       (image-for request (lambda (id h image)
+                                            (unless (= id 1300) (puthash id h image)))))))
+               (read (dorg-mutate--postimage-read-batched (car rec))))
+          (should-error (dorg-mutate--postimage-assert-partitions read specs)
+                        :type 'dorg-sql-postimage-parity)
+          (should (= (length (dorg-test-2g25t--requests (cdr rec))) 2)))
+        ;; corruption in the second chunk
+        (let* ((rec (dorg-test-2g25t--recording-read
+                     (lambda (request)
+                       (image-for request (lambda (id h image)
+                                            (when (= id 1300) (setf (dorg-heading-title h) "corrupt"))
+                                            (puthash id h image))))))
+               (read (dorg-mutate--postimage-read-batched (car rec))))
+          (should-error (dorg-mutate--postimage-assert-partitions read specs)
+                        :type 'dorg-sql-postimage-parity))
+        ;; control: intact second chunk passes
+        (let* ((rec (dorg-test-2g25t--recording-read
+                     (lambda (request)
+                       (image-for request (lambda (id h image) (puthash id h image))))))
+               (read (dorg-mutate--postimage-read-batched (car rec))))
+          (dorg-mutate--postimage-assert-partitions read specs)
+          (should (= (length (dorg-test-2g25t--requests (cdr rec))) 2)))))))
+
+(ert-deftest dorg-test-2g25t-proof-hand-off-wraps-the-read-port ()
+  "The proof's validate function hands every assertion one read wrapped by
+the bounded wrapper, built exactly once, never the raw port."
+  (let* ((ctx (dorg-ext-index-context-create
+               :source-kind 'dolt :root-id 1 :from-root-id nil :to-root-id nil
+               :patches nil :created nil :changed nil :moved nil :deleted nil
+               :base-image (make-hash-table :test 'eql)
+               :candidate-postimage (make-hash-table :test 'eql)
+               :owner-partitions (list (dorg-test-2ij34--static-partition))
+               :candidate-id (make-string 40 ?c) :base-commit "base"))
+         (validate (plist-get (dorg-mutate--postimage-plan ctx nil) :validate))
+         (raw (lambda (_request) :raw))
+         (wrapped-calls 0)
+         (seen nil)
+         (real (symbol-function 'dorg-mutate--postimage-read-batched)))
+    (cl-letf (((symbol-function 'dorg-mutate--postimage-read-batched)
+               (lambda (read) (cl-incf wrapped-calls) (funcall real read)))
+              ((symbol-function 'dorg-ext-run-index-validators) (lambda (&rest _) nil))
+              ((symbol-function 'dorg-mutate--postimage-assert-core)
+               (lambda (read &rest _) (push read seen)))
+              ((symbol-function 'dorg-mutate--postimage-assert-partitions)
+               (lambda (read &rest _) (push read seen)))
+              ((symbol-function 'dorg-mutate--postimage-assert-rows)
+               (lambda (read &rest _) (push read seen))))
+      (funcall (plist-get validate :function) raw)
+      (should (= wrapped-calls 1))
+      (should (= (length seen) 3))
+      (should (cl-every (lambda (r) (eq r (car seen))) seen))
+      (should-not (eq (car seen) raw))
+      (should (functionp (car seen))))))

@@ -63,7 +63,7 @@ Clearing is defined per exposed target kind, with one canonical spelling for eac
 |------+----------+--------------------|
 | property | delete | ~(delete (property KEY))~ |
 | keyword-occurrence | delete | ~(delete (keyword KEY (occurrence N)))~ |
-| keyword-sequence | delete | ~(delete (keywords KEY))~ |
+| keyword-sequence | delete | ~(delete (keyword KEY (all)))~ |
 | heading | empty-assignment | ~documented nil, empty string, or empty list by FIELD~ |
 | planning | empty-assignment | ~nil~ |
 | items | unsupported-public | ~no public clear; replace requires at least one item~ |
@@ -78,18 +78,27 @@ The full items replacement is a broad hammer: it assigns the complete ordered it
 |--------+------------+---------------+-------------+---------+----------+----------+--------|
 | Property | ~(set (property KEY) VALUE)~ | 1 | singleton | create | none | delete | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
 | Property | ~(delete (property KEY))~ | 1 | singleton | no-op | none | canonical | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
-| Keyword sequence | ~(replace (keywords KEY) VALUE...)~ | 1 | whole-sequence | materialize | none | delete-only | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
-| Keyword sequence | ~(delete (keywords KEY))~ | 1 | whole-sequence | no-op | none | canonical | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Keyword sequence | ~(replace (keyword KEY (all)) VALUE...)~ | 1 | whole-sequence | materialize | none | delete-only | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Keyword sequence | ~(delete (keyword KEY (all)))~ | 1 | whole-sequence | no-op | none | canonical | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
 | Keyword occurrence | ~(replace (keyword KEY (occurrence N)) VALUE)~ | 1 | one-occurrence | error | none | delete-only | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
 | Keyword occurrence | ~(delete (keyword KEY (occurrence N)))~ | 1 | one-occurrence | error | none | canonical | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
-| Keyword occurrence | ~(insert (keyword KEY) POSITION VALUE)~ | 1 | one-new-occurrence | create-at-host-end | before-first, after-last | unsupported | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
-| Drawer line | ~(insert (drawer-line NAME (occurrence 1)) POSITION RAW-LINE)~ | 2 | one-new-line | create-or-error | before-first, after-last | unsupported | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Keyword occurrence | ~(insert (keyword KEY) POSITION VALUE)~ | 1 | one-new-occurrence | create-at-host-end | before-first, after-last, before, after | unsupported | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Drawer line | ~(insert (drawer-line NAME) POSITION RAW-LINE)~ | 1 | one-new-line | create-or-error | before-first, after-last, before, after | unsupported | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Drawer line | ~(replace (drawer-line NAME (all)) RAW-LINE...)~ | 1 | whole-non-empty-sequence | materialize | none | delete-only | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Drawer line | ~(delete (drawer-line NAME (all)))~ | 1 | whole-sequence | no-op | none | canonical | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Drawer line | ~(replace (drawer-line NAME (occurrence N)) RAW-LINE)~ | 1 | one-occurrence | error | none | delete-only | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Drawer line | ~(delete (drawer-line NAME (occurrence N)))~ | 1 | one-occurrence | error | none | canonical | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
 | Heading field | ~(set (heading FIELD) VALUE)~ | 1 | singleton | error | none | empty-assignment-by-field | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
 | Planning field | ~(set (planning FIELD) VALUE)~ | 1 | singleton | error | none | nil-assignment | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
-| Text | ~(insert (text) POSITION TEXT)~ | 0 | one-new-element | create-at-host-end | before-first, after-last | unsupported | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
-| Text | ~(replace (text (occurrence 1)) TEXT)~ | 0 | first-occurrence-only | error | none | unsupported | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
-| Full item sequence | ~(replace (items) ITEM...)~ | 0 | whole-non-empty-sequence | error | none | unsupported-public | base=when-supplied, expected-targets=when-where, broad-write=full-ordered-item-sequence |
-| Tree structure | ~(move (subtree) (under TGT [ANCHOR]))~ | 0 | one-subtree | error | under, before, after | not-applicable | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Text | ~(insert (text) POSITION TEXT)~ | 0 | one-new-element | create-at-host-end | before-first, after-last, before, after | unsupported | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Text | ~(replace (text (occurrence N)) TEXT)~ | 0 | one-occurrence | error | none | unsupported | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| nil | ~(replace (body (literal OLD)) NEW)~ | 0 | one-unique-range | error | none | unsupported | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Text | ~(delete (text (occurrence N)))~ | 0 | one-occurrence | error | none | canonical | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Full item sequence | ~(replace (item (all)) ITEM...)~ | 0 | whole-non-empty-sequence | materialize | none | unsupported-public | base=when-supplied, expected-targets=when-where, broad-write=full-ordered-item-sequence |
+| Full item sequence | ~(replace (item (occurrence N)) ITEM)~ | 0 | one-occurrence | error | none | delete-only | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Full item sequence | ~(delete (item (occurrence N)))~ | 0 | one-occurrence | error | none | canonical | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Full item sequence | ~(insert (item) POSITION ITEM)~ | 0 | one-new-element | create-at-host-end | before-first, after-last, before, after | unsupported | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
+| Tree structure | ~(move (subtree) (under TGT [ANCHOR] [OFFSET]))~ | 0 | one-subtree | error | under, before, after | not-applicable | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
 | Tree structure | ~(delete (heading))~ | 0 | one-heading-promote-children | error | none | destructive | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
 | Tree structure | ~(delete (subtree))~ | 0 | one-subtree | error | none | destructive | base=when-supplied, expected-targets=when-where, broad-write=threshold-gated |
 | Tree structure | ~(insert (heading CLAUSE...) (under TGT [ANCHOR]))~ | 0 | one-new-subtree | error | under, before, after | not-applicable | base=when-supplied, expected-targets=not-applicable, broad-write=bounded-constructor-subtree |

@@ -56,17 +56,44 @@ OP is one of `= != < <= > >='.  Signals `dorg-ql-error' otherwise."
     ('>= (>= a b))
     (_ (dorg-ql--error "unsupported ordered operator: %S" op))))
 
-(defun dorg-ql--apply-string-op (op actual value)
-  "Apply string OP comparing the heading's ACTUAL string against VALUE.
+(defun dorg-ql--case-canonical-string (value)
+  "Return VALUE's per-character standard-case uppercase spelling.
+ASCII unibyte text is text; all other raw-byte/non-Unicode strings are a typed
+limitation rather than an implicit byte or locale collation."
+  (unless (stringp value)
+    (dorg-ql--error "case canonicalization requires a string: %S" value))
+  (with-case-table (standard-case-table)
+    (apply #'string
+           (mapcar
+            (lambda (char)
+              (unless (and (<= 0 char #x10ffff)
+                           (not (<= #xd800 char #xdfff))
+                           (or (multibyte-string-p value) (<= char #x7f)))
+                (dorg-ql--unsupported
+                 "case-insensitive text contains a non-Unicode/raw-byte character"))
+              (upcase char))
+            (string-to-list value)))))
+
+(defun dorg-ql--apply-string-op (op actual value &optional mode)
+  "Apply string OP comparing ACTUAL against VALUE under literal MODE.
 ACTUAL must be a non-nil string; VALUE is the query string.  OP is one
-of `= != contains prefix suffix'.  Signals `dorg-ql-error' otherwise."
-  (pcase op
-    ('= (string= actual value))
-    ('!= (not (string= actual value)))
-    ('contains (and (string-search value actual) t))
-    ('prefix (string-prefix-p value actual))
-    ('suffix (string-suffix-p value actual))
-    (_ (dorg-ql--error "unsupported string operator: %S" op))))
+of `= != contains prefix suffix'.  MODE defaults to `sensitive';
+`insensitive' canonicalizes each character under `standard-case-table' before
+using the same literal operations.  Signals `dorg-ql-error' otherwise."
+  (pcase-let* ((`(,actual . ,value)
+                (if (or (null mode) (eq mode 'sensitive))
+                    (cons actual value)
+                  (if (eq mode 'insensitive)
+                      (cons (dorg-ql--case-canonical-string actual)
+                            (dorg-ql--case-canonical-string value))
+                    (dorg-ql--error "unknown string case mode: %S" mode)))))
+    (pcase op
+      ('= (string= actual value))
+      ('!= (not (string= actual value)))
+      ('contains (and (string-search value actual) t))
+      ('prefix (string-prefix-p value actual))
+      ('suffix (string-suffix-p value actual))
+      (_ (dorg-ql--error "unsupported string operator: %S" op)))))
 
 (defun dorg-ql--priority-rank (priority)
   "Return an integer rank for PRIORITY where a higher Org priority ranks higher.
@@ -79,7 +106,7 @@ and \"A\" outranks \"B\".  Returns nil for a nil or empty PRIORITY."
 
 ;;;; Shared alist predicate matching
 
-(defun dorg-ql--alist-match-p (key op value alist)
+(defun dorg-ql--alist-match-p (key op value alist &optional mode)
   "Return non-nil when the assoc ALIST satisfies KEY OP VALUE.
 `exists'/`missing' test KEY presence; every other operator requires KEY
 present and then compares its value string with `dorg-ql--apply-string-op'.
@@ -89,7 +116,7 @@ property/keyword leaf predicates."
     (pcase op
       ('exists (and cell t))
       ('missing (not cell))
-      (_ (and cell (dorg-ql--apply-string-op op (cdr cell) value))))))
+      (_ (and cell (dorg-ql--apply-string-op op (cdr cell) value mode))))))
 
 ;;;; Boolean AST recursion
 

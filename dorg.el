@@ -4,7 +4,7 @@
 
 ;; This file is not part of GNU Emacs.
 
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Keywords: outlines, data, org
 ;; Package-Requires: ((emacs "28.1"))
 
@@ -108,6 +108,7 @@
 (require 'dorg-find)
 (require 'dorg-command)
 (require 'dorg-api)
+(require 'dorg-clock)
 (require 'dorg-doctor)
 (require 'dorg-mode)
 (require 'dorg-vfs)
@@ -160,6 +161,8 @@ materialization publishes them to a canonical Dolt projection."
     dorg-id
     dorg-sortkey
     dorg-timestamp
+    ;; The typed-row struct; its dependents include `dorg-dolt' and `dorg-ext'.
+    dorg-sql-quote
     dorg-schema
     dorg-backend
     dorg-projection
@@ -178,6 +181,7 @@ materialization publishes them to a canonical Dolt projection."
     dorg-parse
     dorg-git-sync
     dorg-ql-core
+    dorg-ql-dolt
     dorg-session
     dorg-mutate
     dorg-api)

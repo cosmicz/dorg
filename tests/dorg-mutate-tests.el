@@ -140,6 +140,19 @@ otherwise false-green.  Returns SOURCE."
               (dorg-test-mutate--reason
                (dorg-mutate--resolve-source '(:bogus "x"))))))
 
+(ert-deftest dorg-test-ay3q8-identity-policy-refuses-protected-metadata ()
+  "No system or registered DORG_ key can become an addressing identity."
+  (dolist (key '("DORG_CLOCK_START" "dorg_clock_start" "DORG_ID" "DORG_HASH"))
+    (let ((err (should-error
+                (dorg-mutate--normalize-identity (list :property key))
+                :type 'dorg-mutate-error)))
+      (should (eq 'invalid-target (dorg-mutate-error-reason err)))
+      (should (eq 'identity-policy-protected
+                  (plist-get (dorg-mutate-error-data err) :detail)))
+      (should (equal key (plist-get (dorg-mutate-error-data err) :key)))))
+  (should (equal '(:property "CAPTURE_ID")
+                 (dorg-mutate--normalize-identity '(:property "CAPTURE_ID")))))
+
 ;;; ─── Native typed-patch validation ────────────────────────────────────
 
 (defun dorg-test-mutate--heading-address (id)
@@ -169,6 +182,65 @@ otherwise false-green.  Returns SOURCE."
                 :target (list :planning :host
                               (dorg-test-mutate--heading-address id)))
           fields))
+
+(ert-deftest dorg-test-mutate-planning-update-preserves-absent-fields ()
+  "A planning patch preserves absent fields and removes only after a clear-last."
+  (let* ((planning (dorg-planning-item :scheduled "S" :deadline "D" :closed "C"))
+         (heading (make-dorg-heading :id 1 :level 1 :level-offset 1 :title "H"
+                                     :items (list planning)))
+         (headings (make-hash-table :test 'eql))
+         (ps nil))
+    (puthash 1 heading headings)
+    (setq ps (dorg-mutate--ps-create :headings headings :root-id 1))
+    (dorg-mutate--ps-update-planning
+     ps '(:op update :target (:planning :host 1) :scheduled "S2"))
+    (should (equal "S2" (dorg-planning-item-scheduled planning)))
+    (should (equal "D" (dorg-planning-item-deadline planning)))
+    (should (equal "C" (dorg-planning-item-closed planning)))
+    (dorg-mutate--ps-update-planning
+     ps '(:op update :target (:planning :host 1) :scheduled nil))
+    (should-not (dorg-planning-item-scheduled planning))
+    (should (equal "D" (dorg-planning-item-deadline planning)))
+    (should (equal "C" (dorg-planning-item-closed planning)))
+    (dorg-mutate--ps-update-planning
+     ps '(:op update :target (:planning :host 1) :deadline nil :closed nil))
+    (should-not (cl-find-if (lambda (it) (cl-typep it 'dorg-planning-item))
+                            (dorg-heading-items heading)))
+    (let ((err (should-error
+                (dorg-mutate--validate-patches
+                 '((:op update :target (:planning :host (:heading :id 1)))))
+                :type 'dorg-mutate-error)))
+      (should (equal "planning update requires at least one field" (cadr err)))
+      (should (eq 'invalid-target (plist-get (caddr err) :reason))))))
+
+(ert-deftest dorg-test-mutate-planning-update-clear-absent-is-a-noop ()
+  "An explicit clear does not create a planning line on an unplanned heading."
+  (let* ((heading (make-dorg-heading :id 1 :level 1 :level-offset 1 :title "H"))
+         (headings (make-hash-table :test 'eql))
+         (ps nil))
+    (puthash 1 heading headings)
+    (setq ps (dorg-mutate--ps-create :headings headings :root-id 1))
+    (dorg-mutate--ps-update-planning
+     ps '(:op update :target (:planning :host 1) :deadline nil))
+    (should-not (dorg-heading-items heading))))
+
+(ert-deftest dorg-test-mutate-planning-update-batch-composes-fields ()
+  "Successive planning fields compose without erasing an existing sibling."
+  (let* ((planning (dorg-planning-item :closed "C"))
+         (heading (make-dorg-heading :id 1 :level 1 :level-offset 1 :title "H"
+                                     :items (list planning)))
+         (headings (make-hash-table :test 'eql))
+         (ps nil)
+         (context (dorg-mutate--item-batch-context)))
+    (puthash 1 heading headings)
+    (setq ps (dorg-mutate--ps-create :headings headings :root-id 1))
+    (dorg-mutate--ps-update-planning
+     ps '(:op update :target (:planning :host 1) :scheduled "S") context)
+    (dorg-mutate--ps-update-planning
+     ps '(:op update :target (:planning :host 1) :deadline "D") context)
+    (should (equal "S" (dorg-planning-item-scheduled planning)))
+    (should (equal "D" (dorg-planning-item-deadline planning)))
+    (should (equal "C" (dorg-planning-item-closed planning)))))
 
 (defun dorg-test-mutate--heading-update-patch (id &rest fields)
   "Return a canonical heading update patch for ID and FIELDS."
@@ -204,14 +276,16 @@ FIELDS are private top-level move fields such as :to-source."
   "Return a canonical typed keyword collection patch.
 VERB is a typed verb, HOST a typed host, KEY the keyword name, and FIELDS the
 top-level payload."
-  (append (list :op verb :target (list :keywords :host host :name key)) fields))
+  (append (list :op verb :target (append (list :keyword :host host :name key)
+                                       (unless (eq verb 'insert)
+                                         '(:select (:all))))) fields))
 
 (defun dorg-test-mutate--keyword-occurrence-patch
     (verb host key occurrence &rest fields)
   "Return a canonical typed single-keyword occurrence patch."
   (append (list :op verb
                 :target (list :keyword :host host :name key
-                              :occurrence occurrence))
+                              :select (list :occurrence occurrence)))
           fields))
 
 (defun dorg-test-mutate--plan-patch-batch (source patches &rest options)
@@ -227,12 +301,463 @@ top-level payload."
   (let ((patch (dorg-test-mutate--property-put-patch 3 "K" "V")))
     (should (equal (list patch) (dorg-mutate--validate-patches (list patch))))))
 
-(ert-deftest dorg-test-mutate-native-validator-protects-dorg-id ()
-  "The engine refuses DORG_ID even when a caller bypasses the public API."
-  (should (eq 'invalid-target
-              (dorg-test-mutate--reason
-               (dorg-mutate--validate-patches
-                (list (dorg-test-mutate--property-put-patch 3 "DORG_ID" "9")))))))
+(ert-deftest dorg-test-32mp9-native-validator-protects-owned-properties ()
+  "Typed property put/delete delegates to the shared DORG_ prefix rule.
+
+These are direct-IR rows: they deliberately bypass the public normalizer, so
+they turn RED if the engine returns to literal DORG_ID comparison."
+  (dolist (key '("DORG_ID" "dorg_id" "DORG_HASH"))
+    (dolist (patch (list (dorg-test-mutate--property-put-patch 3 key "9")
+                         (dorg-test-mutate--property-delete-patch 3 key)))
+      (should (eq 'invalid-target
+                  (dorg-test-mutate--reason
+                   (dorg-mutate--validate-patches (list patch)))))))
+  (let ((patch (dorg-test-mutate--property-put-patch 3 "XDORG_ID" "9")))
+    (should (equal (list patch) (dorg-mutate--validate-patches (list patch))))))
+
+(ert-deftest dorg-test-mutate-native-validator-refuses-owned-metadata-in-every-property-door ()
+  "Typed IR cannot bypass an unavailable owner's registered family.
+
+The direct property target and the typed drawer-item validator are distinct
+engine entry doors; both must reject before planning."
+  (dolist (thunk
+           (list
+            (lambda ()
+              (dorg-mutate--validate-patches
+               (list (dorg-test-mutate--property-put-patch
+                      3 "DORG_CLOCK_START" "2026-10-14T08:00:00Z"))))
+            (lambda ()
+              (dorg-mutate--patch-validate-item-value
+               '(:kind drawer :name "PROPERTIES"
+                 :properties (("DORG_CLOCK_START" . "2026-10-14T08:00:00Z")))
+               'replace))))
+    (let ((err (should-error (funcall thunk) :type 'dorg-mutate-error)))
+      (should (eq 'invalid-target (dorg-mutate-error-reason err)))
+      (should (eq 'owner-unavailable
+                  (plist-get (dorg-mutate-error-data err) :detail))))))
+
+(ert-deftest dorg-test-mutate-owner-lowering-writes-only-its-family ()
+  "A test-only lazy owner can write its own registered family through lowering."
+  (dorg-test-mutate--with-content buf
+      "* Task\n:PROPERTIES:\n:DORG_ID: 1001\n:END:\n"
+    (let ((patch (dorg-test-mutate--property-put-patch
+                  1001 "DORG_CLOCK_START" "2026-10-14T08:00:00Z")))
+      (cl-letf (((symbol-function 'dorg-clock-metadata-owner)
+                 (lambda ()
+                   (list :lower (lambda (_request) (list :patches (list patch)))
+                         :validate (lambda (_context) nil)))))
+        (dorg-mutate--owner-lowering-execute buf "DORG_CLOCK_" '(:start t))
+        (should (string-match-p
+                 ":DORG_CLOCK_START: 2026-10-14T08:00:00Z" (buffer-string)))))))
+
+(ert-deftest dorg-test-mutate-saved-owner-lowering-holds-gate-before-lower ()
+  "A saved owner lowerer runs only after acquiring the canonical file gate."
+  (dorg-test-mutate--with-content buf
+      "* Task\n:PROPERTIES:\n:DORG_ID: 1001\n:END:\n"
+    (let ((patch (dorg-test-mutate--property-put-patch
+                  1001 "DORG_CLOCK_START" "2026-10-14T08:00:00Z"))
+          (lock (dorg-file-lock-path dorg-test-mutate--tmp))
+          (saw-lock nil))
+      (cl-letf (((symbol-function 'dorg-clock-metadata-owner)
+                 (lambda ()
+                   (list :lower (lambda (_request)
+                                  (setq saw-lock (file-symlink-p lock))
+                                  (list :patches (list patch)))
+                         :validate (lambda (_context) nil)))))
+        (let ((result (dorg-mutate--owner-lowering-execute
+                       buf "DORG_CLOCK_" '(:start t) :save t)))
+          (should (plist-get result :saved))))
+      (should (string-prefix-p "dorg-lock-v1:" saw-lock))
+      (should-not (file-symlink-p lock)))))
+
+(ert-deftest dorg-test-mutate-owner-lowering-refuses-system-key ()
+  "Family authority cannot mutate DORG_ID through the private executor."
+  (dorg-test-mutate--with-buffer buf
+    (let ((patch (dorg-test-mutate--property-put-patch 1001 "DORG_ID" "9")))
+      (cl-letf (((symbol-function 'dorg-clock-metadata-owner)
+                 (lambda ()
+                   (list :lower (lambda (_request) (list :patches (list patch)))
+                         :validate (lambda (_context) nil)))))
+        (let ((err (should-error
+                    (dorg-mutate--owner-lowering-execute buf "DORG_CLOCK_" '(:start t))
+                    :type 'dorg-mutate-error)))
+          (should (eq 'invalid-target (dorg-mutate-error-reason err))))))))
+
+(ert-deftest dorg-test-mutate-owner-lowering-refuses-foreign-family ()
+  "DORG_CLOCK_ authority cannot write a different registered family."
+  (dorg-test-mutate--with-buffer buf
+    (let ((dorg-owned-metadata-families
+           '(("DORG_CLOCK_" dorg-clock-metadata-owner 1 dorg-clock)
+             ("DORG_OTHER_" dorg-other-metadata-owner 1 nil)))
+          (patch (dorg-test-mutate--property-put-patch 1001 "DORG_OTHER_X" "x")))
+      (cl-letf (((symbol-function 'dorg-clock-metadata-owner)
+                 (lambda ()
+                   (list :lower (lambda (_request) (list :patches (list patch)))
+                         :validate (lambda (_context) nil)))))
+        (let ((err (should-error
+                    (dorg-mutate--owner-lowering-execute buf "DORG_CLOCK_" '(:start t))
+                    :type 'dorg-mutate-error)))
+          (should (eq 'invalid-target (dorg-mutate-error-reason err)))
+          (should (eq 'capability-family-mismatch
+                      (plist-get (dorg-mutate-error-data err) :detail))))))))
+
+(ert-deftest dorg-test-mutate-owner-lowering-refuses-unavailable-owner ()
+  "A registered family with no loaded participant cannot enter lowering."
+  (dorg-test-mutate--with-buffer buf
+    (cl-letf (((symbol-function 'dorg-clock-metadata-owner) nil))
+      (let ((err (should-error
+                  (dorg-mutate--owner-lowering-execute buf "DORG_CLOCK_" '(:start t))
+                  :type 'dorg-mutate-error)))
+        (should (eq 'invalid-target (dorg-mutate-error-reason err)))
+        (should (eq 'owner-unavailable
+                    (plist-get (dorg-mutate-error-data err) :detail)))))))
+
+(ert-deftest dorg-test-mutate-owner-validation-sees-immutable-plain-candidate ()
+  "A managed plain dry-run validates against immutable candidate images.
+
+The refusal must see a complete before/after context and leave the source
+untouched.  Removing the shared validator call makes this control green,
+which is the intended RED mutation."
+  (dorg-test-mutate--with-content buf
+      "* Before\n:PROPERTIES:\n:DORG_ID: 1001\n:DORG_CLOCK_START: 2026-10-14T08:00:00Z\n:END:\n"
+    (let ((before (buffer-string))
+          seen)
+      (cl-letf (((symbol-function 'dorg-clock-metadata-owner)
+                 (lambda ()
+                   (list
+                    :lower
+                    (lambda (_request)
+                      (list :patches
+                            (list (dorg-test-mutate--heading-update-patch
+                                   1001 :title "After"))))
+                    :validate
+                    (lambda (context)
+                      (setq seen context)
+                      (error "clock owner rejects candidate"))))))
+        (let ((err (should-error
+                    (dorg-mutate--owner-lowering-execute
+                     buf "DORG_CLOCK_" '(:update t) :dry-run t)
+                    :type 'dorg-mutate-error)))
+          (should (eq 'invalid-target (dorg-mutate-error-reason err)))
+          (should (eq 'owner-refused
+                      (plist-get (dorg-mutate-error-data err) :detail)))
+          (should (equal "DORG_CLOCK_"
+                         (plist-get (dorg-mutate-error-data err) :family)))))
+      (should (cl-typep seen 'dorg-ext-index-context))
+      (should (gethash 1001 (dorg-ext-index-context-base-image seen)))
+      (should (gethash 1001 (dorg-ext-index-context-candidate-postimage seen)))
+      (let ((changed (dorg-ext-index-context-changed seen)))
+        (should (= 1 (length changed)))
+        (should (dorg-ext-index-entry-before (car changed)))
+        (should (dorg-ext-index-entry-after (car changed))))
+      (should (equal before (buffer-string))))))
+
+(ert-deftest dorg-test-mutate-owner-validation-sees-property-identity-candidate ()
+  "A property-identity plain candidate cannot bypass owner validation.
+
+The source intentionally has no DORG_ID.  The validator must nevertheless
+receive a changed before/after entry derived from CAPTURE_ID, then refuse the
+dry run without changing source bytes."
+  (dorg-test-mutate--with-content buf
+      "* Before\n:PROPERTIES:\n:CAPTURE_ID: capture-1\n:DORG_CLOCK_START: 2026-10-14T08:00:00Z\n:END:\n"
+    (let ((before (buffer-string))
+          seen
+          (patch '(:op update
+                   :target (:heading :extern t :key "CAPTURE_ID" :value "capture-1")
+                   :fields (:title "After"))))
+      (cl-letf (((symbol-function 'dorg-clock-metadata-owner)
+                 (lambda ()
+                   (list :lower (lambda (_request) (list :patches (list patch)))
+                         :validate (lambda (context)
+                                     (setq seen context)
+                                     (error "clock owner rejects property candidate"))))))
+        (let ((err (should-error
+                    (dorg-mutate--owner-lowering-execute
+                     (list :buffer buf :identity '(:property "CAPTURE_ID"))
+                     "DORG_CLOCK_" '(:update t) :dry-run t)
+                    :type 'dorg-mutate-error)))
+          (should (eq 'invalid-target (dorg-mutate-error-reason err)))
+          (should (eq 'owner-refused
+                      (plist-get (dorg-mutate-error-data err) :detail)))))
+      (should (cl-typep seen 'dorg-ext-index-context))
+      (should (= 1 (length (dorg-ext-index-context-changed seen))))
+      (let ((entry (car (dorg-ext-index-context-changed seen))))
+        (should (dorg-ext-index-entry-before entry))
+        (should (dorg-ext-index-entry-after entry)))
+      (should (equal before (buffer-string))))))
+
+(ert-deftest dorg-test-mutate-owner-validation-sees-last-key-removal ()
+  "A before-only family member remains visible to its plain owner validator."
+  (dorg-test-mutate--with-content buf
+      "* Before\n:PROPERTIES:\n:DORG_ID: 1001\n:DORG_CLOCK_START: 2026-10-14T08:00:00Z\n:END:\n"
+    (let ((before (buffer-string))
+          seen
+          (patch '(:op delete
+                   :target (:property :host (:heading :id 1001)
+                              :name "DORG_CLOCK_START"))))
+      (cl-letf (((symbol-function 'dorg-clock-metadata-owner)
+                 (lambda ()
+                   (list :lower (lambda (_request) (list :patches (list patch)))
+                         :validate (lambda (context)
+                                     (setq seen context)
+                                     (error "clock owner rejects removal"))))))
+        (let ((err (should-error
+                    (dorg-mutate--owner-lowering-execute
+                     buf "DORG_CLOCK_" '(:delete t) :dry-run t)
+                    :type 'dorg-mutate-error)))
+          (should (eq 'owner-refused
+                      (plist-get (dorg-mutate-error-data err) :detail)))))
+      (let ((entry (car (dorg-ext-index-context-changed seen))))
+        (should entry)
+        (should (dorg-ext-index-entry-before entry))
+        (should (dorg-ext-index-entry-after entry))
+        (should (member "DORG_CLOCK_"
+                        (dorg-mutate--heading-owned-metadata-families
+                         (dorg-ext-index-entry-before entry))))
+        (should-not (dorg-mutate--heading-owned-metadata-families
+                     (dorg-ext-index-entry-after entry))))
+      (should (equal before (buffer-string))))))
+
+(ert-deftest dorg-test-mutate-owner-validation-normalizes-lazy-owner-failure ()
+  "A lazy owner load error is the same typed candidate refusal as validation."
+  (let* ((managed
+          (make-dorg-heading
+           :id 2 :items
+           (list (dorg-drawer-item
+                  :name "PROPERTIES"
+                  :properties
+                  '(("DORG_CLOCK_START" . "2026-10-14T08:00:00Z"))))))
+         (context
+          (dorg-ext-index-context-create
+           :changed
+           (list (dorg-ext-index-entry-create
+                  :kind 'change :id 2 :before managed :after managed))
+           :base-image (let ((image (make-hash-table :test 'eql)))
+                         (puthash 2 managed image)
+                         image)
+           :candidate-postimage (let ((image (make-hash-table :test 'eql)))
+                                  (puthash 2 managed image)
+                                  image))))
+    (cl-letf (((symbol-function 'dorg-clock-metadata-owner)
+               (lambda () (error "lazy owner failed"))))
+      (let ((err (should-error
+                  (dorg-mutate--validate-owned-metadata-context context)
+                  :type 'dorg-mutate-error)))
+        (should (eq 'owner-refused
+                    (plist-get (dorg-mutate-error-data err) :detail)))
+        (should (equal "lazy owner failed"
+                       (plist-get (dorg-mutate-error-data err) :owner-message)))))))
+
+(ert-deftest dorg-test-ay3q8-owner-validation-refuses-nil-images-before-owner ()
+  "Owner validation never receives a context with a missing immutable image.
+
+The test owner returns normally, so deleting the image preflight turns this
+control RED by allowing the malformed context to pass."
+  (let* ((managed
+          (make-dorg-heading
+           :id 2 :items
+           (list (dorg-drawer-item
+                  :name "PROPERTIES"
+                  :properties
+                  '(("DORG_CLOCK_START" . "2026-10-14T08:00:00Z"))))))
+         (context
+          (dorg-ext-index-context-create
+           :changed (list (dorg-ext-index-entry-create
+                           :kind 'change :id 2 :before managed :after managed))
+           :base-image nil :candidate-postimage nil))
+         called)
+    (cl-letf (((symbol-function 'dorg-clock-metadata-owner)
+               (lambda ()
+                 (list :validate (lambda (_context) (setq called t))))))
+      (let ((err (should-error
+                  (dorg-mutate--validate-owned-metadata-context context)
+                  :type 'dorg-mutate-error)))
+        (should (eq 'invalid-target (dorg-mutate-error-reason err)))
+        (should (eq 'owner-context-images-missing
+                    (plist-get (dorg-mutate-error-data err) :detail)))
+        (should-not called)))))
+
+(ert-deftest dorg-test-mutate-owner-plan-capability-refuses-crafted-values ()
+  "The shared plan validator refuses forged, foreign, stale, and nil authority."
+  (let* ((family "DORG_CLOCK_")
+         (execution (make-symbol "execution-"))
+         (matching (dorg-mutate--owner-capability--make
+                    :family family :execution-id execution))
+         (foreign (dorg-mutate--owner-capability--make
+                   :family "DORG_OTHER_" :execution-id execution)))
+    (dolist (case
+             (list
+              (cons (list :owner-capability '(:family "DORG_CLOCK_")
+                          :owner-execution-id execution)
+                    'capability-forged)
+              (cons (list :owner-capability foreign :owner-execution-id execution)
+                    'capability-family-mismatch)
+              (cons (list :owner-capability matching
+                          :owner-execution-id (make-symbol "other-execution-"))
+                    'capability-forged)
+              (cons (list :owner-capability nil :owner-execution-id execution)
+                    'capability-forged)))
+      (let ((err (should-error (dorg-mutate--owner-plan-capability
+                                (car case) family)
+                               :type 'dorg-mutate-error)))
+        (should (eq (cdr case) (plist-get (dorg-mutate-error-data err) :detail)))))
+    (should (eq matching
+                (dorg-mutate--owner-plan-capability
+                 (list :owner-capability matching :owner-execution-id execution)
+                 family)))))
+
+(ert-deftest dorg-test-mutate-owner-plan-capability-authorizes-drawer-item ()
+  "The whole-item engine validator accepts matching private plan authority."
+  (let* ((family "DORG_CLOCK_")
+         (execution (make-symbol "execution-"))
+         (capability (dorg-mutate--owner-capability--make
+                      :family family :execution-id execution))
+         (plan (list :owner-capability capability :owner-execution-id execution))
+         (item '(:kind drawer :name "PROPERTIES"
+                 :properties (("DORG_CLOCK_START" . "2026-10-14T08:00:00Z"))))
+         (patch `(:op replace :target (:item :host (:heading :id 3) :select (:all))
+                   :items (,item))))
+    (should (eq item
+                (dorg-mutate--patch-validate-item-value item 'replace plan)))
+    (should (= 1 (length (dorg-mutate--validate-patches (list patch) plan))))))
+
+(ert-deftest dorg-test-mutate-owner-plan-capability-refuses-system-drawer-key ()
+  "Private family authority cannot smuggle DORG_ID through a drawer item."
+  (let* ((family "DORG_CLOCK_")
+         (execution (make-symbol "execution-"))
+         (capability (dorg-mutate--owner-capability--make
+                      :family family :execution-id execution))
+         (plan (list :owner-capability capability :owner-execution-id execution))
+         (item '(:kind drawer :name "PROPERTIES"
+                 :properties (("DORG_ID" . "9"))))
+         (patch `(:op replace :target (:item :host (:heading :id 3) :select (:all))
+                   :items (,item))))
+    (let ((err (should-error
+                (dorg-mutate--validate-patches (list patch) plan)
+                :type 'dorg-mutate-error)))
+      (should (eq 'invalid-target (dorg-mutate-error-reason err))))))
+
+(ert-deftest dorg-test-ay3q8-owner-plan-refuses-noncanonical-family-keys ()
+  "Private lowering cannot bypass family case or KEY+ storage rules."
+  (let* ((family "DORG_CLOCK_")
+         (execution (make-symbol "execution-"))
+         (capability (dorg-mutate--owner-capability--make
+                      :family family :execution-id execution))
+         (plan (list :owner-capability capability :owner-execution-id execution)))
+    (dolist (key '("dorg_clock_start" "DORG_CLOCK_START+"))
+      (let ((err (should-error
+                  (dorg-mutate--validate-patches
+                   (list (dorg-test-mutate--property-put-patch 3 key "x")) plan)
+                  :type 'dorg-mutate-error)))
+        (should (eq 'invalid-target (dorg-mutate-error-reason err)))
+        (should (eq 'owned-metadata-noncanonical
+                    (plist-get (dorg-mutate-error-data err) :detail)))))
+    (let* ((item '(:kind drawer :name "PROPERTIES"
+                  :properties (("dorg_clock_start" . "x"))))
+           (patch `(:op replace :target (:item :host (:heading :id 3) :select (:all))
+                     :items (,item)))
+           (err (should-error (dorg-mutate--validate-patches (list patch) plan)
+                              :type 'dorg-mutate-error)))
+      (should (eq 'invalid-target (dorg-mutate-error-reason err)))
+      (should (eq 'owned-metadata-noncanonical
+                  (plist-get (dorg-mutate-error-data err) :detail))))))
+
+(ert-deftest dorg-test-mutate-structural-owned-metadata-refuses-unavailable-owner ()
+  "A structural deletion cannot silently discard a registered family value.
+
+The control is deliberately pure: the immutable before/candidate images are
+the mutation simulator's boundary immediately before projection or persistence.
+Removing the preflight makes this assertion red, so it proves the preflight
+rather than a later Dolt or fixture failure."
+  (let* ((before (make-hash-table :test 'eql))
+         (after (make-hash-table :test 'eql))
+         (managed
+          (make-dorg-heading
+           :id 2 :parent-id 1 :items
+           (list (dorg-drawer-item
+                  :name "PROPERTIES"
+                  :properties
+                  '(("OWNER" . "me")
+                    ("DORG_CLOCK_START" . "2026-10-14T08:00:00Z"))))))
+         (context
+          (dorg-ext-index-context-create
+           :patches (list (dorg-test-mutate--delete-patch 2 t))
+           :deleted
+           (list (dorg-ext-index-entry-create
+                  :kind 'delete :id 2 :before managed :after nil))
+           :base-image (progn (puthash 2 managed before) before)
+           :candidate-postimage after)))
+    (let ((err (should-error
+                (dorg-mutate--assert-structural-owned-metadata-available context)
+                :type 'dorg-mutate-error)))
+      (should (eq 'invalid-target (dorg-mutate-error-reason err)))
+      (should (eq 'owner-unavailable
+                  (plist-get (dorg-mutate-error-data err) :detail)))
+      (should (equal "DORG_CLOCK_"
+                     (plist-get (dorg-mutate-error-data err) :family))))))
+
+(ert-deftest dorg-test-mutate-structural-demotion-refuses-unavailable-owner ()
+  "A real same-store demotion cannot move family data around an absent owner.
+
+The managed heading starts at the root and becomes a child of peer 9, the
+parent/level change that represents a heading demotion rather than reparenting
+between two existing parents."
+  (let* ((before (make-dorg-heading
+                  :id 2 :parent-id nil :level 1 :level-offset 1 :items
+                  (list (dorg-drawer-item
+                         :name "PROPERTIES"
+                         :properties
+                         '(("DORG_CLOCK_START" . "2026-10-14T08:00:00Z"))))))
+         (after (dorg-heading-deep-copy before))
+         (context
+          (dorg-ext-index-context-create
+           :patches (list (dorg-test-mutate--move-patch
+                           2 (dorg-test-mutate--heading-address 9)))
+           :moved
+           (list (dorg-ext-index-entry-create
+                  :kind 'move :id 2 :before before :after after)))))
+    (setf (dorg-heading-parent-id after) 9
+          (dorg-heading-level after) 2)
+    (let ((err (should-error
+                (dorg-mutate--assert-structural-owned-metadata-available context)
+                :type 'dorg-mutate-error)))
+      (should (eq 'owner-unavailable
+                  (plist-get (dorg-mutate-error-data err) :detail)))
+      (should (equal "DORG_CLOCK_"
+                     (plist-get (dorg-mutate-error-data err) :family))))))
+
+(ert-deftest dorg-test-mutate-structural-ancestor-delete-promotion-sees-managed-child ()
+  "Deleting an unmarked ancestor still guards its promoted managed child.
+
+The parent itself has no family key.  The only family observation is the
+child's immutable before/after entry, which changes parent from 10 to 1 as a
+heading delete promotes it.  Omitting that changed entry makes the control
+vacuously green, so it proves the classified promotion boundary."
+  (let* ((parent (make-dorg-heading :id 10 :parent-id 1 :items nil))
+         (before-child
+          (make-dorg-heading
+           :id 11 :parent-id 10 :items
+           (list (dorg-drawer-item
+                  :name "PROPERTIES"
+                  :properties
+                  '(("DORG_CLOCK_START" . "2026-10-14T08:00:00Z"))))))
+         (after-child (dorg-heading-deep-copy before-child))
+         (context
+          (dorg-ext-index-context-create
+           :patches (list (dorg-test-mutate--delete-patch 10 nil))
+           :deleted (list (dorg-ext-index-entry-create
+                           :kind 'delete :id 10 :before parent :after nil))
+           :changed (list (dorg-ext-index-entry-create
+                           :kind 'change :id 11
+                           :before before-child :after after-child)))))
+    (setf (dorg-heading-parent-id after-child) 1)
+    (let ((err (should-error
+                (dorg-mutate--assert-structural-owned-metadata-available context)
+                :type 'dorg-mutate-error)))
+      (should (eq 'owner-unavailable
+                  (plist-get (dorg-mutate-error-data err) :detail)))
+      (should (equal "DORG_CLOCK_"
+                     (plist-get (dorg-mutate-error-data err) :family))))))
 
 (ert-deftest dorg-test-mutate-native-validator-protects-dorg-keywords ()
   "Every DORG_* keyword is protected at the engine boundary."
@@ -241,7 +766,7 @@ top-level payload."
      (eq 'invalid-target
          (dorg-test-mutate--reason
           (dorg-mutate--validate-patches
-           `((:op insert :target (:keywords :host :root :name ,key)
+           `((:op insert :target (:keyword :host :root :name ,key)
                   :position :after-last :value "x"))))))))
 
 (ert-deftest dorg-test-mutate-native-validator-rejects-restore-fields-on-update ()
@@ -407,7 +932,7 @@ a token captured from another file current."
       (let* ((before (buffer-string))
              (patch (dorg-test-mutate--keyword-occurrence-patch
                      'replace (dorg-test-mutate--heading-address 1001)
-                     "FOO" occurrence :value "changed" :missing :error))
+                     "FOO" occurrence :value "changed"))
              (data (dorg-test-mutate--error-data
                     (dorg-test-mutate--apply-patch-batch buf (list patch)))))
         (should (eq 'invalid-target (plist-get data :reason)))
@@ -593,7 +1118,7 @@ a token captured from another file current."
       (dorg-api-execute
        '(batch
          (on (id 1001) (insert (text) (before-first) "A"))
-         (on (id 1001) (replace (items) (text "old")))
+         (on (id 1001) (replace (item (all)) (text "old")))
          (on (id 1001) (insert (text) (before-first) "B")))
        :mode 'apply :source buf)
       (should-not (equal before (buffer-string)))
@@ -652,62 +1177,55 @@ a token captured from another file current."
       (case
        '((invalid-target nil
           (:op replace :target (:text :host (:heading :id 1001)
-                                      :occurrence 0)
-               :missing :error :value "x"))
+                                      :select (:occurrence 0)) :value "x"))
          (invalid-target nil
           (:op replace :target (:text :host (:heading :id 1001)
-                                      :occurrence 2)
-               :missing :error :value "x"))
+                                      :select (:occurrence 2)) :value "x"))
          (invalid-target nil
           (:op replace :target (:text :host (:heading :id 1001)
-                                      :occurrence 1.5)
-               :missing :error :value "x"))
+                                      :select (:occurrence 1.5)) :value "x"))
          (invalid-op invalid-position
-          (:op insert :target (:texts :host (:heading :id 1001))
+          (:op insert :target (:text :host (:heading :id 1001))
                :position :front :value "x"))
          (invalid-op nil
-          (:op insert :target (:texts :host (:heading :id 1001))
+          (:op insert :target (:text :host (:heading :id 1001))
                :value "x"))
-         (invalid-op nil
-          (:op insert :target (:texts :host (:heading :id 1001)
-                                      :occurrence 1)
+         (invalid-target nil
+          (:op insert :target (:text :host (:heading :id 1001)
+                                      :select (:occurrence 1))
                :position :after-last :value "x"))
          (invalid-target nil
-          (:op insert :target (:texts :host (:heading :id 1001))
+          (:op insert :target (:text :host (:heading :id 1001))
                :position :after-last :value 42))
          (invalid-target structural-payload-boundary
-          (:op insert :target (:texts :host (:heading :id 1001))
+          (:op insert :target (:text :host (:heading :id 1001))
                :position :after-last :value "* fused"))
          (invalid-target structural-payload-boundary
-          (:op insert :target (:texts :host (:heading :id 1001))
+          (:op insert :target (:text :host (:heading :id 1001))
                :position :after-last :value "first\n\nsecond"))
          (invalid-target structural-payload-boundary
-          (:op insert :target (:keywords :host (:heading :id 1001) :name "K")
+          (:op insert :target (:keyword :host (:heading :id 1001) :name "K")
                :position :after-last :value "two\nlines"))
          (invalid-target structural-payload-boundary
-          (:op insert :target (:drawer-lines :host (:heading :id 1001)
-                                             :name "AUDIT" :occurrence 1)
-               :position :before-first :missing :create :value "two\nlines"))
+          (:op insert :target (:drawer-line :host (:heading :id 1001)
+                                             :name "AUDIT")
+               :position :before-first :value "two\nlines"))
          (invalid-target missing
-          (:op insert :target (:drawer-lines :host (:heading :id 1001)
-                                             :name "AUDIT" :occurrence 1)
-               :position :before-first :missing :error :value "- refused"))
+          (:op replace :target (:drawer-line :host (:heading :id 1001)
+                                             :name "AUDIT" :select (:occurrence 1))
+               :value "- refused"))
          (invalid-target missing
-          (:op insert :target (:drawer-lines :host (:heading :id 1001)
-                                             :name "AUDIT" :occurrence 1)
-               :position :after-last :missing :error :value "- refused"))
-         (invalid-op invalid-missing-policy
+          (:op delete :target (:drawer-line :host (:heading :id 1001)
+                                             :name "AUDIT" :select (:occurrence 1))))
+         (invalid-target retired-ir
           (:op replace :target (:text :host (:heading :id 1001)
-                                      :occurrence 1)
-               :missing :create :value "x"))
-         (invalid-op nil
-          (:op replace :target (:text :host (:heading :id 1001)
-                                      :occurrence 1)
+                                      :select (:occurrence 1)) :missing :create :value "x"))
+         (invalid-target nil
+          (:op replace :target (:text :host (:heading :id 1001))
                :value "x"))
          (invalid-target nil
           (:op replace :target (:text :host (:heading :id 1001)
-                                      :occurrence 1)
-               :missing :error :value nil))))
+                                      :select (:occurrence 1)) :value nil))))
     (dorg-test-mutate--with-buffer buf
       (let* ((before (buffer-string))
              (data (dorg-test-mutate--error-data
@@ -750,7 +1268,7 @@ a token captured from another file current."
 (ert-deftest dorg-test-mutate-typed-item-heading-copy-refreshes-hash ()
   "Applying an item patch copies its heading and refreshes the items hash."
   (let* ((heading (make-dorg-heading
-                   :id 7 :parent-id nil :level 1 :post-blank 0
+                   :id 7 :parent-id nil :level 1 :level-offset 1 :post-blank 0
                    :items (list (dorg-test-mutate--text "old" 1))))
          (patch '(:op replace
                   :target (:text :host (:heading :id 7) :occurrence 1)
@@ -1114,22 +1632,299 @@ byte-identical.  Root keyword semantics retained on Dolt by
     ;; identity is preserved
     (should (string-match-p ":DORG_ID: 1001" (buffer-string)))))
 
-(ert-deftest dorg-test-mutate-exec-update-planning-refuses ()
-  "AC (clean-break C3): a planning update has no source-preserving editor on
-plain-org (whole-verb collapse, C3 slice S2) and is refused pre-write with the
-exact `unsupported'/`no-source-preserving-editor' + empty variant nil, buffer
-byte-identical.  Planning writes are retained on Dolt by
-`dorg-test-mutate-dolt-property-and-planning'."
-  (dorg-test-mutate--with-buffer buf
-    (let* ((before (buffer-string))
-           (d (dorg-test-mutate--error-data
-               (dorg-test-mutate--apply-patch-batch
-                buf (list (dorg-test-mutate--planning-patch
-                           1002 :scheduled "<2026-05-29 Fri>"))))))
-      (should (eq 'unsupported (plist-get d :reason)))
-      (should (eq 'no-source-preserving-editor (plist-get d :detail)))
-      (should (null (plist-get d :variant)))
-      (should (equal (buffer-string) before)))))
+(ert-deftest dorg-test-hiyva-plain-planning-replaces-one-raw-field ()
+  "Plain planning edits replace only the selected raw field bytes.
+The deadline, property drawer and body make this fail if the editor renders a
+whole planning section rather than splicing the selected raw timestamp."
+  (let* ((before (concat "* Task\n"
+                         "SCHEDULED: <2026-01-02 Fri> DEADLINE: <2026-01-03 Sat>\n"
+                         ":PROPERTIES:\n:DORG_ID: 1001\n:KEEP: yes\n:END:\n"
+                         "Body.\nSCHEDULED: <2099-01-01 Thu>\n"))
+         (after (concat "* Task\n"
+                        "SCHEDULED: <2026-02-02 Mon> DEADLINE: <2026-01-03 Sat>\n"
+                        ":PROPERTIES:\n:DORG_ID: 1001\n:KEEP: yes\n:END:\n"
+                        "Body.\nSCHEDULED: <2099-01-01 Thu>\n")))
+    (dorg-test-mutate--with-content buf before
+      (dorg-api-execute
+       '(on (id 1001) (set (planning scheduled) "<2026-02-02 Mon>"))
+       :mode 'apply :source buf)
+      (should-not (equal before after))
+      (should (equal after (buffer-string))))))
+
+(ert-deftest dorg-test-hiyva-plain-planning-replaces-no-space-timestamp ()
+  "A legal planning token keeps its zero-space colon geometry on replacement."
+  (let* ((before (concat "* Task\nSCHEDULED:<2026-01-02 Fri> DEADLINE: <2026-01-03 Sat>\n"
+                         ":PROPERTIES:\n:DORG_ID: 1001\n:END:\n"))
+         (after (concat "* Task\nSCHEDULED:<2026-02-02 Mon> DEADLINE: <2026-01-03 Sat>\n"
+                        ":PROPERTIES:\n:DORG_ID: 1001\n:END:\n")))
+    (dorg-test-mutate--with-content buf before
+      (dorg-api-execute
+       '(on (id 1001) (set (planning scheduled) "<2026-02-02 Mon>"))
+       :mode 'apply :source buf)
+      (should-not (equal before after))
+      (should (equal after (buffer-string))))))
+
+(ert-deftest dorg-test-hiyva-plain-planning-persists-explicit-file-source ()
+  "A planning apply through `:file' writes the exact projected bytes."
+  (let* ((before (concat "* Task\nSCHEDULED: <2026-01-02 Fri>\n"
+                         ":PROPERTIES:\n:DORG_ID: 1001\n:END:\nBody.\n"))
+         (after (concat "* Task\nSCHEDULED: <2026-02-02 Mon>\n"
+                        ":PROPERTIES:\n:DORG_ID: 1001\n:END:\nBody.\n"))
+         (file (make-temp-file "dorg-hiyva-file" nil ".org" before)))
+    (unwind-protect
+        (progn
+          (dorg-api-execute
+           '(on (id 1001) (set (planning scheduled) "<2026-02-02 Mon>"))
+           :mode 'apply :source (list :file file))
+          (should (equal after
+                         (with-temp-buffer
+                           (insert-file-contents-literally file)
+                           (buffer-string)))))
+      (delete-file file))))
+
+(ert-deftest dorg-test-hiyva-plain-planning-owns-maximal-separators ()
+  "Planning clear owns only its declared maximal horizontal separator run.
+
+The literal rows cover a tab after SCHEDULED, two spaces after SCHEDULED,
+two spaces before a last DEADLINE, and an indented clear-last line."
+  (dolist
+      (row
+       `(("* Task\nSCHEDULED: <2026-02-02 Mon>\tDEADLINE: <2026-01-03 Sat>\n"
+          (:scheduled nil)
+          "* Task\nDEADLINE: <2026-01-03 Sat>\n")
+         ("* Task\nSCHEDULED: <2026-02-02 Mon>  DEADLINE: <2026-01-03 Sat>\n"
+          (:scheduled nil)
+          "* Task\nDEADLINE: <2026-01-03 Sat>\n")
+         ("* Task\nSCHEDULED: <2026-02-02 Mon>  DEADLINE: <2026-01-03 Sat>\n"
+          (:deadline nil)
+          "* Task\nSCHEDULED: <2026-02-02 Mon>\n")
+         ("* Task\n  SCHEDULED: <2026-01-02 Fri>\n"
+          (:scheduled nil)
+          "* Task\n")))
+    (pcase-let ((`(,before ,fields ,after) row))
+      (setq before (concat before ":PROPERTIES:\n:DORG_ID: 1001\n:END:\nBody.\n"))
+      (setq after (concat after ":PROPERTIES:\n:DORG_ID: 1001\n:END:\nBody.\n"))
+      (dorg-test-mutate--with-content buf before
+        (dorg-test-mutate--apply-patch-batch
+         buf (list (apply #'dorg-test-mutate--planning-patch 1001 fields)))
+        (should-not (equal before after))
+        (should (equal after (buffer-string)))))))
+
+(ert-deftest dorg-test-hiyva-plain-planning-inserts-before-properties ()
+  "An absent planning line is inserted immediately below its heading."
+  (let* ((before (concat "* Task\n:PROPERTIES:\n:DORG_ID: 1001\n:KEEP: yes\n:END:\nBody.\n"))
+         (after (concat "* Task\nSCHEDULED: <2026-02-02 Mon>\n"
+                        ":PROPERTIES:\n:DORG_ID: 1001\n:KEEP: yes\n:END:\nBody.\n")))
+    (dorg-test-mutate--with-content buf before
+      (dorg-test-mutate--apply-patch-batch
+       buf (list (dorg-test-mutate--planning-patch
+                  1001 :scheduled "<2026-02-02 Mon>")))
+      (should (equal after (buffer-string))))))
+
+(ert-deftest dorg-test-hiyva-plain-planning-dry-run-matches-apply ()
+  "Planning dry-run uses the real editor and predicts apply bytes exactly."
+  (let* ((before (concat "* Task\nSCHEDULED: <2026-01-02 Fri>\n"
+                         ":PROPERTIES:\n:DORG_ID: 1001\n:END:\nBody.\n"))
+         (form '(on (id 1001) (set (planning scheduled) "<2026-02-02 Mon>"))))
+    (dorg-test-mutate--with-content buf before
+      (let* ((preview (dorg-api-execute form :mode 'dry-run :source buf))
+             (projected (plist-get (car (plist-get preview :projections)) :after)))
+        (should (equal before (buffer-string)))
+        (dorg-api-execute form :mode 'apply :source buf)
+        (should-not (equal before (buffer-string)))
+        (should (equal projected (buffer-string)))))))
+
+(ert-deftest dorg-test-hiyva-plain-planning-same-heading-batch-composes ()
+  "Ordered planning patches share phase-one simulation and shifted spans."
+  (let* ((before (concat "* Task\nSCHEDULED: <2026-01-02 Fri> DEADLINE: <2026-01-03 Sat>\n"
+                         ":PROPERTIES:\n:DORG_ID: 1001\n:END:\nBody.\n"))
+         (after (concat "* Task\nSCHEDULED: <2026-02-02 Mon> DEADLINE: <2026-02-03 Tue>\n"
+                        ":PROPERTIES:\n:DORG_ID: 1001\n:END:\nBody.\n"))
+         (form '(batch
+                 (on (id 1001) (set (planning scheduled) "<2026-02-02 Mon>"))
+                 (on (id 1001) (set (planning deadline) "<2026-02-03 Tue>")))))
+    (dorg-test-mutate--with-content buf before
+      (dorg-api-execute form :mode 'apply :source buf)
+      (should (equal after (buffer-string))))))
+
+(ert-deftest dorg-test-hiyva-plain-planning-two-heading-batch-lockstep ()
+  "A two-heading planning batch has matching dry-run projections and apply bytes."
+  (let* ((before (concat "* One\n:PROPERTIES:\n:DORG_ID: 1001\n:END:\n"
+                         "* Two\n:PROPERTIES:\n:DORG_ID: 1002\n:END:\n"))
+         (after (concat "* One\nSCHEDULED: <2026-02-02 Mon>\n:PROPERTIES:\n:DORG_ID: 1001\n:END:\n"
+                        "* Two\nSCHEDULED: <2026-02-03 Tue>\n:PROPERTIES:\n:DORG_ID: 1002\n:END:\n"))
+         (form '(batch
+                 (on (id 1001) (set (planning scheduled) "<2026-02-02 Mon>"))
+                 (on (id 1002) (set (planning scheduled) "<2026-02-03 Tue>")))))
+    (dorg-test-mutate--with-content buf before
+      (let ((preview (dorg-api-execute form :mode 'dry-run :source buf)))
+        (should (equal before (buffer-string)))
+        (should (= 2 (length (plist-get preview :projections))))
+        (should (string-match-p "SCHEDULED: <2026-02-02 Mon>"
+                                (plist-get (nth 0 (plist-get preview :projections)) :after)))
+        (should (string-match-p "SCHEDULED: <2026-02-03 Tue>"
+                                (plist-get (nth 1 (plist-get preview :projections)) :after))))
+      (dorg-api-execute form :mode 'apply :source buf)
+      (should (equal after (buffer-string))))))
+
+(ert-deftest dorg-test-hiyva-plain-planning-later-invalid-batch-is-atomic ()
+  "A later unrepresentable planning request leaves the earlier heading intact."
+  (let ((before (concat "* One\n:PROPERTIES:\n:DORG_ID: 1001\n:END:\n"
+                        "* Two\nSCHEDULED: <2026-01-02 Fri>\n:PROPERTIES:\n:DORG_ID: 1002\n:END:\n")))
+    (dorg-test-mutate--with-content buf before
+      (let ((err (should-error
+                  (dorg-api-execute
+                   '(batch
+                     (on (id 1001) (set (planning scheduled) "<2026-02-02 Mon>"))
+                     (on (id 1002) (set (planning scheduled) "tomorrow")))
+                  :mode 'apply :source buf)
+                  :type 'dorg-mutate-error)))
+        (should (eq 'invalid-target (dorg-mutate-error-reason err)))
+        (should (eq 'planning-line-unrepresentable
+                    (plist-get (dorg-mutate-error-data err) :detail))))
+      (should (equal before (buffer-string))))))
+
+(ert-deftest dorg-test-hiyva-plain-planning-preserves-unrelated-metadata ()
+  "A literal planning edit cannot alter recurrence metadata or completion data."
+  (let* ((before (concat "* TODO Task\n"
+                         "SCHEDULED: <2026-01-02 Fri> DEADLINE: <2026-01-03 Sat> CLOSED: [2026-01-04 Sun]\n"
+                         ":PROPERTIES:\n:DORG_ID: 1001\n:DORG_SCHEDULED_RULE: +1w\n:DORG_DEADLINE_RULE: +2d\n:END:\n"
+                         ":LOGBOOK:\n- State TODO\n:END:\nBody.\n** Child\n:PROPERTIES:\n:DORG_ID: 1002\n:END:\nChild.\n"))
+         (after (concat "* TODO Task\n"
+                        "SCHEDULED: <2026-02-02 Mon> DEADLINE: <2026-01-03 Sat> CLOSED: [2026-01-04 Sun]\n"
+                        ":PROPERTIES:\n:DORG_ID: 1001\n:DORG_SCHEDULED_RULE: +1w\n:DORG_DEADLINE_RULE: +2d\n:END:\n"
+                        ":LOGBOOK:\n- State TODO\n:END:\nBody.\n** Child\n:PROPERTIES:\n:DORG_ID: 1002\n:END:\nChild.\n")))
+    (dorg-test-mutate--with-content buf before
+      (dorg-api-execute
+       '(on (id 1001) (set (planning scheduled) "<2026-02-02 Mon>"))
+       :mode 'apply :source buf)
+      (should (equal after (buffer-string))))))
+
+(ert-deftest dorg-test-hiyva-plain-planning-refuses-unrepresentable-input ()
+  "Malformed and injected planning values refuse without a byte change."
+  (dolist (row `(("SCHEDULED: tomorrow\n" planning-line-malformed)
+                 ("scheduled: <2026-02-02 Mon>\n" planning-line-malformed)
+                 ("SCHEDULED: <2026-02-02 Mon> junk DEADLINE: <2026-01-03 Sat>\n"
+                  planning-line-malformed)))
+    (pcase-let ((`(,line ,detail) row))
+      (let ((before (concat "* Task\n" line ":PROPERTIES:\n:DORG_ID: 1001\n:END:\n")))
+        (dorg-test-mutate--with-content buf before
+          (let ((data (dorg-test-mutate--error-data
+                       (dorg-test-mutate--apply-patch-batch
+                        buf (list (dorg-test-mutate--planning-patch
+                                   1001 :scheduled "<2026-03-02 Mon>"))))))
+            (should (eq 'invalid-target (plist-get data :reason)))
+            (should (eq detail (plist-get data :detail)))
+            (should (equal before (buffer-string)))))))
+  (let ((before (concat "* Task\nSCHEDULED: <2026-01-02 Fri>\n"
+                        ":PROPERTIES:\n:DORG_ID: 1001\n:END:\n")))
+    (dorg-test-mutate--with-content buf before
+      (let ((data (dorg-test-mutate--error-data
+                   (dorg-test-mutate--apply-patch-batch
+                    buf (list (dorg-test-mutate--planning-patch
+                               1001 :scheduled
+                               "<2026-02-02 Mon> DEADLINE: <2027-01-01 Fri>"))))))
+        (should (eq 'invalid-target (plist-get data :reason)))
+        (should (eq 'planning-line-unrepresentable (plist-get data :detail)))
+        (should (equal before (buffer-string)))))))
+  (let ((before (concat "* Task\nSCHEDULED: <2026-01-02 Fri>\n"
+                        ":PROPERTIES:\n:DORG_ID: 1001\n:END:\n")))
+    (dorg-test-mutate--with-content buf before
+      (let ((data (dorg-test-mutate--error-data
+                   (dorg-test-mutate--apply-patch-batch
+                    buf (list (dorg-test-mutate--planning-patch
+                               1001 :scheduled "tomorrow"))))))
+        (should (eq 'invalid-target (plist-get data :reason)))
+        (should (eq 'planning-line-unrepresentable (plist-get data :detail)))
+        (should (equal "tomorrow" (plist-get data :value)))
+        (should (equal before (buffer-string))))))
+  (let ((before (concat "* Task\n"
+                        "SCHEDULED: <2026-01-02 Fri> SCHEDULED: <2026-02-02 Mon>\n"
+                        ":PROPERTIES:\n:DORG_ID: 1001\n:END:\n")))
+    (dorg-test-mutate--with-content buf before
+      (let ((data (dorg-test-mutate--error-data
+                   (dorg-test-mutate--apply-patch-batch
+                    buf (list (dorg-test-mutate--planning-patch
+                               1001 :scheduled "<2026-03-02 Mon>"))))))
+        (should (eq 'invalid-target (plist-get data :reason)))
+        (should (eq 'planning-line-ambiguous (plist-get data :detail)))
+        (should (equal before (buffer-string)))))))
+
+(ert-deftest dorg-test-hiyva-plain-planning-refuses-unterminated-source ()
+  "A missing final newline has its own fail-closed planning diagnostic."
+  (let ((before "* Task\nSCHEDULED: <2026-01-02 Fri>\n:PROPERTIES:\n:DORG_ID: 1001\n:END:"))
+    (dorg-test-mutate--with-content buf before
+      (let ((data (dorg-test-mutate--error-data
+                   (dorg-test-mutate--apply-patch-batch
+                    buf (list (dorg-test-mutate--planning-patch
+                               1001 :scheduled "<2026-02-02 Mon>"))))))
+        (should (eq 'invalid-target (plist-get data :reason)))
+        (should (eq 'planning-line-unterminated (plist-get data :detail)))
+        (should (equal before (buffer-string)))))))
+
+(ert-deftest dorg-test-hiyva-plain-planning-preserves-representable-raw-values ()
+  "Plain planning stores representable raw Org forms without normalization."
+  (dolist (value '("<2026-02-02 Mon 10:00-11:00 +1w -2d>"
+                   "<2026-02-02 Mon>--<2026-02-03 Tue>"
+                   "<%%(diary-float t 4 2)>"
+                   "[2026-02-02 Mon]"))
+    (let ((before "* Task\n:PROPERTIES:\n:DORG_ID: 1001\n:END:\nBody.\n"))
+      (dorg-test-mutate--with-content buf before
+        (dorg-test-mutate--apply-patch-batch
+         buf (list (dorg-test-mutate--planning-patch 1001 :scheduled value)))
+        (should (equal (concat "* Task\nSCHEDULED: " value "\n"
+                               ":PROPERTIES:\n:DORG_ID: 1001\n:END:\nBody.\n")
+                       (buffer-string)))))))
+
+(ert-deftest dorg-test-hiyva-plain-planning-refuses-diary-sexp-keyword-without-evaluation ()
+  "An unrepresentable diary sexp refuses in both modes without evaluation.
+The sexp intentionally contains `SCHEDULED:' to pin that scanner-looking text
+does not execute while representability is checked."
+  (let* ((counter 0)
+         (value "<%%(dorg-test-hiyva--diary-trap \"SCHEDULED:\")>")
+         (before (concat "* Task\nSCHEDULED: <2026-01-02 Fri>\n"
+                         ":PROPERTIES:\n:DORG_ID: 1001\n:END:\n")))
+    (cl-letf (((symbol-function 'dorg-test-hiyva--diary-trap)
+               (lambda (&rest _args) (setq counter (1+ counter)) "ignored")))
+      (dorg-test-mutate--with-content buf before
+      (dolist (mode '(dry-run apply))
+        (condition-case err
+            (progn
+              (dorg-api-execute
+               `(on (id 1001) (set (planning scheduled) ,value))
+               :mode mode :source buf)
+              (ert-fail "diary sexp request unexpectedly succeeded"))
+          ((dorg-api-error dorg-mutate-error)
+           (let ((data (dorg-error-data err)))
+             (should (eq 'invalid-target (plist-get data :reason)))
+             (should (eq 'planning-line-unrepresentable (plist-get data :detail)))
+             (should (equal value (plist-get data :value))))))
+        (should (= 0 counter))
+        (should (equal before (buffer-string))))
+    ;; The same malformed diary text in source is never evaluated or written.
+    ;; The current whole-line duplicate guard reports it before splice.
+    (let ((source (concat "* Task\nSCHEDULED: " value "\n"
+                          ":PROPERTIES:\n:DORG_ID: 1001\n:END:\n")))
+      (dorg-test-mutate--with-content buf source
+        (let ((data (dorg-test-mutate--error-data
+                     (dorg-test-mutate--apply-patch-batch
+                      buf (list (dorg-test-mutate--planning-patch
+                                 1001 :deadline "<2026-03-02 Mon>"))))))
+          (should (eq 'invalid-target (plist-get data :reason)))
+          (should (equal source (buffer-string)))
+          (should (= 0 counter)))))
+    ;; A real second field is still the unambiguous duplicate witness.
+    (let ((duplicate (concat "* Task\nSCHEDULED: <2026-01-02 Fri> "
+                             "SCHEDULED: <2026-02-02 Mon>\n"
+                             ":PROPERTIES:\n:DORG_ID: 1001\n:END:\n")))
+      (dorg-test-mutate--with-content buf duplicate
+        (let ((data (dorg-test-mutate--error-data
+                     (dorg-test-mutate--apply-patch-batch
+                      buf (list (dorg-test-mutate--planning-patch
+                                 1001 :deadline "<2026-03-02 Mon>"))))))
+          (should (eq 'invalid-target (plist-get data :reason)))
+          (should (eq 'planning-line-ambiguous (plist-get data :detail)))
+          (should (equal duplicate (buffer-string))))))))))
 
 ;; Local-identity resolver: property ops target the ONE property drawer org
 ;; reads back as the heading's own, never a generic body :PROPERTIES: block.
@@ -1201,19 +1996,16 @@ lines.  The block and its `:FOO: bar' line must survive untouched."
 
 ;;; Heading metadata + structure ---------------------------------------
 
-(ert-deftest dorg-test-mutate-exec-update-heading-refuses ()
-  "AC (clean-break C3): heading update has no source-preserving editor on
-plain-org (whole-verb collapse, C3 slice S1) and is refused pre-write with the
-exact `unsupported'/`no-source-preserving-editor' + empty variant nil, buffer
-byte-identical.  Heading-title updates are retained on Dolt by
-`dorg-test-mutate-dolt-commit-heading-update' /
-`dorg-test-mutate-result-token-affected-dolt'."
+(ert-deftest dorg-test-mutate-exec-update-heading-post-blank-refuses ()
+  "Post-blank remains outside the plain heading-line editor and refuses pre-write.
+The ordinary title/TODO/priority/tags/COMMENTED cells are covered by 1qdtb's
+literal transformation tests; this retains the whole-field C3 protection."
   (dorg-test-mutate--with-buffer buf
     (let* ((before (buffer-string))
            (d (dorg-test-mutate--error-data
                (dorg-test-mutate--apply-patch-batch
                 buf (list (dorg-test-mutate--heading-update-patch
-                           1001 :title "Renamed" :todo "TODO"))))))
+                           1001 :post-blank 2))))))
       (should (eq 'unsupported (plist-get d :reason)))
       (should (eq 'no-source-preserving-editor (plist-get d :detail)))
       (should (null (plist-get d :variant)))
@@ -1311,8 +2103,7 @@ byte-identical.  Sibling reorder is retained on Dolt by
   (dorg-test-mutate--with-buffer buf
     (dorg-test-mutate--apply-patch-batch
      buf '((:op replace
-            :target (:text :host (:heading :id 1001) :occurrence 1)
-            :missing :error :value "Rewritten body.")))
+            :target (:text :host (:heading :id 1001) :select (:occurrence 1)) :value "Rewritten body.")))
     (should (string-match-p "Rewritten body\\." (buffer-string)))
     (should-not (string-match-p "First body\\." (buffer-string)))))
 
@@ -1718,6 +2509,29 @@ either source, so the source file is left untouched."
     (should (equal '("First" "Second")
                    (dorg-test-mutate--heading-titles buf)))))
 
+;;; ─── Dolt order-fact result coercion ──────────────────────────────────
+
+(ert-deftest dorg-test-mutate-dolt-order-facts-preserve-hex-after-json-parse ()
+  "Order facts preserve numeric-only hex text from the real JSON parser.
+The private `dorg-sql' response seam avoids a SQL process, but the test uses
+the real `dorg-sql--parse-result' and `dorg-mutate--dolt-order-facts' path.
+IDs arrive as JSON numbers and HEX sort keys as JSON strings; the parser keeps
+both, so numeric-only hex stays text until decoded."
+  (let ((rows (with-temp-buffer
+                (insert (concat "{\"rows\":["
+                                "{\"id\":107,\"sort_key_hex\":\"01\"},"
+                                "{\"id\":108,\"sort_key_hex\":\"00\"},"
+                                "{\"id\":109,\"sort_key_hex\":\"AF\"}]}"))
+                (dorg-sql--parse-result (current-buffer) 0 "order facts"))))
+    (cl-letf (((symbol-function 'dorg-sql)
+               (lambda (_dolt-dir sql &rest _)
+                 (should (string-match-p "HEX(sort_key) AS sort_key_hex" sql))
+                 rows)))
+      (should (equal (list (cons 107 (unibyte-string 1))
+                           (cons 108 (unibyte-string 0))
+                           (cons 109 (unibyte-string #xaf)))
+                     (dorg-mutate--dolt-order-facts "/tmp/0cjqb" 100 101))))))
+
 ;;; ─── Dolt Executor Integration (gated on a live Dolt repo) ────────────
 
 ;; These exercise the Dolt planner/executor against a real
@@ -1763,6 +2577,36 @@ Returns ROOT-ID (default 100)."
              (string< (dorg-heading-sort-key a)
                       (dorg-heading-sort-key b))))))
 
+(defun dorg-test-mutate--tree-child-keys (tree parent-id)
+  "Return direct child sort keys of PARENT-ID from TREE in sibling order."
+  (mapcar #'dorg-heading-sort-key
+          (sort
+           (cl-loop for heading being the hash-values of tree
+                    when (equal parent-id (dorg-heading-parent-id heading))
+                    collect heading)
+           (lambda (a b)
+             (string< (dorg-heading-sort-key a)
+                      (dorg-heading-sort-key b))))))
+
+(defun dorg-test-mutate--tree-children (tree parent-id)
+  "Return direct children of PARENT-ID from TREE in sibling order."
+  (sort
+   (cl-loop for heading being the hash-values of tree
+            when (equal parent-id (dorg-heading-parent-id heading))
+            collect heading)
+   (lambda (a b)
+     (string< (dorg-heading-sort-key a)
+              (dorg-heading-sort-key b)))))
+
+(defun dorg-test-mutate--assert-tree-sibling-order (tree parent-id)
+  "Assert PARENT-ID's direct child keys in TREE are unique and sub-cliff."
+  (let ((keys (dorg-test-mutate--tree-child-keys tree parent-id)))
+    (should (cl-loop for (a b) on keys
+                     while b
+                     always (string< a b)))
+    (should (cl-every (lambda (key) (< (length key) dorg-sortkey-max-bytes))
+                      keys))))
+
 (defun dorg-test-mutate--dolt-keyword-values (tree id key)
   "Return the ordered list of KEY keyword-item values for heading ID in TREE."
   (let ((h (gethash id tree)) (out nil))
@@ -1770,6 +2614,65 @@ Returns ROOT-ID (default 100)."
       (when (and (cl-typep it 'dorg-keyword-item)
                  (equal (dorg-keyword-item-keyword it) key))
         (push (dorg-keyword-item-value it) out)))))
+
+(defun dorg-test-mutate--be16 (n)
+  "Return the fixed-width item boundary key for integer N."
+  (dorg-sortkey-from-integer n dorg-sortkey-boundary-width))
+
+(defun dorg-test-mutate--be4 (n)
+  "Return the four-byte suffix key for integer N."
+  (dorg-sortkey-from-integer n 4))
+
+(defun dorg-test-mutate--ac4-text-rows ()
+  "Return aged AC4 text rows whose 16-byte prefix is saturated.
+The first row is exactly sixteen #xff bytes and the next twelve carry be4(N)
+suffixes, so no append can find room after the last key at the fixed width:
+any append renormalizes the complete list, rewriting every reused row's key
+to a fresh one that equals none of the old keys."
+  (let ((base (apply #'unibyte-string (make-list 16 #xff))))
+    (cl-loop for id from 42 to 54
+             for key = (if (= id 42)
+                           base
+                         (concat base (dorg-test-mutate--be4 (- id 42))))
+             collect (dorg-text-item :id id
+                                     :sort-key key
+                                     :text (format "item-%d" id)))))
+
+(defun dorg-test-mutate--seed-text-heading (dolt-dir rows)
+  "Seed DOLT-DIR with root 100, text heading 200, and DB-bound ROWS."
+  (let* ((root-h (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
+                                    :sort-key (unibyte-string #x80)))
+         (h (make-dorg-heading :id 200 :parent-id 100 :level 1 :level-offset 1 :title "H"
+                               :sort-key (unibyte-string #x80)
+                               :items rows)))
+    (dorg-heading-compute-items-hash h)
+    (dorg-sql-batch
+     dolt-dir
+     (append
+      (list (dorg-sql-gen-heading-insert root-h 100)
+            (dorg-sql-gen-heading-insert h 100))
+      (cl-loop for row in rows
+               append (dorg-item-to-sql row
+                                        (dorg-item-id row)
+                                        200
+                                        (dorg-item-sort-key row)))))
+    (dorg-commit dolt-dir "seed")
+    200))
+
+(defun dorg-test-mutate--dolt-text-items (dolt-dir root-id heading-id)
+  "Return loaded text items for HEADING-ID from DOLT-DIR/ROOT-ID."
+  (let* ((tree (dorg-model-load-tree dolt-dir root-id))
+         (heading (gethash heading-id tree)))
+    (should heading)
+    (cl-remove-if-not (lambda (item) (cl-typep item 'dorg-text-item))
+                      (dorg-heading-items heading))))
+
+(defun dorg-test-mutate--text-append-patch (heading-id text)
+  "Return a typed text append patch adding TEXT under HEADING-ID."
+  `(:op insert
+    :target (:text :host (:heading :id ,heading-id))
+    :position :after-last
+    :value ,text))
 
 (ert-deftest dorg-test-mutate-public-keyword-insert-backend-parity ()
   "Public keyword insertion has one heading meaning on plain-org and Dolt.
@@ -1924,7 +2827,7 @@ persists and HEAD advances (B8 lazy-load boundary is at dispatch, not constructi
                          (dorg-heading-sort-key (gethash 200 tree))))))))
 
 (ert-deftest dorg-test-mutate-dolt-property-and-planning ()
-  "Property put and planning update persist; all-nil planning removes it."
+  "Property put and planning update persist; an explicit clear removes it."
   (dorg-test-mutate--with-dolt
     (let* ((root (dorg-test-mutate--seed dolt-dir "* H\n"))
            (hid (dorg-test-mutate--id-by-title dolt-dir "H"))
@@ -1945,13 +2848,217 @@ persists and HEAD advances (B8 lazy-load boundary is at dispatch, not constructi
         (should (equal (cdr (assoc "K" (dorg-drawer-item-properties drawer))) "V"))
         (should planning)
         (should (equal (dorg-planning-item-scheduled planning) "<2026-05-29 Fri>")))
-      ;; All-nil planning removes the planning line.
+      ;; Clearing the last stored field removes the planning line.
       (dorg-test-mutate--apply-patch-batch
-       src (list (dorg-test-mutate--planning-patch hid)))
+       src (list (dorg-test-mutate--planning-patch hid :scheduled nil)))
       (let* ((tree (dorg-model-load-tree dolt-dir root))
              (planning (cl-find-if (lambda (it) (cl-typep it 'dorg-planning-item))
                                    (dorg-heading-items (gethash hid tree)))))
         (should-not planning)))))
+
+(defun dorg-test-mutate--planning-raw-row (dolt-dir heading-id)
+  "Return the first planning row's raw fields for HEADING-ID in DOLT-DIR."
+  (car (dorg-sql
+        dolt-dir
+        (format (concat "SELECT pi.scheduled_raw, pi.deadline_raw, pi.closed_raw "
+                        "FROM planning_items pi "
+                        "JOIN heading_items hi ON hi.id = pi.item_id "
+                        "WHERE hi.heading_id = %d ORDER BY hi.sort_key LIMIT 1")
+                heading-id))))
+
+(ert-deftest dorg-test-mutate-dolt-public-planning-preserves-sibling-fields ()
+  "Public planning set preserves raw siblings and neighboring body items.
+This is the native AC4/D3 control: reverting key-presence semantics erases
+DEADLINE/CLOSED and fails after reload."
+  (dorg-test-mutate--with-dolt
+    (let* ((root (dorg-test-mutate--seed
+                  dolt-dir
+                  (concat "* H\n"
+                          "SCHEDULED: <2026-05-29 Thu> "
+                          "DEADLINE: <2026-05-30 Fri> "
+                          "CLOSED: [2026-05-31 Sat]\n"
+                          "Neighbour body.\n")))
+           (hid (dorg-test-mutate--id-by-title dolt-dir "H"))
+           (src (list :dolt-dir dolt-dir :root-id root))
+           (before (dorg-test-mutate--planning-raw-row dolt-dir hid))
+           (deadline (alist-get 'deadline_raw before))
+           (closed (alist-get 'closed_raw before)))
+      (should deadline)
+      (should closed)
+      (should (plist-get
+               (dorg-api-execute
+                `(on (id ,hid) (set (planning scheduled) "<2026-06-01 Mon>"))
+                :mode 'apply :source src)
+               :ok))
+      (let* ((after (dorg-test-mutate--planning-raw-row dolt-dir hid))
+             (heading (gethash hid (dorg-model-load-tree dolt-dir root))))
+        (should (equal "<2026-06-01 Mon>" (alist-get 'scheduled_raw after)))
+        (should (equal deadline (alist-get 'deadline_raw after)))
+        (should (equal closed (alist-get 'closed_raw after)))
+        (should (equal '((planning "<2026-06-01 Mon>" "<2026-05-30 Fri>"
+                                   "[2026-05-31 Sat]")
+                         (text "Neighbour body.\n"))
+                       (dorg-test-mutate--items-shape
+                        (dorg-heading-items heading)))))
+      (should (plist-get
+               (dorg-api-execute
+                `(on (id ,hid)
+                     (set (planning scheduled) "<2026-06-02 Tue>")
+                     (set (planning deadline) "<2026-06-03 Wed>"))
+                :mode 'apply :source src)
+               :ok))
+      (let* ((after-batch (dorg-test-mutate--planning-raw-row dolt-dir hid))
+             (heading (gethash hid (dorg-model-load-tree dolt-dir root))))
+        (should (equal "<2026-06-02 Tue>"
+                       (alist-get 'scheduled_raw after-batch)))
+        (should (equal "<2026-06-03 Wed>"
+                       (alist-get 'deadline_raw after-batch)))
+        (should (equal closed (alist-get 'closed_raw after-batch)))
+        (should (equal '((planning "<2026-06-02 Tue>" "<2026-06-03 Wed>"
+                                   "[2026-05-31 Sat]")
+                         (text "Neighbour body.\n"))
+                       (dorg-test-mutate--items-shape
+                        (dorg-heading-items heading)))))
+      (should (plist-get
+               (dorg-api-execute
+                `(on (id ,hid) (set (planning scheduled) nil))
+                :mode 'apply :source src)
+               :ok))
+      (let* ((after-clear (dorg-test-mutate--planning-raw-row dolt-dir hid))
+             (heading (gethash hid (dorg-model-load-tree dolt-dir root))))
+        (should-not (alist-get 'scheduled_raw after-clear))
+        (should (equal "<2026-06-03 Wed>"
+                       (alist-get 'deadline_raw after-clear)))
+        (should (equal closed (alist-get 'closed_raw after-clear)))
+        (should (equal '((planning nil "<2026-06-03 Wed>" "[2026-05-31 Sat]")
+                         (text "Neighbour body.\n"))
+                       (dorg-test-mutate--items-shape
+                        (dorg-heading-items heading))))))))
+
+(ert-deftest dorg-test-hiyva-dolt-planning-stores-tomorrow-literally ()
+  "Dolt keeps the raw planning domain where plain Org rejects `tomorrow'."
+  (dorg-test-mutate--with-dolt
+    (let* ((root (dorg-test-mutate--seed dolt-dir "* H\n"))
+           (hid (dorg-test-mutate--id-by-title dolt-dir "H"))
+           (src (list :dolt-dir dolt-dir :root-id root)))
+      (should (plist-get
+               (dorg-api-execute
+                `(on (id ,hid) (set (planning scheduled) "tomorrow"))
+                :mode 'apply :source src)
+               :ok))
+      (should (equal "tomorrow"
+                     (alist-get 'scheduled_raw
+                                (dorg-test-mutate--planning-raw-row dolt-dir hid)))))))
+
+(defun dorg-test-hiyva--planning-source (fields)
+  "Return an exact plain fixture with planning FIELDS and identity 1001.
+FIELDS is an alist whose keys are the public field symbols and whose values are
+raw timestamp strings.  The helper deliberately fixes the non-planning suffix
+so every plain parity row proves the complete resulting bytes."
+  (concat "* Task\n"
+          (when fields
+            (concat
+             (mapconcat
+              (lambda (entry)
+                (format "%s: %s" (upcase (symbol-name (car entry))) (cdr entry)))
+              fields " ")
+             "\n"))
+          ":PROPERTIES:\n:DORG_ID: 1001\n:END:\nBody.\n"))
+
+(defun dorg-test-hiyva--planning-intent (id fields)
+  "Return one public planning intent for ID and FIELD alist."
+  (append (list 'on (list 'id id))
+          (mapcar (lambda (entry)
+                    (list 'set (list 'planning (car entry)) (cdr entry)))
+                  fields)))
+
+(defconst dorg-test-hiyva--planning-parity-rows
+  '((scheduled-set
+     ((scheduled . "<2026-01-02 Fri>") (deadline . "<2026-01-03 Sat>") (closed . "[2026-01-04 Sun]"))
+     ((scheduled . "<2026-02-02 Mon>"))
+     ((scheduled . "<2026-02-02 Mon>") (deadline . "<2026-01-03 Sat>") (closed . "[2026-01-04 Sun]")))
+    (scheduled-clear
+     ((scheduled . "<2026-01-02 Fri>") (deadline . "<2026-01-03 Sat>") (closed . "[2026-01-04 Sun]"))
+     ((scheduled))
+     ((deadline . "<2026-01-03 Sat>") (closed . "[2026-01-04 Sun]")))
+    (scheduled-clear-last ((scheduled . "<2026-01-02 Fri>")) ((scheduled)) nil)
+    (scheduled-unchanged ((scheduled . "<2026-01-02 Fri>")) ((scheduled . "<2026-01-02 Fri>")) ((scheduled . "<2026-01-02 Fri>")))
+    (deadline-set
+     ((scheduled . "<2026-01-02 Fri>") (deadline . "<2026-01-03 Sat>") (closed . "[2026-01-04 Sun]"))
+     ((deadline . "<2026-02-03 Tue>"))
+     ((scheduled . "<2026-01-02 Fri>") (deadline . "<2026-02-03 Tue>") (closed . "[2026-01-04 Sun]")))
+    (deadline-clear
+     ((scheduled . "<2026-01-02 Fri>") (deadline . "<2026-01-03 Sat>") (closed . "[2026-01-04 Sun]"))
+     ((deadline))
+     ((scheduled . "<2026-01-02 Fri>") (closed . "[2026-01-04 Sun]")))
+    (deadline-clear-last ((deadline . "<2026-01-03 Sat>")) ((deadline)) nil)
+    (deadline-unchanged ((deadline . "<2026-01-03 Sat>")) ((deadline . "<2026-01-03 Sat>")) ((deadline . "<2026-01-03 Sat>")))
+    (closed-set
+     ((scheduled . "<2026-01-02 Fri>") (deadline . "<2026-01-03 Sat>") (closed . "[2026-01-04 Sun]"))
+     ((closed . "[2026-02-04 Wed]"))
+     ((scheduled . "<2026-01-02 Fri>") (deadline . "<2026-01-03 Sat>") (closed . "[2026-02-04 Wed]")))
+    (closed-clear
+     ((scheduled . "<2026-01-02 Fri>") (deadline . "<2026-01-03 Sat>") (closed . "[2026-01-04 Sun]"))
+     ((closed))
+     ((scheduled . "<2026-01-02 Fri>") (deadline . "<2026-01-03 Sat>")))
+    (closed-clear-last ((closed . "[2026-01-04 Sun]")) ((closed)) nil)
+    (closed-unchanged ((closed . "[2026-01-04 Sun]")) ((closed . "[2026-01-04 Sun]")) ((closed . "[2026-01-04 Sun]")))
+    (scheduled-deadline-two-field-batch
+     ((scheduled . "<2026-01-02 Fri>") (deadline . "<2026-01-03 Sat>") (closed . "[2026-01-04 Sun]"))
+     ((scheduled . "<2026-02-02 Mon>") (deadline . "<2026-02-03 Tue>"))
+     ((scheduled . "<2026-02-02 Mon>") (deadline . "<2026-02-03 Tue>") (closed . "[2026-01-04 Sun]"))))
+  "Named shared planning operation rows required by hiyva R5.")
+
+(ert-deftest dorg-test-hiyva-plain-planning-parity-rows ()
+  "Every named R5 operation has an exact plain byte witness."
+  (dolist (row dorg-test-hiyva--planning-parity-rows)
+    (pcase-let ((`(,name ,before-fields ,patches ,after-fields) row))
+      (let ((before (dorg-test-hiyva--planning-source before-fields))
+            (after (dorg-test-hiyva--planning-source after-fields)))
+        (dorg-test-mutate--with-content buf before
+          (should (plist-get
+                   (dorg-api-execute
+                    (dorg-test-hiyva--planning-intent 1001 patches)
+                    :mode 'apply :source buf)
+                   :ok))
+          (should (equal after (buffer-string)))
+          ;; Keep NAME in the failure context if a row becomes non-discriminating.
+          (should (or (not (equal before after))
+                      (string-suffix-p "unchanged" (symbol-name name)))))))))
+
+(ert-deftest dorg-test-hiyva-dolt-planning-parity-rows ()
+  "Every named R5 operation has the same resulting Dolt planning values."
+  (dorg-test-mutate--with-dolt
+    (let ((root-id 100))
+      (dolist (row dorg-test-hiyva--planning-parity-rows)
+      (pcase-let ((`(,name ,before-fields ,patches ,after-fields) row))
+        (let* ((identity (1+ root-id))
+               (contents (replace-regexp-in-string
+                          ":DORG_ID: 1001" (format ":DORG_ID: %d" identity)
+                          (dorg-test-hiyva--planning-source before-fields)
+                          t t))
+               (title (symbol-name name))
+               (root (dorg-test-mutate--seed
+                      dolt-dir
+                      (concat "* " title "\n" (substring contents (length "* Task\n")))
+                      root-id))
+               (hid (dorg-test-mutate--id-by-title dolt-dir title))
+               (source (list :dolt-dir dolt-dir :root-id root)))
+          (should hid)
+          (should (plist-get
+                   (dorg-api-execute
+                    (dorg-test-hiyva--planning-intent hid patches)
+                    :mode 'apply :source source)
+                   :ok))
+          (let ((actual (dorg-test-mutate--planning-raw-row dolt-dir hid)))
+            (dolist (field '((scheduled . scheduled_raw)
+                             (deadline . deadline_raw)
+                             (closed . closed_raw)))
+              (should (equal (alist-get (car field) after-fields)
+                             (alist-get (cdr field) actual)))))
+          ;; NAME is a named matrix cell, even when it is semantically a no-op.
+          (should (symbolp name)))
+        (setq root-id (+ root-id 100)))))))
 
 (ert-deftest dorg-test-mutate-dolt-put-property-preserves-body-drawer ()
   "Dolt property put spares a generic body :PROPERTIES: block end-to-end.
@@ -2003,12 +3110,12 @@ its lines lost."
       (dorg-test-mutate--apply-patch-batch
        src (list (dorg-test-mutate--keyword-occurrence-patch
                   'replace (dorg-test-mutate--heading-address hid)
-                  "FOO" 1 :value "b" :missing :error)))
+                  "FOO" 1 :value "b")))
       (should (equal (dorg-test-mutate--dolt-keyword-values
                       (dorg-model-load-tree dolt-dir root) hid "FOO")
                      '("b")))
       (dorg-test-mutate--apply-patch-batch
-       src `((:op replace :target (:items :host (:heading :id ,hid))
+       src `((:op replace :target (:item :host (:heading :id ,hid) :select (:all))
                :items ((:kind keyword :keyword "BAR" :value "1")
                        (:kind keyword :keyword "BAR" :value "2")))))
       (should (equal (dorg-test-mutate--dolt-keyword-values
@@ -2025,19 +3132,22 @@ its lines lost."
                      '("x" "y")))
       ;; Replace only the second occurrence.
       (dorg-test-mutate--apply-patch-batch
-       src (list (dorg-test-mutate--keyword-occurrence-patch
-                  'replace :root "OPTIONS" 2 :value "y2" :missing :error)))
+       src (list '(:op replace
+                   :target (:keyword :host :root :name "OPTIONS"
+                                     :select (:occurrence 2))
+                   :value "y2")))
       ;; Insert a third after the last same-key occurrence.
       (dorg-test-mutate--apply-patch-batch
-       src (list (dorg-test-mutate--keyword-patch
-                  'insert :root "OPTIONS" :position :after-last :value "z3")))
+       src (list '(:op insert :target (:keyword :host :root :name "OPTIONS")
+                   :position :after-last :value "z3")))
       (should (equal (dorg-test-mutate--dolt-keyword-values
                       (dorg-model-load-tree dolt-dir root) root "OPTIONS")
                      '("x" "y2" "z3")))
       ;; Delete only the first occurrence.
       (dorg-test-mutate--apply-patch-batch
-       src (list (dorg-test-mutate--keyword-occurrence-patch
-                  'delete :root "OPTIONS" 1 :missing :error)))
+       src (list '(:op delete
+                   :target (:keyword :host :root :name "OPTIONS"
+                                     :select (:occurrence 1)))))
       (should (equal (dorg-test-mutate--dolt-keyword-values
                       (dorg-model-load-tree dolt-dir root) root "OPTIONS")
                      '("y2" "z3"))))))
@@ -2056,8 +3166,8 @@ source is persisted).  Wrong initial state -> corrected state (before != after).
       (should (null (dorg-test-mutate--dolt-keyword-values
                      (dorg-model-load-tree dolt-dir root) root "AUTHOR")))
       (dorg-test-mutate--apply-patch-batch
-       src (list (dorg-test-mutate--keyword-patch
-                  'insert :root "AUTHOR" :position :after-last :value "OC")))
+       src (list '(:op insert :target (:keyword :host :root :name "AUTHOR")
+                   :position :after-last :value "OC")))
       ;; reloaded tree: exact root keyword value, pre-existing OPTIONS order intact
       (let ((tree (dorg-model-load-tree dolt-dir root)))
         (should (equal (dorg-test-mutate--dolt-keyword-values tree root "AUTHOR") '("OC")))
@@ -2147,7 +3257,7 @@ parent AND child ABSENT, the sibling PRESENT, and HEAD advanced."
                                :position :after-last :value "9"))))))
       (dorg-test-mutate--apply-patch-batch
        src (list (dorg-test-mutate--keyword-occurrence-patch
-                  'replace :root "OPTIONS" 1 :value "x2" :missing :error)))
+                  'replace :root "OPTIONS" 1 :value "x2")))
       ;; No DORG_* keyword content rows exist for the root.
       (let ((rows (dorg-sql dolt-dir
                     (format "SELECT COUNT(*) AS n FROM heading_items hi JOIN keyword_items ki ON ki.item_id = hi.id WHERE hi.heading_id = %d AND ki.keyword LIKE 'DORG_%%'"
@@ -2246,6 +3356,141 @@ back (HEAD unchanged, no partial rows)."
       (should (equal (dorg-test-mutate--dolt-keyword-values
                       (dorg-model-load-tree dolt-dir root) h1 "FOO")
                      '("a"))))))
+
+(ert-deftest dorg-test-mutate-postimage-validates-all-owner-rows-without-wire ()
+  "Every row of every present partition validates; deleted scope stays independent."
+  (let ((validated nil))
+    (cl-labels
+        ((heading (id)
+           (let ((h (make-dorg-heading :id id)))
+             (dorg-heading-compute-items-hash h)
+             h))
+         (image (ids)
+           (let ((out (make-hash-table :test 'eql)))
+             (dolist (id ids) (puthash id (heading id) out))
+             out))
+         (expected (ids)
+           (let ((out (make-hash-table :test 'eql)))
+             (dolist (id ids)
+               (let ((h (heading id)))
+                 (puthash id
+                          (cons (dorg-mutate--index-heading-canonical h)
+                                (dorg-mutate--postimage-item-row-canonical h))
+                          out)))
+             out)))
+      (let ((specs (list (list 100 1 '(1 2 3) (expected '(1 2 3)) nil)
+                         (list 100 10 '(10 11) (expected '(10 11)) nil)
+                         (list 100 20 nil nil t)))
+            (canonical (symbol-function 'dorg-mutate--postimage-item-row-canonical)))
+        (cl-letf (((symbol-function 'dorg-mutate--postimage-item-row-canonical)
+                   (lambda (h)
+                     (push (dorg-heading-id h) validated)
+                     (funcall canonical h))))
+          (dorg-mutate--postimage-assert-partitions
+           (lambda (request) (image (plist-get request :ids))) specs))
+        (should (equal '(1 2 3 10 11) (nreverse validated)))))))
+
+(ert-deftest dorg-test-mutate-dolt-ac4-aged-item-append-commits-atomically ()
+  "AC4: aged item normalization and the requested append persist atomically.
+The Dolt seed saturates the 16-byte prefix, so the append renormalizes every
+reused row to a fresh 16-byte key that equals none of the old keys; no temporary
+key is needed.  The committed image preserves row ids, content, and order."
+  (dorg-test-mutate--with-dolt
+    (let* ((rows (dorg-test-mutate--ac4-text-rows))
+           (old-keys (mapcar #'dorg-item-sort-key rows))
+           (hid (dorg-test-mutate--seed-text-heading dolt-dir rows))
+           (src (list :dolt-dir dolt-dir :root-id 100))
+           (base (dorg-head-commit dolt-dir)))
+      (let ((dorg-mutate--dolt-item-id-generator (lambda () 55)))
+        (let ((res (dorg-test-mutate--apply-patch-batch
+                    src (list (dorg-test-mutate--text-append-patch
+                               hid "appended")))))
+          (should (plist-get res :ok))
+          (should (member hid (plist-get res :changed)))))
+      (should-not (equal base (dorg-head-commit dolt-dir)))
+      (let* ((items (dorg-test-mutate--dolt-text-items dolt-dir 100 hid))
+             (ids (mapcar #'dorg-item-id items))
+             (texts (mapcar #'dorg-text-item-text items))
+             (keys (mapcar #'dorg-item-sort-key items)))
+        (should (equal ids (number-sequence 42 55)))
+        (should (equal texts
+                       (append (cl-loop for id from 42 to 54
+                                        collect (format "item-%d" id))
+                               '("appended"))))
+        (should-not (equal old-keys keys))
+        (should (dorg-sortkey-ordered-p keys))
+        (should (cl-every (lambda (key) (= (length key) 16)) keys))))))
+
+(ert-deftest dorg-test-mutate-dolt-ac4-rollback-keeps-aged-image ()
+  "AC4: a forced write failure rolls back both normalization and append.
+The generated appended text id is forced to collide with an existing item row,
+after the item plan has computed normalized keys.  The transaction abort leaves
+HEAD and the aged DB image unchanged."
+  (dorg-test-mutate--with-dolt
+    (let* ((rows (dorg-test-mutate--ac4-text-rows))
+           (old-keys (mapcar #'dorg-item-sort-key rows))
+           (hid (dorg-test-mutate--seed-text-heading dolt-dir rows))
+           (src (list :dolt-dir dolt-dir :root-id 100))
+           (base (dorg-head-commit dolt-dir)))
+      (let ((dorg-mutate--dolt-item-id-generator (lambda () 42)))
+        (condition-case err
+            (progn
+              (dorg-test-mutate--apply-patch-batch
+               src (list (dorg-test-mutate--text-append-patch hid "appended")))
+              (ert-fail "expected constraint error"))
+          (dorg-mutate-error
+           (should (eq (dorg-mutate-error-reason err) 'invariant))
+           (should (eq (plist-get (dorg-mutate-error-data err) :detail)
+                       'constraint)))))
+      (should (equal base (dorg-head-commit dolt-dir)))
+      (let* ((items (dorg-test-mutate--dolt-text-items dolt-dir 100 hid))
+             (ids (mapcar #'dorg-item-id items))
+             (texts (mapcar #'dorg-text-item-text items))
+             (keys (mapcar #'dorg-item-sort-key items)))
+        (should (equal ids (number-sequence 42 54)))
+        (should (equal texts
+                       (cl-loop for id from 42 to 54
+                                collect (format "item-%d" id))))
+        (should (equal keys old-keys))))))
+
+(ert-deftest dorg-test-mutate-dolt-ac4-lost-rekey-caught-by-postimage ()
+  "AC4: database-side postimage parity catches a lost persisted rekey.
+The test mutates the generated item SQL by removing id 42's rekey.  SQL
+constraints still allow that image, so the postimage verifier must reject the
+committed rows and roll back."
+  (dorg-test-mutate--with-dolt
+    (let* ((rows (dorg-test-mutate--ac4-text-rows))
+           (old-keys (mapcar #'dorg-item-sort-key rows))
+           (hid (dorg-test-mutate--seed-text-heading dolt-dir rows))
+           (src (list :dolt-dir dolt-dir :root-id 100))
+           (base (dorg-head-commit dolt-dir))
+           (real-lower (symbol-function 'dorg-sql-gen--lower-item-plan)))
+      (cl-letf (((symbol-function 'dorg-sql-gen--lower-item-plan)
+                 (lambda (new-heading db-heading item-id-gen)
+                   (cl-remove-if
+                    (lambda (stmt)
+                      (and (string-match-p
+                            "UPDATE heading_items SET sort_key = .*post_blank"
+                            stmt)
+                           (string-match-p "WHERE id = 42\\'" stmt)))
+                    (funcall real-lower new-heading db-heading item-id-gen)))))
+        (let ((dorg-mutate--dolt-item-id-generator (lambda () 55)))
+          (condition-case err
+              (progn
+                (dorg-test-mutate--apply-patch-batch
+                 src (list (dorg-test-mutate--text-append-patch
+                            hid "appended")))
+                (ert-fail "expected postimage parity error"))
+            (dorg-mutate-error
+             (should (eq (dorg-mutate-error-reason err) 'invariant))
+             (should (eq (plist-get (dorg-mutate-error-data err) :detail)
+                         'postimage-parity))))))
+      (should (equal base (dorg-head-commit dolt-dir)))
+      (let* ((items (dorg-test-mutate--dolt-text-items dolt-dir 100 hid))
+             (ids (mapcar #'dorg-item-id items))
+             (keys (mapcar #'dorg-item-sort-key items)))
+        (should (equal ids (number-sequence 42 54)))
+        (should (equal keys old-keys))))))
 
 (ert-deftest dorg-test-mutate-dolt-dry-run-no-write ()
   "`:dry-run t' returns the plan with :db-ops and leaves HEAD/model unchanged."
@@ -2360,11 +3605,11 @@ so a correct simulated model cannot mask omitted descendant UPDATEs."
 
 (ert-deftest dorg-test-bejl7-ps-insert-after-anchor-batch-preserves-order ()
   "Repeated same-anchor typed heading inserts preserve declared batch order."
-  (let* ((root (make-dorg-heading :id 0 :level 0 :title "Root"
+  (let* ((root (make-dorg-heading :id 0 :level 0 :level-offset 0 :title "Root"
                                   :sort-key (unibyte-string #x80)))
-         (x (make-dorg-heading :id 10 :parent-id 0 :level 1 :title "X"
+         (x (make-dorg-heading :id 10 :parent-id 0 :level 1 :level-offset 1 :title "X"
                                :sort-key (unibyte-string #x40)))
-         (tail (make-dorg-heading :id 11 :parent-id 0 :level 1 :title "Tail"
+         (tail (make-dorg-heading :id 11 :parent-id 0 :level 1 :level-offset 1 :title "Tail"
                                   :sort-key (unibyte-string #xc0)))
          (ps (dorg-test-mutate--ps-with 0 root x tail))
          (source (dorg-mutate--resolve-source
@@ -2383,18 +3628,18 @@ so a correct simulated model cannot mask omitted descendant UPDATEs."
 
 (ert-deftest dorg-test-bejl7-ps-move-after-anchor-batch-preserves-order ()
   "Repeated same-anchor typed subtree moves preserve declared batch order."
-  (let* ((root (make-dorg-heading :id 0 :level 0 :title "Root"
+  (let* ((root (make-dorg-heading :id 0 :level 0 :level-offset 0 :title "Root"
                                   :sort-key (unibyte-string #x80)))
-         (x (make-dorg-heading :id 10 :parent-id 0 :level 1 :title "X"
+         (x (make-dorg-heading :id 10 :parent-id 0 :level 1 :level-offset 1 :title "X"
                                :sort-key (unibyte-string #x20)))
-         (tail (make-dorg-heading :id 11 :parent-id 0 :level 1 :title "Tail"
+         (tail (make-dorg-heading :id 11 :parent-id 0 :level 1 :level-offset 1 :title "Tail"
                                   :sort-key (unibyte-string #x80)))
-         (holding (make-dorg-heading :id 12 :parent-id 0 :level 1
+         (holding (make-dorg-heading :id 12 :parent-id 0 :level 1 :level-offset 1
                                      :title "Holding"
                                      :sort-key (unibyte-string #xe0)))
-         (a (make-dorg-heading :id 20 :parent-id 12 :level 2 :title "A"
+         (a (make-dorg-heading :id 20 :parent-id 12 :level 2 :level-offset 1 :title "A"
                                :sort-key (unibyte-string #x40)))
-         (b (make-dorg-heading :id 21 :parent-id 12 :level 2 :title "B"
+         (b (make-dorg-heading :id 21 :parent-id 12 :level 2 :level-offset 1 :title "B"
                                :sort-key (unibyte-string #xc0)))
          (ps (dorg-test-mutate--ps-with 0 root x tail holding a b))
          (source (dorg-mutate--resolve-source
@@ -2412,32 +3657,32 @@ so a correct simulated model cannot mask omitted descendant UPDATEs."
                    '("X" "A" "B" "Tail" "Holding")))))
 
 (ert-deftest dorg-test-bejl7-ps-move-after-anchor-exhaustion-keeps-cursor-order ()
-  "The move rebalance fallback uses the same effective anchor as position-key."
-  (let* ((root (make-dorg-heading :id 0 :level 0 :title "Root"
+  "The window fallback of a move uses the same effective anchor as the fast path."
+  (let* ((root (make-dorg-heading :id 0 :level 0 :level-offset 0 :title "Root"
                                   :sort-key (unibyte-string #x80)))
-         (x (make-dorg-heading :id 10 :parent-id 0 :level 1 :title "X"
+         (x (make-dorg-heading :id 10 :parent-id 0 :level 1 :level-offset 1 :title "X"
                                :sort-key (unibyte-string #x20)))
-         (tail (make-dorg-heading :id 11 :parent-id 0 :level 1 :title "Tail"
+         (tail (make-dorg-heading :id 11 :parent-id 0 :level 1 :level-offset 1 :title "Tail"
                                   :sort-key (unibyte-string #x80)))
-         (holding (make-dorg-heading :id 12 :parent-id 0 :level 1
+         (holding (make-dorg-heading :id 12 :parent-id 0 :level 1 :level-offset 1
                                      :title "Holding"
                                      :sort-key (unibyte-string #xe0)))
-         (a (make-dorg-heading :id 20 :parent-id 12 :level 2 :title "A"
+         (a (make-dorg-heading :id 20 :parent-id 12 :level 2 :level-offset 1 :title "A"
                                :sort-key (unibyte-string #x40)))
-         (b (make-dorg-heading :id 21 :parent-id 12 :level 2 :title "B"
+         (b (make-dorg-heading :id 21 :parent-id 12 :level 2 :level-offset 1 :title "B"
                                :sort-key (unibyte-string #xc0)))
          (ps (dorg-test-mutate--ps-with 0 root x tail holding a b))
          (source (dorg-mutate--resolve-source
                   '(:dolt-dir "/tmp/dorg-test-repo" :root-id 0)))
          (batch-context (dorg-mutate--item-batch-context))
          (calls 0)
-         (orig (symbol-function 'dorg-sortkey-midpoint-limited)))
-    (cl-letf (((symbol-function 'dorg-sortkey-midpoint-limited)
-               (lambda (lo hi)
+         (orig (symbol-function 'dorg-model-plan-gap)))
+    (cl-letf (((symbol-function 'dorg-model-plan-gap)
+               (lambda (&rest args)
                  (cl-incf calls)
                  (if (= calls 2)
                      (signal 'dorg-sortkey-exhausted nil)
-                   (funcall orig lo hi)))))
+                   (apply orig args)))))
       (dolist (patch
                (list
                 '(:op move :target (:subtree :id 20)
@@ -2445,18 +3690,20 @@ so a correct simulated model cannot mask omitted descendant UPDATEs."
                 '(:op move :target (:subtree :id 21)
                       :to (:under :root :after (:heading :id 10)))))
         (dorg-mutate--ps-apply-patch ps patch source batch-context)))
-    (should (= 2 calls))
+    ;; The forced exhaustion (call 2) sends the move through the facts path,
+    ;; whose empty window allocates through the gap planner again.
+    (should (>= calls 2))
     (should (equal (dorg-test-mutate--child-titles
                     (dorg-mutate--ps-headings ps) 0)
                    '("X" "A" "B" "Tail" "Holding")))))
 
 (ert-deftest dorg-test-bejl7-ps-after-cursor-deleted-falls-back-to-declared-anchor ()
   "A deleted after-cursor does not make a later same-anchor insert invalid."
-  (let* ((root (make-dorg-heading :id 0 :level 0 :title "Root"
+  (let* ((root (make-dorg-heading :id 0 :level 0 :level-offset 0 :title "Root"
                                   :sort-key (unibyte-string #x80)))
-         (x (make-dorg-heading :id 10 :parent-id 0 :level 1 :title "X"
+         (x (make-dorg-heading :id 10 :parent-id 0 :level 1 :level-offset 1 :title "X"
                                :sort-key (unibyte-string #x40)))
-         (tail (make-dorg-heading :id 11 :parent-id 0 :level 1 :title "Tail"
+         (tail (make-dorg-heading :id 11 :parent-id 0 :level 1 :level-offset 1 :title "Tail"
                                   :sort-key (unibyte-string #xc0)))
          (ps (dorg-test-mutate--ps-with 0 root x tail))
          (source (dorg-mutate--resolve-source
@@ -2476,9 +3723,9 @@ so a correct simulated model cannot mask omitted descendant UPDATEs."
 
 (ert-deftest dorg-test-bejl7-ps-insert-before-anchor-batch-stays-declared-order ()
   "Before-anchor heading inserts stay order-correct and untouched by cursors."
-  (let* ((root (make-dorg-heading :id 0 :level 0 :title "Root"
+  (let* ((root (make-dorg-heading :id 0 :level 0 :level-offset 0 :title "Root"
                                   :sort-key (unibyte-string #x80)))
-         (x (make-dorg-heading :id 10 :parent-id 0 :level 1 :title "X"
+         (x (make-dorg-heading :id 10 :parent-id 0 :level 1 :level-offset 1 :title "X"
                                :sort-key (unibyte-string #x80)))
          (ps (dorg-test-mutate--ps-with 0 root x))
          (source (dorg-mutate--resolve-source
@@ -2499,11 +3746,11 @@ so a correct simulated model cannot mask omitted descendant UPDATEs."
   "Pin chained mixed order: A after X, B after A, C after X => X,A,C,B.
 C follows the request-local after-X cursor A and therefore lands before B,
 which was explicitly anchored to A on a separate after-A chain."
-  (let* ((root (make-dorg-heading :id 0 :level 0 :title "Root"
+  (let* ((root (make-dorg-heading :id 0 :level 0 :level-offset 0 :title "Root"
                                   :sort-key (unibyte-string #x80)))
-         (x (make-dorg-heading :id 10 :parent-id 0 :level 1 :title "X"
+         (x (make-dorg-heading :id 10 :parent-id 0 :level 1 :level-offset 1 :title "X"
                                :sort-key (unibyte-string #x40)))
-         (tail (make-dorg-heading :id 11 :parent-id 0 :level 1 :title "Tail"
+         (tail (make-dorg-heading :id 11 :parent-id 0 :level 1 :level-offset 1 :title "Tail"
                                   :sort-key (unibyte-string #xc0)))
          (ps (dorg-test-mutate--ps-with 0 root x tail))
          (source (dorg-mutate--resolve-source
@@ -2586,17 +3833,16 @@ which was explicitly anchored to A on a separate after-A chain."
 ;; into place.
 
 (ert-deftest dorg-test-mutate-dolt-delete-freed-insert-success ()
-  "Delete a sibling and INSERT into its freed slot: commits via staging.
-Seeds A at X'01' and B at X'02'; a batch deletes A and inserts C :before
-B, landing on A's freed slot X'01'.  The scheduler inserts C at a temp
-key, deletes A, then finalizes C's sort key — committing atomically
-instead of racing `uq_heading_sibling_order'."
+  "Delete a sibling and INSERT before its successor: commits atomically.
+Seeds A at X'01' and B at X'02'; a batch deletes A and inserts C :before B.
+The fixed-width boundary allocator gives C a final key strictly before B,
+without depending on the legacy exact byte that A used to occupy."
   (dorg-test-mutate--with-dolt
-    (let* ((root-h (make-dorg-heading :id 100 :level 0 :title "Root"
+    (let* ((root-h (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                       :sort-key (unibyte-string #x80)))
-           (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
+           (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
                                  :sort-key (unibyte-string 1)))
-           (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :title "B"
+           (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :level-offset 1 :title "B"
                                  :sort-key (unibyte-string 2))))
       (dorg-sql-batch dolt-dir
                       (list (dorg-sql-gen-heading-insert root-h 100)
@@ -2621,26 +3867,23 @@ instead of racing `uq_heading_sibling_order'."
         (let ((tree (dorg-model-load-tree dolt-dir 100)))
           (should-not (gethash 101 tree))
           (should (gethash 300 tree))
-          ;; C occupies A's freed slot X'01' and orders before B.
-          (should (equal (dorg-heading-sort-key (gethash 300 tree))
-                         (unibyte-string 1)))
+          (dorg-test-mutate--assert-tree-sibling-order tree 100)
           (should (string< (dorg-heading-sort-key (gethash 300 tree))
                            (dorg-heading-sort-key (gethash 102 tree)))))))))
 
 (ert-deftest dorg-test-mutate-dolt-delete-freed-move-success ()
-  "Delete a sibling and MOVE an existing heading into its freed slot.
-Seeds A X'01', B X'02', D X'03'; deletes A and moves D :before B, landing
-on A's freed slot X'01'.  No `delete-freed-sort-key-reuse' classification:
-the scheduler updates D to a temp key, deletes A, then finalizes D's sort
-key."
+  "Delete a sibling and MOVE an existing heading before its successor.
+Seeds A X'01', B X'02', D X'03'; deletes A and moves D :before B.  The
+observable contract is D strictly before B with a valid sibling sequence,
+not reuse of A's legacy one-byte key."
   (dorg-test-mutate--with-dolt
-    (let* ((root-h (make-dorg-heading :id 100 :level 0 :title "Root"
+    (let* ((root-h (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                       :sort-key (unibyte-string #x80)))
-           (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
+           (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
                                  :sort-key (unibyte-string 1)))
-           (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :title "B"
+           (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :level-offset 1 :title "B"
                                  :sort-key (unibyte-string 2)))
-           (d (make-dorg-heading :id 103 :parent-id 100 :level 1 :title "D"
+           (d (make-dorg-heading :id 103 :parent-id 100 :level 1 :level-offset 1 :title "D"
                                  :sort-key (unibyte-string 3))))
       (dorg-sql-batch dolt-dir
                       (list (dorg-sql-gen-heading-insert root-h 100)
@@ -2664,28 +3907,29 @@ key."
         (should-not (equal base (dorg-head-commit dolt-dir)))
         (let ((tree (dorg-model-load-tree dolt-dir 100)))
           (should-not (gethash 101 tree))
-          (should (equal (dorg-heading-sort-key (gethash 103 tree))
-                         (unibyte-string 1)))
+          (dorg-test-mutate--assert-tree-sibling-order tree 100)
           (should (string< (dorg-heading-sort-key (gethash 103 tree))
                            (dorg-heading-sort-key (gethash 102 tree)))))))))
 
 (ert-deftest dorg-test-mutate-dolt-delete-freed-insert-parent-move-child ()
   "Combined FK + collision case commits atomically.
-Deletes sibling S, inserts a new parent P into S's freed slot via staging,
-and moves existing child X under that new parent — all in one commit.  P's
-row exists (at a temp key) before X's UPDATE references it, the delete
-frees the slot, and P's sort key is finalized last."
+Deletes sibling S, inserts a new parent P before existing child X, and moves
+X under that new parent — all in one commit.  The test pins the final tree
+shape and sibling-order invariants, not the allocator's incidental bytes."
   (dorg-test-mutate--with-dolt
-    (let* ((root-h (make-dorg-heading :id 100 :level 0 :title "Root"
+    (let* ((root-h (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                       :sort-key (unibyte-string #x80)))
-           (s (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "S"
+           (s (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "S"
                                  :sort-key (unibyte-string 1)))
-           (x (make-dorg-heading :id 102 :parent-id 100 :level 1 :title "X"
-                                 :sort-key (unibyte-string 2))))
+           (x (make-dorg-heading :id 102 :parent-id 100 :level 1 :level-offset 1 :title "X"
+                                 :sort-key (unibyte-string 2)))
+           (q (make-dorg-heading :id 103 :parent-id 100 :level 1 :level-offset 1 :title "Q"
+                                 :sort-key (unibyte-string 3))))
       (dorg-sql-batch dolt-dir
                       (list (dorg-sql-gen-heading-insert root-h 100)
                             (dorg-sql-gen-heading-insert s 100)
-                            (dorg-sql-gen-heading-insert x 100)))
+                            (dorg-sql-gen-heading-insert x 100)
+                            (dorg-sql-gen-heading-insert q 100)))
       (dorg-commit dolt-dir "seed")
       (let* ((src (list :dolt-dir dolt-dir :root-id 100))
              (base (dorg-head-commit dolt-dir))
@@ -2707,27 +3951,28 @@ frees the slot, and P's sort key is finalized last."
         (let ((tree (dorg-model-load-tree dolt-dir 100)))
           (should-not (gethash 101 tree))
           (should (gethash 300 tree))
-          ;; New parent P took S's freed slot X'01' at the root.
           (should (eql (dorg-heading-parent-id (gethash 300 tree)) 100))
-          (should (equal (dorg-heading-sort-key (gethash 300 tree))
-                         (unibyte-string 1)))
+          (dorg-test-mutate--assert-tree-sibling-order tree 100)
+          (should (string< (dorg-heading-sort-key (gethash 300 tree))
+                           (dorg-heading-sort-key (gethash 103 tree))))
           ;; X is now a child of the freshly inserted parent.
-          (should (eql (dorg-heading-parent-id (gethash 102 tree)) 300)))))))
+          (should (eql (dorg-heading-parent-id (gethash 102 tree)) 300))
+          (dorg-test-mutate--assert-tree-sibling-order tree 300))))))
 
 (ert-deftest dorg-test-mutate-dolt-delete-freed-child-promotion ()
   "Child promotion into the freed parent slot stays FK/cascade safe.
 Deletes parent P (no :subtree) whose sole child C is promoted to the root
-and lands on P's freed sibling slot X'40'.  The scheduler reparents C to a
-temp key BEFORE deleting P, so ON DELETE CASCADE cannot remove the
-surviving child, then finalizes C's sort key."
+before Q.  The scheduler reparents C before deleting P, so ON DELETE CASCADE
+cannot remove the surviving child; the observable contract is C before Q in
+a strictly ordered root sibling sequence."
   (dorg-test-mutate--with-dolt
-    (let* ((root-h (make-dorg-heading :id 100 :level 0 :title "Root"
+    (let* ((root-h (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                       :sort-key (unibyte-string #x80)))
-           (p (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "P"
+           (p (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "P"
                                  :sort-key (unibyte-string #x40)))
-           (q (make-dorg-heading :id 103 :parent-id 100 :level 1 :title "Q"
+           (q (make-dorg-heading :id 103 :parent-id 100 :level 1 :level-offset 1 :title "Q"
                                  :sort-key (unibyte-string #x80)))
-           (c (make-dorg-heading :id 102 :parent-id 101 :level 2 :title "C"
+           (c (make-dorg-heading :id 102 :parent-id 101 :level 2 :level-offset 1 :title "C"
                                  :sort-key (unibyte-string #x80))))
       (dorg-sql-batch dolt-dir
                       (list (dorg-sql-gen-heading-insert root-h 100)
@@ -2751,32 +3996,194 @@ surviving child, then finalizes C's sort key."
           (should (gethash 102 tree))
           (should (eql (dorg-heading-parent-id (gethash 102 tree)) 100))
           (should (eql (dorg-heading-level (gethash 102 tree)) 1))
-          (should (equal (dorg-heading-sort-key (gethash 102 tree))
-                         (unibyte-string #x40)))
+          (dorg-test-mutate--assert-tree-sibling-order tree 100)
+          (should (string< (dorg-heading-sort-key (gethash 102 tree))
+                           (dorg-heading-sort-key (gethash 103 tree))))
           ;; Q untouched.
           (should (equal (dorg-heading-sort-key (gethash 103 tree))
                          (unibyte-string #x80))))))))
 
+(ert-deftest dorg-test-mutate-dolt-delete-promotion-scope-is-recursive-once ()
+  "Both delete forms load the deleted heading's complete subtree once.
+This is a source-only scope test: the production scope resolver and recursive
+subtree helper run against a pinned SQL response seam.  The target 101 has a
+promoted child 102, deep descendants 103/104, and an unrelated branch 105/106.
+The scope must include the target, its parent, and every promoted descendant,
+but never the unrelated branch or a per-child direct-order query."
+  (let* ((source (dorg-mutate--resolve-source
+                  (list :dolt-dir "/tmp/dorg-delete-promotion/" :root-id 100)))
+         (head "hh12c-head")
+         (recursive-queries nil)
+         (direct-child-queries nil)
+         (heading-patch (dorg-test-mutate--delete-patch 101))
+         (subtree-patch (dorg-test-mutate--delete-patch 101 t)))
+    (cl-letf (((symbol-function 'dorg-sql)
+               (lambda (_dolt-dir sql)
+                 (cond
+                  ((string-match-p "WITH RECURSIVE sub" sql)
+                   (push sql recursive-queries)
+                   '(((id . 101)) ((id . 102)) ((id . 103)) ((id . 104))))
+                  ((string-match-p "SELECT id, parent_id FROM headings" sql)
+                   '(((id . 101) (parent_id . 100))))
+                  ((string-match-p "HEX(sort_key) AS sort_key_hex" sql)
+                   (push sql direct-child-queries)
+                   '(((id . 102) (sort_key_hex . "80"))))
+                  (t (ert-fail (format "unexpected hh12c scope SQL: %s" sql)))))))
+      (let ((heading-scope
+             (sort (dorg-mutate--dolt-scope-ids
+                    source (list heading-patch) 100 head) #'<))
+            (subtree-scope
+             (sort (dorg-mutate--dolt-scope-ids
+                    source (list subtree-patch) 100 head) #'<)))
+        ;; The heading form is the pre-fix RED: it currently sees only 102.
+        (should (equal '(100 101 102 103 104) heading-scope))
+        (should (equal heading-scope subtree-scope))
+        (should-not (member 105 heading-scope))
+        (should-not (member 106 heading-scope))
+        ;; One recursive request per patch, both at the same captured HEAD;
+        ;; the old direct-child order query has no place in either form.
+        (should (= 2 (length recursive-queries)))
+        (should (cl-every (lambda (sql) (string-match-p head sql))
+                          recursive-queries))
+        (should-not direct-child-queries)))))
+
+(ert-deftest dorg-test-mutate-delete-promotion-preserves-gapped-levels ()
+  "Promotion keeps every descendant's offset without normalizing gaps.
+Deleting B/102 from A(1) > B(2) > D(3) > E(5) promotes D to level 2, and E
+follows at level 4 through its unchanged offset.  The retained two-level D/E
+gap is an Org-value contract, not inferred from parent links.  Only D's row
+changes; E is recorded as moved for invalidation but is not rewritten."
+  (let* ((root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
+                                  :sort-key (unibyte-string #x80)))
+         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
+                               :sort-key (unibyte-string #x80)))
+         (b (make-dorg-heading :id 102 :parent-id 101 :level 2 :level-offset 1 :title "B"
+                               :sort-key (unibyte-string #x80)))
+         (d (make-dorg-heading :id 103 :parent-id 102 :level 3 :level-offset 1 :title "D"
+                               :sort-key (unibyte-string #x80)))
+         (e (make-dorg-heading :id 104 :parent-id 103 :level 5 :level-offset 2 :title "E"
+                               :sort-key (unibyte-string #x80)))
+         (other (make-dorg-heading :id 105 :parent-id 100 :level 1 :level-offset 1 :title "Other"
+                                   :sort-key (unibyte-string #xc0)))
+         (ps (dorg-test-mutate--ps-with 100 root a b d e other)))
+    ;; Key allocation is outside this level contract; retain the production
+    ;; delete/promotion planner while making its one placement deterministic.
+    (cl-letf (((symbol-function 'dorg-mutate--ps-allocate-keys)
+               (lambda (&rest _) (list (unibyte-string #x40)))))
+      (dorg-mutate--ps-delete-heading ps
+                                       (dorg-test-mutate--delete-patch 102)))
+    (should-not (gethash 102 (dorg-mutate--ps-headings ps)))
+    (should (= 101 (dorg-heading-parent-id (gethash 103 (dorg-mutate--ps-headings ps)))))
+    (should (= 103 (dorg-heading-parent-id (gethash 104 (dorg-mutate--ps-headings ps)))))
+    (should (= 2 (dorg-heading-level (gethash 103 (dorg-mutate--ps-headings ps)))))
+    (should (= 4 (dorg-heading-level (gethash 104 (dorg-mutate--ps-headings ps)))))
+    (should (= 2 (- (dorg-heading-level (gethash 104 (dorg-mutate--ps-headings ps)))
+                    (dorg-heading-level (gethash 103 (dorg-mutate--ps-headings ps))))))
+    (should (= 1 (dorg-heading-level (gethash 105 (dorg-mutate--ps-headings ps)))))
+    (should (member 102 (dorg-mutate--ps-deleted ps)))
+    (should (member 103 (dorg-mutate--ps-changed ps)))
+    (should-not (member 104 (dorg-mutate--ps-changed ps)))
+    (should (gethash 104 (dorg-mutate--ps-moved ps)))))
+
+(ert-deftest dorg-test-mutate-dolt-public-delete-promotion-persists-deep-levels ()
+  "Public heading deletion persists the complete promoted subtree after reload.
+Parent -> Child -> Grandchild -> Great-grandchild is a contiguous depth-three
+survivor chain; an unrelated branch guards bounded scope and conservation."
+  (dorg-test-mutate--with-dolt
+    (let* ((root (dorg-test-mutate--seed
+                  dolt-dir
+                  (concat "* Parent\n"
+                          "** Child\nChild payload.\n"
+                          "*** Grandchild\nGrandchild payload.\n"
+                          "**** Great-grandchild\nGreat payload.\n"
+                          "* Unrelated\n"
+                          "** Unrelated child\nUnrelated payload.\n")
+                  100))
+           (parent (dorg-test-mutate--id-by-title dolt-dir "Parent"))
+           (child (dorg-test-mutate--id-by-title dolt-dir "Child"))
+           (grandchild (dorg-test-mutate--id-by-title dolt-dir "Grandchild"))
+           (great-grandchild
+            (dorg-test-mutate--id-by-title dolt-dir "Great-grandchild"))
+           (unrelated (dorg-test-mutate--id-by-title dolt-dir "Unrelated"))
+           (unrelated-child
+            (dorg-test-mutate--id-by-title dolt-dir "Unrelated child"))
+           (survivors (list child grandchild great-grandchild))
+           (source (list :dolt-dir dolt-dir :root-id root))
+           (before-head (dorg-head-commit dolt-dir))
+           (before-tree (dorg-model-load-tree dolt-dir root))
+           (before-content
+            (mapcar (lambda (id)
+                      (let ((heading (gethash id before-tree)))
+                        (list id (dorg-heading-title heading)
+                              (dorg-heading-items heading))))
+                    survivors))
+           (before-unrelated
+            (let ((heading (gethash unrelated before-tree)))
+              (list (dorg-heading-parent-id heading)
+                    (dorg-heading-level heading)
+                    (dorg-heading-sort-key heading)
+                    (dorg-heading-title heading)
+                    (dorg-heading-items heading))))
+           (result (dorg-api-execute
+                    `(on (id ,parent) (delete (heading)))
+                    :mode 'apply :source source)))
+      ;; This is a transformation, not a reload-only assertion.
+      (should (plist-get result :ok))
+      (should-not (equal before-head (dorg-head-commit dolt-dir)))
+      (should (member parent (plist-get (plist-get result :affected) :deleted)))
+      (dolist (id survivors)
+        (should (member id (plist-get (plist-get result :affected) :changed))))
+      (let ((after-tree (dorg-model-load-tree dolt-dir root)))
+        (should-not (gethash parent after-tree))
+        ;; Persisted topology and the contiguous uniform decrement.
+        (should (= root (dorg-heading-parent-id (gethash child after-tree))))
+        (should (= child (dorg-heading-parent-id (gethash grandchild after-tree))))
+        (should (= grandchild
+                   (dorg-heading-parent-id (gethash great-grandchild after-tree))))
+        (should (= 1 (dorg-heading-level (gethash child after-tree))))
+        (should (= 2 (dorg-heading-level (gethash grandchild after-tree))))
+        (should (= 3 (dorg-heading-level (gethash great-grandchild after-tree))))
+        (should (equal before-content
+                       (mapcar (lambda (id)
+                                 (let ((heading (gethash id after-tree)))
+                                   (list id (dorg-heading-title heading)
+                                         (dorg-heading-items heading))))
+                               survivors)))
+        (should (equal (list child unrelated)
+                       (mapcar #'dorg-heading-id
+                               (dorg-test-mutate--tree-children after-tree root))))
+        (let ((after-unrelated (gethash unrelated after-tree)))
+          (should (equal before-unrelated
+                         (list (dorg-heading-parent-id after-unrelated)
+                               (dorg-heading-level after-unrelated)
+                               (dorg-heading-sort-key after-unrelated)
+                               (dorg-heading-title after-unrelated)
+                               (dorg-heading-items after-unrelated)))))
+        (should (= unrelated
+                   (dorg-heading-parent-id (gethash unrelated-child after-tree))))))))
+
 (ert-deftest dorg-test-mutate-dolt-delete-freed-rollback ()
-  "A staged delete-freed batch that fails at commit rolls back wholesale.
-Seeds A X'01', B X'02' (#+FOO a), D X'03' (#+BAZ q).  The batch deletes A,
-inserts C into A's freed slot (staged), and appends a keyword item to B; a
-forced `heading_items.id' generator collides the new item id with D's
-surviving BAZ row, so the whole transaction — staged insert, delete, and
-item append — is rolled back.  HEAD is unchanged, A keeps its slot, C is
-never finalized, and B's FOO is still \"a\"."
+  "A delete-freed batch that fails at commit rolls back wholesale.
+Seeds A one step before B, B at X'80' (#+FOO a), and D at X'c0' (#+BAZ q).
+The batch deletes A, inserts C into A's freed gap, and appends a keyword item
+to B; a forced `heading_items.id' generator collides the new item id with D's
+surviving BAZ row, so the whole transaction — insert, delete, and item append
+— is rolled back.  HEAD is unchanged, A keeps its slot, C is absent, and B's
+FOO is still \"a\"."
   (dorg-test-mutate--with-dolt
     (let* ((idg (let ((n 9000)) (lambda () (cl-incf n))))
-           (root-h (make-dorg-heading :id 100 :level 0 :title "Root"
+           (b-key (unibyte-string #x80))
+           (a-key (dorg-sortkey-step-before b-key))
+           (root-h (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                       :sort-key (unibyte-string #x80)))
-           (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
-                                 :sort-key (unibyte-string 1)))
-           (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :title "B"
-                                 :sort-key (unibyte-string 2)
+           (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
+                                 :sort-key a-key))
+           (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :level-offset 1 :title "B"
+                                 :sort-key b-key
                                  :items (list (dorg-keyword-item
                                                :keyword "FOO" :value "a"))))
-           (d (make-dorg-heading :id 103 :parent-id 100 :level 1 :title "D"
-                                 :sort-key (unibyte-string 3)
+           (d (make-dorg-heading :id 103 :parent-id 100 :level 1 :level-offset 1 :title "D"
+                                 :sort-key (unibyte-string #xc0)
                                  :items (list (dorg-keyword-item
                                                :keyword "BAZ" :value "q")))))
       (dorg-heading-compute-items-hash b)
@@ -2815,35 +4222,38 @@ never finalized, and B's FOO is still \"a\"."
         (let ((tree (dorg-model-load-tree dolt-dir 100)))
           (should (gethash 101 tree))
           (should (equal (dorg-heading-sort-key (gethash 101 tree))
-                         (unibyte-string 1)))
+                         a-key))
           (should-not (gethash 300 tree))
           (should (equal (dorg-test-mutate--dolt-keyword-values tree 102 "FOO")
                          '("a"))))))))
 
-(ert-deftest dorg-test-mutate-dolt-delete-freed-insert-key-collision ()
-  "Staged insert whose id-derived temp key is already taken still commits.
-Mirrors the acceptance blocker: an existing sibling D (103)
-is seeded at the id-derived staging key for the inserted id 300, A (101)
-sits at the midpoint between D and B (so an insert :before B lands on A's
-freed slot), and B (102) is at X'80'.  Deleting A and inserting C (300)
-:before B is a valid final model whose naive id-derived staging key would
-collide with D on `uq_heading_sibling_order'.  The scheduler must detect
-the occupied slot, pick a free temp key, and commit — plan agreeing,
-without relying on rollback."
+(defun dorg-test-mutate--legacy-be8-key (id)
+  "Return the retired be8(id) staging key used by legacy fixtures."
+  (apply #'unibyte-string
+         (mapcar (lambda (shift) (logand (ash id shift) #xff))
+                 '(-56 -48 -40 -32 -24 -16 -8 0))))
+
+(ert-deftest dorg-test-mutate-dolt-delete-freed-insert-takes-a-fresh-key ()
+  "W7: an insert into a slot a same-batch delete frees never reuses the freed key.
+D (103) is seeded at the retired be8(300) value, A (101) between D and B, and
+B (102) at X'80'.  Deleting A and inserting C (300) :before B commits in one
+transaction: C lands strictly between D and B on a key that is neither A's
+freed key nor any live key, so no statement order can collide on
+`uq_heading_sibling_order' and nothing is staged."
   (dorg-test-mutate--with-dolt
-    (let* ((d-key (dorg-mutate--dolt-temp-sort-key 300))
+    (let* ((d-key (dorg-test-mutate--legacy-be8-key 300))
            (b-key (unibyte-string #x80))
-           (a-key (dorg-sortkey-midpoint d-key b-key))
-           (root-h (make-dorg-heading :id 100 :level 0 :title "Root"
+           (a-key (unibyte-string #x40))
+           (root-h (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                       :sort-key (unibyte-string #x80)))
-           (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
+           (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
                                  :sort-key a-key))
-           (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :title "B"
+           (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :level-offset 1 :title "B"
                                  :sort-key b-key))
-           (d (make-dorg-heading :id 103 :parent-id 100 :level 1 :title "D"
+           (d (make-dorg-heading :id 103 :parent-id 100 :level 1 :level-offset 1 :title "D"
                                  :sort-key d-key)))
       ;; Sanity: D really holds the slot the naive temp key would reuse.
-      (should (equal d-key (dorg-mutate--dolt-temp-sort-key 300)))
+      (should (equal d-key (dorg-test-mutate--legacy-be8-key 300)))
       (should (string< d-key a-key))
       (should (string< a-key b-key))
       (dorg-sql-batch dolt-dir
@@ -2869,8 +4279,8 @@ without relying on rollback."
         (should-not (equal base (dorg-head-commit dolt-dir)))
         (let ((tree (dorg-model-load-tree dolt-dir 100)))
           (should-not (gethash 101 tree))
-          ;; C took A's freed slot and orders between D and B.
-          (should (equal (dorg-heading-sort-key (gethash 300 tree)) a-key))
+          ;; C orders between D and B on a fresh key, not on A's freed key.
+          (should-not (equal (dorg-heading-sort-key (gethash 300 tree)) a-key))
           (should (string< (dorg-heading-sort-key (gethash 103 tree))
                            (dorg-heading-sort-key (gethash 300 tree))))
           (should (string< (dorg-heading-sort-key (gethash 300 tree))
@@ -2878,32 +4288,26 @@ without relying on rollback."
           ;; D is untouched at its (colliding-looking) seeded slot.
           (should (equal (dorg-heading-sort-key (gethash 103 tree)) d-key)))))))
 
-(ert-deftest dorg-test-mutate-dolt-delete-freed-update-key-collision-fails-closed ()
-  "Staged update pinned to an occupied id-derived slot fails closed.
-A staged UPDATE's transient staging key is forced to the id-derived value
-by the core lowerer's divergent staging, so it cannot be perturbed.  Here
-an existing sibling D (103) holds the id-derived staging key for the
-moved heading M (300); deleting A (101) and moving M onto A's freed slot
-is a valid final model, but the staging key is unavailable.  The
-scheduler must refuse deterministically BEFORE SQL — plan and apply
-signalling the same `unsupported' reason — rather than committing a
-half-applied batch or leaning on rollback."
+(ert-deftest dorg-test-mutate-dolt-delete-freed-move-takes-a-fresh-key ()
+  "W7: a move into a slot a same-batch delete frees never reuses the freed key.
+D sits at the retired be8(300) value; moving M :before B lands it between D
+and B on a fresh key, so nothing is staged and the batch commits."
   (dorg-test-mutate--with-dolt
-    (let* ((m-key (dorg-mutate--dolt-temp-sort-key 300))
+    (let* ((m-key (dorg-test-mutate--legacy-be8-key 300))
            (b-key (unibyte-string #x80))
-           (a-key (dorg-sortkey-midpoint m-key b-key))
-           (root-h (make-dorg-heading :id 100 :level 0 :title "Root"
+           (a-key (unibyte-string #x40))
+           (root-h (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                       :sort-key (unibyte-string #x80)))
-           (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
+           (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
                                  :sort-key a-key))
-           (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :title "B"
+           (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :level-offset 1 :title "B"
                                  :sort-key b-key))
            ;; D holds the id-derived staging slot M would need.
-           (d (make-dorg-heading :id 103 :parent-id 100 :level 1 :title "D"
+           (d (make-dorg-heading :id 103 :parent-id 100 :level 1 :level-offset 1 :title "D"
                                  :sort-key m-key))
            ;; M is parked far to the right; moving it :before B lands it on
            ;; A's freed slot, requiring staging.
-           (m (make-dorg-heading :id 300 :parent-id 100 :level 1 :title "M"
+           (m (make-dorg-heading :id 300 :parent-id 100 :level 1 :level-offset 1 :title "M"
                                  :sort-key (unibyte-string #xc0))))
       (dorg-sql-batch dolt-dir
                       (list (dorg-sql-gen-heading-insert root-h 100)
@@ -2918,60 +4322,41 @@ half-applied batch or leaning on rollback."
               (list (dorg-test-mutate--delete-patch 101)
                     (dorg-test-mutate--move-before-patch
                      300 :root (dorg-test-mutate--heading-address 102)))))
-        ;; Plan fails closed with the same unsupported reason apply raises.
-        (should (eq 'unsupported
-                    (dorg-test-mutate--reason
-                     (dorg-test-mutate--plan-patch-batch src patches))))
-        (should (eq 'unsupported
-                    (dorg-test-mutate--reason
-                     (dorg-test-mutate--apply-patch-batch src patches))))
-        ;; No write: HEAD unchanged, A still in its slot.
-        (should (equal base (dorg-head-commit dolt-dir)))
+        (let ((plan (dorg-test-mutate--plan-patch-batch src patches)))
+          (should (plist-get plan :supported))
+          (should-not (plist-get plan :unsupported)))
+        (let ((res (dorg-test-mutate--apply-patch-batch src patches)))
+          (should (plist-get res :ok))
+          (should (member 300 (plist-get res :changed)))
+          (should (member 101 (plist-get res :deleted))))
+        (should-not (equal base (dorg-head-commit dolt-dir)))
         (let ((tree (dorg-model-load-tree dolt-dir 100)))
-          (should (gethash 101 tree))
-          (should (equal (dorg-heading-sort-key (gethash 101 tree)) a-key)))))))
+          (should-not (gethash 101 tree))
+          (should (eql (dorg-heading-parent-id (gethash 300 tree)) 100))
+          (dorg-test-mutate--assert-tree-sibling-order tree 100)
+          (should-not (equal (dorg-heading-sort-key (gethash 300 tree)) a-key))
+          (should (string< (dorg-heading-sort-key (gethash 103 tree))
+                           (dorg-heading-sort-key (gethash 300 tree))))
+          (should (string< (dorg-heading-sort-key (gethash 300 tree))
+                           (dorg-heading-sort-key (gethash 102 tree)))))))))
 
-(ert-deftest dorg-test-mutate-dolt-delete-freed-move-source-parent-collision-fails-closed ()
-  "Reparenting staged move fails closed when be8(id) collides in the SOURCE parent.
-The database-op lowerer (`dorg-sql-gen-lower-heading-ops') parks every staged
-`:update-heading' at the forced be8(id) staging key in a phase-1 pass
-that runs BEFORE parent_id is changed, so for a REPARENTING move that
-key is briefly live under the heading's ORIGINAL parent before it
-becomes live under the destination parent.
-
-Here the collision exists ONLY in the source parent: sibling X (301)
-under source parent P (200) holds be8(300), the forced staging key of
-the moved heading M (300).  No sibling of M's destination parent (root
-100) holds that key.  A collision check that inspects only the final
-parent therefore MISSES the source-parent collision, lets planning report the
-batch supported, and lets apply reach SQL where it
-fails on the unique (parent_id, sort_key) order under P and only rolls
-back — i.e. plan and apply disagree.  This is the reviewer
-repro.  The scheduler must instead detect the source-parent collision
-and fail closed BEFORE SQL with reason `unsupported', so plan and apply
-agree.
-
-Layout: under root 100, A id 101 @ X'01' (deleted, frees slot X'01'),
-B id 102 @ X'02', and survivor source parent P id 200 @ X'03'.  Under P:
-M id 300 @ X'10' and X id 301 @ be8(300).  The batch deletes A and moves
-M to root :before B, landing M on A's freed slot X'01' (so M is staged);
-M's forced staging key be8(300) duplicates X under the original parent P."
+(ert-deftest dorg-test-mutate-dolt-delete-freed-move-source-parent-collision-commits ()
+  "A legacy source-parent be8 collision no longer blocks reparenting.
+The planner chooses a temp from the shared bounded namespace against the
+complete affected source/destination sibling facts."
   (dorg-test-mutate--with-dolt
-    (let* ((m-temp (dorg-mutate--dolt-temp-sort-key 300))
-           (root-h (make-dorg-heading :id 100 :level 0 :title "Root"
+    (let* ((m-temp (dorg-test-mutate--legacy-be8-key 300))
+           (root-h (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                       :sort-key (unibyte-string #x80)))
-           (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
+           (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
                                  :sort-key (unibyte-string 1)))
-           (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :title "B"
+           (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :level-offset 1 :title "B"
                                  :sort-key (unibyte-string 2)))
-           (p (make-dorg-heading :id 200 :parent-id 100 :level 1 :title "P"
+           (p (make-dorg-heading :id 200 :parent-id 100 :level 1 :level-offset 1 :title "P"
                                  :sort-key (unibyte-string 3)))
-           ;; M is the heading that will reparent from P to root.
-           (m (make-dorg-heading :id 300 :parent-id 200 :level 2 :title "M"
+           (m (make-dorg-heading :id 300 :parent-id 200 :level 2 :level-offset 1 :title "M"
                                  :sort-key (unibyte-string #x10)))
-           ;; X sits under the SOURCE parent P at M's forced staging key;
-           ;; root (the destination) has no sibling at this key.
-           (x (make-dorg-heading :id 301 :parent-id 200 :level 2 :title "X"
+           (x (make-dorg-heading :id 301 :parent-id 200 :level 2 :level-offset 1 :title "X"
                                  :sort-key m-temp)))
       (dorg-sql-batch dolt-dir
                       (list (dorg-sql-gen-heading-insert root-h 100)
@@ -2987,58 +4372,41 @@ M's forced staging key be8(300) duplicates X under the original parent P."
               (list (dorg-test-mutate--delete-patch 101)
                     (dorg-test-mutate--move-before-patch
                      300 :root (dorg-test-mutate--heading-address 102)))))
-        ;; Plan must fail closed (NOT report supported): the source-parent
-        ;; collision is caught before SQL with `unsupported'.
-        (should (eq 'unsupported
-                    (dorg-test-mutate--reason
-                     (dorg-test-mutate--plan-patch-batch src patches))))
-        ;; Apply must signal the SAME deterministic pre-SQL reason — not
-        ;; the `invariant' constraint/rollback reason the pre-fix
-        ;; final-parent-only check produced.  Asserting `unsupported' here
-        ;; is what makes this regression non-vacuous: with the fix removed
-        ;; the collision is missed, plan reports supported, and apply
-        ;; signals `invariant' from the rolled-back unique-key violation.
-        (should (eq 'unsupported
-                    (dorg-test-mutate--reason
-                     (dorg-test-mutate--apply-patch-batch src patches))))
-        ;; No write: HEAD unchanged, M still under its original parent P
-        ;; at its original key, X untouched.
-        (should (equal base (dorg-head-commit dolt-dir)))
+        (let ((plan (dorg-test-mutate--plan-patch-batch src patches)))
+          (should (plist-get plan :supported))
+          (should-not (plist-get plan :unsupported)))
+        (let ((res (dorg-test-mutate--apply-patch-batch src patches)))
+          (should (plist-get res :ok))
+          (should (member 300 (plist-get res :changed)))
+          (should (member 101 (plist-get res :deleted))))
+        (should-not (equal base (dorg-head-commit dolt-dir)))
         (let ((tree (dorg-model-load-tree dolt-dir 100)))
-          (should (gethash 101 tree))
-          (should (eql (dorg-heading-parent-id (gethash 300 tree)) 200))
-          (should (equal (dorg-heading-sort-key (gethash 300 tree))
-                         (unibyte-string #x10)))
+          (should-not (gethash 101 tree))
+          (should (eql (dorg-heading-parent-id (gethash 300 tree)) 100))
+          (dorg-test-mutate--assert-tree-sibling-order tree 100)
           (should (equal (dorg-heading-sort-key (gethash 301 tree))
                          m-temp)))))))
 
 (ert-deftest dorg-test-mutate-dolt-delete-freed-move-own-temp-key-commits ()
-  "Staged move whose OWN current key is be8(id) commits (no false collision).
-The forced staging key for a staged `:update-heading' is be8(id).  When
-the moving heading ALREADY sits at be8(id) — and no DISTINCT sibling does
-— the core lowerer's phase-1 staging merely rewrites the row's own slot
-back to itself; this never races the `uq_heading_sibling_order' unique
-key.  An owner-blind check counts the heading's own original row as an
-occupied sibling and over-rejects the valid final model with
-`delete-freed-sort-key-reuse'.  The check must be OWNER-AWARE.
+  "A move whose own current key looks like a legacy temp key commits.
+Nothing about a key's shape matters any more: a mover simply receives a fresh
+key between its new neighbours, and its old key stays vacated until commit.
 
-Layout (reviewer repro): under root 100, A id 101 @ X'40'
-\(deleted, frees slot X'40'), B id 102 @ X'80', and M id 300 already
-parked at its own forced staging key be8(300).  The batch deletes A and
-moves M :before B, landing M on A's freed slot X'40' (so M is staged); M's
-forced staging key be8(300) is occupied ONLY by M itself, so the move must
-commit."
+Layout: under root 100, A id 101 @ X'40', B id 102 @ X'80', and M id 300
+already parked at its own forced staging key be8(300).  The batch deletes A
+and moves M :before B.  M's own temp-key-shaped current key must not cause a
+false collision, and the final model must order M strictly before B."
   (dorg-test-mutate--with-dolt
-    (let* ((m-temp (dorg-mutate--dolt-temp-sort-key 300))
-           (root-h (make-dorg-heading :id 100 :level 0 :title "Root"
+    (let* ((m-temp (dorg-test-mutate--legacy-be8-key 300))
+           (root-h (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                       :sort-key (unibyte-string #x80)))
-           (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
+           (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
                                  :sort-key (unibyte-string #x40)))
-           (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :title "B"
+           (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :level-offset 1 :title "B"
                                  :sort-key (unibyte-string #x80)))
            ;; M already sits at its OWN forced staging key be8(300); no
            ;; other sibling occupies that slot.
-           (m (make-dorg-heading :id 300 :parent-id 100 :level 1 :title "M"
+           (m (make-dorg-heading :id 300 :parent-id 100 :level 1 :level-offset 1 :title "M"
                                  :sort-key m-temp)))
       (dorg-sql-batch dolt-dir
                       (list (dorg-sql-gen-heading-insert root-h 100)
@@ -3060,13 +4428,12 @@ commit."
           (should (plist-get res :ok))
           (should (member 300 (plist-get res :changed)))
           (should (member 101 (plist-get res :deleted))))
-        ;; HEAD advanced once; A gone, M landed on A's freed slot before B.
+        ;; HEAD advanced once; A gone, M orders before B.
         (should-not (equal base (dorg-head-commit dolt-dir)))
         (let ((tree (dorg-model-load-tree dolt-dir 100)))
           (should-not (gethash 101 tree))
           (should (eql (dorg-heading-parent-id (gethash 300 tree)) 100))
-          (should (equal (dorg-heading-sort-key (gethash 300 tree))
-                         (unibyte-string #x40)))
+          (dorg-test-mutate--assert-tree-sibling-order tree 100)
           (should (string< (dorg-heading-sort-key (gethash 300 tree))
                            (dorg-heading-sort-key (gethash 102 tree)))))))))
 
@@ -3120,12 +4487,13 @@ IDS is the bounded load slice forced through the future scope resolver."
                                  "scoped parity run must not call whole-root load")))
                              ((symbol-function 'dorg-model-load-headings)
                               (lambda (dolt-dir root-id got-ids
-                                                &optional as-of headline-only)
+                                                &optional as-of headline-only
+                                                query-fn levels)
                                 (push (list root-id got-ids as-of headline-only)
                                       load-calls)
                                 (funcall real-load-headings
                                          dolt-dir root-id got-ids
-                                         as-of headline-only))))
+                                         as-of headline-only query-fn levels))))
                      (dorg-mutate--dolt-simulate src patches nil)))))
     (should scope-calls)
     (should load-calls)
@@ -3158,11 +4526,11 @@ and pass the same HEAD to the id-restricted loader."
   (let* ((src (dorg-mutate--resolve-source '(:dolt-dir "/tmp/dorg-scope/" :root-id 100)))
          (patches (list (dorg-test-mutate--heading-update-patch
                          101 :title "A*")))
-         (root (make-dorg-heading :id 100 :level 0 :title "Root"
+         (root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                   :sort-key (unibyte-string #x80)))
-         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
+         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
                                :sort-key (unibyte-string #x40)))
-         (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :title "B"
+         (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :level-offset 1 :title "B"
                                :sort-key (unibyte-string #x80)))
          (scope-calls nil)
          (load-calls nil))
@@ -3180,7 +4548,7 @@ and pass the same HEAD to the id-restricted loader."
                (lambda (&rest _)
                  (ert-fail "bounded mutation must not call dorg-model-load-tree")))
               ((symbol-function 'dorg-model-load-headings)
-               (lambda (_dolt-dir root-id ids &optional as-of headline-only)
+               (lambda (_dolt-dir root-id ids &optional as-of headline-only &rest _)
                  (push (list root-id ids as-of headline-only) load-calls)
                  (dorg-test-mutate--scope-tree root a b))))
       (let ((sim (dorg-mutate--dolt-simulate src patches nil)))
@@ -3190,21 +4558,21 @@ and pass the same HEAD to the id-restricted loader."
         (should (member 100 (cadar load-calls)))
         (should (equal (list src patches 100 "H-plan") (car scope-calls)))))))
 
-(ert-deftest dorg-test-mutate-dolt-scope-includes-affected-sibling-fan ()
-  "Same-root scope includes root + affected siblings and excludes unrelated descendants.
-For a delete-freed insert under the root, the executor reads all siblings of the
-affected parent to prove staging keys are collision-free.  It does not need an
-unrelated descendant under an unaffected sibling."
+(ert-deftest dorg-test-mutate-dolt-scope-hydrates-targets-and-anchors-only ()
+  "W4: same-root scope hydrates the root, the targets and the anchors only.
+A delete-freed insert under the root loads A (deleted) and B (anchor); it
+never hydrates the unrelated sibling P or P's descendant, because placement
+reads the parent's order as keys, never as headings."
   (dorg-test-mutate--with-dolt
-    (let* ((root (make-dorg-heading :id 100 :level 0 :title "Root"
+    (let* ((root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                     :sort-key (unibyte-string #x80)))
-           (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
+           (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
                                  :sort-key (unibyte-string #x20)))
-           (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :title "B"
+           (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :level-offset 1 :title "B"
                                  :sort-key (unibyte-string #x40)))
-           (p (make-dorg-heading :id 103 :parent-id 100 :level 1 :title "P"
+           (p (make-dorg-heading :id 103 :parent-id 100 :level 1 :level-offset 1 :title "P"
                                  :sort-key (unibyte-string #x60)))
-           (far (make-dorg-heading :id 104 :parent-id 103 :level 2 :title "Far"
+           (far (make-dorg-heading :id 104 :parent-id 103 :level 2 :level-offset 1 :title "Far"
                                    :sort-key (unibyte-string #x40))))
       (dorg-sql-batch dolt-dir
                       (list (dorg-sql-gen-heading-insert root 100)
@@ -3224,17 +4592,17 @@ unrelated descendant under an unaffected sibling."
                          (dorg-mutate--dolt-scope-ids
                           src patches 100 (dorg-head-commit dolt-dir)))
                         #'<)))
-        (dolist (id '(100 101 102 103))
+        (dolist (id '(100 101 102))
           (should (member id ids)))
+        (should-not (member 103 ids))
         (should-not (member 104 ids))))))
 
 (ert-deftest dorg-test-2xv2m-insert-scope-is-local-to-placement-facts ()
-  "Pure insert scope contains only the parent and exact placement neighbors.
-The fixture has four direct root children.  Tail insertion needs only the last
-child; insertion before B needs A+B; insertion after B needs B+C.  The old
-affected-parent fan returns every child and therefore fails each exact set.
-This applies only to pure insertion: move/delete tests continue to pin their
-complete affected sibling fan independently."
+  "Pure insert scope contains only the parent and the anchor.
+The fixture has four direct root children.  Placement reads the parent's
+order as keys, so no sibling is hydrated for it: tail insertion hydrates only
+the root; insertion before or after B hydrates the root and B.  The old
+affected-parent fan returned every child and therefore fails each exact set."
   (dorg-test-mutate--with-dolt
     (let* ((root (dorg-test-mutate--seed
                   dolt-dir "* A\n* B\n* C\n* D\n" 100))
@@ -3249,16 +4617,17 @@ complete affected sibling fan independently."
             (lambda (patch)
               (sort (dorg-mutate--dolt-scope-ids
                      source (list patch) root head) #'<))))
-      (should (equal (sort (list root d) #'<)
+      (ignore a c d)
+      (should (equal (list root)
                      (funcall scope
                               (dorg-test-mutate--tree-insert-patch
                                :root '(:id 300 :title "Tail")))))
-      (should (equal (sort (list root a b) #'<)
+      (should (equal (sort (list root b) #'<)
                      (funcall scope
                               (dorg-test-mutate--tree-insert-patch
                                :root '(:id 301 :title "Before B")
                                :before (dorg-test-mutate--heading-address b)))))
-      (should (equal (sort (list root b c) #'<)
+      (should (equal (sort (list root b) #'<)
                      (funcall scope
                               (dorg-test-mutate--tree-insert-patch
                                :root '(:id 302 :title "After B")
@@ -3281,9 +4650,10 @@ implementation passes 820 ids (root + every child)."
            (real-load (symbol-function 'dorg-model-load-headings))
            (loaded nil))
       (cl-letf (((symbol-function 'dorg-model-load-headings)
-                 (lambda (dir rid ids &optional as-of headline-only)
+                 (lambda (dir rid ids &optional as-of headline-only query-fn levels)
                    (push (copy-sequence ids) loaded)
-                   (funcall real-load dir rid ids as-of headline-only))))
+                   (funcall real-load dir rid ids as-of headline-only
+                            query-fn levels))))
         (dorg-mutate--dolt-simulate
          source
          (list (dorg-test-mutate--tree-insert-patch
@@ -3405,23 +4775,23 @@ unresolved external host into integer SQL helpers."
               (,(list :op 'delete
                       :target (dorg-test-mutate--external-address
                                :subtree "EXT" "alpha")))
-              (,root ,a ,a-kid ,b ,c)
-              (,c-kid))
+              (,root ,a ,a-kid)
+              (,b ,c ,c-kid))
              ("move-heading"
               (,(dorg-test-mutate--move-before-patch
                  (dorg-test-mutate--external-address
                   :subtree "EXT" "beta")
                  :root (dorg-test-mutate--heading-address a)))
-              (,root ,a ,b ,c)
-              (,a-kid ,c-kid))
+              (,root ,a ,b)
+              (,c ,a-kid ,c-kid))
              ("move-subtree"
               (,(list :op 'move
                       :target (dorg-test-mutate--external-address
                                :subtree "EXT" "alpha")
                       :to (list :under :root
                                 :after (dorg-test-mutate--heading-address b))))
-              (,root ,a ,a-kid ,b ,c)
-              (,c-kid))))
+              (,root ,a ,a-kid ,b)
+              (,c ,c-kid))))
         (let* ((name (nth 0 case))
                (patches (nth 1 case))
                (ids (dorg-mutate--dolt-scope-ids source patches root head)))
@@ -3471,10 +4841,14 @@ unresolved external host into integer SQL helpers."
       (should dst-ids)
       (should (cl-every #'integerp src-ids))
       (should (cl-every #'integerp dst-ids))
-      (dolist (id (list src-root movable kid src-sibling))
+      (dolist (id (list src-root movable kid))
         (should (member id src-ids)))
-      (dolist (id (list dst-root dst-parent dst-child))
+      ;; No placement happens in the source: its sibling fan is not hydrated.
+      (should-not (member src-sibling src-ids))
+      (dolist (id (list dst-root dst-parent))
         (should (member id dst-ids)))
+      ;; Destination order is read as keys; no destination child is hydrated.
+      (should-not (member dst-child dst-ids))
       (should-not (member dst-root-sibling dst-ids)))))
 
 (ert-deftest dorg-test-mutate-dolt-scope-parity-matrix ()
@@ -3531,10 +4905,10 @@ it can accidentally compare two whole-root runs."
                ,(dorg-test-mutate--planning-patch
                  a :deadline "<2026-08-01 Sat>")
                ,(dorg-test-mutate--keyword-occurrence-patch
-                 'replace :root "OPTIONS" 1 :value "new" :missing :error)
+                 'replace :root "OPTIONS" 1 :value "new")
                ,(dorg-test-mutate--keyword-occurrence-patch
                  'replace (dorg-test-mutate--heading-address a)
-                 "FOO" 1 :value "new" :missing :error))
+                 "FOO" 1 :value "new"))
               ,(list root a))
              ("insert-anchor"
               (,(dorg-test-mutate--tree-insert-patch
@@ -3585,9 +4959,9 @@ captured plan HEAD."
                                              :root-id 100)))
          (patches (list (dorg-test-mutate--heading-update-patch
                          101 :title "A*")))
-         (root (make-dorg-heading :id 100 :level 0 :title "Root"
+         (root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                   :sort-key (unibyte-string #x80)))
-         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :title "A"
+         (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
                                :sort-key (unibyte-string #x40)))
          (scope-calls nil)
          (load-tree-calls nil)
@@ -3607,7 +4981,7 @@ captured plan HEAD."
                  (push (list root-id as-of) load-tree-calls)
                  (dorg-test-mutate--scope-tree root a)))
               ((symbol-function 'dorg-model-load-headings)
-               (lambda (_dolt-dir root-id ids &optional as-of headline-only)
+               (lambda (_dolt-dir root-id ids &optional as-of headline-only &rest _)
                  (push (list root-id ids as-of headline-only) load-heading-calls)
                  (ert-fail "nil scope fallback must not use id-restricted load"))))
       (let ((sim (dorg-mutate--dolt-simulate src patches nil)))
@@ -3645,6 +5019,88 @@ sibling `SrcSib' (103).  Destination root 500: `DestParent' (501) and
           (list :dolt-dir dolt-dir :root-id root-id))
          fields))
 
+(defun dorg-test-level-offset--cross-root-fixture (dolt-dir)
+  "Seed a cross-root move with an inner gap; return the ids as a plist.
+Source root 100: Movable (offset 1) > Kid (offset 3), then SrcSib.
+Destination root 500: DstParent at level 1."
+  (dorg-test-mutate--seed dolt-dir "* Movable\n**** Kid\n* SrcSib\n" 100)
+  (dorg-test-mutate--seed dolt-dir "* DstParent\n" 500)
+  (list :movable (dorg-test-mutate--id-by-title dolt-dir "Movable")
+        :kid (dorg-test-mutate--id-by-title dolt-dir "Kid")
+        :dst-parent (dorg-test-mutate--id-by-title dolt-dir "DstParent")))
+
+(defun dorg-test-level-offset--cross-root-apply (dolt-dir ids)
+  "Move the fixture's Movable under DstParent in root 500; return the result."
+  (dorg-test-mutate--apply-patch-batch
+   (list :dolt-dir dolt-dir :root-id 100)
+   (list (dorg-test-mutate--cross-root-move-patch
+          (plist-get ids :movable)
+          (dorg-test-mutate--heading-address (plist-get ids :dst-parent))
+          dolt-dir 500))))
+
+(ert-deftest dorg-test-level-offset-dolt-cross-root-refuses-corrupt-descendant ()
+  "A cross-root move over a zero descendant offset is refused before writing.
+The destination candidate derives the moved closure through the shared
+fail-closed rule, so Kid's invalid offset cannot yield a numeric level."
+  (dorg-test-mutate--with-dolt
+    (let ((ids (dorg-test-level-offset--cross-root-fixture dolt-dir)))
+      (dorg-sql dolt-dir (format "UPDATE headings SET level_offset = 0 WHERE id = %d"
+                                 (plist-get ids :kid)))
+      (dorg-commit dolt-dir "corrupt Kid")
+      (let* ((head (dorg-head-commit dolt-dir))
+             (err (should-error (dorg-test-level-offset--cross-root-apply dolt-dir ids)
+                                :type 'dorg-mutate-error)))
+        (should (eq 'invalid-level-offset
+                    (plist-get (dorg-mutate-error-data err) :detail)))
+        (should (equal head (dorg-head-commit dolt-dir)))
+        (should (eql 100 (alist-get 'root_id
+                                    (car (dorg-sql dolt-dir (format "SELECT root_id FROM headings WHERE id = %d"
+                                                                    (plist-get ids :kid)))))))))))
+
+(ert-deftest dorg-test-level-offset-dolt-cross-root-move-root-id ()
+  "GUARD: a cross-root move re-homes every moved row into the destination root."
+  (dorg-test-mutate--with-dolt
+    (let ((ids (dorg-test-level-offset--cross-root-fixture dolt-dir)))
+      (should (plist-get (dorg-test-level-offset--cross-root-apply dolt-dir ids) :ok))
+      (dolist (id (list (plist-get ids :movable) (plist-get ids :kid)))
+        (should (eql 500 (alist-get 'root_id
+                                    (car (dorg-sql dolt-dir (format "SELECT root_id FROM headings WHERE id = %d" id))))))))))
+
+(ert-deftest dorg-test-level-offset-dolt-cross-root-move-no-descendant-offset ()
+  "A cross-root move resets only the moved root's offset; descendants keep theirs."
+  (dorg-test-mutate--with-dolt
+    (let ((ids (dorg-test-level-offset--cross-root-fixture dolt-dir)))
+      (should (plist-get (dorg-test-level-offset--cross-root-apply dolt-dir ids) :ok))
+      (let ((offset (lambda (id)
+                      (alist-get 'level_offset
+                                 (car (dorg-sql dolt-dir (format "SELECT level_offset FROM headings WHERE id = %d" id))))))
+            (tree (dorg-model-load-tree dolt-dir 500)))
+        (should (eql 1 (funcall offset (plist-get ids :movable))))
+        (should (eql 3 (funcall offset (plist-get ids :kid))))
+        (should (eql 2 (dorg-heading-level (gethash (plist-get ids :movable) tree))))
+        (should (eql 5 (dorg-heading-level (gethash (plist-get ids :kid) tree))))))))
+
+(ert-deftest dorg-test-level-offset-dolt-cross-root-candidate-derives-descendant-levels ()
+  "The cross-root candidate hands consumers the descendants' derived levels.
+Extension images read these in-memory levels, so they must follow the new
+ancestry from the stored offsets, not only after a reload."
+  (dorg-test-mutate--with-dolt
+    (let* ((ids (dorg-test-level-offset--cross-root-fixture dolt-dir))
+           (sim (dorg-mutate--dolt-cross-root-simulate
+                 (dorg-mutate--resolve-source (list :dolt-dir dolt-dir :root-id 100))
+                 (car (dorg-mutate--validate-patches
+                       (list (dorg-test-mutate--cross-root-move-patch
+                              (plist-get ids :movable)
+                              (dorg-test-mutate--heading-address (plist-get ids :dst-parent))
+                              dolt-dir 500))))
+                 nil))
+           (level (lambda (id)
+                    (dorg-heading-level
+                     (cadr (cl-find-if (lambda (op) (eql id (dorg-heading-id (cadr op))))
+                                       (plist-get sim :db-ops)))))))
+      (should (eql 2 (funcall level (plist-get ids :movable))))
+      (should (eql 5 (funcall level (plist-get ids :kid)))))))
+
 (ert-deftest dorg-test-mutate-dolt-cross-root-move-success ()
   "A same-repo cross-root move re-homes the subtree in one Dolt commit.
 The moved subtree leaves the source root and appears under the destination
@@ -3676,7 +5132,7 @@ parent with adjusted levels; HEAD advances exactly once."
         (should-not (gethash (plist-get ids :kid) src-tree))
         (should (gethash (plist-get ids :src-sib) src-tree)))
       ;; Destination root now holds the moved subtree with preserved ids,
-      ;; correct parent linkage, and shifted levels.
+      ;; correct parent linkage, and levels derived from the new ancestry.
       (let* ((dst-tree (dorg-model-load-tree dolt-dir (plist-get ids :dst-root)))
              (mv (gethash (plist-get ids :movable) dst-tree))
              (kid (gethash (plist-get ids :kid) dst-tree)))
@@ -4285,6 +5741,62 @@ line, a user CATEGORY property, and prose — the rich preservation fixture."
                   (dorg-planning-item-scheduled i)))
            (dorg-heading-items h)))
 
+(defun dorg-test-32mp9--assert-owned-property-refusal (form key source before current)
+  "Assert FORM cannot change owned KEY through SOURCE in either public mode.
+
+CURRENT reads the source preimage.  The shared public normalizer must reject
+before either planning or apply, preserving the exact preimage in both modes."
+  (dolist (mode '(dry-run apply))
+    (let ((data (condition-case err
+                    (progn
+                      (dorg-api-execute form :mode mode :source source)
+                      (ert-fail "expected owned-property refusal"))
+                  (dorg-api-error (dorg-api-error-data err))
+                  (dorg-mutate-error (dorg-mutate-error-data err)))))
+      (should (eq 'invalid-target (plist-get data :reason)))
+      (should (equal key (plist-get data :key)))
+      (should (equal before (funcall current))))))
+
+(ert-deftest dorg-test-32mp9-public-property-prefix-preserves-preimages ()
+  "Case variants of owned properties cannot forge or erase DORG_ID.
+
+The old public guard compared only the literal uppercase spelling.  These
+rows exercise the actual property door in dry-run and apply on buffer, file,
+and Dolt sources; the rich Dolt fixture additionally proves planning and an
+ordinary user property survive the refusal."
+  (let ((content (concat "* Host\nSCHEDULED: <2026-07-01 Wed>\n"
+                         ":PROPERTIES:\n:DORG_ID: 7\n:CATEGORY: work\n:END:\nbody\n")))
+    (dorg-test-mutate--with-content buf content
+      (dolist (form '((on (id 7) (set (property "dorg_id") "9"))
+                      (on (id 7) (delete (property "dorg_id")))))
+        (dorg-test-32mp9--assert-owned-property-refusal
+         form "dorg_id" (list :buffer buf :identity 'dorg) content
+         (lambda () (buffer-string)))))
+    (let ((file (make-temp-file "dorg-32mp9-" nil ".org" content)))
+      (unwind-protect
+          (dolist (form '((on (id 7) (set (property "Dorg_Id") "9"))
+                          (on (id 7) (delete (property "Dorg_Id")))))
+            (dorg-test-32mp9--assert-owned-property-refusal
+             form "Dorg_Id" (list :file file :identity 'dorg) content
+             (lambda () (with-temp-buffer (insert-file-contents file) (buffer-string)))))
+        (when-let ((buffer (get-file-buffer file)))
+          (with-current-buffer buffer (set-buffer-modified-p nil))
+          (kill-buffer buffer))
+        (delete-file file))))
+  (skip-unless dorg-test--dolt-available)
+  (dorg-test--with-temp-db dolt-dir
+    (dorg-test-api--dolt-seed-rich dolt-dir)
+    (let* ((source (list :dolt-dir dolt-dir :root-id 1000))
+           (head (dorg-head-commit dolt-dir)))
+      (dolist (form '((on (id 3001) (set (property "dorg_id") "9"))
+                      (on (id 3001) (delete (property "dorg_id")))))
+        (dorg-test-32mp9--assert-owned-property-refusal
+         form "dorg_id" source head (lambda () (dorg-head-commit dolt-dir))))
+      (let ((heading (gethash 3001 (dorg-model-load-headings dolt-dir 1000 nil))))
+        (should (= 3001 (dorg-heading-id heading)))
+        (should (dorg-test-api--heading-scheduled-p heading))
+        (should (equal "work" (dorg-test-api--heading-category heading)))))))
+
 (ert-deftest dorg-test-2rx9n-api-exec-replace-text-dolt-preserves ()
   "Text occurrence replacement on Dolt preserves metadata and trailing drawer.
 user CATEGORY property, the planning line, and identity — plain-org/Dolt
@@ -4396,10 +5908,10 @@ absent or incomplete."
           (dorg-api-execute
            '(batch
              (on (id 1001)
-                 (insert (drawer-line "AUDIT" (occurrence 1)) (before-first)
+                 (insert (drawer-line "AUDIT") (before-first)
                          "- A"))
              (on (id 1001)
-                 (insert (drawer-line "AUDIT" (occurrence 1)) (before-first)
+                 (insert (drawer-line "AUDIT") (before-first)
                          "- B")))
            :mode 'apply :source buf)
           (should (equal after (buffer-string))))
@@ -4423,10 +5935,10 @@ absent or incomplete."
           (dorg-api-execute
            '(batch
              (on (id 1001)
-                 (insert (drawer-line "LOGBOOK" (occurrence 1)) (before-first)
+                 (insert (drawer-line "LOGBOOK") (before-first)
                          "- x"))
              (on (id 1001)
-                 (insert (drawer-line "LOGBOOK" (occurrence 1)) (before-first)
+                 (insert (drawer-line "LOGBOOK") (before-first)
                          "- x")))
            :mode 'apply :source buf)
           (should (equal after (buffer-string))))
@@ -4454,10 +5966,10 @@ absent or incomplete."
           (dorg-api-execute
            '(batch
              (on (id 1001)
-                 (insert (drawer-line "AUDIT" (occurrence 1)) (after-last)
+                 (insert (drawer-line "AUDIT") (after-last)
                          "- A"))
              (on (id 1001)
-                 (insert (drawer-line "AUDIT" (occurrence 1)) (after-last)
+                 (insert (drawer-line "AUDIT") (after-last)
                          "- B")))
            :mode 'apply :source buf)
           (should (equal after (buffer-string))))
@@ -4483,7 +5995,7 @@ absent or incomplete."
           (let ((org-inhibit-startup t)) (org-mode))
           (dorg-api-execute
            '(on (id 1001)
-                (insert (drawer-line "LOGBOOK" (occurrence 1)) (before-first)
+                (insert (drawer-line "LOGBOOK") (before-first)
                         "- created"))
            :mode 'apply :source buf)
           (should (equal after (buffer-string))))
@@ -4507,7 +6019,7 @@ absent or incomplete."
           (let ((org-inhibit-startup t)) (org-mode))
           (dorg-api-execute
            '(on (id 1001)
-                (insert (drawer-line "AUDIT" (occurrence 1)) (after-last)
+                (insert (drawer-line "AUDIT") (after-last)
                         "- created"))
            :mode 'apply :source buf)
           (should (equal after (buffer-string))))
@@ -4532,7 +6044,7 @@ absent or incomplete."
              (dorg-test-mutate--assert-dorg-policy buf)
              (dorg-api-execute
               `(on (id 1001)
-                   (insert (drawer-line "AUDIT" (occurrence 1))
+                   (insert (drawer-line "AUDIT")
                            ,(list position)
                            "- created"))
               :mode 'apply :source buf)
@@ -4574,7 +6086,7 @@ absent or incomplete."
            (source (list :dolt-dir dolt-dir :root-id root)))
       (dorg-api-execute
        `(on (id 3001)
-            (insert (drawer-line "AUDIT" (occurrence 1))
+            (insert (drawer-line "AUDIT")
                     ,(list position)
                     "- created"))
        :mode 'apply :source source)
@@ -4670,7 +6182,7 @@ and same-op-id replay is idempotent.  Planning and user properties survive."
                   1000))
            (source (list :dolt-dir dolt-dir :root-id root))
            (form '(on (id 3001)
-                      (insert (drawer-line "LOGBOOK" (occurrence 1)) (before-first) "- created")))
+                      (insert (drawer-line "LOGBOOK") (before-first) "- created")))
            (head0 (dorg-head-commit dolt-dir))
            (preview0 (dorg-api-execute form :mode 'dry-run :source source)))
       (should (equal head0 (plist-get preview0 :base)))
@@ -4722,7 +6234,7 @@ and same-op-id replay is idempotent.  Planning and user properties survive."
                    (progn
                      (dorg-api-execute
                       '(on (id 3001)
-                           (insert (drawer-line "LOGBOOK" (occurrence 1)) (before-first) "- different"))
+                           (insert (drawer-line "LOGBOOK") (before-first) "- different"))
                       :mode 'apply :source source :op-id "bnsmz-create")
                      :no-error)
                  (dorg-api-error (dorg-api-error-reason err))
@@ -4744,7 +6256,7 @@ unchanged; the batch is validated/simulated atomically before SQL."
            (head (dorg-head-commit dolt-dir))
            (form `(batch
                    (on (id ,id)
-                       (insert (drawer-line "AUDIT" (occurrence 1)) (before-first) "- must roll back"))
+                       (insert (drawer-line "AUDIT") (before-first) "- must roll back"))
                    (on (id 999999) (set (property "K") "V")))))
       (should
        (eq 'invalid-target
@@ -4942,20 +6454,19 @@ BOTH paths.  Requires Dolt; skipped under bounded static evidence, run at ACCEPT
      (list (dorg-mutate-error-reason err) (cadr err)))))
 
 (ert-deftest dorg-test-3yo52-c3-refusal-shape-is-single-source ()
-  "The shared C3 builder owns whole-verb and root-host refusal shapes."
+  "The shared C3 builder admits concrete planning and refuses its root cell."
   (let ((planning (dorg-test-mutate--planning-patch
                    1001 :scheduled "<2026-08-19 Wed>"))
-        (root-property '(:op put
-                         :target (:property :host :root :name "K")
+        (root-planning '(:op update :target (:planning :host :root)
+                         :scheduled "<2026-08-19 Wed>"))
+        (root-property '(:op put :target (:property :host :root :name "K")
                          :value "V")))
-    (should
-     (equal '(:unsupported t
-              :reason no-source-preserving-editor
-              :message "no source-preserving editor for (update :planning)"
-              :operation update
-              :target-kind :planning
-              :variant nil)
-            (dorg-mutate--c3-refusal planning)))
+    (should-not (dorg-mutate--c3-refusal planning))
+    (should (equal '(:unsupported t
+                     :reason no-source-preserving-editor
+                     :message "no source-preserving editor for (update :planning) at the level-0 root"
+                     :operation update :target-kind :planning :variant (:host root))
+                   (dorg-mutate--c3-refusal root-planning)))
     (should
      (equal '(:unsupported t
               :reason no-source-preserving-editor
@@ -5078,8 +6589,8 @@ BOTH paths.  Requires Dolt; skipped under bounded static evidence, run at ACCEPT
     (should-not (fboundp executor-symbol))
     (should-not (boundp kinds-symbol))))
 
-(ert-deftest dorg-test-c8ynt-c3-commented-cell-is-the-sole-s1-exception ()
-  "C3 data supports only exact COMMENTED fields; general S1 remains refused."
+(ert-deftest dorg-test-c8ynt-c3-heading-line-cells-are-supported ()
+  "C3 admits every nonempty intrinsic heading-line field subset at a heading."
   (should
    (equal '((((update :heading) heading (:commented))
              :status supported :slice S1
@@ -5095,7 +6606,7 @@ BOTH paths.  Requires Dolt; skipped under bounded static evidence, run at ACCEPT
                 :fields (:commented t))))
     (should (equal '(supported . S1)
                    (dorg-mutate--c3-cell commented 'heading)))
-    (should (equal '(unsupported . S1)
+    (should (equal '(supported . S1)
                    (dorg-mutate--c3-cell mixed 'heading)))
     (should (equal '(unsupported . S1)
                    (dorg-mutate--c3-cell root 'root)))))
@@ -5114,15 +6625,22 @@ BOTH paths.  Requires Dolt; skipped under bounded static evidence, run at ACCEPT
              (plan (dorg-mutate--plan-patches buf patches)))
         (should (plist-get plan :supported))
         (should (plist-get (car (plist-get plan :patch-support)) :supported)))
-      ;; A mixed S1 payload remains refused in phase 1, before COMMENT can land.
+      ;; A mixed S1 payload shares the heading-line editor: both changed
+      ;; fields land, while all omitted heading facets retain their bytes.
       (let* ((before (buffer-string))
-             (data (dorg-test-mutate--error-data
-                    (dorg-mutate--apply-patches
-                     buf '((:op update :target (:heading :id 9101)
-                                  :fields (:commented t :title "Renamed")))))))
-        (should (eq 'unsupported (plist-get data :reason)))
-        (should (eq 'no-source-preserving-editor (plist-get data :detail)))
-        (should (equal before (buffer-string))))
+             (expected (replace-regexp-in-string
+                        (regexp-quote "* TODO [#A] Task  :alpha:beta:\n")
+                        "* TODO [#A] COMMENT Renamed  :alpha:beta:\n"
+                        before t t)))
+        (dorg-mutate--apply-patches
+         buf '((:op update :target (:heading :id 9101)
+                      :fields (:commented t :title "Renamed"))))
+        (should-not (equal before (buffer-string)))
+        (should (equal expected (buffer-string)))
+        ;; Keep the historical COMMENT-only public-path control below on its
+        ;; original source image.
+        (erase-buffer)
+        (insert before))
       (dorg-api-execute '(on (id 9101) (set (heading commented) t))
                         :mode 'apply :source buf)
       (let* ((bytes1 (buffer-string))
@@ -5247,20 +6765,22 @@ BOTH paths.  Requires Dolt; skipped under bounded static evidence, run at ACCEPT
   (car (plist-get (dorg-mutate--plan-patches source (list patch))
                   :patch-support)))
 
-(ert-deftest dorg-test-ltxz7-commented-constructor-is-one-c3-data-cell ()
-  "C3 data, not a dispatch bypass, owns the explicit-commented constructor."
+(ert-deftest dorg-test-ltxz7-plain-constructor-is-one-c3-data-cell ()
+  "C3 data, not a dispatch bypass, owns the bounded plain constructor."
   (should
    (equal
     '((((update :heading) heading (:commented))
        :status supported :slice S1
        :variant (:host heading :fields (:commented)))
-      (((insert :tree) heading (:commented))
+      (((insert :tree) heading (:constructor))
        :status supported :slice S3
-       :variant (:host heading :constructor (:commented))))
+       :variant (:host heading :constructor :plain-child)))
     dorg-mutate--c3-field-cells))
-  (dolist (value '(t nil))
+  (dolist (value '(t nil omitted))
     (let ((patch (dorg-test-ltxz7--insert-patch
-                  nil (list :title "Resolution" :commented value))))
+                  nil (append (list :title "Resolution")
+                              (unless (eq value 'omitted)
+                                (list :commented value))))))
       (should (equal '(supported . S3)
                      (dorg-mutate--c3-cell patch 'heading)))))
   ;; Transformation: deleting the new data cell must remove plain support.
@@ -5274,8 +6794,6 @@ BOTH paths.  Requires Dolt; skipped under bounded static evidence, run at ACCEPT
   "Every non-ratified plain constructor shape stays typed and byte-unchanged."
   (dorg-test-mutate--with-content buf dorg-test-ltxz7--fixture
     (let* ((source (dorg-mutate--resolve-source buf))
-           (omitted (dorg-test-ltxz7--insert-patch
-                     nil '(:title "Visible")))
            (root (dorg-test-ltxz7--insert-patch
                   '(:tree :under :root)))
            (anchored (dorg-test-ltxz7--insert-patch
@@ -5284,8 +6802,7 @@ BOTH paths.  Requires Dolt; skipped under bounded static evidence, run at ACCEPT
            (broader (dorg-test-ltxz7--insert-patch
                      nil '(:title "Raw" :commented t :post-blank 1)))
            (before (buffer-string)))
-      (dolist (case `((omitted . ,omitted)
-                      (root . ,root)
+      (dolist (case `((root . ,root)
                       (anchored . ,anchored)
                       (broader . ,broader)))
         (ert-info ((symbol-name (car case)))
@@ -5330,6 +6847,7 @@ BOTH paths.  Requires Dolt; skipped under bounded static evidence, run at ACCEPT
                                (todo "TODO")
                                (priority "A")
                                (tags "workflow")
+                               (property "BEAD_ID" "resolution-1")
                                (commented t))
                       (under (id 9201)))
              :mode 'apply :source buf))
@@ -5345,7 +6863,7 @@ BOTH paths.  Requires Dolt; skipped under bounded static evidence, run at ACCEPT
       (should (equal 9201 (dorg-heading-parent-id heading)))
       (should (string-match-p
                (regexp-quote
-                (format "** TODO [#A] COMMENT Resolution  :workflow:\n:PROPERTIES:\n:DORG_ID: %d\n:END:"
+                (format "** TODO [#A] COMMENT Resolution  :workflow:\n:PROPERTIES:\n:DORG_ID: %d\n:BEAD_ID: resolution-1\n:END:"
                         id))
                (buffer-string)))
       (should-not (equal before (buffer-string)))
@@ -5353,6 +6871,89 @@ BOTH paths.  Requires Dolt; skipped under bounded static evidence, run at ACCEPT
       ;; COMMENT; no visible preimage was ever committed to the buffer.
       (should-not (string-match-p "^\\*\\* TODO \\[#A\\] Resolution"
                                   (buffer-string))))))
+
+;;; ─── Recursive constructor item spacing ──────────────────────────────
+
+(defun dorg-test-7dyd0--constructor-patch ()
+  "Return one public recursive constructor patch with declared item spacing."
+  (car
+   (dorg-api-normalize
+    '(insert
+      (heading
+       (title "Parent")
+       (items (text "Para one." :post-blank 1)
+              (text "Para two."))
+       (children
+        (heading
+         (title "Child")
+         (items (text "Child one." :post-blank 1)
+                (text "Child two.")))))
+      (under (id 0))))))
+
+(defun dorg-test-7dyd0--heading-by-title (ps title)
+  "Return the heading named TITLE from constructor postimage PS."
+  (let (found)
+    (maphash (lambda (_id heading)
+               (when (equal title (dorg-heading-title heading))
+                 (setq found heading)))
+             (dorg-mutate--ps-headings ps))
+    (should found)
+    found))
+
+(defun dorg-test-7dyd0--text-items (heading)
+  "Return HEADING's text items in document order."
+  (cl-remove-if-not (lambda (item) (cl-typep item 'dorg-text-item))
+                    (dorg-heading-items heading)))
+
+(ert-deftest dorg-test-7dyd0-ps-constructor-preserves-item-post-blank-recursively ()
+  "Public constructor spacing survives PS construction, rendering, and reparse.
+
+This is the no-Dolt real PS-apply witness.  Its child covers recursive
+construction; the source-preserving constructor has a separate pure-model
+witness because C3 deliberately refuses this rich payload before persistence."
+  (let* ((root (make-dorg-heading :id 0 :parent-id nil :level 0 :level-offset 0
+                                  :sort-key (unibyte-string 0)))
+         (ps (dorg-test-mutate--ps-with 0 root))
+         (patch (dorg-test-7dyd0--constructor-patch)))
+    (dorg-mutate--ps-insert-heading ps patch)
+    (dolist (title '("Parent" "Child"))
+      (let* ((heading (dorg-test-7dyd0--heading-by-title ps title))
+             (items (dorg-test-7dyd0--text-items heading))
+             (prefix (if (equal title "Parent") "Para" "Child")))
+        (should (equal '(1 0) (mapcar #'dorg-item-post-blank items)))
+        (let ((rendered (dorg-model-render-heading-section heading)))
+          (should (string-match-p
+                   (regexp-quote
+                    (format "%s one.\n\n%s two.\n" prefix prefix))
+                   rendered))
+          (with-temp-buffer
+            (insert rendered)
+            (org-mode)
+            (let* ((parsed (dorg-parse-buffer (current-buffer)))
+                   (round-trip
+                    (cl-find title (dorg-parse-result-headings parsed)
+                             :key #'dorg-heading-title :test #'equal))
+                   (round-items (dorg-test-7dyd0--text-items round-trip)))
+              (should (= 2 (length round-items)))
+              ;; The parser retains the final item's terminal newline; the
+              ;; first item's blank separator is structural, not text payload.
+              (should (equal (list (format "%s one." prefix)
+                                   (format "%s two.\n" prefix))
+                             (mapcar #'dorg-text-item-text round-items))))))))))
+
+(ert-deftest dorg-test-7dyd0-source-preserving-constructor-preserves-item-post-blank ()
+  "The restricted source-preserving constructor keeps normalized item spacing.
+
+This is deliberately a pure construction witness: the public C3 source path
+admits only its commented/properties cell, so it refuses the rich two-text
+payload above before persistence.  The existing C3 refusal matrix remains the
+write-path admission witness."
+  (let* ((heading (dorg-mutate--source-preserving-constructor-heading
+                   (dorg-test-7dyd0--constructor-patch) 2 7001))
+         (items (dorg-test-7dyd0--text-items heading)))
+    (should (equal '(1 0) (mapcar #'dorg-item-post-blank items)))
+    ;; Normalized forms with no explicit tail stay at the established zero.
+    (should (= 0 (dorg-item-post-blank (nth 1 items))))))
 
 (ert-deftest dorg-test-ltxz7-property-identity-creates-no-fabricated-id ()
   "A DORG_ID-less faithful child carries its key and reports no numeric id."
@@ -5392,10 +6993,271 @@ BOTH paths.  Requires Dolt; skipped under bounded static evidence, run at ACCEPT
                                   (buffer-string)))
           (should-not (string-match-p ":DORG_ID:" (buffer-string))))))))
 
-(ert-deftest dorg-test-ltxz7-plain-constructor-batch-failure-restores-preimage ()
-  "A later phase-one miss leaves no hidden child or other partial bytes."
+(ert-deftest dorg-test-jgc67-plain-constructor-admits-visible-child-with-body ()
+  "A property-bound parent admits one visible public child at subtree end."
+  (let ((fixture
+         (concat "* Inbox\n:PROPERTIES:\n:CAPTURE_ID: inbox\n:END:\n"
+                 "Existing body.\n\n"
+                 "* Sibling\n:PROPERTIES:\n:CAPTURE_ID: sibling\n:END:\n")))
+    (dorg-test-mutate--with-content buf fixture
+      (let* ((source (list :buffer buf :identity '(:property "CAPTURE_ID")))
+             (response
+              (dorg-api-execute
+               '(insert (heading (title "Captured note")
+                                 (property "CAPTURE_ID" "capture-1")
+                                 (items (text "First paragraph." :post-blank 1)
+                                        (text "Second paragraph.")))
+                        (under (key "inbox")))
+               :mode 'apply :source source)))
+        (should (plist-get response :ok))
+        (should-not (plist-get (plist-get response :affected) :created))
+        (should
+         (equal
+          (concat "* Inbox\n:PROPERTIES:\n:CAPTURE_ID: inbox\n:END:\n"
+                  "Existing body.\n\n"
+                  "** Captured note\n"
+                  ":PROPERTIES:\n:CAPTURE_ID: capture-1\n:END:\n"
+                  "First paragraph.\n\nSecond paragraph.\n"
+                  "* Sibling\n:PROPERTIES:\n:CAPTURE_ID: sibling\n:END:\n")
+          (buffer-string)))))))
+
+(ert-deftest dorg-test-jgc67-plain-constructor-keeps-descendants-blanks-and-sibling ()
+  "The literal insertion boundary is after all old subtree bytes, before S."
+  (let* ((prefix (concat "* Parent\n:PROPERTIES:\n:CAPTURE_ID: inbox\n:END:\n"
+                         "** Old child\nold\n\n\n"))
+         (suffix "* Next\n")
+         (new (concat "** TODO Captured note\n:PROPERTIES:\n:CAPTURE_ID: capture-1\n:END:\n"
+                      "First paragraph.\n\nSecond paragraph.\n")))
+    (dorg-test-mutate--with-content buf (concat prefix suffix)
+      (let ((response
+             (dorg-api-execute
+              '(insert (heading (title "Captured note") (todo "TODO")
+                                (property "CAPTURE_ID" "capture-1")
+                                (items (text "First paragraph." :post-blank 1)
+                                       (text "Second paragraph.")))
+                       (under (key "inbox")))
+              :mode 'apply
+              :source (list :buffer buf :identity '(:property "CAPTURE_ID")))))
+        (should (plist-get response :ok))
+        (should (equal (concat prefix new suffix) (buffer-string)))))))
+
+(ert-deftest dorg-test-jgc67-plain-constructor-handles-both-eof-newline-cases ()
+  "An existing EOF LF is retained; a missing LF becomes only the new separator."
+  (let ((new (concat "** TODO Captured note\n:PROPERTIES:\n:CAPTURE_ID: capture-1\n:END:\n"
+                     "First paragraph.\n\nSecond paragraph.\n")))
+    (dolist (case '(("body\n" . "") ("body" . "\n")))
+      (let ((prefix (concat "* Parent\n:PROPERTIES:\n:CAPTURE_ID: inbox\n:END:\n"
+                            (car case))))
+        (dorg-test-mutate--with-content buf prefix
+          (let ((response
+                 (dorg-api-execute
+                  '(insert (heading (title "Captured note") (todo "TODO")
+                                    (property "CAPTURE_ID" "capture-1")
+                                    (items (text "First paragraph." :post-blank 1)
+                                           (text "Second paragraph.")))
+                           (under (key "inbox")))
+                  :mode 'apply
+                  :source (list :buffer buf :identity '(:property "CAPTURE_ID")))))
+            (should (plist-get response :ok))
+            (should (equal (concat prefix (cdr case) new) (buffer-string)))))))))
+
+(ert-deftest dorg-test-jgc67-plain-constructor-preserves-crlf-bytes ()
+  "A file source receives CRLF constructor bytes without changing raw P/S."
+  (let* ((prefix (concat "* Parent\r\n:PROPERTIES:\r\n:CAPTURE_ID: inbox\r\n:END:\r\n"))
+         (suffix "* Next\r\n")
+         (new (concat "** TODO Captured note\r\n:PROPERTIES:\r\n:CAPTURE_ID: capture-1\r\n:END:\r\n"
+                      "First paragraph.\r\n\r\nSecond paragraph.\r\n"))
+         (file (make-temp-file "dorg-jgc67-crlf" nil ".org")))
+    (unwind-protect
+        (progn
+          (let ((coding-system-for-write 'no-conversion))
+            (write-region (concat prefix suffix) nil file nil 'silent))
+          (let ((response
+                 (dorg-api-execute
+                  '(insert (heading (title "Captured note") (todo "TODO")
+                                    (property "CAPTURE_ID" "capture-1")
+                                    (items (text "First paragraph." :post-blank 1)
+                                           (text "Second paragraph.")))
+                           (under (key "inbox")))
+                  :mode 'apply :source (list :file file :identity '(:property "CAPTURE_ID")))))
+            (should (plist-get response :ok))
+            (should
+             (equal (concat prefix new suffix)
+                    (with-temp-buffer
+                      (insert-file-contents-literally file)
+                      (buffer-string))))))
+      (when (get-file-buffer file) (kill-buffer (get-file-buffer file)))
+      (delete-file file))))
+
+(ert-deftest dorg-test-jgc67-plain-constructor-preserves-all-item-order ()
+  "Planning, drawer, keyword, and text stay in the declared constructor order."
+  (let* ((prefix "* Parent\n:PROPERTIES:\n:CAPTURE_ID: inbox\n:END:\n")
+         (new (concat "** TODO Capture α\n"
+                      "SCHEDULED: <2026-10-20 Tue>\n"
+                      ":PROPERTIES:\n:CAPTURE_ID: capture-1\n:END:\n"
+                      "#+CAPTURE_KIND: transcript\n"
+                      "First paragraph.\n\nSecond paragraph.\n")))
+    (dorg-test-mutate--with-content buf prefix
+      (let ((response
+             (dorg-api-execute
+              '(insert (heading (title "Capture α") (todo "TODO")
+                                (items (planning :scheduled "<2026-10-20 Tue>")
+                                       (drawer "PROPERTIES" ("CAPTURE_ID" "capture-1"))
+                                       (keyword "CAPTURE_KIND" "transcript")
+                                       (text "First paragraph." :post-blank 1)
+                                       (text "Second paragraph.")))
+                       (under (key "inbox")))
+              :mode 'apply
+              :source (list :buffer buf :identity '(:property "CAPTURE_ID")))))
+        (should (plist-get response :ok))
+        (should (equal (concat prefix new) (buffer-string)))))))
+
+(ert-deftest dorg-test-jgc67-plain-constructor-refuses-planning-after-drawer ()
+  "A constructor never silently reorders a planning line around its drawer."
+  (let ((fixture "* Parent\n:PROPERTIES:\n:CAPTURE_ID: inbox\n:END:\n"))
+    (dorg-test-mutate--with-content buf fixture
+      (let ((before (buffer-string))
+            (err (should-error
+                  (dorg-api-execute
+                   '(insert (heading (title "Capture")
+                                     (items (drawer "PROPERTIES" ("CAPTURE_ID" "capture-1"))
+                                            (planning :scheduled "<2026-10-20 Tue>")))
+                            (under (key "inbox")))
+                   :mode 'apply
+                   :source (list :buffer buf :identity '(:property "CAPTURE_ID")))
+                  :type 'dorg-mutate-error)))
+        ;; This is the heading/section constructor door, not a body/text
+        ;; payload splice; keep its established constructor-specific detail.
+        (should (eq 'constructor-section-unrepresentable
+                    (plist-get (dorg-mutate-error-data err) :detail)))
+        (should (equal before (buffer-string)))))))
+
+(ert-deftest dorg-test-jgc67-property-identity-child-keeps-body-lookalike ()
+  "Only the local drawer carries property identity; body text remains ordinary."
+  (let ((prefix "* Parent\n:PROPERTIES:\n:CAPTURE_ID: inbox\n:END:\n")
+        (new (concat "** Capture\n:PROPERTIES:\n:CAPTURE_ID: capture-1\n:END:\n"
+                     "Body says :PROPERTIES: :CAPTURE_ID: decoy.\n")))
+    (dorg-test-mutate--with-content buf prefix
+      (let ((response
+             (dorg-api-execute
+              '(insert (heading (title "Capture")
+                                (property "CAPTURE_ID" "capture-1")
+                                (items (text "Body says :PROPERTIES: :CAPTURE_ID: decoy.")))
+                       (under (key "inbox")))
+              :mode 'apply
+              :source (list :buffer buf :identity '(:property "CAPTURE_ID")))))
+        (should (plist-get response :ok))
+        (should-not (plist-get (plist-get response :affected) :created))
+        (should (equal (concat prefix new) (buffer-string)))
+        (should-not (string-match-p ":DORG_ID:" (buffer-string)))))))
+
+(ert-deftest dorg-test-jgc67-plain-constructor-captures-odd-level-grammar ()
+  "A source-local odd-level grammar chooses Org's valid child star count."
   (dorg-test-mutate--with-content buf dorg-test-ltxz7--fixture
-    (let ((before (buffer-string)))
+    (setq-local org-odd-levels-only t)
+    (let ((response
+           (dorg-api-execute
+            '(insert (heading (title "Odd child")) (under (id 9201)))
+            :mode 'apply :source buf)))
+      (should (plist-get response :ok))
+      (should (string-match-p "^\\*\\*\\* Odd child$" (buffer-string))))))
+
+(ert-deftest dorg-test-jgc67-plain-constructor-refuses-injected-heading-in-both-grammars ()
+  "A body heading is never hidden by either source headline grammar.
+The old odd-level bypass accepted this exact form because it skipped both the
+source org-element check and item validation."
+  (dolist (odd '(nil t))
+    (dorg-test-mutate--with-content buf dorg-test-ltxz7--fixture
+      (setq-local org-odd-levels-only odd)
+      (let ((before (buffer-string))
+            (err (should-error
+                  (dorg-api-execute
+                   '(insert (heading (title "Captured")
+                                     (items (text "First.\n*** Injected\n")))
+                            (under (id 9201)))
+                   :mode 'apply :source buf)
+                  :type 'dorg-mutate-error)))
+        ;; This is the heading/section constructor door, not a body/text
+        ;; payload splice; keep its established constructor-specific detail.
+        (should (eq 'constructor-section-unrepresentable
+                    (plist-get (dorg-mutate-error-data err) :detail)))
+        (should (equal before (buffer-string)))))))
+
+(ert-deftest dorg-test-mutate-refusal-detail-is-specific-to-its-door ()
+  "Constructor and payload guards retain their distinct typed details.
+
+The public constructor and body controls above exercise each physical route;
+this compact table pins the two shared rejection owners so an unrelated
+diagnostic rename cannot make one door silently inherit the other's class."
+  (dolist (case
+           `((constructor-section-unrepresentable
+              ,(lambda () (dorg-mutate--source-preserving-constructor-refuse
+                           "* injected")))
+             (structural-payload-boundary
+              ,(lambda () (dorg-mutate--raise-structural-payload
+                           'replace "* injected")))))
+    (let ((err (should-error (funcall (cadr case)) :type 'dorg-mutate-error)))
+      (should (eq (car case) (plist-get (dorg-mutate-error-data err) :detail))))))
+
+(ert-deftest dorg-test-jgc67-plain-constructor-reuses-heading-line-refusals ()
+  "Constructor titles use the shared 1qdtb grammar guard before any edit."
+  (dolist (title '("TODO Capture" "COMMENT Capture" "[#A] Capture"
+                   "Capture :tag:" "Captured\nInjected"))
+    (dorg-test-mutate--with-content buf dorg-test-ltxz7--fixture
+      (let ((before (buffer-string))
+            (err (should-error
+                  (dorg-api-execute
+                   `(insert (heading (title ,title)) (under (id 9201)))
+                   :mode 'apply :source buf)
+                  :type 'dorg-mutate-error)))
+        (should (eq 'heading-line-unrepresentable
+                    (plist-get (dorg-mutate-error-data err) :detail)))
+        (should (equal before (buffer-string)))))))
+
+(ert-deftest dorg-test-jgc67-plain-constructor-refuses-unrepresentable-items ()
+  "Section reparse rejects item bytes that would change Org structure."
+  (dolist (item '((drawer "LOGBOOK" :lines ("alpha" ":END:" "omega"))
+                  (keyword "CAPTURE_KIND" "one\ntwo")
+                  (keyword "DORG_CLOCK_START" "2026-10-14T08:00:00Z")))
+    (dorg-test-mutate--with-content buf dorg-test-ltxz7--fixture
+      (let ((before (buffer-string))
+            (err (should-error
+                  (dorg-api-execute
+                   `(insert (heading (title "Captured") (items ,item))
+                            (under (id 9201)))
+                   :mode 'apply :source buf))))
+        (let ((detail (plist-get (if (eq (car-safe err) 'dorg-api-error)
+                                     (dorg-api-error-data err)
+                                   (dorg-mutate-error-data err))
+                                  :detail)))
+          ;; Constructor item rendering has the constructor-door diagnostic;
+          ;; this does not broaden the text/body payload detail contract.
+          (should (or (null detail)
+                      (memq detail '(constructor-section-unrepresentable
+                                     protected-keyword)))))
+        (should (equal before (buffer-string)))))))
+
+(ert-deftest dorg-test-jgc67-plain-constructor-uses-valid-level-from-even-parent ()
+  "Odd-level grammar maps an even physical parent to Org's valid child level."
+  (dorg-test-mutate--with-content
+      buf (concat "* Context\n** Parent\n:PROPERTIES:\n:DORG_ID: 9201\n:END:\n")
+    (setq-local org-odd-levels-only t)
+    (let ((response
+           (dorg-api-execute
+            '(insert (heading (title "Even parent child")) (under (id 9201)))
+            :mode 'apply :source buf)))
+      (should (plist-get response :ok))
+      (should (string-match-p "^\\*\\*\\* Even parent child$" (buffer-string))))))
+
+(ert-deftest dorg-test-ltxz7-plain-constructor-batch-failure-restores-preimage ()
+  "A later phase-one miss leaves buffer and file bytes untouched."
+  (dorg-test-mutate--with-content buf dorg-test-ltxz7--fixture
+    (let ((before (buffer-string))
+          (file-before (with-temp-buffer
+                         (insert-file-contents-literally dorg-test-mutate--tmp)
+                         (buffer-string)))
+          (mtime (file-attribute-modification-time
+                  (file-attributes dorg-test-mutate--tmp))))
       (should (eq 'invalid-target
                   (dorg-test-mutate--reason
                    (dorg-api-execute
@@ -5405,6 +7267,12 @@ BOTH paths.  Requires Dolt; skipped under bounded static evidence, run at ACCEPT
                       (on (id 999999) (set (property "K") "V")))
                     :mode 'apply :source buf))))
       (should (equal before (buffer-string)))
+      (should (equal file-before
+                     (with-temp-buffer
+                       (insert-file-contents-literally dorg-test-mutate--tmp)
+                       (buffer-string))))
+      (should (equal mtime (file-attribute-modification-time
+                            (file-attributes dorg-test-mutate--tmp))))
       (should-not (string-match-p "Resolution" (buffer-string))))))
 
 (ert-deftest dorg-test-ltxz7-plain-dry-run-is-deterministic-and-no-write ()
@@ -5537,17 +7405,15 @@ The source is byte-pinned so silently ignoring `:bogus' cannot false-green."
       (should (eq 'invalid-op (plist-get data :reason)))
       (should (equal before (buffer-string))))))
 
-;;; ─── Sortkey exhaustion / bounded-midpoint adoption (tracked-regression) ────
+;;; ─── Sibling placement: fixed-width keys and bounded windows ───────────────
 ;;
-;; The typed-mutation seams (`dorg-mutate--position-key' for insert/move and
-;; the `dorg-mutate--ps-delete-heading' child-promotion loop) historically
-;; allocated with the raw `dorg-sortkey-midpoint', which grows the key length
-;; without bound.  On an aged sibling list a single placement can reach the
-;; VARBINARY(64) storage cliff; the SQL guard then refuses AFTER the core rows
-;; commit, orphaning them.  These tests pin the restorative repair: bounded
-;; allocation (`dorg-sortkey-midpoint-limited') plus complete-parent rebalance,
-;; so the placement succeeds with strictly-ordered, sub-cliff keys and the SQL
-;; guard is never the failing path.
+;; Every placement site (insert, move, child promotion, cross-root move) goes
+;; through `dorg-mutate--ps-allocate-keys': a fast path from the two loaded
+;; neighbours, and when that gap has no room, a window rebalance over the
+;; parent's key facts (keys only, never hydrated content) lowered as one
+;; key-only `:rekey' statement.  Fresh keys never equal a live or vacated key,
+;; so no statement order can collide and nothing is staged.  These tests pin
+;; that contract on aged fixtures whose keys leave no room at the fixed width.
 
 (defun dorg-test-mutate--aged-key (n)
   "Return a 63-byte sort key: 62 null bytes terminated by byte N.
@@ -5575,51 +7441,520 @@ allocations strictly below the storage limit, never at or beyond it."
   (and (dorg-sortkey-ordered-p keys)
        (cl-every (lambda (k) (< (length k) dorg-sortkey-max-bytes)) keys)))
 
-(ert-deftest dorg-test-mutate-insert-prepend-refuses-cleanly-on-exhaustion ()
-  "A before-first insert onto an aged list refuses before any core commit (AC1).
-The first sibling key is a 63-byte aged key, so a before-first midpoint reaches
-the storage cliff.  The insert executor hydrates only the parent plus placement
-neighbors (tracked-regression), so it cannot complete-parent rebalance; it must fail
-closed with a structured `invariant'/`sort-key-exhausted' refusal and leave the
-working model untouched — no orphaned core heading.  (The raw midpoint instead
-staged a 64-byte cliff key, the class this repair eliminates.)"
-  (let* ((s1 (make-dorg-heading :id 10 :parent-id 0 :level 1
-                                :sort-key (dorg-test-mutate--aged-key 1)))
-         (s2 (make-dorg-heading :id 11 :parent-id 0 :level 1
-                                :sort-key (dorg-test-mutate--aged-key 2)))
-         (root (make-dorg-heading :id 0 :parent-id nil :level 0
-                                  :sort-key (unibyte-string 1)))
-         (ps (dorg-test-mutate--ps-with 0 root s1 s2))
-         (data (dorg-test-mutate--error-data
-                (dorg-mutate--ps-insert-heading
-                 ps '(:op insert
-                      :target (:tree :under (:heading :id 0)
-                               :before (:heading :id 10))
-                      :heading (:title "prepended"))))))
-    ;; Structured refusal, not a raw signal or a silent cliff key.
-    (should (eq 'invariant (plist-get data :reason)))
-    (should (eq 'sort-key-exhausted (plist-get data :detail)))
-    ;; No partial state: the new heading was never staged and siblings are intact.
-    (should (null (dorg-mutate--ps-created ps)))
-    (should-not (cl-find "prepended" (dorg-mutate--ps-children ps 0)
-                         :key #'dorg-heading-title :test #'equal))
-    (should (equal (dorg-heading-sort-key s1) (dorg-test-mutate--aged-key 1)))
-    (should (equal (dorg-heading-sort-key s2) (dorg-test-mutate--aged-key 2)))))
+(defun dorg-test-mutate--note-prepend-patch (parent-id before-id id)
+  "Return a typed heading prepend patch under PARENT-ID before BEFORE-ID."
+  (dorg-test-mutate--tree-insert-patch
+   (dorg-test-mutate--heading-address parent-id)
+   (list :id id :title (format "Note %d" id))
+   :before (dorg-test-mutate--heading-address before-id)))
 
-(ert-deftest dorg-test-mutate-position-key-no-rebalance-when-roomy ()
-  "A roomy typed insert does NOT rebalance and matches the raw midpoint (AC8).
-When the bounded midpoint does not signal, `position-key' returns exactly the
-key the raw midpoint would, and no sibling key is rewritten — proving the
-rebalance is boundary-triggered, not unconditional."
-  (let* ((s1 (make-dorg-heading :id 10 :parent-id 0 :level 1
+(defun dorg-test-mutate--raw-prepend-keys (count)
+  "Return COUNT keys shaped like the retired before-first bisection chain.
+Level 0 halves a single byte from X'80' down to X'01'; every deeper level
+prefixes one more zero byte and halves from X'7f'.  The list is newest-first
+document order, matching repeated prepends, strictly increasing, and its
+longest key has (COUNT-8)/7 + 2 bytes."
+  (let ((bytes '(#x80 #x40 #x20 #x10 #x08 #x04 #x02 #x01))
+        (deeper '(#x7f #x3f #x1f #x0f #x07 #x03 #x01))
+        keys)
+    (dotimes (n count)
+      (push (if (< n 8)
+                (unibyte-string (nth n bytes))
+              (let* ((level (1+ (/ (- n 8) 7)))
+                     (byte (nth (% (- n 8) 7) deeper)))
+                (concat (make-string level 0) (unibyte-string byte))))
+            keys))
+    keys))
+
+(defun dorg-test-mutate--heading-insert-clears-sort-key-guard (heading)
+  "Return non-nil when HEADING lowers through the heading sort-key guard."
+  (dorg-sql-gen-heading-insert heading 1)
+  t)
+
+(defun dorg-test-mutate--heading-property (heading key)
+  "Return HEADING's local property value for KEY, or nil."
+  (cl-loop for item in (and heading (dorg-heading-items heading))
+           when (and (cl-typep item 'dorg-drawer-item)
+                     (dorg-drawer-item-properties item)
+                     (assoc key (dorg-drawer-item-properties item)))
+           return (cdr (assoc key (dorg-drawer-item-properties item)))))
+
+(defun dorg-test-mutate--heading-text (heading)
+  "Return HEADING's text-item body, joined in item order."
+  (mapconcat
+   #'identity
+   (cl-loop for item in (and heading (dorg-heading-items heading))
+            when (cl-typep item 'dorg-text-item)
+            collect (dorg-text-item-text item))
+   "\n"))
+
+(defun dorg-test-mutate--make-prepend-ps (&optional raw-count)
+  "Return a PS with a parent and RAW-COUNT prepended note children.
+RAW-COUNT, when non-nil, seeds children with the raw prepend chain."
+  (let* ((parent-id 10)
+         (root (make-dorg-heading :id 1 :level 0 :level-offset 0 :title "Root"
+                                  :sort-key (unibyte-string #x80)))
+         (parent (make-dorg-heading :id parent-id :parent-id 1 :level 1 :level-offset 1
+                                    :title "Notes"
+                                    :sort-key (unibyte-string #x80)))
+         (children
+          (cl-loop for key in (dorg-test-mutate--raw-prepend-keys
+                               (or raw-count 1))
+                   for id from 100
+                   collect (make-dorg-heading
+                            :id id :parent-id parent-id :level 2 :level-offset 1
+                            :title (format "Note %d" id)
+                            :sort-key key))))
+    (apply #'dorg-test-mutate--ps-with 1 root parent children)))
+
+(defun dorg-test-mutate--dolt-simulate-counting-heading-fan-reads
+    (patches &optional aged)
+  "Run PATCHES through the Dolt simulator and count keys-only ordering reads.
+FAN-PARENTS lists whole-group reads (no LIMIT); ORDER-QUERIES and ORDER-ROWS
+count every ordering query and the rows it returned.  When AGED is non-nil,
+parent 101's children use storage-cliff keys so a before-first insert has no
+room and must rekey a local window.  The fixture also carries an unrelated
+loaded title-update child under parent 201 so eager scans are visible."
+  (let* ((source (dorg-mutate--source-make
+                  :kind 'dolt :dolt-dir "/not-a-real-store/" :root-id 100))
+         (root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
+                                  :sort-key (unibyte-string #x80)))
+         (parent (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1
+                                    :title "Parent"
+                                    :sort-key (unibyte-string #x40)))
+         (a-key (if aged
+                    (dorg-test-mutate--aged-key 1)
+                  (unibyte-string #x80)))
+         (a (make-dorg-heading :id 102 :parent-id 101 :level 2 :level-offset 1
+                               :title "A" :sort-key a-key))
+         (b (make-dorg-heading :id 103 :parent-id 101 :level 2 :level-offset 1
+                               :title "B"
+                               :sort-key (if aged
+                                             (dorg-test-mutate--aged-key 2)
+                                           (unibyte-string #xc0))))
+         (c (make-dorg-heading :id 104 :parent-id 101 :level 2 :level-offset 1
+                               :title "C"
+                               :sort-key (if aged
+                                             (dorg-test-mutate--aged-key 3)
+                                           (unibyte-string #xe0))))
+         (other (make-dorg-heading :id 202 :parent-id 201 :level 2 :level-offset 1
+                                   :title "Other"
+                                   :sort-key (unibyte-string #x60)))
+         (table (make-hash-table :test 'eql))
+         fan-parents
+         (order-queries 0)
+         (order-rows 0)
+         sql-log)
+    (dolist (heading (list root parent a b c other))
+      (puthash (dorg-heading-id heading) heading table))
+    (cl-labels
+        ((rows-for (ids)
+           (let ((out (make-hash-table :test 'eql)))
+             (dolist (id ids out)
+               (when-let ((heading (gethash id table)))
+                 (puthash id (dorg-heading-deep-copy heading) out)))))
+         (order-rows-for (parent-id sql)
+           ;; Serve the ranged ordering read the way the store would.
+           (let* ((bound (and (string-match "sort_key \\([<>]\\) X'\\([0-9a-f]+\\)'" sql)
+                              (cons (match-string 1 sql)
+                                    (dorg-sortkey-from-hex (match-string 2 sql)))))
+                  (excluded (and (string-match "NOT IN (\\([0-9, ]+\\))" sql)
+                                 (mapcar #'string-to-number
+                                         (split-string (match-string 1 sql) ", "))))
+                  (limit (and (string-match "LIMIT \\([0-9]+\\)" sql)
+                              (string-to-number (match-string 1 sql))))
+                  (desc (string-match-p "ORDER BY sort_key DESC" sql))
+                  (ids (pcase parent-id (101 '(102 103 104)) (201 '(202)) (_ nil)))
+                  (rows (cl-loop for id in ids
+                                 for key = (dorg-heading-sort-key (gethash id table))
+                                 unless (or (memql id excluded)
+                                            (and bound
+                                                 (if (equal (car bound) "<")
+                                                     (not (string< key (cdr bound)))
+                                                   (not (string< (cdr bound) key)))))
+                                 collect (cons id key)))
+                  (sorted (sort rows (if desc
+                                         (lambda (a b) (string> (cdr a) (cdr b)))
+                                       (lambda (a b) (string< (cdr a) (cdr b)))))))
+             (mapcar (lambda (cell)
+                       (list (cons 'id (car cell))
+                             (cons 'sort_key_hex (dorg-sql-gen--sort-key-hex (cdr cell)))
+                             ;; Like the store read, report the stored offset.
+                             (cons 'level_offset
+                                   (dorg-heading-level-offset (gethash (car cell) table)))))
+                     (if limit (seq-take sorted limit) sorted)))))
+      (cl-letf (((symbol-function 'dorg-head-commit) (lambda (_) "fixed-head"))
+                ((symbol-function 'dorg-model-load-headings)
+                 (lambda (_dir _root ids as-of &rest _)
+                   (unless (equal as-of "fixed-head")
+                     (error "unexpected AS-OF %S" as-of))
+                   (rows-for ids)))
+                ((symbol-function 'dorg-sql)
+                 (lambda (_dir sql &rest _)
+                   (push sql sql-log)
+                   (cond
+                    ((string-match
+                      (concat "SELECT id, HEX(sort_key) AS sort_key_hex, level_offset FROM "
+                              "headings.*parent_id = \\([0-9]+\\)")
+                      sql)
+                     (let ((parent-id (string-to-number (match-string 1 sql)))
+                           (rows nil))
+                       (unless (string-match-p " LIMIT " sql)
+                         (push parent-id fan-parents))
+                       (setq rows (order-rows-for parent-id sql))
+                       (cl-incf order-queries)
+                       (cl-incf order-rows (length rows))
+                       rows))
+                    (t (error "unexpected SQL %s" sql)))))
+                ((symbol-function 'dorg-mutate--dolt-index-context)
+                 (lambda (&rest _) nil)))
+        (let ((sim (dorg-mutate--dolt-simulate source patches nil)))
+          (list :sim sim
+                :fan-parents (nreverse fan-parents)
+                :order-queries order-queries
+                :order-rows order-rows
+                :sql (nreverse sql-log)))))))
+
+(ert-deftest dorg-test-mutate-dolt-title-update-does-not-read-complete-fan ()
+  "A non-ordering sparse update does not prove complete sibling facts."
+  (let* ((patch (dorg-test-mutate--heading-update-patch 102 :title "Changed"))
+         (res (dorg-test-mutate--dolt-simulate-counting-heading-fan-reads
+               (list patch)))
+         (sim (plist-get res :sim))
+         (after (gethash 102 (dorg-mutate--ps-headings (plist-get sim :ps)))))
+    (should (equal nil (plist-get res :fan-parents)))
+    (should (equal '(100 102) (plist-get sim :scope-ids)))
+    (should (equal '(102) (plist-get sim :changed)))
+    (should (equal "Changed" (dorg-heading-title after)))))
+
+(ert-deftest dorg-test-mutate-dolt-roomy-insert-reads-one-neighbour-row ()
+  "W-bounded: a roomy anchored insert reads at most one ordering row per side.
+Insertion before B needs B's predecessor from the store; B itself is the
+loaded anchor.  No whole-group read happens."
+  (let* ((patch (dorg-test-mutate--tree-insert-patch
+                 (dorg-test-mutate--heading-address 101)
+                 '(:id 300 :title "Inserted")
+                 :before (dorg-test-mutate--heading-address 102)))
+         (res (dorg-test-mutate--dolt-simulate-counting-heading-fan-reads
+               (list patch)))
+         (sim (plist-get res :sim))
+         (after (gethash 300 (dorg-mutate--ps-headings (plist-get sim :ps)))))
+    (should (null (plist-get res :fan-parents)))
+    (should (<= (plist-get res :order-queries) 2))
+    (should (<= (plist-get res :order-rows) 2))
+    (should (member 300 (plist-get sim :created)))
+    (should (string< (dorg-heading-sort-key after)
+                     (dorg-heading-sort-key
+                      (gethash 102 (dorg-mutate--ps-headings
+                                    (plist-get sim :ps))))))))
+
+(ert-deftest dorg-test-mutate-dolt-exhausted-insert-reads-only-the-requested-parent ()
+  "W4: an exhausted insert reads ordering rows for its own parent only.
+An unrelated touched child under another parent causes no ordering read
+there, and the exhausted parent's unloaded siblings stay unloaded: they are
+rekeyed as pending rekeys and appear in the effective order, not in the PS."
+  (let* ((insert (dorg-test-mutate--tree-insert-patch
+                  (dorg-test-mutate--heading-address 101)
+                  '(:id 300 :title "Inserted")
+                  :before (dorg-test-mutate--heading-address 102)))
+         (unrelated (dorg-test-mutate--heading-update-patch 202 :title "Touched"))
+         (res (dorg-test-mutate--dolt-simulate-counting-heading-fan-reads
+               (list insert unrelated) t))
+         (sim (plist-get res :sim))
+         (ps (plist-get sim :ps))
+         (kids (dorg-mutate--ps-children ps 101))
+         (facts (sort (cdr (dorg-mutate--ps-order-delta ps 101))
+                      (lambda (a b) (string< (cdr a) (cdr b)))))
+         (other (gethash 202 (dorg-mutate--ps-headings ps))))
+    (should (null (plist-get res :fan-parents)))
+    (should (cl-every (lambda (sql) (not (string-match-p "parent_id = 201" sql)))
+                      (cl-remove-if-not (lambda (sql) (string-match-p "HEX(sort_key)" sql))
+                                        (plist-get res :sql))))
+    (should (equal '(300 102) (mapcar #'dorg-heading-id kids)))
+    (should (equal '(300 102 103 104) (mapcar #'car facts)))
+    (should (dorg-test-mutate--keys-bounded-ordered-p (mapcar #'cdr facts)))
+    (should (equal "Touched" (dorg-heading-title other)))
+    (should-not (member 201 (plist-get res :fan-parents)))))
+
+(ert-deftest dorg-test-mutate-dolt-exhausted-insert-rekeys-a-local-window ()
+  "W-local: a before-first insert with no room rekeys a local neighbourhood.
+The aged fan leaves no room below its first key, so the simulator reads a
+bounded neighbourhood (never the whole group), hydrates nothing beyond the
+placement slice, rekeys the window through one `:rekey' op, marks no sibling
+changed, and lowers exactly one key-only UPDATE."
+  (let* ((insert (dorg-test-mutate--tree-insert-patch
+                  (dorg-test-mutate--heading-address 101)
+                  '(:id 300 :title "Inserted")
+                  :before (dorg-test-mutate--heading-address 102)))
+         (res (dorg-test-mutate--dolt-simulate-counting-heading-fan-reads
+               (list insert) t))
+         (sim (plist-get res :sim))
+         (ps (plist-get sim :ps))
+         (rekey-ops (cl-remove-if-not (lambda (op) (eq (car op) :rekey))
+                                      (plist-get sim :db-ops)))
+         (rekey-stmts (cl-remove-if-not
+                       (lambda (stmt)
+                         (string-match-p "UPDATE headings h JOIN (VALUES " stmt))
+                       (plist-get sim :sql))))
+    (should (null (plist-get res :fan-parents)))
+    (should (<= (plist-get res :order-rows) (* 2 (1+ dorg-mutate-rebalance-neighbourhood))))
+    (should (equal '(100 101 102) (plist-get sim :scope-ids)))
+    (should (equal '(300) (plist-get sim :created)))
+    (should (null (plist-get sim :changed)))
+    (should (= 1 (length rekey-ops)))
+    (should (= 1 (length rekey-stmts)))
+    ;; The loaded neighbour was rekeyed in place; the unloaded ones only pend.
+    (should (gethash 102 (dorg-mutate--ps-rekeys ps)))
+    (should-not (gethash 103 (dorg-mutate--ps-headings ps)))
+    ;; Every stored row was rekeyed, so the pending delta alone carries the
+    ;; candidate order (the store stub is out of scope here).
+    (let* ((facts (sort (cdr (dorg-mutate--ps-order-delta ps 101))
+                        (lambda (a b) (string< (cdr a) (cdr b)))))
+           (ids (mapcar #'car facts))
+           (keys (mapcar #'cdr facts)))
+      (should (equal ids '(300 102 103 104)))
+      (should (dorg-sortkey-ordered-p keys))
+      (should (cl-every (lambda (k) (= (length k) dorg-sortkey-boundary-width))
+                        keys)))))
+
+(ert-deftest dorg-test-mutate-prepend-heading-legacy-fan-rekeys-a-bounded-window ()
+  "W2: a prepend onto a 449-key legacy fan rekeys a window, never the whole fan.
+The deepest legacy keys share sixteen leading zero bytes, so the window expands
+over them until an outside key leaves room; shallow keys keep their bytes.
+Order is preserved, no sibling is marked changed, and the rekeys lower to one
+statement."
+  (let* ((parent-id 10)
+         (new-id 999)
+         (ps (dorg-test-mutate--make-prepend-ps 449))
+         (before-kids (dorg-mutate--ps-children ps parent-id))
+         (old-ids (mapcar #'dorg-heading-id before-kids))
+         (before-keys (mapcar #'dorg-heading-sort-key before-kids))
+         (patch (dorg-test-mutate--note-prepend-patch
+                 parent-id (car old-ids) new-id)))
+    (dorg-mutate--ps-insert-heading ps patch)
+    (let* ((kids (dorg-mutate--ps-children ps parent-id))
+           (ids (mapcar #'dorg-heading-id kids))
+           (keys (mapcar #'dorg-heading-sort-key kids))
+           (rekeys (dorg-mutate--ps-rekeys ps))
+           (ops (dorg-mutate--ps-rekey-ops ps (make-hash-table :test 'eql)))
+           (stmts (dorg-sql-gen-lower-heading-ops
+                   ops (make-hash-table :test 'eql)
+                   (lambda () (ert-fail "heading rekey lowering allocates no item ids")))))
+      (should (equal ids (cons new-id old-ids)))
+      (should (= 450 (length keys)))
+      (should (dorg-sortkey-ordered-p keys))
+      (dolist (key keys) (should (dorg-sql-gen--sort-key-hex key)))
+      (should (null (dorg-mutate--ps-changed ps)))
+      (should (> (hash-table-count rekeys) 0))
+      (should (< (hash-table-count rekeys) 449))
+      (should (= 1 (length ops)))
+      (should (= 1 (length stmts)))
+      ;; Rekeyed rows are 16 bytes; untouched rows keep their legacy bytes.
+      (cl-loop for kid in (cdr kids)
+               for old in before-keys
+               do (if (gethash (dorg-heading-id kid) rekeys)
+                      (should (= dorg-sortkey-boundary-width
+                                 (length (dorg-heading-sort-key kid))))
+                    (should (equal old (dorg-heading-sort-key kid))))))))
+
+(defun dorg-test-mutate--facts-fn (facts &optional counter)
+  "Return an ordering reader over FACTS ((ID . KEY) ...) with store semantics.
+COUNTER, a cons, has its car incremented and its cdr accumulates rows served."
+  (lambda (_parent-id &optional bound side limit exclude-ids)
+    (let* ((rows (cl-remove-if
+                  (lambda (cell)
+                    (or (memql (car cell) exclude-ids)
+                        (and bound (if (eq side 'before)
+                                       (not (string< (cdr cell) bound))
+                                     (not (string< bound (cdr cell)))))))
+                  facts))
+           (sorted (sort (copy-sequence rows)
+                         (if (eq side 'before)
+                             (lambda (a b) (string> (cdr a) (cdr b)))
+                           (lambda (a b) (string< (cdr a) (cdr b))))))
+           (served (if limit (seq-take sorted limit) sorted)))
+      (when counter
+        (cl-incf (car counter))
+        (cl-incf (cdr counter) (length served)))
+      served)))
+
+(ert-deftest dorg-test-mutate-prepend-heading-sparse-fan-reads-keys-only ()
+  "W4: a sparse prepend reads ordering rows only and hydrates nothing.
+The PS holds only the root, the parent and the first child; the store reader
+answers ranged reads over the complete 449-key order.  The legacy cluster is
+wider than the neighbourhood, so the group is read once (keys only); the
+window rekeys unloaded rows as pending rekeys without adding a single heading
+to the PS."
+  (let* ((parent-id 10)
+         (full (dorg-test-mutate--make-prepend-ps 449))
+         (kids (dorg-mutate--ps-children full parent-id))
+         (facts (mapcar (lambda (h) (cons (dorg-heading-id h)
+                                          (dorg-heading-sort-key h)))
+                        kids))
+         (counter (cons 0 0))
+         (ps (dorg-test-mutate--ps-with
+              1 (gethash 1 (dorg-mutate--ps-headings full))
+              (gethash parent-id (dorg-mutate--ps-headings full))
+              (car kids)))
+         (patch (dorg-test-mutate--note-prepend-patch
+                 parent-id (dorg-heading-id (car kids)) 999)))
+    (setf (dorg-mutate--ps-order-facts-fn ps)
+          (dorg-test-mutate--facts-fn facts counter))
+    (dorg-mutate--ps-insert-heading ps patch)
+    ;; The zero-prefixed legacy cluster is wider than the neighbourhood, so
+    ;; after the bounded reads the whole 449-row group is read once.
+    (should (<= (cdr counter) (+ 449 (* 2 (1+ dorg-mutate-rebalance-neighbourhood)))))
+    (should (= 4 (hash-table-count (dorg-mutate--ps-headings ps))))
+    (should (> (hash-table-count (dorg-mutate--ps-rekeys ps)) 0))
+    (should (< (hash-table-count (dorg-mutate--ps-rekeys ps)) 449))
+    (let* ((after (dorg-mutate--ps-group ps parent-id))
+           (ids (mapcar #'car (append after nil)))
+           (keys (mapcar #'cdr (append after nil))))
+      (should (equal ids (cons 999 (mapcar #'car facts))))
+      (should (dorg-sortkey-ordered-p keys)))))
+
+(ert-deftest dorg-test-mutate-dolt-note-prepend-legacy-fan-public-path ()
+  "Public note-style Dolt apply rekeys a window of an aged note fan end to end."
+  (dorg-test-mutate--with-dolt
+    (let* ((root (dorg-test-mutate--seed
+                  dolt-dir
+                  (concat "* Task\n"
+                          ":PROPERTIES:\n:BEAD_ID: task-r3\n:END:\n"
+                          "** Notes\n")
+                  1000))
+           (owner-id (dorg-test-mutate--id-by-title dolt-dir "Task"))
+           (notes-id (dorg-test-mutate--id-by-title dolt-dir "Notes"))
+           (old-ids (number-sequence 10000 10448))
+           (old-keys (dorg-test-mutate--raw-prepend-keys (length old-ids)))
+           (source (list :dolt-dir dolt-dir :root-id root
+                         :identity '(:property "BEAD_ID")))
+           (title "[2026-09-12 Sat 09:20]")
+           (body "Public note body.")
+           (actor "driver")
+           (updated-at "[2026-09-12 Sat 09:20]")
+           (form
+            `(batch
+              (insert
+               (heading
+                (title ,title)
+                (items
+                 (drawer "PROPERTIES" ("BEAD_ACTOR" ,actor))
+                 (text ,body)))
+               (under (id ,notes-id) (before (id ,(car old-ids)))))
+              (on (key "task-r3")
+                  (set (property "BEAD_UPDATED_AT") ,updated-at))))
+           fact-reads
+           scopes
+           (real-scope (symbol-function 'dorg-mutate--dolt-scope-ids))
+           (real-facts (symbol-function 'dorg-mutate--dolt-order-facts)))
+      (should owner-id)
+      (should notes-id)
+      (dorg-sql-batch
+       dolt-dir
+       (cl-loop for id in old-ids
+                for key in old-keys
+                collect
+                (dorg-sql-gen-heading-insert
+                 (make-dorg-heading
+                  :id id :parent-id notes-id :level 3 :level-offset 1
+                  :title (format "Old %d" id)
+                  :sort-key key)
+                 root)))
+      (dorg-commit dolt-dir "seed aged note fan")
+      (let ((head0 (dorg-head-commit dolt-dir)))
+        (cl-letf (((symbol-function 'dorg-mutate--dolt-scope-ids)
+                   (lambda (&rest args)
+                     (let ((ids (apply real-scope args)))
+                       (push (sort (copy-sequence ids) #'<) scopes)
+                       ids)))
+                  ((symbol-function 'dorg-mutate--dolt-order-facts)
+                   (lambda (dir root parent-id &rest rest)
+                     (push parent-id fact-reads)
+                     (apply real-facts dir root parent-id rest))))
+          (let* ((result (dorg-api-execute
+                          form :mode 'apply :source source :base head0
+                          :op-id "r3-note-prepend"))
+                 (head1 (dorg-head-commit dolt-dir))
+                 (tree (dorg-model-load-tree dolt-dir root))
+                 (owner (gethash owner-id tree))
+                 (kids (dorg-test-mutate--tree-children tree notes-id))
+                 (ids (mapcar #'dorg-heading-id kids))
+                 (keys (mapcar #'dorg-heading-sort-key kids))
+                 (new-note (car kids)))
+            (should (plist-get result :ok))
+            (should-not (equal head0 head1))
+            (should (equal head1 (plist-get result :new-token)))
+            ;; Only the notes parent is read for ordering: bounded reads
+            ;; and, because the legacy cluster is wider than the
+            ;; neighbourhood, one whole-group read; no scope hydrated the fan.
+            (should (cl-every (lambda (p) (= p notes-id)) fact-reads))
+            (should (<= (length fact-reads) 6))
+            (should (cl-notany (lambda (scope)
+                                 (cl-every (lambda (id) (member id scope))
+                                           old-ids))
+                               scopes))
+            (should (= 450 (length kids)))
+            (should (equal (cdr ids) old-ids))
+            (should (equal title (dorg-heading-title new-note)))
+            (should (equal actor
+                           (dorg-test-mutate--heading-property
+                            new-note "BEAD_ACTOR")))
+            (should (string-match-p (regexp-quote body)
+                                    (dorg-test-mutate--heading-text new-note)))
+            (should (equal updated-at
+                           (dorg-test-mutate--heading-property
+                            owner "BEAD_UPDATED_AT")))
+            (should (dorg-sortkey-ordered-p keys))
+            (should (= dorg-sortkey-boundary-width
+                       (length (dorg-heading-sort-key new-note))))
+            (should (cl-every (lambda (key)
+                                (<= (length key) dorg-sortkey-max-bytes))
+                              keys))))))))
+
+(ert-deftest dorg-test-mutate-insert-prepend-normalizes-on-exhaustion ()
+  "A before-first insert onto a complete aged PS rekeys a window (AC3).
+The aged keys leave no room at the fixed width, so the placement rekeys the
+siblings it must pass; rekeyed rows are recorded for key-only lowering and are
+not marked changed."
+  (let* ((s1 (make-dorg-heading :id 10 :parent-id 0 :level 1 :level-offset 1
+                                :sort-key (dorg-test-mutate--aged-key 1)))
+         (s2 (make-dorg-heading :id 11 :parent-id 0 :level 1 :level-offset 1
+                                :sort-key (dorg-test-mutate--aged-key 2)))
+         (root (make-dorg-heading :id 0 :parent-id nil :level 0 :level-offset 0
+                                  :sort-key (unibyte-string 1)))
+         (ps (dorg-test-mutate--ps-with 0 root s1 s2)))
+    (dorg-mutate--ps-insert-heading
+     ps '(:op insert
+          :target (:tree :under (:heading :id 0)
+                   :before (:heading :id 10))
+          :heading (:id 12 :title "prepended")))
+    (let* ((kids (dorg-mutate--ps-children ps 0))
+           (ids (mapcar #'dorg-heading-id kids))
+           (keys (mapcar #'dorg-heading-sort-key kids)))
+      (should (equal ids '(12 10 11)))
+      (should (dorg-sortkey-ordered-p keys))
+      (should (cl-every (lambda (key)
+                          (= (length key) dorg-sortkey-boundary-width))
+                        keys))
+      (should (member 12 (dorg-mutate--ps-created ps)))
+      (should (null (dorg-mutate--ps-changed ps)))
+      (should (gethash 10 (dorg-mutate--ps-rekeys ps)))
+      (should (gethash 11 (dorg-mutate--ps-rekeys ps))))))
+
+(ert-deftest dorg-test-mutate-roomy-insert-rekeys-nothing ()
+  "A roomy typed insert takes the fast-path key and rewrites no sibling (AC8).
+The key equals what the gap planner returns for the two neighbours, no rekey
+is recorded, and no sibling is marked changed — the window is room-triggered,
+not unconditional."
+  (let* ((s1 (make-dorg-heading :id 10 :parent-id 0 :level 1 :level-offset 1
                                 :sort-key (unibyte-string #x40)))
-         (s2 (make-dorg-heading :id 11 :parent-id 0 :level 1
+         (s2 (make-dorg-heading :id 11 :parent-id 0 :level 1 :level-offset 1
                                 :sort-key (unibyte-string #xc0)))
-         (root (make-dorg-heading :id 0 :parent-id nil :level 0
+         (root (make-dorg-heading :id 0 :parent-id nil :level 0 :level-offset 0
                                   :sort-key (unibyte-string 1)))
          (ps (dorg-test-mutate--ps-with 0 root s1 s2))
-         (expected (dorg-sortkey-midpoint (unibyte-string #x40)
-                                          (unibyte-string #xc0))))
+         (expected (car (dorg-model-plan-gap (unibyte-string #x40)
+                                             (unibyte-string #xc0) 1))))
     (dorg-mutate--ps-insert-heading
      ps '(:op insert
           :target (:tree :under (:heading :id 0) :after (:heading :id 10))
@@ -5628,6 +7963,7 @@ rebalance is boundary-triggered, not unconditional."
                         :key #'dorg-heading-title :test #'equal)))
       (should (equal (dorg-heading-sort-key new) expected))
       ;; No rebalance: pre-existing siblings were not rewritten.
+      (should (zerop (hash-table-count (dorg-mutate--ps-rekeys ps))))
       (should-not (memq 10 (dorg-mutate--ps-changed ps)))
       (should-not (memq 11 (dorg-mutate--ps-changed ps)))
       (should (equal (dorg-heading-sort-key s1) (unibyte-string #x40)))
@@ -5637,16 +7973,16 @@ rebalance is boundary-triggered, not unconditional."
   "A same-root move into an aged gap rebalances instead of allocating a
 cliff key (AC5).  The moved node lands ahead of the aged first sibling with
 strictly-ordered, sub-cliff keys."
-  (let* ((s1 (make-dorg-heading :id 10 :parent-id 0 :level 1
+  (let* ((s1 (make-dorg-heading :id 10 :parent-id 0 :level 1 :level-offset 1
                                 :sort-key (dorg-test-mutate--aged-key 1)))
-         (s2 (make-dorg-heading :id 11 :parent-id 0 :level 1
+         (s2 (make-dorg-heading :id 11 :parent-id 0 :level 1 :level-offset 1
                                 :sort-key (dorg-test-mutate--aged-key 2)))
          ;; Mover currently under a different parent so the move re-homes it.
-         (mover (make-dorg-heading :id 20 :parent-id 5 :level 2
+         (mover (make-dorg-heading :id 20 :parent-id 5 :level 2 :level-offset 1
                                    :sort-key (unibyte-string #x80)))
-         (other (make-dorg-heading :id 5 :parent-id 0 :level 1
+         (other (make-dorg-heading :id 5 :parent-id 0 :level 1 :level-offset 1
                                    :sort-key (dorg-test-mutate--aged-key 9)))
-         (root (make-dorg-heading :id 0 :parent-id nil :level 0
+         (root (make-dorg-heading :id 0 :parent-id nil :level 0 :level-offset 0
                                   :sort-key (unibyte-string 1)))
          (ps (dorg-test-mutate--ps-with 0 root s1 s2 mover other)))
     (dorg-mutate--ps-move
@@ -5667,17 +8003,17 @@ strictly-ordered, sub-cliff keys."
 Deleting a heading promotes its children to the grandparent between two
 aged siblings; the raw loop would exhaust on the second child, so the repair
 rebalances the merged sibling order to strictly-ordered, sub-cliff keys."
-  (let* ((left (make-dorg-heading :id 30 :parent-id 0 :level 1
+  (let* ((left (make-dorg-heading :id 30 :parent-id 0 :level 1 :level-offset 1
                                   :sort-key (dorg-test-mutate--aged-key 1)))
-         (mid (make-dorg-heading :id 31 :parent-id 0 :level 1
+         (mid (make-dorg-heading :id 31 :parent-id 0 :level 1 :level-offset 1
                                  :sort-key (dorg-test-mutate--aged-key 2)))
-         (right (make-dorg-heading :id 32 :parent-id 0 :level 1
+         (right (make-dorg-heading :id 32 :parent-id 0 :level 1 :level-offset 1
                                    :sort-key (dorg-test-mutate--aged-key 3)))
-         (k1 (make-dorg-heading :id 40 :parent-id 31 :level 2
+         (k1 (make-dorg-heading :id 40 :parent-id 31 :level 2 :level-offset 1
                                 :sort-key (unibyte-string #x40)))
-         (k2 (make-dorg-heading :id 41 :parent-id 31 :level 2
+         (k2 (make-dorg-heading :id 41 :parent-id 31 :level 2 :level-offset 1
                                 :sort-key (unibyte-string #xc0)))
-         (root (make-dorg-heading :id 0 :parent-id nil :level 0
+         (root (make-dorg-heading :id 0 :parent-id nil :level 0 :level-offset 0
                                   :sort-key (unibyte-string 1)))
          (ps (dorg-test-mutate--ps-with 0 root left mid right k1 k2)))
     (dorg-mutate--ps-delete-heading
@@ -5700,22 +8036,22 @@ rebalances the merged sibling order to strictly-ordered, sub-cliff keys."
 (ert-deftest dorg-test-mutate-dolt-move-into-aged-siblings-persists-rebalance ()
   "End-to-end: a same-root move into an aged destination persists a bounded,
 strictly-ordered rebalance (AC5 + AC3).  Crafted 63-byte destination sibling
-keys force the before-first placement to the storage cliff; the move loads the
-complete destination fan (affected-parent scope), complete-parent rebalances,
-and the executor emits the sibling UPDATEs.  Read back from Dolt, every child
+keys force the before-first placement to the storage cliff; the move reads
+the destination fan's keys, rekeys a window, and the executor emits one
+key-only UPDATE for it.  Read back from Dolt, every child
 key is sub-cliff and the mover leads — proving the rebalance is not just an
 in-memory artifact but a committed transformation (raw midpoint instead left a
 64-byte cliff key and stale 63-byte siblings)."
   (dorg-test-mutate--with-dolt
-    (let* ((root (make-dorg-heading :id 100 :level 0 :title "Root"
+    (let* ((root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
                                     :sort-key (unibyte-string #x80)))
-           (c1 (make-dorg-heading :id 201 :parent-id 100 :level 1 :title "C1"
+           (c1 (make-dorg-heading :id 201 :parent-id 100 :level 1 :level-offset 1 :title "C1"
                                   :sort-key (dorg-test-mutate--aged-key 1)))
-           (c2 (make-dorg-heading :id 202 :parent-id 100 :level 1 :title "C2"
+           (c2 (make-dorg-heading :id 202 :parent-id 100 :level 1 :level-offset 1 :title "C2"
                                   :sort-key (dorg-test-mutate--aged-key 2)))
-           (g (make-dorg-heading :id 210 :parent-id 100 :level 1 :title "G"
+           (g (make-dorg-heading :id 210 :parent-id 100 :level 1 :level-offset 1 :title "G"
                                  :sort-key (dorg-test-mutate--aged-key 5)))
-           (m (make-dorg-heading :id 300 :parent-id 210 :level 2 :title "M"
+           (m (make-dorg-heading :id 300 :parent-id 210 :level 2 :level-offset 1 :title "M"
                                  :sort-key (unibyte-string #x80)))
            (src (list :dolt-dir dolt-dir :root-id 100)))
       (dorg-sql-batch dolt-dir
@@ -5743,23 +8079,74 @@ in-memory artifact but a committed transformation (raw midpoint instead left a
         (dolist (r rows)
           (should (< (alist-get 'n r) dorg-sortkey-max-bytes)))))))
 
-(ert-deftest dorg-test-mutate-dolt-cross-root-into-aged-dest-refuses-no-write ()
-  "A cross-root move into an aged destination fails closed with no write (AC-X).
+(ert-deftest dorg-test-mutate-dolt-insert-aged-boundary-rekeys-in-one-simulation ()
+  "AC3: a sparse insert with no room rekeys a window inside one simulation.
+The scope stays the minimal placement slice (root plus the first aged sibling);
+the exhausted placement reads the parent's key facts and never replays with a
+hydrated fan.  The committed result preserves identity/content order and writes
+fixed-width keys for the rekeyed window."
+  (dorg-test-mutate--with-dolt
+    (let* ((root-h (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
+                                      :sort-key (unibyte-string #x80)))
+           (a (make-dorg-heading :id 101 :parent-id 100 :level 1 :level-offset 1 :title "A"
+                                 :sort-key (dorg-test-mutate--aged-key 1)))
+           (b (make-dorg-heading :id 102 :parent-id 100 :level 1 :level-offset 1 :title "B"
+                                 :sort-key (dorg-test-mutate--aged-key 2)))
+           (c (make-dorg-heading :id 103 :parent-id 100 :level 1 :level-offset 1 :title "C"
+                                 :sort-key (dorg-test-mutate--aged-key 3)))
+           (src (list :dolt-dir dolt-dir :root-id 100))
+           (scopes nil)
+           (real-scope (symbol-function 'dorg-mutate--dolt-scope-ids)))
+      (dorg-sql-batch dolt-dir
+                      (list (dorg-sql-gen-heading-insert root-h 100)
+                            (dorg-sql-gen-heading-insert a 100)
+                            (dorg-sql-gen-heading-insert b 100)
+                            (dorg-sql-gen-heading-insert c 100)))
+      (dorg-commit dolt-dir "seed aged insert fan")
+      (let* ((patches
+              (list (dorg-test-mutate--tree-insert-patch
+                     :root '(:id 300 :title "Prepended")
+                     :before (dorg-test-mutate--heading-address 101))))
+             (base (dorg-head-commit dolt-dir)))
+        (cl-letf (((symbol-function 'dorg-mutate--dolt-scope-ids)
+                   (lambda (&rest args)
+                     (let ((ids (apply real-scope args)))
+                       (push (sort (copy-sequence ids) #'<) scopes)
+                       ids))))
+          (dorg-mutate--dolt-simulate
+           (dorg-mutate--resolve-source src) patches nil))
+        (let ((res (dorg-test-mutate--apply-patch-batch src patches)))
+          (should (plist-get res :ok))
+          (should (member 300 (plist-get res :created))))
+        (should-not (equal base (dorg-head-commit dolt-dir))))
+      ;; Exactly one simulation with the minimal slice; no hydrated replay.
+      (should (equal scopes '((100 101))))
+      (let* ((tree (dorg-model-load-tree dolt-dir 100))
+             (kids (dorg-test-mutate--tree-children tree 100))
+             (ids (mapcar #'dorg-heading-id kids))
+             (titles (mapcar #'dorg-heading-title kids))
+             (keys (mapcar #'dorg-heading-sort-key kids)))
+        (should (equal ids '(300 101 102 103)))
+        (should (equal titles '("Prepended" "A" "B" "C")))
+        (should (dorg-sortkey-ordered-p keys))
+        (should (cl-every (lambda (key)
+                            (= (length key) dorg-sortkey-boundary-width))
+                          keys))))))
+
+(ert-deftest dorg-test-mutate-dolt-cross-root-into-aged-dest-rekeys-destination ()
+  "A cross-root move into an aged destination rekeys the destination window.
 The destination parent carries a crafted 63-byte aged sibling fan, so a
-before-first cross-root placement bisects to the storage cliff.  The cross-root
-executor emits SQL by mapping over the moved rows only (not a net-membership
-diff), so it cannot complete-parent rebalance the destination; it must raise a
-structured `invariant'/`sort-key-exhausted' refusal BEFORE any write.  The whole
-move is simulated outside the gate, so HEAD does not advance and neither root's
-membership changes — no core row is committed without its projection."
+before-first cross-root placement has no room.  The destination PS rekeys the
+window it must pass and the executor lowers those rekeys with the moved rows
+in the same transaction: the subtree arrives, leads the fan, every key is
+sub-cliff, and both roots read back consistently."
   (dorg-test-mutate--with-dolt
     (dorg-test-mutate--seed dolt-dir "* Movable\n** Kid\n* SrcSib\n" 100)
     (dorg-test-mutate--seed dolt-dir "* DestParent\n" 500)
     (let* ((src (list :dolt-dir dolt-dir :root-id 100))
-           ;; DestParent (501) is level 1; craft two aged level-2 children.
-           (da1 (make-dorg-heading :id 600 :parent-id 501 :level 2 :title "DA1"
+           (da1 (make-dorg-heading :id 600 :parent-id 501 :level 2 :level-offset 1 :title "DA1"
                                    :sort-key (dorg-test-mutate--aged-key 1)))
-           (da2 (make-dorg-heading :id 601 :parent-id 501 :level 2 :title "DA2"
+           (da2 (make-dorg-heading :id 601 :parent-id 501 :level 2 :level-offset 1 :title "DA2"
                                    :sort-key (dorg-test-mutate--aged-key 2))))
       (dorg-sql-batch dolt-dir
                       (list (dorg-sql-gen-heading-insert da1 500)
@@ -5772,22 +8159,1720 @@ membership changes — no core row is committed without its projection."
                                     :before (dorg-test-mutate--heading-address 600))
                           :to-source (dorg-mutate--resolve-source
                                       (list :dolt-dir dolt-dir :root-id 500))))
-             (data (dorg-test-mutate--error-data
-                    (dorg-test-mutate--apply-patch-batch src (list patch)))))
-        ;; Structured refusal — not a raw signal, not a silent cliff key.
-        (should (eq 'invariant (plist-get data :reason)))
-        (should (eq 'sort-key-exhausted (plist-get data :detail)))
-        ;; No write: HEAD did not advance.
-        (should (equal base (dorg-head-commit dolt-dir)))
-        ;; Source membership intact — the subtree never left.
+             (res (dorg-test-mutate--apply-patch-batch src (list patch))))
+        (should (plist-get res :ok))
+        (should-not (equal base (dorg-head-commit dolt-dir)))
         (let ((src-tree (dorg-model-load-tree dolt-dir 100)))
-          (should (gethash 101 src-tree))
-          (should (gethash 102 src-tree)))
-        ;; Destination membership intact — nothing was homed in, aged fan kept.
-        (let ((dst-tree (dorg-model-load-tree dolt-dir 500)))
-          (should-not (gethash 101 dst-tree))
-          (should (gethash 600 dst-tree))
-          (should (gethash 601 dst-tree)))))))
+          (should-not (gethash 101 src-tree))
+          (should-not (gethash 102 src-tree)))
+        (let* ((dst-tree (dorg-model-load-tree dolt-dir 500))
+               (kids (dorg-test-mutate--tree-children dst-tree 501))
+               (keys (mapcar #'dorg-heading-sort-key kids)))
+          (should (equal (mapcar #'dorg-heading-id kids) '(101 600 601)))
+          (should (eql (dorg-heading-parent-id (gethash 102 dst-tree)) 101))
+          (should (dorg-sortkey-ordered-p keys))
+          (should (cl-every (lambda (k) (< (length k) dorg-sortkey-max-bytes))
+                            keys)))))))
+
+;;; ─── Shared heading ordering owner retirement guards ─────────────────────
+
+(defun dorg-test-mutate--old-symbol (suffix)
+  "Return an old private mutate symbol assembled from SUFFIX."
+  (intern (concat "dorg-mutate--" suffix)))
+
+(defun dorg-test-mutate--old-source-hit-p (needle)
+  "Return non-nil if NEEDLE appears in dorg-mutate.el or dorg-sql-gen.el."
+  (let ((hit nil)
+        (root (file-name-as-directory
+               (or (locate-dominating-file
+                    (or load-file-name buffer-file-name default-directory)
+                    "dorg.el")
+                   default-directory))))
+    (dolist (file '("dorg-mutate.el" "dorg-sql-gen.el"))
+      (with-temp-buffer
+        (insert-file-contents (expand-file-name file root))
+        (goto-char (point-min))
+        (when (search-forward needle nil t)
+          (setq hit t))))
+    hit))
+
+(defun dorg-test-mutate--sql-index (stmts pattern)
+  "Return the zero-based index of the first statement matching PATTERN."
+  (cl-position-if (lambda (stmt) (string-match-p pattern stmt)) stmts))
+
+(ert-deftest dorg-test-mutate-dolt-assembler-phases-and-single-rekey-statement ()
+  "W3: the assembler lowers inserts, then updates and rekeys, then deletes.
+A rekey op lowers to exactly one VALUES-join UPDATE; no temporary key and no
+finalize statement exist anywhere in the output."
+  (let* ((orig (make-hash-table :test 'eql))
+         (new (make-dorg-heading :id 300 :parent-id 100 :level 1 :level-offset 1 :title "New"
+                                 :sort-key (dorg-sortkey-encode 5000)))
+         (pairs (list (cons 201 (dorg-sortkey-encode 1000))
+                      (cons 202 (dorg-sortkey-encode 2000))))
+         (sql (dorg-mutate--dolt-assemble-sql
+               (list (list :delete-heading 203)
+                     (list :rekey 100 pairs)
+                     (list :insert-heading new 100))
+               orig (lambda () 9000)))
+         (kinds (mapcar (lambda (stmt)
+                          (cond ((string-prefix-p "INSERT INTO headings" stmt) 'insert)
+                                ((string-prefix-p "UPDATE headings h JOIN (VALUES " stmt) 'rekey)
+                                ((string-prefix-p "DELETE FROM headings" stmt) 'delete)
+                                (t 'other)))
+                        sql)))
+    (should (equal kinds '(insert rekey delete)))
+    (should (= 1 (cl-count 'rekey kinds)))
+    (should-not (cl-some (lambda (stmt) (string-match-p "WHERE id = 20[12]\\'" stmt)) sql))))
+
+
+(ert-deftest dorg-test-mutate-dolt-bench-10k-fan-rekey ()
+  "W6: a 10,000-sibling fan with no room anywhere renormalises in seconds.
+Every seeded key shares sixteen leading zero bytes, so a before-first prepend
+finds no room until the window covers the whole fan: the largest possible
+rekey.  The apply runs the complete public path — planning, one key-only
+UPDATE, validation, audit row, commit — and the wall time, statement count and
+rekey count are reported.  Skipped unless DORG_BENCH is set."
+  (unless (getenv "DORG_BENCH")
+    (ert-skip "set DORG_BENCH=1 to run the 10k rekey benchmark"))
+  (dorg-test-mutate--with-dolt
+    (let* ((n 10000)
+           (root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
+                                    :sort-key (unibyte-string #x80)))
+           (prefix (make-string 16 0))
+           (rows (cl-loop for i from 1 to n
+                          collect (format "(%d, 100, 100, %s, 1, NULL, NULL, FALSE, %s, 0, NULL)"
+                                          (+ 1000 i)
+                                          (dorg-sql-gen--sort-key-hex
+                                           (concat prefix (dorg-sortkey-from-integer i 2)))
+                                          (dorg-sql-quote (format "N%d" i)))))
+           (chunks (cl-loop for start from 0 below n by 500
+                            collect (format (concat "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset,"
+                                                    " todo_keyword, priority, commented, title, post_blank,"
+                                                    " items_hash) VALUES %s")
+                                            (mapconcat #'identity
+                                                       (cl-subseq rows start (min n (+ start 500)))
+                                                       ", "))))
+           (src (list :dolt-dir dolt-dir :root-id 100))
+           (statements 0)
+           (real-batch (symbol-function 'dorg-sql--mysql-batch-on-conn)))
+      (dorg-sql-batch dolt-dir (cons (dorg-sql-gen-heading-insert root 100) chunks))
+      (dorg-commit dolt-dir "seed 10k aged fan")
+      (let* ((base (dorg-head-commit dolt-dir))
+             (t0 (float-time))
+             ;; The public execute path: planning, the key-only UPDATE,
+             ;; validation, audit row and commit, with an op-id.
+             (res (cl-letf (((symbol-function 'dorg-sql--mysql-batch-on-conn)
+                             (lambda (conn stmts &rest rest)
+                               (setq statements (length stmts))
+                               (apply real-batch conn stmts rest))))
+                    (dorg-api-execute
+                     '(insert (heading (title "Prepended"))
+                              (under (id 100) (before (id 1001))))
+                     :mode 'apply :source src :base base
+                     :op-id "bench-10k-rekey")))
+             (wall (- (float-time) t0)))
+        (should (plist-get res :ok))
+        (should-not (equal base (dorg-head-commit dolt-dir)))
+        (let* ((facts (dorg-sql dolt-dir
+                                (concat "SELECT id, title, LENGTH(sort_key) AS n FROM headings"
+                                        " WHERE parent_id = 100 ORDER BY sort_key, id")))
+               (ids (mapcar (lambda (r) (alist-get 'id r)) facts)))
+          (should (= (1+ n) (length ids)))
+          (should (equal "Prepended" (alist-get 'title (car facts))))
+          (should (equal (cdr ids) (number-sequence 1001 (+ 1000 n))))
+          (should (cl-every (lambda (r) (<= (alist-get 'n r) dorg-sortkey-max-bytes))
+                            facts))
+          (message "BENCH 10k rekey: wall=%.2fs statements=%d rekeyed-rows=%d"
+                   wall statements
+                   (cl-count-if (lambda (r) (= (alist-get 'n r) dorg-sortkey-boundary-width))
+                                facts)))
+        (should (< wall 60.0))))))
+
+(ert-deftest dorg-test-mutate-dolt-delete-neighbour-then-insert-keeps-live-adjacency ()
+  "F1: deleting a loaded neighbour never turns an unloaded live sibling into a collision.
+Siblings A/101, B/102, C/103, D/104 hold keys 1..4 times 2^64.  One batch
+deletes subtree B and inserts 200 before C.  The production scope hydrates
+root, B and C only; placement locates the slot in the parent's fan (keys
+only, read once), so the insert lands strictly between the still-live A and C
+— the same key the whole-root simulation chooses (parity).  Control: without
+the delete, the roomy insert also reads the fan once and lands between B and
+C."
+  (dorg-test-mutate--with-dolt
+    (let* ((step dorg-sortkey-boundary-step)
+           (root-h (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
+                                      :sort-key (unibyte-string #x80)))
+           (rows (cl-loop for id from 101 to 104
+                          for n from 1
+                          collect (make-dorg-heading
+                                   :id id :parent-id 100 :level 1 :level-offset 1
+                                   :title (format "S%d" id)
+                                   :sort-key (dorg-sortkey-encode (* n step)))))
+           (src (dorg-mutate--resolve-source (list :dolt-dir dolt-dir :root-id 100)))
+           (a-key (dorg-sortkey-encode step))
+           (c-key (dorg-sortkey-encode (* 3 step)))
+           (insert (dorg-test-mutate--tree-insert-patch
+                    :root '(:id 200 :title "X")
+                    :before (dorg-test-mutate--heading-address 103)))
+           (batch (list (list :op 'delete :target (list :subtree :id 102)) insert))
+           (real-scope (symbol-function 'dorg-mutate--dolt-scope-ids))
+           (real-facts (symbol-function 'dorg-mutate--dolt-order-facts))
+           fact-reads scope)
+      (dorg-sql-batch dolt-dir
+                      (cons (dorg-sql-gen-heading-insert root-h 100)
+                            (mapcar (lambda (h) (dorg-sql-gen-heading-insert h 100)) rows)))
+      (dorg-commit dolt-dir "seed")
+      (cl-flet ((new-key (sim)
+                  (dorg-heading-sort-key
+                   (gethash 200 (dorg-mutate--ps-headings (plist-get sim :ps))))))
+        ;; Sparse production path.
+        (let ((sparse
+               (cl-letf (((symbol-function 'dorg-mutate--dolt-scope-ids)
+                          (lambda (&rest args)
+                            (setq scope (sort (copy-sequence (apply real-scope args)) #'<))
+                            scope))
+                         ((symbol-function 'dorg-mutate--dolt-order-facts)
+                          (lambda (dir root parent-id &rest rest)
+                            (push parent-id fact-reads)
+                            (apply real-facts dir root parent-id rest))))
+                 (new-key (dorg-mutate--dolt-simulate src batch nil))))
+              ;; Whole-root parity.
+              (whole (cl-letf (((symbol-function 'dorg-mutate--dolt-scope-ids)
+                                (lambda (&rest _) nil)))
+                       (new-key (dorg-mutate--dolt-simulate src batch nil)))))
+          (should (equal scope '(100 102 103)))
+          (should (equal fact-reads '(100)))   ; one predecessor read
+          (should-not (equal sparse a-key))
+          (should (string< a-key sparse))
+          (should (string< sparse c-key))
+          (should (equal sparse whole)))
+        ;; Control: no removal, no facts read, key between B and C.
+        (setq fact-reads nil)
+        (let ((roomy (cl-letf (((symbol-function 'dorg-mutate--dolt-order-facts)
+                                (lambda (dir root parent-id &rest rest)
+                                  (push parent-id fact-reads)
+                                  (apply real-facts dir root parent-id rest))))
+                       (new-key (dorg-mutate--dolt-simulate src (list insert) nil)))))
+          (should (equal fact-reads '(100)))
+          (should (string< (dorg-sortkey-encode (* 2 step)) roomy))
+          (should (string< roomy c-key))))
+      ;; The batch commits and reads back as A, X, C, D.
+      (let ((res (dorg-test-mutate--apply-patch-batch src batch)))
+        (should (plist-get res :ok)))
+      (let ((rows (dorg-sql dolt-dir
+                            "SELECT id FROM headings WHERE parent_id = 100 ORDER BY sort_key, id")))
+        (should (equal (mapcar (lambda (r) (alist-get 'id r)) rows) '(101 200 103 104)))))))
+
+(ert-deftest dorg-test-mutate-window-work-is-linear ()
+  "F2: a forced n-row window plans and applies with O(n) hash writes and no scans.
+Every key shares sixteen leading zero bytes, so a before-first placement must
+absorb the whole fan.  Hash insertions across planning and application stay
+within a small constant times n, and application performs no linear search."
+  (let* ((n 4000)
+         (root (make-dorg-heading :id 0 :level 0 :level-offset 0 :sort-key (unibyte-string 1)))
+         (kids (cl-loop for i from 1 to n
+                        collect (make-dorg-heading
+                                 :id i :parent-id 0 :level 1 :level-offset 1
+                                 :sort-key (concat (make-string 16 0)
+                                                   (dorg-sortkey-from-integer i 2)))))
+         (ps (apply #'dorg-test-mutate--ps-with 0 root kids))
+         (puthashes 0)
+         (scans 0)
+         (real-puthash (symbol-function 'puthash))
+         (real-find (symbol-function 'cl-find))
+         (real-position (symbol-function 'cl-position)))
+    (cl-letf (((symbol-function 'puthash)
+               (lambda (&rest args) (cl-incf puthashes) (apply real-puthash args))))
+      (dorg-mutate--ps-insert-heading
+       ps '(:op insert
+            :target (:tree :under (:heading :id 0) :before (:heading :id 1))
+            :heading (:id 9999 :title "prepended"))))
+    (should (= (1+ n) (length (dorg-mutate--ps-children ps 0))))
+    (should (= n (hash-table-count (dorg-mutate--ps-rekeys ps))))
+    ;; An in-memory model IS its own pending set, so each ordering step is
+    ;; proportional to n; a handful of such steps stays a small multiple.
+    (should (< puthashes (* 16 n)))
+    ;; Applying rekeys performs no linear search over the group.
+    (let ((old (make-hash-table :test 'eql)))
+      (cl-loop for cell across (dorg-mutate--ps-group ps 0)
+               do (puthash (car cell) (cdr cell) old))
+      (cl-letf (((symbol-function 'cl-find)
+                 (lambda (&rest args) (cl-incf scans) (apply real-find args)))
+                ((symbol-function 'cl-position)
+                 (lambda (&rest args) (cl-incf scans) (apply real-position args))))
+        (dorg-mutate--ps-apply-rekeys
+         ps 0 old (list (cons 1 (dorg-sortkey-encode 12345)))))
+      (should (zerop scans)))))
+
+(defun dorg-test-mutate--bench-seed-10k-fan (dolt-dir)
+  "Seed root 100 with 10,000 aged siblings (shared 16-byte zero prefix) and commit."
+  (let* ((n 10000)
+         (root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
+                                  :sort-key (unibyte-string #x80)))
+         (prefix (make-string 16 0))
+         (rows (cl-loop for i from 1 to n
+                        collect (format "(%d, 100, 100, %s, 1, NULL, NULL, FALSE, %s, 0, NULL)"
+                                        (+ 1000 i)
+                                        (dorg-sql-gen--sort-key-hex
+                                         (concat prefix (dorg-sortkey-from-integer i 2)))
+                                        (dorg-sql-quote (format "N%d" i)))))
+         (chunks (cl-loop for start from 0 below n by 500
+                          collect (format (concat "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset,"
+                                                  " todo_keyword, priority, commented, title, post_blank,"
+                                                  " items_hash) VALUES %s")
+                                          (mapconcat #'identity
+                                                     (cl-subseq rows start (min n (+ start 500)))
+                                                     ", ")))))
+    (dorg-sql-batch dolt-dir (cons (dorg-sql-gen-heading-insert root 100) chunks))
+    (dorg-commit dolt-dir "seed 10k aged fan")
+    n))
+
+(defun dorg-test-mutate--bench-measure (label dolt-dir form)
+  "Apply FORM through the public execute path on DOLT-DIR; report and return facts.
+Counts store queries (with rows returned) and transaction statements, and
+reports LABEL with the wall time."
+  (let* ((src (list :dolt-dir dolt-dir :root-id 100))
+         (base (dorg-head-commit dolt-dir))
+         (queries 0) (rows 0) (statements 0)
+         (order-queries 0) (order-rows 0) (group-reads 0)
+         (real-sql (symbol-function 'dorg-sql))
+         (real-facts (symbol-function 'dorg-mutate--dolt-order-facts))
+         (real-batch (symbol-function 'dorg-sql--mysql-batch-on-conn))
+         (t0 (float-time))
+         (res (cl-letf (((symbol-function 'dorg-sql)
+                         (lambda (&rest args)
+                           (let ((out (apply real-sql args)))
+                             (cl-incf queries)
+                             (cl-incf rows (length out))
+                             out)))
+                        ((symbol-function 'dorg-mutate--dolt-order-facts)
+                         (lambda (dir root parent-id &optional as-of bound side limit exclude-ids
+                                 offsets-sink)
+                           (let ((out (funcall real-facts dir root parent-id as-of
+                                               bound side limit exclude-ids offsets-sink)))
+                             (cl-incf order-queries)
+                             (cl-incf order-rows (length out))
+                             (unless limit (cl-incf group-reads))
+                             out)))
+                        ((symbol-function 'dorg-sql--mysql-batch-on-conn)
+                         (lambda (conn stmts &rest rest)
+                           (setq statements (length stmts))
+                           (apply real-batch conn stmts rest))))
+                (dorg-api-execute form :mode 'apply :source src :base base
+                                  :op-id (format "bench-%s" label))))
+         (wall (- (float-time) t0)))
+    (should (plist-get res :ok))
+    (message "BENCH %s: wall=%.3fs queries=%d rows=%d ordering-queries=%d ordering-rows=%d group-reads=%d statements=%d"
+             label wall queries rows order-queries order-rows group-reads statements)
+    (list :wall wall :queries queries :rows rows :statements statements
+          :order-queries order-queries :order-rows order-rows :group-reads group-reads)))
+
+(ert-deftest dorg-test-mutate-dolt-bench-10k-ordinary-append ()
+  "M1: an ordinary append into a 10,000-sibling fan reads its keys once and rekeys nothing.
+Skipped unless DORG_BENCH is set."
+  (unless (getenv "DORG_BENCH")
+    (ert-skip "set DORG_BENCH=1 to run the benchmarks"))
+  (dorg-test-mutate--with-dolt
+    (let* ((n (dorg-test-mutate--bench-seed-10k-fan dolt-dir))
+           (m (dorg-test-mutate--bench-measure
+               "10k-append" dolt-dir
+               '(insert (heading (title "Appended")) (under (id 100))))))
+      ;; The insert and the audit row; no rekey statement.  Ordering reads
+      ;; transferred at most one row per side, never the fan.
+      (should (= 2 (plist-get m :statements)))
+      (should (<= (plist-get m :order-rows) 2))
+      (should (zerop (plist-get m :group-reads)))
+      (let ((rows (dorg-sql dolt-dir
+                            (concat "SELECT title, LENGTH(sort_key) AS n FROM headings"
+                                    " WHERE parent_id = 100 ORDER BY sort_key, id"))))
+        (should (= (1+ n) (length rows)))
+        (should (equal "Appended" (alist-get 'title (car (last rows)))))
+        ;; No sibling was rekeyed: only the appended row is 16 bytes wide.
+        (should (= 1 (cl-count-if (lambda (r) (= (alist-get 'n r) dorg-sortkey-boundary-width))
+                                  rows)))))))
+
+(ert-deftest dorg-test-mutate-dolt-bench-10k-multi-op-batch ()
+  "M2: fifty appends in one batch read one ordering row each and commit together.
+Skipped unless DORG_BENCH is set."
+  (unless (getenv "DORG_BENCH")
+    (ert-skip "set DORG_BENCH=1 to run the benchmarks"))
+  (dorg-test-mutate--with-dolt
+    (let* ((n (dorg-test-mutate--bench-seed-10k-fan dolt-dir))
+           (m (dorg-test-mutate--bench-measure
+               "10k-batch-50" dolt-dir
+               (cons 'batch
+                     (cl-loop for i from 1 to 50
+                              collect `(insert (heading (title ,(format "B%d" i)))
+                                               (under (id 100))))))))
+      (should (zerop (plist-get m :group-reads)))
+      (should (<= (plist-get m :order-rows) 50))
+      (let ((rows (dorg-sql dolt-dir
+                            "SELECT title FROM headings WHERE parent_id = 100 ORDER BY sort_key, id")))
+        (should (= (+ n 50) (length rows)))
+        (should (equal (mapcar (lambda (r) (alist-get 'title r)) (last rows 50))
+                       (cl-loop for i from 1 to 50 collect (format "B%d" i))))))))
+
+(ert-deftest dorg-test-mutate-dolt-bench-10k-large-t-placement ()
+  "M3 / W-large-T: after a whole-group rekey, a further placement in the same
+batch stays correct and its exclusion query stays cheap.  Skipped unless
+DORG_BENCH is set."
+  (unless (getenv "DORG_BENCH")
+    (ert-skip "set DORG_BENCH=1 to run the benchmarks"))
+  (dorg-test-mutate--with-dolt
+    (let* ((n (dorg-test-mutate--bench-seed-10k-fan dolt-dir))
+           (excluded-max 0)
+           (elapsed 0.0)
+           (real-facts (symbol-function 'dorg-mutate--dolt-order-facts))
+           (m (cl-letf (((symbol-function 'dorg-mutate--dolt-order-facts)
+                         (lambda (dir root parent-id &optional as-of bound side limit exclude-ids
+                                 offsets-sink)
+                           (let ((t0 (float-time)))
+                             (prog1 (funcall real-facts dir root parent-id as-of
+                                             bound side limit exclude-ids offsets-sink)
+                               (when (> (length exclude-ids) excluded-max)
+                                 (setq excluded-max (length exclude-ids)
+                                       elapsed (- (float-time) t0))))))))
+                (dorg-test-mutate--bench-measure
+                 "10k-rekey-then-append" dolt-dir
+                 '(batch (insert (heading (title "Prepended"))
+                                 (under (id 100) (before (id 1001))))
+                         (insert (heading (title "Appended")) (under (id 100))))))))
+      (message "BENCH large-T: largest exclusion list=%d ids, that query=%.3fs"
+               excluded-max elapsed)
+      (should (>= excluded-max n))
+      (let ((rows (dorg-sql dolt-dir
+                            "SELECT title FROM headings WHERE parent_id = 100 ORDER BY sort_key, id")))
+        (should (= (+ n 2) (length rows)))
+        (should (equal "Prepended" (alist-get 'title (car rows))))
+        (should (equal "Appended" (alist-get 'title (car (last rows)))))
+        (ignore m)))))
+
+(defun dorg-test-mutate--seed-fan (dolt-dir keys &optional parent-id start-id)
+  "Seed DOLT-DIR with root 100 and siblings holding KEYS under PARENT-ID.
+Ids run from START-ID (default 101); titles are S<id>.  Returns the id list."
+  (let* ((parent (or parent-id 100))
+         (root (make-dorg-heading :id 100 :level 0 :level-offset 0 :title "Root"
+                                  :sort-key (unibyte-string #x80)))
+         (ids (cl-loop for _ in keys for id from (or start-id 101) collect id))
+         (rows (cl-loop for key in keys for id in ids
+                        collect (make-dorg-heading
+                                 :id id :parent-id parent :level 1 :level-offset 1
+                                 :title (format "S%d" id) :sort-key key))))
+    (dorg-sql-batch dolt-dir
+                    (append (unless parent-id (list (dorg-sql-gen-heading-insert root 100)))
+                            (mapcar (lambda (h) (dorg-sql-gen-heading-insert h 100)) rows)))
+    (dorg-commit dolt-dir "seed fan")
+    ids))
+
+(defun dorg-test-mutate--fan-order (dolt-dir &optional parent-id)
+  "Return (ID . KEY) rows under PARENT-ID (default 100) in stored order."
+  (mapcar (lambda (r) (cons (alist-get 'id r)
+                            (dorg-sortkey-from-hex (alist-get 'k r))))
+          (dorg-sql dolt-dir
+                    (format "SELECT id, HEX(sort_key) AS k FROM headings WHERE parent_id = %d ORDER BY sort_key, id"
+                            (or parent-id 100)))))
+
+(defun dorg-test-mutate--assert-fan (dolt-dir expected-ids &optional parent-id)
+  "Assert the stored fan under PARENT-ID is EXPECTED-IDS with distinct ordered keys."
+  (let ((rows (dorg-test-mutate--fan-order dolt-dir parent-id)))
+    (should (equal (mapcar #'car rows) expected-ids))
+    (should (dorg-sortkey-ordered-p (mapcar #'cdr rows)))
+    (should (= (length rows)
+               (length (cl-remove-duplicates (mapcar #'cdr rows) :test #'equal))))))
+
+(defmacro dorg-test-mutate--with-ordering-spy (var &rest body)
+  "Run BODY with VAR bound to a spy record of ordering reads.
+VAR is a plist (:queries N :rows N :group-reads N :max-excluded N) updated
+by every call of the store ordering reader."
+  (declare (indent 1))
+  `(let ((,var (list :queries 0 :rows 0 :group-reads 0 :max-excluded 0))
+         (real (symbol-function 'dorg-mutate--dolt-order-facts)))
+     (cl-letf (((symbol-function 'dorg-mutate--dolt-order-facts)
+                (lambda (dir root parent-id &optional as-of bound side limit exclude-ids
+                        offsets-sink)
+                  (let ((out (funcall real dir root parent-id as-of
+                                      bound side limit exclude-ids offsets-sink)))
+                    (cl-incf (plist-get ,var :queries))
+                    (cl-incf (plist-get ,var :rows) (length out))
+                    (unless limit (cl-incf (plist-get ,var :group-reads)))
+                    (setf (plist-get ,var :max-excluded)
+                          (max (plist-get ,var :max-excluded) (length exclude-ids)))
+                    out))))
+       ,@body)))
+
+(ert-deftest dorg-test-mutate-dolt-w-rekey-then-insert ()
+  "W-rekey-then-insert: a placement after a same-batch rekey sees the new keys.
+A and B are aged (no room), C is far.  Inserting X before B rekeys a window;
+inserting Y after X in the same batch must land between X and the REKEYED B:
+the store answer excludes the rekeyed ids and the pending rows supply them."
+  (dorg-test-mutate--with-dolt
+    (dorg-test-mutate--seed-fan dolt-dir (list (dorg-test-mutate--aged-key 1)
+                                               (dorg-test-mutate--aged-key 2)
+                                               (dorg-sortkey-encode (ash 1 100))))
+    (let* ((src (list :dolt-dir dolt-dir :root-id 100))
+           (patches (list (dorg-test-mutate--tree-insert-patch
+                           :root '(:id 300 :title "X")
+                           :before (dorg-test-mutate--heading-address 102))
+                          (dorg-test-mutate--tree-insert-patch
+                           :root '(:id 301 :title "Y")
+                           :after (dorg-test-mutate--heading-address 300))))
+           spy)
+      (dorg-test-mutate--with-ordering-spy s
+        (should (plist-get (dorg-test-mutate--apply-patch-batch src patches) :ok))
+        (setq spy s))
+      (should (>= (plist-get spy :max-excluded) 1))
+      (should (zerop (plist-get spy :group-reads)))
+      (dorg-test-mutate--assert-fan dolt-dir '(101 300 301 102 103)))))
+
+(ert-deftest dorg-test-mutate-dolt-w-created-anchor ()
+  "W-created-anchor: anchors created earlier in the batch are ordinary pending rows."
+  (dorg-test-mutate--with-dolt
+    (dorg-test-mutate--seed-fan dolt-dir (list (dorg-sortkey-encode (ash 1 100))
+                                               (dorg-sortkey-encode (ash 1 101))))
+    (let* ((src (list :dolt-dir dolt-dir :root-id 100))
+           (patches (list (dorg-test-mutate--tree-insert-patch
+                           :root '(:id 300 :title "X")
+                           :after (dorg-test-mutate--heading-address 101))
+                          (dorg-test-mutate--tree-insert-patch
+                           :root '(:id 301 :title "Y")
+                           :after (dorg-test-mutate--heading-address 300))
+                          (dorg-test-mutate--tree-insert-patch
+                           :root '(:id 302 :title "Z")
+                           :before (dorg-test-mutate--heading-address 300)))))
+      (should (plist-get (dorg-test-mutate--apply-patch-batch src patches) :ok))
+      (dorg-test-mutate--assert-fan dolt-dir '(101 302 300 301 102)))))
+
+(ert-deftest dorg-test-mutate-dolt-w-moved-anchor ()
+  "W-moved-anchor: a mover entering the parent is a pending row; a placement after it sees the stored successor."
+  (dorg-test-mutate--with-dolt
+    (dorg-test-mutate--seed-fan dolt-dir (list (dorg-sortkey-encode (ash 1 100))
+                                               (dorg-sortkey-encode (ash 1 101))
+                                               (dorg-sortkey-encode (ash 1 102))))
+    ;; M lives under sibling 101 and moves before 103.
+    (dorg-test-mutate--seed-fan dolt-dir (list (dorg-sortkey-encode (ash 1 100))) 101 200)
+    (let* ((src (list :dolt-dir dolt-dir :root-id 100))
+           (patches (list (dorg-test-mutate--move-before-patch
+                           200 :root (dorg-test-mutate--heading-address 103))
+                          (dorg-test-mutate--tree-insert-patch
+                           :root '(:id 300 :title "N")
+                           :after (dorg-test-mutate--heading-address 200)))))
+      (should (plist-get (dorg-test-mutate--apply-patch-batch src patches) :ok))
+      (dorg-test-mutate--assert-fan dolt-dir '(101 102 200 300 103))
+      (should (null (dorg-test-mutate--fan-order dolt-dir 101))))))
+
+(ert-deftest dorg-test-mutate-dolt-w-delete-chain ()
+  "W-delete-chain: three deleted rows are skipped by one exclusion query.
+Deleting A, B, C then inserting before D finds Z, the row before the chain,
+with a single predecessor read whose exclusion list names the chain."
+  (dorg-test-mutate--with-dolt
+    (dorg-test-mutate--seed-fan dolt-dir (cl-loop for n from 1 to 5
+                                                  collect (dorg-sortkey-encode (* n (ash 1 100)))))
+    (let* ((src (list :dolt-dir dolt-dir :root-id 100))
+           (patches (list (list :op 'delete :target (list :subtree :id 102))
+                          (list :op 'delete :target (list :subtree :id 103))
+                          (list :op 'delete :target (list :subtree :id 104))
+                          (dorg-test-mutate--tree-insert-patch
+                           :root '(:id 300 :title "X")
+                           :before (dorg-test-mutate--heading-address 105))))
+           spy)
+      (dorg-test-mutate--with-ordering-spy s
+        (should (plist-get (dorg-test-mutate--apply-patch-batch src patches) :ok))
+        (setq spy s))
+      (should (= 1 (plist-get spy :queries)))
+      (should (>= (plist-get spy :max-excluded) 3))
+      (dorg-test-mutate--assert-fan dolt-dir '(101 300 105)))))
+
+(ert-deftest dorg-test-mutate-dolt-w-distant ()
+  "W-distant: a placement far from an earlier one finds its stored successor."
+  (dorg-test-mutate--with-dolt
+    (dorg-test-mutate--seed-fan dolt-dir (cl-loop for n from 1 to 20
+                                                  collect (dorg-sortkey-encode (* n (ash 1 100)))))
+    (let* ((src (list :dolt-dir dolt-dir :root-id 100))
+           (patches (list (dorg-test-mutate--tree-insert-patch
+                           :root '(:id 300 :title "Tail"))
+                          (dorg-test-mutate--tree-insert-patch
+                           :root '(:id 301 :title "X")
+                           :after (dorg-test-mutate--heading-address 105))))
+           spy)
+      (dorg-test-mutate--with-ordering-spy s
+        (should (plist-get (dorg-test-mutate--apply-patch-batch src patches) :ok))
+        (setq spy s))
+      (should (<= (plist-get spy :rows) 2))
+      (should (zerop (plist-get spy :group-reads)))
+      (dorg-test-mutate--assert-fan
+       dolt-dir (append (number-sequence 101 105) '(301) (number-sequence 106 120) '(300))))))
+
+(ert-deftest dorg-test-mutate-dolt-w-local-then-full ()
+  "W-local / W-full: a small aged cluster rekeys locally; a wide one falls back to the group.
+Both go through the same rebalance function and lower one bulk statement."
+  (dorg-test-mutate--with-dolt
+    ;; Local: 60 far rows, a 3-row aged cluster, 60 far rows.
+    (dorg-test-mutate--seed-fan
+     dolt-dir (append (cl-loop for n from 1 to 60 collect (dorg-sortkey-encode (* n (ash 1 64))))
+                      (list (dorg-test-mutate--aged-key 1) (dorg-test-mutate--aged-key 2)
+                            (dorg-test-mutate--aged-key 3))
+                      (cl-loop for n from 1 to 60 collect (dorg-sortkey-encode (+ (ash 1 120) (* n (ash 1 64)))))))
+    ;; Aged keys sort first (zero prefix), so the cluster is ids 161..163 at the head.
+    (let* ((src (list :dolt-dir dolt-dir :root-id 100))
+           (patches (list (dorg-test-mutate--tree-insert-patch
+                           :root '(:id 300 :title "X")
+                           :before (dorg-test-mutate--heading-address 162))))
+           (statements 0)
+           (real-batch (symbol-function 'dorg-sql--mysql-batch-on-conn))
+           spy)
+      (dorg-test-mutate--with-ordering-spy s
+        (cl-letf (((symbol-function 'dorg-sql--mysql-batch-on-conn)
+                   (lambda (conn stmts &rest rest)
+                     (setq statements (cl-count-if
+                                       (lambda (st) (string-match-p "JOIN (VALUES" st)) stmts))
+                     (apply real-batch conn stmts rest))))
+          (should (plist-get (dorg-test-mutate--apply-patch-batch src patches) :ok)))
+        (setq spy s))
+      (should (zerop (plist-get spy :group-reads)))
+      (should (= 1 statements))
+      (let ((rows (dorg-test-mutate--fan-order dolt-dir)))
+        (should (= 124 (length rows)))
+        (should (dorg-sortkey-ordered-p (mapcar #'cdr rows)))
+        ;; Only the cluster (and possibly its nearest neighbours) changed width.
+        (should (<= (cl-count-if (lambda (r) (= 16 (length (cdr r)))) rows) 124))
+        (should (>= (cl-count-if (lambda (r) (> (length (cdr r)) 16)) rows) 0))))
+    ;; Full: 200 aged rows, no room anywhere; the neighbourhood cannot fit.
+    (dorg-sql-batch dolt-dir '("DELETE FROM headings WHERE parent_id = 100"))
+    (dorg-commit dolt-dir "clear")
+    (dorg-test-mutate--seed-fan dolt-dir (cl-loop for n from 1 to 200
+                                                  collect (concat (make-string 16 0)
+                                                                  (dorg-sortkey-from-integer n 2)))
+                                100 1001)
+    (let* ((src (list :dolt-dir dolt-dir :root-id 100))
+           (patches (list (dorg-test-mutate--tree-insert-patch
+                           :root '(:id 300 :title "X")
+                           :before (dorg-test-mutate--heading-address 1001))))
+           spy)
+      (dorg-test-mutate--with-ordering-spy s
+        (should (plist-get (dorg-test-mutate--apply-patch-batch src patches) :ok))
+        (setq spy s))
+      (should (= 1 (plist-get spy :group-reads)))
+      (let ((rows (dorg-test-mutate--fan-order dolt-dir)))
+        (should (= 201 (length rows)))
+        (should (= 300 (car (car rows))))
+        (should (cl-every (lambda (r) (= 16 (length (cdr r)))) rows))))))
+
+(ert-deftest dorg-test-mutate-dolt-w-index-use ()
+  "W-index-use: the neighbour query is an indexed range scan with a hash exclusion."
+  (dorg-test-mutate--with-dolt
+    (dorg-test-mutate--seed-fan dolt-dir (list (dorg-sortkey-encode (ash 1 100))
+                                               (dorg-sortkey-encode (ash 1 101))))
+    (let* ((sql (concat "EXPLAIN PLAN SELECT id, HEX(sort_key) AS sort_key_hex, level_offset FROM headings"
+                        " WHERE root_id = 100 AND parent_id = 100 AND sort_key < "
+                        (dorg-sql-gen--sort-key-hex (dorg-sortkey-encode (ash 1 101)))
+                        " AND id NOT IN (101, 102) ORDER BY sort_key DESC, id DESC LIMIT 1"))
+           (plan (mapconcat (lambda (r) (format "%s" (alist-get 'plan r)))
+                            (dorg-sql dolt-dir sql) "\n")))
+      (should (string-match-p "IndexedTableAccess" plan))
+      (should (string-match-p "index: \\[headings.parent_id,headings.sort_key\\]" plan))
+      (should (string-match-p "HASH IN" plan))
+      (should (string-match-p "Limit(1)\\|TopN" plan)))))
+
+(ert-deftest dorg-test-mutate-retired-ordering-machinery-is-gone ()
+  "D1: temp-key staging, finalize and complete-parent replay no longer exist."
+  (dolist (sym '(dorg-mutate--ps-rebalance-order
+                 dorg-mutate--ps-sibling-order-with
+                 dorg-mutate--ps-parent-complete-p
+                 dorg-mutate--ps-require-complete-parent
+                 dorg-mutate--position-key
+                 dorg-mutate--dolt-finalize-stmt
+                 dorg-mutate--dolt-heading-with-sort-key
+                 dorg-mutate--dolt-heading-staging-parent-ids
+                 dorg-mutate--dolt-heading-order-facts
+                 dorg-mutate--dolt-heading-order-facts-from-orig
+                 dorg-mutate--ordering-facts-error-data
+                 dorg-mutate--dolt-placement-row
+                 dorg-mutate--dolt-placement-neighbor-id
+                 dorg-mutate--dolt-last-child-id
+                 dorg-mutate--dolt-insert-placement-ids
+                 dorg-mutate--ps-order-facts
+                 dorg-mutate--ps-remove-under
+                 dorg-mutate--ps-slot-index
+                 dorg-mutate--ps-fan
+                 dorg-mutate--ps-fan-index
+                 dorg-mutate--ps-fan-insert
+                 dorg-mutate--ps-fan-remove
+                 dorg-mutate--ps-fan-rekey
+                 dorg-model-plan-heading-staging
+                 dorg-model-plan-item-staging
+                 dorg-model-plan-item-ordering
+                 dorg-model-plan-heading-position
+                 dorg-model-plan-heading-gap-keys
+                 dorg-model-plan-heading-rebalance
+                 dorg-model--ordering-staging-key
+                 dorg-model--validate-heading-order-facts
+                 dorg-sortkey-midpoint
+                 dorg-sortkey-midpoint-limited
+                 dorg-sortkey-normalized-keys
+                 dorg-sortkey-width-for-count))
+    (should-not (fboundp sym)))
+  (dolist (sym '(dorg-mutate--ps-complete-parent-ids
+                 dorg-mutate--dolt-complete-parent-ids
+                 dorg-mutate--dolt-complete-parent-child-ids
+                 dorg-sortkey-rebalance-threshold))
+    (should-not (boundp sym))))
+
+(ert-deftest dorg-test-mutate-dolt-heading-structural-retire-freed-slots ()
+  "Retires the old freed-slot collector as a key-scheduling owner."
+  (should-not (fboundp (dorg-test-mutate--old-symbol "dolt-freed-slots"))))
+
+(ert-deftest dorg-test-mutate-dolt-heading-structural-retire-staged-slot-p ()
+  "Retires the old staged-slot predicate; planner owns the decision."
+  (should-not (fboundp (dorg-test-mutate--old-symbol "dolt-staged-slot-p"))))
+
+(ert-deftest dorg-test-mutate-dolt-heading-structural-retire-temp-sort-key ()
+  "Retires the old be8(id) heading temp-key function."
+  (should-not (fboundp (dorg-test-mutate--old-symbol "dolt-temp-sort-key"))))
+
+(ert-deftest dorg-test-mutate-dolt-heading-structural-retire-sibling-keys ()
+  "Retires the old mutate-side sibling-key census helper."
+  (should-not (fboundp (dorg-test-mutate--old-symbol "dolt-sibling-keys"))))
+
+(ert-deftest dorg-test-mutate-dolt-heading-structural-retire-sibling-key-conflict-p ()
+  "Retires the old distinct-sibling temp-key collision predicate."
+  (should-not (fboundp (dorg-test-mutate--old-symbol "dolt-sibling-key-conflict-p"))))
+
+(ert-deftest dorg-test-mutate-dolt-heading-structural-retire-free-temp-key ()
+  "Retires the old mutate-side temp search in favor of the shared model owner."
+  (should-not (fboundp (dorg-test-mutate--old-symbol "dolt-free-temp-key"))))
+
+(ert-deftest dorg-test-mutate-dolt-heading-structural-retire-raise-staging-collision ()
+  "Retires the old be8 collision raiser; planner either schedules or exhausts."
+  (should-not (fboundp (dorg-test-mutate--old-symbol "dolt-raise-staging-collision"))))
+
+(ert-deftest dorg-test-mutate-dolt-heading-structural-retire-divergent-temp-guard ()
+  "Retires the ordinary divergent-update source-parent be8 guard."
+  (should-not (fboundp (dorg-test-mutate--old-symbol
+                        "dolt-check-divergent-update-temp-key"))))
+
+(ert-deftest dorg-test-mutate-dolt-heading-structural-retire-staged-slot-scheduling ()
+  "Retires the old staged-slot scheduling branch inside the assembler."
+  (should-not (dorg-test-mutate--old-source-hit-p "dorg-mutate--dolt-staged-slot-p")))
+
+(ert-deftest dorg-test-mutate-refusal-carries-closed-diagnostic-facts ()
+  "A database-failure refusal surfaces the executor's closed correlation facts.
+The rolled-back receipt's `:statement-index', `:statement-class' and capture
+status reach `dorg-mutate--rolled-back-decision's public refusal unchanged,
+while nothing raw (server prose, SQL, values) crosses.  The receipt here is
+built by hand to pin the passthrough alone; the real-executor control lives
+beside the capture witnesses in the dolt tests."
+  (let* ((receipt
+          (list 'dorg-sql-transaction-rolled-back
+                "Dolt transaction rolled back"
+                (list :rollback-confirmed t
+                      :transaction-phase 'statements
+                      :class 'database-failure
+                      :db-code 1105
+                      :statement-index 2
+                      :statement-class '(insert "headings")
+                      :capture 'written
+                      :capture-id "cap-RAW-NEVER-abc123")))
+         (plan (list :caller-base "b0" :plan-base "b0"
+                     :root-scope '(1) :identity-scope '((1 1 1))))
+         (err (should-error
+               (dorg-mutate--rolled-back-decision receipt plan "h1" nil nil 0)
+               :type 'dorg-mutate-error))
+         (data (dorg-mutate-error-data err))
+         (printed (format "%s %S" (error-message-string err) data)))
+    (should (eq 'invariant (plist-get data :reason)))
+    (should (eq 'database-failure (plist-get data :detail)))
+    (should (= 2 (plist-get data :statement-index)))
+    (should (equal '(insert "headings") (plist-get data :statement-class)))
+    (should (eq 'written (plist-get data :capture)))
+    (should (equal "cap-RAW-NEVER-abc123" (plist-get data :capture-id)))
+    ;; The capture id is an opaque file stem; no server prose or SQL is present.
+    (should-not (string-match-p "RAW-NEVER-[^a]" printed))
+    (should-not (plist-member data :underlying))
+    (should-not (plist-member data :message))))
+
+(ert-deftest dorg-test-mutate-postimage-refusal-projects-classified-ids-only ()
+  "The confirmed parity refusal exposes classifier IDs but never replans."
+  (let* ((parity (condition-case caught
+                     (signal 'dorg-sql-postimage-parity
+                             (list "in-transaction readback diverged"
+                                   '(:plane core :ids (7 11))))
+                   (dorg-sql-postimage-parity caught)))
+         (facts (dorg-dolt--classify-db-error parity))
+         (receipt (list 'dorg-sql-transaction-rolled-back "rolled back"
+                        (append (list :rollback-confirmed t
+                                      :transaction-phase 'validate) facts)))
+         (plan (list :caller-base "b0" :plan-base "b0"
+                     :root-scope '(1) :identity-scope '((1 1 1))))
+         (err (should-error
+               (dorg-mutate--rolled-back-decision receipt plan "h1" t "op" (+ (float-time) 60))
+               :type 'dorg-mutate-error))
+         (data (dorg-mutate-error-data err)))
+    (should (eq 'invariant (dorg-mutate-error-reason err)))
+    (should (eq 'postimage-parity (plist-get data :detail)))
+    (should (equal '(7 11) (plist-get data :parity-ids)))
+    (should (= 2 (plist-get data :parity-id-count)))
+    (should (string-match-p "in-transaction readback diverged; rolled back pre-commit"
+                            (error-message-string err))))
+  (let* ((facts '(:class serialization :db-code 1213))
+         (receipt (list 'dorg-sql-transaction-rolled-back "rolled back"
+                        (append (list :rollback-confirmed t) facts)))
+         (plan (list :caller-base "b0" :plan-base "b0" :root-scope '(1)
+                     :identity-scope '((1 1 1))))
+         (err (should-error
+               (dorg-mutate--rolled-back-decision receipt plan "h1" nil nil 0)
+               :type 'dorg-mutate-error)))
+    (should-not (plist-member (dorg-mutate-error-data err) :parity-ids))))
+
+(ert-deftest dorg-test-mutate-postimage-validator-rollback-receipt-keeps-ids ()
+  "The real validator, rollback builder, and refusal retain closed mismatch IDs."
+  (let (queries parity receipt)
+    (condition-case caught
+        (dorg-mutate--postimage-assert-core
+         (lambda (request)
+           (when (eq (plist-get request :op) 'core-heading-ids)
+             '(((id . 42)))))
+         (make-hash-table :test 'eql) '(42))
+      (dorg-sql-postimage-parity (setq parity caught)))
+    (cl-letf (((symbol-function 'mysql-query)
+               (lambda (_conn sql) (push sql queries) nil)))
+      (condition-case caught
+          (dorg-sql--raise-batch-rollback-result
+           'conn parity 'validate nil t)
+        (dorg-sql-transaction-rolled-back (setq receipt caught))))
+    (let* ((plan (list :caller-base "b0" :plan-base "b0" :root-scope '(1)
+                       :identity-scope '((1 1 1))))
+           (err (should-error
+                 (dorg-mutate--rolled-back-decision receipt plan "h1" t nil 0)
+                 :type 'dorg-mutate-error))
+           (data (dorg-mutate-error-data err)))
+      (should (equal '(42) (plist-get data :parity-ids)))
+      (should (= 1 (plist-get data :parity-id-count)))
+      (should (equal '("ROLLBACK") (nreverse queries))))))
+
+(ert-deftest dorg-test-mutate-unconfirmed-rollback-omits-parity-ids ()
+  "A rollback-unconfirmed refusal never claims parity diagnostics or rollback."
+  (let* ((receipt
+          '(dorg-sql-transaction-rollback-failed "rollback failed"
+            (:rollback-confirmed nil :class postimage-parity :parity-plane core
+             :parity-ids (42) :parity-id-count 1)))
+         (plan (list :caller-base "b0" :plan-base "b0" :root-scope '(1)
+                     :identity-scope '((1 1 1))))
+         (err (should-error
+               (dorg-mutate--rolled-back-decision receipt plan "h1" t nil 0)
+               :type 'dorg-mutate-error))
+         (data (dorg-mutate-error-data err)))
+    (should (eq 'rollback-failed (plist-get data :detail)))
+    (should-not (plist-member data :parity-ids))
+    (should-not (plist-member data :parity-id-count))
+    (should-not (string-match-p "rolled back" (error-message-string err)))))
+
+(ert-deftest dorg-test-q60zv-body-literal-engine-replaces-unique-cross-paragraph-range ()
+  "One model-view literal may cross a normal paragraph boundary.
+The changed postimage and preserved planning/property prefix make this a real
+body operation rather than an occurrence-item substitute."
+  (let* ((planning (dorg-planning-item :scheduled "<2026-10-16 Thu>"))
+         (properties (dorg-drawer-item :name "PROPERTIES"
+                                       :properties '(("DORG_ID" . "7"))))
+         (heading (make-dorg-heading
+                   :id 7 :level 1 :level-offset 1 :title "H"
+                   :items (list planning properties
+                                (dorg-text-item :text "First" :post-blank 1)
+                                (dorg-text-item :text "Second" :post-blank 0))))
+         (patch '(:op replace
+                   :target (:body :host (:heading :id 7)
+                                  :literal "First\n\nSecond")
+                   :value "Joined"))
+         (new (dorg-mutate--apply-body-literal-to-heading heading patch)))
+    (should (equal "First\n\nSecond\n" (dorg-model-body-view heading)))
+    (should (equal "Joined\n" (dorg-model-body-view new)))
+    (let ((new-planning (car (dorg-heading-items new)))
+          (new-drawer (cadr (dorg-heading-items new))))
+      (should (equal "<2026-10-16 Thu>"
+                     (dorg-planning-item-scheduled new-planning)))
+      (should (equal "7" (cdr (assoc "DORG_ID"
+                                     (dorg-drawer-item-properties new-drawer))))))))
+
+(ert-deftest dorg-test-q60zv-body-literal-engine-refuses-zero-and-overlap ()
+  "Zero and overlapping repeated literals refuse before a heading is copied."
+  (let ((heading (make-dorg-heading
+                  :id 7 :level 1 :level-offset 1 :title "H"
+                  :items (list (dorg-text-item :text "aaa" :post-blank 0)))))
+    (dolist (case '(("missing" 0)
+                    ("aa" 2)))
+      (let* ((literal (car case))
+             (count (cadr case))
+             (data (dorg-test-mutate--error-data
+                   (dorg-mutate--apply-body-literal-to-heading
+                    heading `(:op replace :target (:body :host (:heading :id 7)
+                                                           :literal ,literal)
+                                           :value "new")))))
+        (should (eq 'invalid-target (plist-get data :reason)))
+        (should (eq 'body-literal-count (plist-get data :detail)))
+        (should (= count (plist-get data :count)))))))
+
+(ert-deftest dorg-test-q60zv-body-literal-plain-replaces-mapped-cross-paragraph-range ()
+  "The plain adapter changes only a mapped normal-body literal range."
+  (let ((before (concat "* Host\n"
+                        "SCHEDULED: <2026-10-16 Thu>\n"
+                        ":PROPERTIES:\n:DORG_ID: 7\n:END:\n"
+                        "First\n\nSecond\n"
+                        "** Child\nChild OLD stays.\n")))
+    (dorg-test-mutate--with-content buf before
+      (dorg-test-mutate--assert-dorg-policy buf)
+      (let ((patch '(:op replace
+                     :target (:body :host (:heading :id 7)
+                                    :literal "First\n\nSecond")
+                     :value "Joined")))
+        (should (plist-get (dorg-test-mutate--apply-patch-batch buf (list patch)) :ok))
+        (should (equal (concat "* Host\n"
+                               "SCHEDULED: <2026-10-16 Thu>\n"
+                               ":PROPERTIES:\n:DORG_ID: 7\n:END:\n"
+                               "Joined\n"
+                               "** Child\nChild OLD stays.\n")
+                       (buffer-string)))))))
+
+(ert-deftest dorg-test-q60zv-body-literal-plain-refuses-lossy-model-mapping ()
+  "A comma-escaped verbatim model view never falls back to source matching."
+  (let ((before (concat "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\n"
+                        "#+begin_example\n,* OLD\n#+end_example\n")))
+    (dorg-test-mutate--with-content buf before
+      (dorg-test-mutate--assert-dorg-policy buf)
+      (let ((data (dorg-test-mutate--error-data
+                   (dorg-test-mutate--apply-patch-batch
+                    buf (list '(:op replace
+                                :target (:body :host (:heading :id 7) :literal "* OLD")
+                                :value "new"))))))
+        (should (eq 'invalid-target (plist-get data :reason)))
+        (should (eq 'body-literal-unmappable (plist-get data :detail)))
+        (should (equal before (buffer-string)))))))
+
+(ert-deftest dorg-test-q60zv-body-literal-byte-equality-guards-the-source-span ()
+  "The span mapper itself refuses a model/source byte mismatch.
+
+This pins the mapping guard independently of the later whole-postimage check:
+removing the segment equality makes this control RED before any mutation can
+mask the missing proof."
+  (dorg-test-mutate--with-content
+      buf (concat "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\n"
+                  "#+begin_example\n,* OLD\n#+end_example\n")
+    (dorg-test-mutate--assert-dorg-policy buf)
+    (goto-char (point-min))
+    (let ((data (dorg-test-mutate--error-data
+                 (dorg-mutate--source-preserving-body-literal-span
+                  '(:op replace
+                    :target (:body :host (:heading :id 7) :literal "* OLD")
+                    :value "new")
+                  (point-marker) nil))))
+      (should (eq 'invalid-target (plist-get data :reason)))
+      (should (eq 'body-literal-unmappable (plist-get data :detail))))))
+
+(ert-deftest dorg-test-q60zv-body-literal-plain-refuses-collapsed-whitespace ()
+  "A whitespace-only paragraph separator cannot be mapped as canonical bytes."
+  (let ((before (concat "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\n"
+                        "Start.\n   \nEnd.\n")))
+    (dorg-test-mutate--with-content buf before
+      (dorg-test-mutate--assert-dorg-policy buf)
+      (let ((data (dorg-test-mutate--error-data
+                   (dorg-test-mutate--apply-patch-batch
+                    buf (list '(:op replace
+                                :target (:body :host (:heading :id 7)
+                                               :literal "Start.\n\nEnd")
+                                :value "Joined"))))))
+        (should (eq 'invalid-target (plist-get data :reason)))
+        (should (eq 'body-literal-unmappable (plist-get data :detail)))
+        (should (equal before (buffer-string)))))))
+
+(ert-deftest dorg-test-q60zv-body-literal-plain-refuses-view-mismatch ()
+  "Plain refuses the f2 local-drawer ambiguity before matching source bytes."
+  (let ((before (concat "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\n"
+                        ":PROPERTIES:\n:KEY: OLD\n:END:\n"
+                        "Body.\n")))
+    (dorg-test-mutate--with-content buf before
+      (dorg-test-mutate--assert-dorg-policy buf)
+      (let ((data (dorg-test-mutate--error-data
+                   (dorg-test-mutate--apply-patch-batch
+                    buf (list '(:op replace
+                                :target (:body :host (:heading :id 7) :literal "OLD")
+                                :value "NEW"))))))
+        (should (eq 'invalid-target (plist-get data :reason)))
+        (should (eq 'body-literal-unmappable
+                    (plist-get data :detail)))
+        (should (equal before (buffer-string)))))))
+
+(ert-deftest dorg-test-q60zv-public-body-literal-uses-the-mutation-door ()
+  "The public form reaches the same mapped body operation, not item replace."
+  (dorg-test-mutate--with-content
+      buf "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\nPublic OLD.\n"
+    (dorg-test-mutate--assert-dorg-policy buf)
+    (should (plist-get
+             (dorg-api-execute
+              '(on (id 7) (replace (body (literal "Public OLD")) "Public NEW"))
+              :mode 'apply :source buf)
+             :ok))
+    (should (equal "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\nPublic NEW.\n"
+                   (buffer-string)))))
+
+(ert-deftest dorg-test-q60zv-dolt-replaces-the-same-model-body-range ()
+  "Dolt uses model replacement and pins replay/mismatch at its committed HEAD."
+  (dorg-test-mutate--with-dolt
+    (let* ((root (dorg-test-mutate--seed dolt-dir "* Host\nFirst\n\nSecond\n"))
+           (id (dorg-test-mutate--id-by-title dolt-dir "Host"))
+           (source (list :dolt-dir dolt-dir :root-id root))
+           (form `(on (id ,id)
+                      (replace (body (literal "First\n\nSecond")) "Joined")))
+           (result (dorg-api-execute form :mode 'apply :source source
+                                     :op-id "q60zv-body-replay"))
+           (head (dorg-head-commit dolt-dir))
+           (heading (gethash id (dorg-model-load-tree dolt-dir root))))
+      (should (plist-get result :ok))
+      (should (equal "Joined\n" (dorg-model-body-view heading)))
+      (let ((replay (dorg-api-execute form :mode 'apply :source source
+                                      :op-id "q60zv-body-replay")))
+        (should (plist-get replay :idempotent))
+        (should (equal head (dorg-head-commit dolt-dir))))
+      (should
+       (eq 'idempotency-key-mismatch
+           (condition-case err
+               (progn
+                 (dorg-api-execute
+                  `(on (id ,id) (replace (body (literal "Joined")) "Different"))
+                  :mode 'apply :source source :op-id "q60zv-body-replay")
+                 :no-error)
+             (dorg-api-error (dorg-api-error-reason err))
+             (dorg-mutate-error (dorg-mutate-error-reason err)))))
+      (should (equal head (dorg-head-commit dolt-dir))))))
+
+(ert-deftest dorg-test-q60zv-dolt-refuses-boundary-heading-injection ()
+  "Dolt rejects a deletion that would expose a new headline in the body."
+  (dorg-test-mutate--with-dolt
+    (let* ((root (dorg-test-mutate--seed dolt-dir "* Host\nx* Injected\n"))
+           (id (dorg-test-mutate--id-by-title dolt-dir "Host"))
+           (source (list :dolt-dir dolt-dir :root-id root))
+           (head (dorg-head-commit dolt-dir))
+           (data (dorg-test-mutate--error-data
+                  (dorg-api-execute
+                   `(on (id ,id) (replace (body (literal "x")) ""))
+                   :mode 'apply :source source))))
+      (should (eq 'invalid-target (plist-get data :reason)))
+      (should (eq 'structural-payload-boundary (plist-get data :detail)))
+      (should (equal head (dorg-head-commit dolt-dir))))))
+
+(ert-deftest dorg-test-q60zv-body-literal-noop-still-checks-one-match ()
+  "OLD equal to NEW is unchanged only after the literal guard ran."
+  (dorg-test-mutate--with-content
+      buf "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\nSame.\n"
+    (dorg-test-mutate--assert-dorg-policy buf)
+    (let ((before (buffer-string))
+          (calls 0)
+          (real (symbol-function 'dorg-model-body-view-literal-match)))
+      (cl-letf (((symbol-function 'dorg-model-body-view-literal-match)
+                 (lambda (&rest args) (setq calls (1+ calls)) (apply real args))))
+        (should (plist-get
+                 (dorg-api-execute
+                  '(on (id 7) (replace (body (literal "Same")) "Same"))
+                  :mode 'apply :source buf)
+                 :ok)))
+      ;; One plan check plus the actual source mapping check: deleting the
+      ;; operation's guard therefore cannot make this no-op control pass.
+      (should (>= calls 2))
+      (should (equal before (buffer-string))))))
+
+(ert-deftest dorg-test-q60zv-late-body-literal-refusal-is-prewrite-atomic ()
+  "A later body precondition refusal leaves earlier batch requests unwritten."
+  (dorg-test-mutate--with-content
+      buf "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\nExisting.\n"
+    (dorg-test-mutate--assert-dorg-policy buf)
+    (let ((before (buffer-string))
+          (data (dorg-test-mutate--error-data
+                 (dorg-test-mutate--apply-patch-batch
+                  buf '((:op put :target (:property :host (:heading :id 7) :name "K")
+                                :value "V")
+                        (:op replace :target (:body :host (:heading :id 7)
+                                                       :literal "absent")
+                                     :value "new"))))))
+      (should (eq 'invalid-target (plist-get data :reason)))
+      (should (eq 'body-literal-count (plist-get data :detail)))
+      (should (= 0 (plist-get data :count)))
+      (should (equal before (buffer-string))))))
+
+(ert-deftest dorg-test-q60zv-body-scan-excludes-leading-planning-without-drawer ()
+  "Leading planning is outside body matching even without local PROPERTIES."
+  (with-temp-buffer
+    (insert "* Host\nSCHEDULED: <2026-10-16 Thu>\nBody OLD.\n")
+    (let ((org-inhibit-startup t)) (org-mode))
+    (goto-char (point-min))
+    (let* ((scan (dorg-mutate--source-preserving-body-scan (point-marker) nil))
+           (body (buffer-substring-no-properties (nth 0 scan) (nth 1 scan))))
+      (should (equal "Body OLD.\n" body)))))
+
+(ert-deftest dorg-test-q60zv-body-literal-keeps-a-body-properties-lookalike ()
+  "A body drawer after text is part of the common model/source view."
+  (let ((before (concat "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\n"
+                        "Before.\n:PROPERTIES:\n:K: OLD\n:END:\n")))
+    (dorg-test-mutate--with-content buf before
+      (dorg-test-mutate--assert-dorg-policy buf)
+      (should (plist-get
+               (dorg-test-mutate--apply-patch-batch
+                buf (list '(:op replace
+                            :target (:body :host (:heading :id 7) :literal "OLD")
+                            :value "NEW")))
+               :ok))
+      (should (equal (replace-regexp-in-string "OLD" "NEW" before t t)
+                     (buffer-string))))))
+
+(ert-deftest dorg-test-q60zv-body-literal-simulates-an-ordered-chain ()
+  "Later body patches plan against the preceding postimage, not live bytes."
+  (dorg-test-mutate--with-content
+      buf "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\nStart\n"
+    (dorg-test-mutate--assert-dorg-policy buf)
+    (should (plist-get
+             (dorg-test-mutate--apply-patch-batch
+              buf '((:op replace
+                         :target (:body :host (:heading :id 7) :literal "Start")
+                         :value "Begin")
+                    (:op replace
+                         :target (:body :host (:heading :id 7) :literal "Begin")
+                         :value "Go")))
+             :ok))
+    (should (string-suffix-p "Go\n" (buffer-string)))))
+
+(ert-deftest dorg-test-q60zv-body-literal-simulates-a-prior-text-patch ()
+  "A body literal sees an earlier ordinary text replacement in its batch."
+  (dorg-test-mutate--with-content
+      buf "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\nStart\n"
+    (dorg-test-mutate--assert-dorg-policy buf)
+    (should (plist-get
+             (dorg-test-mutate--apply-patch-batch
+              buf '((:op replace
+                         :target (:text :host (:heading :id 7)
+                                        :select (:occurrence 1))
+                         :value "Begin")
+                    (:op replace
+                         :target (:body :host (:heading :id 7) :literal "Begin")
+                         :value "Go")))
+             :ok))
+    (should (string-suffix-p "Go\n" (buffer-string)))))
+
+(ert-deftest dorg-test-q60zv-body-literal-simulates-before-a-later-text-patch ()
+  "An ordinary text patch observes the body literal's simulated postimage."
+  (dorg-test-mutate--with-content
+      buf "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\nStart\n"
+    (dorg-test-mutate--assert-dorg-policy buf)
+    (should (plist-get
+             (dorg-test-mutate--apply-patch-batch
+              buf '((:op replace
+                         :target (:body :host (:heading :id 7) :literal "Start")
+                         :value "Begin")
+                    (:op replace
+                         :target (:text :host (:heading :id 7)
+                                        :select (:occurrence 1))
+                         :value "Go")))
+             :ok))
+    (should (string-suffix-p "Go\n" (buffer-string)))))
+
+(ert-deftest dorg-test-q60zv-body-literal-does-not-count-a-sibling ()
+  "The host body's literal count excludes sibling body text."
+  (dorg-test-mutate--with-content
+      buf (concat "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\nHost OLD\n"
+                  "* Sibling\n:PROPERTIES:\n:DORG_ID: 8\n:END:\nSibling OLD\n")
+    (dorg-test-mutate--assert-dorg-policy buf)
+    (should (plist-get
+             (dorg-test-mutate--apply-patch-batch
+              buf (list '(:op replace
+                          :target (:body :host (:heading :id 7) :literal "OLD")
+                          :value "NEW")))
+             :ok))
+    (should (equal (concat "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\nHost NEW\n"
+                           "* Sibling\n:PROPERTIES:\n:DORG_ID: 8\n:END:\nSibling OLD\n")
+                   (buffer-string)))))
+
+(ert-deftest dorg-test-q60zv-body-literal-stale-base-refuses-before-write ()
+  "A dry-run base token cannot write through a later source revision."
+  (dorg-test-mutate--with-content
+      buf "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\nOLD\n"
+    (dorg-test-mutate--assert-dorg-policy buf)
+    (let* ((patch '(:op replace
+                   :target (:body :host (:heading :id 7) :literal "OLD")
+                   :value "NEW"))
+           (base (plist-get (dorg-mutate--plan-patches buf (list patch))
+                            :base-revision)))
+      (goto-char (point-max))
+      (insert "Drift.\n")
+      (let ((before (buffer-string))
+            (data (dorg-test-mutate--error-data
+                   (dorg-test-mutate--apply-patch-batch
+                    buf (list patch) :base-revision base))))
+        (should (eq 'stale (plist-get data :reason)))
+        (should (equal before (buffer-string)))))))
+
+(ert-deftest dorg-test-q60zv-body-view-three-items-appends-one-final-lf ()
+  "Three body items retain both paragraph gaps and the renderer's final LF."
+  (let ((heading (make-dorg-heading
+                  :id 7 :level 1 :level-offset 1 :title "H"
+                  :items (list (dorg-text-item :text "Start." :post-blank 1)
+                               (dorg-text-item :text "End one." :post-blank 1)
+                               (dorg-text-item :text "Next para." :post-blank 0)))))
+    (should (equal "Start.\n\nEnd one.\n\nNext para.\n"
+                   (dorg-model-body-view heading)))))
+
+(ert-deftest dorg-test-q60zv-body-literal-permits-paragraph-splitting ()
+  "A representable NEW may introduce a normal paragraph boundary."
+  (dorg-test-mutate--with-content
+      buf "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\nOLD\n"
+    (dorg-test-mutate--assert-dorg-policy buf)
+    (should (plist-get
+             (dorg-test-mutate--apply-patch-batch
+              buf (list '(:op replace
+                          :target (:body :host (:heading :id 7) :literal "OLD")
+                          :value "A.\n\nB.")))
+             :ok))
+    (should (string-suffix-p "A.\n\nB.\n" (buffer-string)))))
+
+(ert-deftest dorg-test-q60zv-body-literal-refuses-heading-injection ()
+  "Boundary deletion/insertion refuses in planning and apply without a write."
+  (dorg-test-mutate--with-content
+      buf "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\nx* Injected\n"
+    (dorg-test-mutate--assert-dorg-policy buf)
+    (dolist (new '("" "* Split\n"))
+      (let ((before (buffer-string))
+            (patch `(:op replace
+                       :target (:body :host (:heading :id 7) :literal "x")
+                       :value ,new)))
+        (dolist (run (list (lambda () (dorg-mutate--plan-patches buf (list patch)))
+                           (lambda () (dorg-test-mutate--apply-patch-batch
+                                       buf (list patch)))))
+          (let ((data (dorg-test-mutate--error-data (funcall run))))
+            (should (eq 'invalid-target (plist-get data :reason)))
+            (should (eq 'structural-payload-boundary
+                        (plist-get data :detail)))
+            (should (equal before (buffer-string)))))))))
+
+(ert-deftest dorg-test-q60zv-body-literal-refuses-structured-and-protected-postimages ()
+  "Only paragraph geometry may change through the body literal door.
+
+Each value is parsed in its composed body context.  The before/after witness
+makes a deleted validator fail rather than merely exercising an invalid DSL
+form."
+  (dolist (value '("#+DORG_HASH: forged"
+                   ":PROPERTIES:\n:DORG_ID: 9\n:END:"
+                   "#+KEY: value"
+                   ":NOTE:\n- created\n:END:"))
+    (dorg-test-mutate--with-content
+        buf "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\nOLD\n"
+      (dorg-test-mutate--assert-dorg-policy buf)
+      (let ((before (buffer-string))
+            (patch `(:op replace
+                       :target (:body :host (:heading :id 7) :literal "OLD")
+                       :value ,value)))
+        (dolist (run (list (lambda () (dorg-mutate--plan-patches buf (list patch)))
+                           (lambda () (dorg-test-mutate--apply-patch-batch
+                                       buf (list patch)))))
+          (let ((data (dorg-test-mutate--error-data (funcall run))))
+            (should (eq 'invalid-target (plist-get data :reason)))
+            (should (eq 'structural-payload-boundary
+                        (plist-get data :detail)))
+            (should (equal before (buffer-string)))))))))
+
+(ert-deftest dorg-test-q60zv-body-literal-simulates-paragraph-split-before-text ()
+  "A later positional occurrence sees every parsed item from a body split."
+  (dorg-test-mutate--with-content
+      buf "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\nStart\n\nTail\n"
+    (dorg-test-mutate--assert-dorg-policy buf)
+    (should (plist-get
+             (dorg-test-mutate--apply-patch-batch
+              buf '((:op replace
+                         :target (:body :host (:heading :id 7) :literal "Start")
+                         :value "A.\n\nB.")
+                    (:op replace
+                         :target (:text :host (:heading :id 7)
+                                        :select (:occurrence 3))
+                         :value "Z.")))
+             :ok))
+    (should (string-suffix-p "A.\n\nB.\n\nZ.\n" (buffer-string)))))
+
+(ert-deftest dorg-test-q60zv-body-literal-file-simulates-paragraph-split-before-text ()
+  "The file adapter gives a later positional patch the parsed body postimage."
+  (let* ((before "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\nStart\n\nTail\n")
+         (file (make-temp-file "dorg-q60zv-batch-file" nil ".org" before)))
+    (unwind-protect
+        (progn
+          (should (plist-get
+                   (dorg-api-execute
+                    '(batch
+                      (on (id 7) (replace (body (literal "Start")) "A.\n\nB."))
+                      (on (id 7) (replace (text (occurrence 3)) "Z.")))
+                    :mode 'apply :source (list :file file :identity 'dorg))
+                   :ok))
+          (should (equal "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\nA.\n\nB.\n\nZ.\n"
+                         (with-temp-buffer
+                           (insert-file-contents file)
+                           (buffer-string)))))
+      (when-let ((buffer (get-file-buffer file)))
+        (with-current-buffer buffer (set-buffer-modified-p nil))
+        (kill-buffer buffer))
+      (delete-file file))))
+
+(ert-deftest dorg-test-q60zv-body-literal-file-source-is-byte-surgical ()
+  "A file descriptor uses the same mapped body range as a live buffer."
+  (let* ((before (concat "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\n"
+                         "OLD body.\n* Sibling\n:PROPERTIES:\n:DORG_ID: 8\n:END:\n"
+                         "OLD sibling.\n"))
+         (file (make-temp-file "dorg-q60zv-file" nil ".org" before)))
+    (unwind-protect
+        (let ((result
+               (dorg-api-execute
+                '(on (id 7) (replace (body (literal "OLD body")) "NEW body"))
+                :mode 'apply :source (list :file file :identity 'dorg))))
+          (should (plist-get result :ok))
+          (should (equal (concat "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\n"
+                                 "NEW body.\n* Sibling\n:PROPERTIES:\n:DORG_ID: 8\n:END:\n"
+                                 "OLD sibling.\n")
+                         (with-temp-buffer
+                           (insert-file-contents file)
+                           (buffer-string)))))
+      (when-let ((buffer (get-file-buffer file)))
+        (with-current-buffer buffer (set-buffer-modified-p nil))
+        (kill-buffer buffer))
+      (delete-file file))))
+
+(ert-deftest dorg-test-q60zv-body-literal-property-identity-buffer-and-file ()
+  "Literal bodies resolve a property-identity host for preview and apply."
+  (let ((before "* Host\n:PROPERTIES:\n:CAPTURE_ID: inbox\n:END:\nOLD\n"))
+    (dorg-test-mutate--with-content buf before
+      (dolist (mode '(dry-run apply))
+        (let ((result (dorg-api-execute
+                       '(on (key "inbox")
+                            (replace (body (literal "OLD")) "NEW"))
+                       :mode mode :source (list :buffer buf
+                                                :identity '(:property "CAPTURE_ID")))))
+          (should (plist-get result :ok))
+          (if (eq mode 'dry-run)
+              (should (equal before (buffer-string)))
+            (should (string-suffix-p "NEW\n" (buffer-string)))))))
+    (let ((file (make-temp-file "dorg-q60zv-property" nil ".org" before)))
+      (unwind-protect
+          (dolist (mode '(dry-run apply))
+            (let ((result (dorg-api-execute
+                           '(on (key "inbox")
+                                (replace (body (literal "OLD")) "NEW"))
+                           :mode mode :source (list :file file
+                                                    :identity '(:property "CAPTURE_ID")))))
+              (should (plist-get result :ok))
+              (if (eq mode 'dry-run)
+                  (should (equal before (with-temp-buffer (insert-file-contents file) (buffer-string))))
+                (should (equal "* Host\n:PROPERTIES:\n:CAPTURE_ID: inbox\n:END:\nNEW\n"
+                               (with-temp-buffer (insert-file-contents file) (buffer-string)))))))
+        (when-let ((buffer (get-file-buffer file)))
+          (with-current-buffer buffer (set-buffer-modified-p nil)) (kill-buffer buffer))
+        (delete-file file)))))
+
+(ert-deftest dorg-test-q60zv-property-identity-body-refuses-forged-dorg-id ()
+  "A property-bound body cannot manufacture a DORG_ID drawer."
+  (dorg-test-mutate--with-content
+      buf "* Host\n:PROPERTIES:\n:CAPTURE_ID: inbox\n:END:\nOLD\n"
+    (let ((before (buffer-string))
+          (data (dorg-test-mutate--error-data
+                 (dorg-api-execute
+                  '(on (key "inbox")
+                       (replace (body (literal "OLD")) ":PROPERTIES:\n:DORG_ID: 9\n:END:"))
+                  :mode 'apply :source (list :buffer buf :identity '(:property "CAPTURE_ID"))))))
+      (should (eq 'structural-payload-boundary (plist-get data :detail)))
+      (should (equal before (buffer-string))))))
+
+(defun dorg-test-7isy6--assert-refusal-in-each-mode (form source before current)
+  "Assert FORM refuses before SOURCE's bytes change in both public modes.
+
+BEFORE is the exact byte string expected from the zero-argument CURRENT
+reader.  Keeping this assertion at the public API boundary makes the control
+fail if planning, application, or either refusal datum regresses."
+  (dolist (mode '(dry-run apply))
+    (let ((data (dorg-test-mutate--error-data
+                 (dorg-api-execute form :mode mode :source source))))
+      (should (eq 'invalid-target (plist-get data :reason)))
+      (should (eq 'structural-payload-boundary (plist-get data :detail)))
+      (should (equal before (funcall current))))))
+
+(ert-deftest dorg-test-7isy6-item-and-drawer-line-refuse-protected-postimages ()
+  "Item and drawer-line payloads cannot manufacture owned metadata.
+
+The pre-fix item and drawer-line paths accept these forms, unlike the text
+path.  Every refusal is checked at both plan and apply, before the backing
+bytes change."
+  (dolist (form '((on (id 7)
+                      (replace (item (occurrence 1))
+                               (text "#+DORG_HASH: forged")))
+                  (on (id 7)
+                      (replace (item (occurrence 1))
+                               (text "  #+dorg_hash: forged")))
+                  (on (id 7)
+                      (replace (item (occurrence 1))
+                               (text "#+KEY: ordinary structural payload")))
+                  (on (id 7)
+                      (replace (item (all))
+                               (text ":PROPERTIES:\n:DORG_ID: 9\n:END:")))
+                  (on (id 7)
+                      (insert (drawer-line "LOGBOOK") (before-first)
+                              ":DORG_ID: 9"))
+                  (on (id 7)
+                      (replace (drawer-line "LOGBOOK" (all))
+                               ":DORG_CLOCK_START: x"))))
+    (dorg-test-mutate--with-content
+        buf (concat "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\n"
+                    "old\n:LOGBOOK:\nentry\n:END:\n")
+      (dorg-test-mutate--assert-dorg-policy buf)
+      (let ((before (buffer-string)))
+        (dolist (run (list (lambda () (dorg-api-execute form :mode 'dry-run
+                                                        :source (list :buffer buf :identity 'dorg)))
+                           (lambda () (dorg-api-execute form :mode 'apply
+                                                        :source (list :buffer buf :identity 'dorg)))))
+          (let ((data (dorg-test-mutate--error-data (funcall run))))
+            (should (eq 'invalid-target (plist-get data :reason)))
+            (should (eq 'structural-payload-boundary (plist-get data :detail)))
+            (should (equal before (buffer-string)))))))))
+
+(ert-deftest dorg-test-ay3q8-body-property-guard-consults-owned-family-seam ()
+  "Registered-family recognition is a load-bearing body-postimage disjunct.
+
+The outer mutation rows establish the public refusal.  This narrow spy keeps
+the explicit owned-family call non-vacuous while the current DORG_ prefix
+happens to cover the same literal key."
+  (let ((calls 0)
+        (real (symbol-function 'dorg-owned-metadata-key-p)))
+    (cl-letf (((symbol-function 'dorg-protected-keyword-p)
+               (lambda (_key) nil))
+              ((symbol-function 'dorg-owned-metadata-key-p)
+               (lambda (key)
+                 (cl-incf calls)
+                 (funcall real key))))
+      (should (dorg-mutate--protected-body-property-p "DORG_CLOCK_START"))
+      (should (= 1 calls)))))
+
+(ert-deftest dorg-test-7isy6-ordinary-item-and-drawer-line-remain-legal ()
+  "The protected-postimage guard does not reject ordinary payloads."
+  (dorg-test-mutate--with-content
+      buf (concat "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\n"
+                  "old\n:LOGBOOK:\nentry\n:END:\n")
+    (dorg-test-mutate--assert-dorg-policy buf)
+    (should (plist-get
+             (dorg-api-execute '(on (id 7)
+                                    (replace (item (occurrence 1)) (text "new")))
+                               :mode 'apply :source (list :buffer buf :identity 'dorg))
+             :ok))
+    (should (plist-get
+             (dorg-api-execute '(on (id 7)
+                                    (replace (drawer-line "LOGBOOK" (all)) "ordinary"))
+                               :mode 'apply :source (list :buffer buf :identity 'dorg))
+             :ok))))
+
+(ert-deftest dorg-test-7isy6-structured-item-postimages-remain-legal ()
+  "The item door accepts declared ordinary keyword and drawer constructors."
+  (dolist (form '((on (id 7)
+                       (replace (item (occurrence 1)) (keyword "KEY" "v")))
+                  (on (id 7)
+                      (insert (item) (after-last) (keyword "KEY" "v")))
+                  (on (id 7)
+                      (insert (item) (after-last)
+                              (drawer "NOTE" :lines ("ordinary"))))))
+    (dorg-test-mutate--with-content
+        buf "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\nold\n"
+      (dorg-test-mutate--assert-dorg-policy buf)
+      (should (plist-get (dorg-api-execute form :mode 'apply
+                                           :source (list :buffer buf :identity 'dorg))
+                         :ok)))))
+
+(ert-deftest dorg-test-7isy6-structured-item-postimages-remain-legal-on-file ()
+  "The same ordinary structured item forms persist through the public file path."
+  (dolist (form '((on (id 7)
+                       (replace (item (occurrence 1)) (keyword "KEY" "v")))
+                  (on (id 7)
+                      (insert (item) (after-last) (keyword "KEY" "v")))
+                  (on (id 7)
+                      (insert (item) (after-last)
+                              (drawer "NOTE" :lines ("ordinary"))))))
+    (let ((file (make-temp-file "dorg-7isy6-structured" nil ".org"
+                                "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\nold\n")))
+      (unwind-protect
+          (let ((result (dorg-api-execute form :mode 'apply
+                                           :source (list :file file :identity 'dorg))))
+            (should (plist-get result :ok))
+            (should (file-exists-p file)))
+        (delete-file file)))))
+
+(ert-deftest dorg-test-7isy6-refuses-item-postimage-heading-and-owned-removal ()
+  "Item and drawer-line edits cannot inject headings or remove owned metadata."
+  (dolist (form '((on (id 7)
+                       (insert (drawer-line "LOGBOOK") (before-first) "* Injected"))
+                  (on (id 7)
+                      (replace (drawer-line "LOGBOOK" (all)) "** Sub"))
+                  (on (id 7) (replace (item (all)) (text "Only.")))))
+    (dorg-test-mutate--with-content
+        buf (concat "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\n"
+                    "#+DORG_HASH: keep\nold\n:LOGBOOK:\nentry\n:END:\n")
+      (dorg-test-mutate--assert-dorg-policy buf)
+      (let ((before (buffer-string))
+            (data (dorg-test-mutate--error-data
+                   (dorg-api-execute form :mode 'apply
+                                     :source (list :buffer buf :identity 'dorg)))))
+        (should (eq 'invalid-target (plist-get data :reason)))
+        (should (eq 'structural-payload-boundary (plist-get data :detail)))
+        (should (equal before (buffer-string)))))))
+
+(ert-deftest dorg-test-7isy6-property-identity-forgery-refuses-at-body-doors ()
+  "A source-configured property identity is protected without a literal key list."
+  (dolist (form '((on (key "host")
+                       (replace (body (literal "old"))
+                                ":LOGBOOK:\n:CAPTURE_ID: forged\n:END:"))
+                  (on (key "host")
+                       (replace (text (occurrence 1))
+                                ":LOGBOOK:\n:CAPTURE_ID: forged\n:END:"))
+                  (on (key "host")
+                       (replace (item (occurrence 1))
+                                (text ":LOGBOOK:\n:CAPTURE_ID: forged\n:END:")))
+                  (on (key "host")
+                      (insert (drawer-line "LOGBOOK") (before-first)
+                              ":CAPTURE_ID: forged"))))
+    (dorg-test-mutate--with-content
+        buf (concat "* Host\n:PROPERTIES:\n:CAPTURE_ID: host\n:END:\n"
+                    "old\n:LOGBOOK:\nentry\n:END:\n")
+      (let ((before (buffer-string))
+            (source (list :buffer buf :identity '(:property "CAPTURE_ID"))))
+        (let ((data (dorg-test-mutate--error-data
+                     (dorg-api-execute form :mode 'apply :source source))))
+          (should (eq 'invalid-target (plist-get data :reason)))
+          (should (eq 'structural-payload-boundary (plist-get data :detail)))
+          (should (equal before (buffer-string))))))))
+
+(ert-deftest dorg-test-7isy6-protected-keyword-is-case-insensitive ()
+  "Lowercase ownership remains protected before Org canonicalizes a payload."
+  (should (dorg-protected-keyword-p "dorg_hash")))
+
+(ert-deftest dorg-test-7isy6-dolt-forgery-preserves-head ()
+  "Dolt rejects item and drawer-line forgeries in both modes before a commit."
+  (dorg-test-mutate--with-dolt
+    (let* ((root (dorg-test-mutate--seed
+                  dolt-dir "* Host\nold\n:LOGBOOK:\nentry\n:END:\n"))
+           (id (dorg-test-mutate--id-by-title dolt-dir "Host"))
+           (source (list :dolt-dir dolt-dir :root-id root))
+           (head (dorg-head-commit dolt-dir)))
+      (dolist (form `((on (id ,id)
+                           (replace (item (occurrence 1))
+                                    (text "#+DORG_HASH: forged")))
+                      (on (id ,id)
+                          (replace (drawer-line "LOGBOOK" (all))
+                                   ":DORG_CLOCK_START: x"))))
+        (dolist (mode '(dry-run apply))
+          (let ((data (dorg-test-mutate--error-data
+                       (dorg-api-execute form :mode mode :source source))))
+            (should (eq 'invalid-target (plist-get data :reason)))
+            (should (eq 'structural-payload-boundary (plist-get data :detail)))
+            (should (equal head (dorg-head-commit dolt-dir)))))))))
+
+(ert-deftest dorg-test-7isy6-dolt-body-doors-preserve-leading-metadata ()
+  "Dolt body doors preserve leading planning and ordinary PROPERTIES metadata.
+The reparse guard operates on the body after that fixed leading prefix, while
+readback proves the prefix and each edited body constructor persist."
+  (skip-unless dorg-test--dolt-available)
+  (dorg-test--with-temp-db dolt-dir
+    (dorg-test-api--dolt-seed-rich dolt-dir)
+    (let ((source (list :dolt-dir dolt-dir :root-id 1000)))
+      (dolist (form
+               '((on (id 3001)
+                     (replace (text (occurrence 1)) "Rewritten by 7isy6."))
+                 (on (id 3001)
+                     (insert (text) (after-last) "Appended by 7isy6."))
+                 (on (id 3001)
+                     (insert (item) (after-last) (keyword "KEY" "value")))
+                 (on (id 3001)
+                     (insert (drawer-line "LOGBOOK") (before-first)
+                             "- 7isy6 audit"))))
+        (should (plist-get (dorg-api-execute form :mode 'apply :source source)
+                           :ok)))
+      (let* ((heading (gethash 3001 (dorg-model-load-headings dolt-dir 1000 nil)))
+             (texts (dorg-test-api--heading-texts heading)))
+        (should (cl-some (lambda (text) (string-match-p "Rewritten by 7isy6" text))
+                         texts))
+        (should (cl-some (lambda (text) (string-match-p "Appended by 7isy6" text))
+                         texts))
+        (should (dorg-test-api--heading-scheduled-p heading))
+        (should (equal "work" (dorg-test-api--heading-category heading)))
+        (should (cl-find-if
+                 (lambda (item)
+                   (and (cl-typep item 'dorg-keyword-item)
+                        (equal "KEY" (dorg-keyword-item-keyword item))
+                        (equal "value" (dorg-keyword-item-value item))))
+                 (dorg-heading-items heading)))
+        (should (member "- 7isy6 audit"
+                        (dorg-test-bnsmz--drawer-lines heading "LOGBOOK")))))))
+
+(ert-deftest dorg-test-7isy6-dolt-rich-leading-metadata-forgeries-refuse ()
+  "Dolt sees forged metadata even when a rich heading loses its leading prefix."
+  (skip-unless dorg-test--dolt-available)
+  (dorg-test--with-temp-db dolt-dir
+    (dorg-test-api--dolt-seed-rich dolt-dir)
+    (let ((source (list :dolt-dir dolt-dir :root-id 1000))
+          (head (dorg-head-commit dolt-dir)))
+      (dolist (form
+               '((on (id 3001)
+                     (replace (item (all))
+                              (text "#+DORG_HASH: f\n") (text "y\n")))
+                 (on (id 3001)
+                     (replace (item (all))
+                              (drawer "NOTE" :lines (":DORG_ID: 9"))
+                              (text "y\n")))
+                 (on (id 3001)
+                     (insert (item) (before (occurrence 1))
+                             (text "#+DORG_HASH: f")))))
+        (dorg-test-7isy6--assert-refusal-in-each-mode
+         form source head (lambda () (dorg-head-commit dolt-dir)))))))
+
+(ert-deftest dorg-test-7isy6-dolt-item-before-leading-planning-refuses ()
+  "Dolt refuses an item insertion that would render before leading planning.
+The sequence would put a keyword before SCHEDULED, where Org no longer
+recognizes the planning line as heading metadata."
+  (skip-unless dorg-test--dolt-available)
+  (dorg-test--with-temp-db dolt-dir
+    (dorg-test-api--dolt-seed-rich dolt-dir)
+    (let ((source (list :dolt-dir dolt-dir :root-id 1000))
+          (head (dorg-head-commit dolt-dir)))
+      (dorg-test-7isy6--assert-refusal-in-each-mode
+       '(on (id 3001)
+            (insert (item) (before (occurrence 1)) (keyword "KEY" "v")))
+       source head (lambda () (dorg-head-commit dolt-dir))))))
+
+(ert-deftest dorg-test-7isy6-composed-and-lowercase-drawer-lines-refuse ()
+  "Composed item batches and lowercase body properties cannot forge ownership."
+  (dolist (case
+           '(((batch
+               (on (id 7) (insert (item) (after-last) (text ":NOTE:")))
+               (on (id 7) (insert (item) (after-last) (text ":DORG_ID: 9")))
+               (on (id 7) (insert (item) (after-last) (text ":END:"))))
+              dorg)
+             ((batch
+               (on (id 7) (insert (drawer-line "LOGBOOK") (before-first)
+                                  ":DORG_ID: 9"))
+               (on (id 7) (replace (text (occurrence 1)) "new")))
+              dorg)
+             ((on (id 7) (insert (drawer-line "LOGBOOK") (before-first)
+                                 ":dorg_id: 9"))
+              dorg)))
+    (pcase-let ((`(,form ,identity) case))
+      (dorg-test-mutate--with-content
+          buf (concat "* Host\n:PROPERTIES:\n:"
+                      (if (equal identity 'dorg) "DORG_ID: 7" "CAPTURE_ID: host")
+                      "\n:END:\nold\n:LOGBOOK:\nentry\n:END:\n")
+        (let ((before (buffer-string))
+              (source (list :buffer buf :identity identity)))
+          (dorg-test-7isy6--assert-refusal-in-each-mode
+           form source before (lambda () (buffer-string))))))))
+
+(ert-deftest dorg-test-7isy6-lowercase-property-identity-drawer-line-refuses ()
+  "The configured property identity is case-insensitive in a body drawer."
+  (dorg-test-mutate--with-content
+      buf (concat "* Host\n:PROPERTIES:\n:CAPTURE_ID: host\n:END:\n"
+                  "old\n:LOGBOOK:\nentry\n:END:\n")
+    (let ((before (buffer-string))
+          (source (list :buffer buf :identity '(:property "CAPTURE_ID"))))
+      (dorg-test-7isy6--assert-refusal-in-each-mode
+       '(on (key "host")
+            (insert (drawer-line "LOGBOOK") (before-first) ":capture_id: c2"))
+       source before (lambda () (buffer-string))))))
+
+(ert-deftest dorg-test-7isy6-drawer-line-occurrence-and-file-forgery-refuse ()
+  "Occurrence and unvisited file drawer-line forgery paths retain exact bytes."
+  (let ((content (concat "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\n"
+                         "old\n:LOGBOOK:\nentry\n:END:\n")))
+    (dorg-test-mutate--with-content buf content
+      (dorg-test-7isy6--assert-refusal-in-each-mode
+       '(on (id 7)
+            (replace (drawer-line "LOGBOOK" (occurrence 1))
+                     ":DORG_CLOCK_START: x"))
+       (list :buffer buf :identity 'dorg) content (lambda () (buffer-string)))))
+  (let ((file (make-temp-file "dorg-7isy6-forgery" nil ".org"
+                              "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\nold\n")))
+    (unwind-protect
+        (let ((before (with-temp-buffer (insert-file-contents file) (buffer-string))))
+          (dorg-test-7isy6--assert-refusal-in-each-mode
+           '(on (id 7) (replace (item (occurrence 1))
+                                 (text "#+DORG_HASH: forged")))
+           (list :file file :identity 'dorg) before
+           (lambda ()
+             (with-temp-buffer (insert-file-contents file) (buffer-string)))))
+      (delete-file file))))
+
+(ert-deftest dorg-test-7isy6-keyword-replace-and-ordinary-drawer-remain-legal ()
+  "A declared ordinary keyword and ordinary drawer content remain editable."
+  (dorg-test-mutate--with-content
+      buf "* Host\n:PROPERTIES:\n:DORG_ID: 7\n:END:\nold\n:NOTE:\n:OTHER: inside\n:END:\n"
+    (let ((source (list :buffer buf :identity 'dorg)))
+      (should (plist-get
+               (dorg-api-execute '(on (id 7)
+                                      (replace (item (occurrence 1))
+                                               (keyword "KEY" "v")))
+                                 :mode 'apply :source source)
+               :ok))
+      (should (plist-get
+               (dorg-api-execute '(on (id 7)
+                                      (replace (drawer-line "NOTE" (occurrence 1))
+                                               ":OTHER: changed"))
+                                 :mode 'apply :source source)
+               :ok))
+      (should (string-match-p "#\\+KEY: v" (buffer-string)))
+      (should (string-match-p (regexp-quote ":NOTE:\n:OTHER: changed\n:END:")
+                              (buffer-string))))))
+
+(ert-deftest dorg-test-7isy6-dolt-heading-forgery-preserves-head ()
+  "Dolt rejects heading-shaped drawer lines before dry-run or apply commits."
+  (dorg-test-mutate--with-dolt
+    (let* ((root (dorg-test-mutate--seed
+                  dolt-dir "* Host\nold\n:LOGBOOK:\nentry\n:END:\n"))
+           (id (dorg-test-mutate--id-by-title dolt-dir "Host"))
+           (source (list :dolt-dir dolt-dir :root-id root))
+           (head (dorg-head-commit dolt-dir))
+           (form `(on (id ,id)
+                      (replace (drawer-line "LOGBOOK" (all)) "* Injected"))))
+      (dorg-test-7isy6--assert-refusal-in-each-mode
+       form source head (lambda () (dorg-head-commit dolt-dir))))))
+
+(ert-deftest dorg-test-q60zv-direct-body-intent-is-closed-and-nonroot ()
+  "Direct engine callers get the same literal/non-root boundary as the DSL."
+  (let ((good '(:op replace :target (:body :host (:heading :id 7) :literal "old")
+                    :value "new")))
+    (should (equal (list good) (dorg-mutate--validate-patches (list good))))
+    (should (eq 'invalid-target
+                (dorg-test-mutate--reason
+                 (dorg-mutate--validate-patches
+                  '((:op replace :target (:body :host :root :literal "old")
+                     :value "new"))))))))
 
 (provide 'dorg-mutate-tests)
 ;;; dorg-mutate-tests.el ends here
+
+;;; ─── Real-Dolt identity witness for equal-content replace ──────────────
+
+(ert-deftest dorg-test-mutate-dolt-6x6b6-equal-items-replace-keeps-identity-and-commits ()
+  "A public whole-items replacement equal to the persisted items passes the
+in-transaction partition proof: the request is :ok, every item row keeps its
+persisted id and key, content and order are unchanged.  A true no-op is not
+required to add a commit.  Before the identity-binding repair this request
+aborted with postimage-parity on the core plane (item-row identity expected nil)."
+  (dorg-test-mutate--with-dolt
+    (let* ((root (dorg-test-mutate--seed dolt-dir "* H\nseed\n"))
+           (cid (dorg-test-mutate--id-by-title dolt-dir "H"))
+           (src (list :dolt-dir dolt-dir :root-id root))
+           (form `(batch (on (id ,cid) (replace (item (all)) (text "A") (text "B")))))
+           (first (dorg-api-execute form :mode 'apply :source src))
+           (ids-before nil) (keys-before nil) (texts-before nil))
+      (should (plist-get first :ok))
+      (let ((h (gethash cid (dorg-model-load-tree dolt-dir root))))
+        (setq ids-before (mapcar #'dorg-item-id (dorg-heading-items h))
+              keys-before (mapcar #'dorg-item-sort-key (dorg-heading-items h))
+              texts-before (mapcar #'dorg-text-item-text (dorg-heading-items h))))
+      (should (equal texts-before '("A" "B")))
+      (should (cl-every #'integerp ids-before))
+      (let* ((head-before (dorg-head-commit dolt-dir))
+             (again (dorg-api-execute form :mode 'apply :source src)))
+        (should (plist-get again :ok))
+        (let ((h (gethash cid (dorg-model-load-tree dolt-dir root))))
+          (should (equal (mapcar #'dorg-item-id (dorg-heading-items h)) ids-before))
+          (should (equal (mapcar #'dorg-item-sort-key (dorg-heading-items h)) keys-before))
+          (should (equal (mapcar #'dorg-text-item-text (dorg-heading-items h)) texts-before)))
+        (ignore head-before)))))

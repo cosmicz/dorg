@@ -31,6 +31,167 @@
 (require 'dorg-error)
 (require 'dorg-timestamp)
 
+(declare-function dorg-ext-query-field "dorg-ext" (name))
+(declare-function dorg-get-extension "dorg-ext" (name))
+
+(defvar dorg-ql--extension-field-plan nil
+  "Dynamically bound field -> immutable descriptor copies for one query.
+The public facade compiles this after AST normalization and binds it for the
+complete invocation.  It is deliberately neither global nor persistent: an
+extension registration replacement is observed by the next invocation.")
+
+(defun dorg-ql--query-field (field)
+  "Return FIELD's invocation descriptor, falling back before plan capture."
+  (when field
+    (let ((entry (assq field dorg-ql--extension-field-plan)))
+      ;; A nil cdr is an intentional negative entry for a built-in field.  It
+      ;; must not fall through to the registry for every selected heading.
+      (if entry (cdr entry) (dorg-ext-query-field field)))))
+
+(defun dorg-ql--compile-field-plan (ast)
+  "Capture query metadata and owner identities for one invocation.
+The plan includes direct fields and each referenced descriptor's declared
+stored dependencies.  Owner identities are captured beside their descriptor
+copies, before extension context callbacks can replace registrations."
+  (let ((pending (dorg-ql--field-references ast)) plan identities)
+    (while pending
+      (let ((field (pop pending)))
+        (unless (assq field plan)
+          (let ((descriptor (dorg-ext-query-field field)))
+            (push (cons field descriptor) plan)
+            (when descriptor
+              (let ((owner (plist-get descriptor :extension)))
+                (unless (assq owner identities)
+                  (push (cons owner (dorg-get-extension owner)) identities)))
+              ;; Registration accepts stored dependencies only, so this is a
+              ;; bounded expansion rather than an extension dependency graph.
+              (dolist (dependency (plist-get descriptor :dependencies))
+                (pcase dependency
+                  (`(field ,stored) (push stored pending)))))))))
+    (list :field-plan (nreverse plan)
+          :extension-identities (nreverse identities))))
+
+(defun dorg-ql--field-references (ast)
+  "Return the distinct stored or extension fields referenced in normalized AST."
+  (let (fields)
+    (cl-labels ((walk (node)
+                  (pcase node
+                    ((or `(:field ,field) `(:cmp ,field . ,_))
+                     (push field fields))
+                    ((pred consp) (mapc #'walk node)))))
+      (walk ast))
+    (delete-dups (nreverse fields))))
+
+(defun dorg-ql--extension-fields (ast)
+  "Return the distinct registered fields referenced in normalized AST."
+  (cl-remove-if-not #'dorg-ql--query-field (dorg-ql--field-references ast)))
+
+(defconst dorg-query-identity-key-version 2
+  "Persisted comparison-key codec version for identity-typed fields.
+Extensions that store identity keys must store this version with their rows and
+migrate old rows explicitly before comparing them with a new codec.")
+
+(defun dorg-query-identity-key (value)
+  "Return VALUE's case-equivalent identity key as UTF-8 hex bytes.
+The v2 codec upcases each character as an integer under the standard case
+table, then encodes that sequence as UTF-8 hex.  This is the equivalence used
+by `string-equal-ignore-case', without whole-string case-expansion or
+canonical-equivalence folding.  Non-Unicode/raw-byte characters are refused
+before encoding because their UTF-8 bytes can collide with Unicode text.
+Original display spelling is kept separately by extensions."
+  (unless (stringp value) (dorg-ql--error "identity must be a string"))
+  (let ((canonical
+         (with-case-table (standard-case-table)
+           (apply #'string
+                  (mapcar
+                   (lambda (char)
+                     ;; An ASCII-only unibyte string denotes the same text as
+                     ;; its multibyte form.  Other unibyte characters, and
+                     ;; Emacs raw-byte characters (> U+10FFFF), do not have a
+                     ;; Unicode identity and must not share UTF-8 byte keys.
+                     (unless (and (<= 0 char #x10ffff)
+                                  (not (<= #xd800 char #xdfff))
+                                  (or (multibyte-string-p value) (<= char #x7f)))
+                       (dorg-ql--unsupported
+                        "identity contains a non-Unicode/raw-byte character: %S" char))
+                     (upcase char))
+                   (string-to-list value))))))
+    (concat (format "v%d:" dorg-query-identity-key-version)
+            (mapconcat (lambda (byte) (format "%02x" byte))
+                       (encode-coding-string canonical 'utf-8 t) ""))))
+
+(defun dorg-ql--validate-extension-scalar (field type value)
+  "Return VALUE or refuse a declared FIELD value that violates TYPE."
+  (unless (or (null value)
+              (pcase type
+                ((or 'string 'identity 'timestamp) (stringp value))
+                ('integer (integerp value))
+                ('boolean (memq value '(t :json-false)))))
+    (dorg-ql--unsupported "field %S returned invalid %S value: %S"
+                          field type value))
+  value)
+
+(defun dorg-ql--validate-extension-value (field value)
+  "Validate FIELD's declared type and cardinality for returned VALUE."
+  (when-let ((descriptor (dorg-ql--query-field field)))
+    (let ((type (plist-get descriptor :type)))
+      (if (eq (plist-get descriptor :cardinality) 'many)
+          (progn
+            (unless (listp value)
+              (dorg-ql--unsupported "collection field %S returned non-list: %S"
+                                    field value))
+            (mapc (lambda (item)
+                      ;; Collections distinguish [] from missing scalar; nil
+                      ;; elements therefore have no representation.
+                      (when (null item)
+                        (dorg-ql--unsupported "collection field %S returned nil element" field))
+                      (dorg-ql--validate-extension-scalar field type item))
+                    value))
+        (dorg-ql--validate-extension-scalar field type value))))
+  value)
+
+(defun dorg-ql--projection-columns (ast)
+  "Return AST's terminal projection columns, or nil for heading results."
+  (let ((last-step (car (last ast))))
+    (and (eq (car-safe last-step) :select) (cdr last-step))))
+
+(defun dorg-ql--selection-ast (ast)
+  "Return AST's heading-selection steps, excluding terminal projection."
+  (if (dorg-ql--projection-columns ast) (butlast ast) ast))
+
+(defun dorg-ql--project-row (columns id marker reader)
+  "Build selected COLUMNS using READER, retaining internal ID and MARKER.
+READER receives each normalized value expression.  The :values alist is the
+public row; identity and marker are separate navigation metadata."
+  (list :heading-id id :marker marker
+        :values
+        (mapcar (lambda (column)
+                  (let* ((expr (nth 2 column))
+                         (value (funcall reader expr))
+                         (field (and (eq (car-safe expr) :field) (nth 1 expr))))
+                    (when field
+                      (dorg-ql--validate-extension-value field value))
+                    ;; Vectors preserve the public distinction between an
+                    ;; empty collection ([] in JSON) and a missing scalar
+                    ;; (null), while evaluators may naturally return lists.
+                    (cons (nth 1 column)
+                          (if (eq (plist-get (dorg-ql--query-field field) :cardinality)
+                                  'many)
+                              (vconcat value)
+                            value))))
+                columns)))
+
+(defun dorg-ql-result-text (result)
+  "Return tab-separated selected values for a projected query RESULT."
+  (mapconcat (lambda (entry)
+               (let ((value (cdr entry)))
+                 (cond ((null value) "null")
+                       ((eq value :json-false) "false")
+                       ((eq value t) "true")
+                       ((stringp value) value)
+                       (t (prin1-to-string value)))))
+             (plist-get result :values) "\t"))
+
 ;;; ─── Errors ───────────────────────────────────────────────────────────
 
 (define-error 'dorg-ql-error "Invalid dorg-ql query" 'dorg-error)

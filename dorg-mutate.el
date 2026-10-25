@@ -53,7 +53,33 @@
 ;;; Code:
 
 (require 'cl-lib)
+(cl-defstruct (dorg-mutate--owner-capability
+               (:constructor dorg-mutate--owner-capability--make)
+               (:copier nil))
+  "Private authority minted for one registered-family execution.
+This is an in-process boundary, not a security boundary against trusted Elisp."
+  family execution-id request)
+
+(defun dorg-mutate--planning-owner-request (plan)
+  "Return the sole request from explicit verified planning PLAN, or nil."
+  (let (requests)
+    (dolist (cap (plist-get plan :owner-capabilities))
+      (unless (and (cl-typep cap 'dorg-mutate--owner-capability)
+                   (memq (dorg-mutate--owner-capability-execution-id cap)
+                         (plist-get plan :owner-execution-ids)))
+        (dorg-mutate--raise 'invalid-target
+                            "owner planning capability is not verified"
+                            :detail 'capability-forged))
+      (when-let ((request (dorg-mutate--owner-capability-request cap)))
+        (push request requests)))
+    (when (cdr requests)
+      (dorg-mutate--raise 'invalid-target
+                          "multiple owner planning requests are ambiguous"
+                          :detail 'multiple-owner-requests))
+    (car requests)))
 (require 'dorg-error)
+(require 'dorg-file-lock)
+(require 'dorg-mutate-grammar)
 (require 'dorg-backend)
 (require 'dorg-registry)
 (require 'dorg-model)
@@ -123,11 +149,7 @@
 (defconst dorg-mutate-error-reasons
   '(invalid-op invalid-target unsupported stale invariant
     ;; tracked-regression multi-writer linearization terminal reasons.
-    overlap contended idempotency-key-mismatch indeterminate
-    ;; tracked-regression: a settled evidence row predating postimage receipts
-    ;; cannot satisfy an evidence-requesting replay; typed operator
-    ;; adjudication, never a verified success.
-    legacy-evidence-unavailable)
+    overlap contended idempotency-key-mismatch indeterminate)
   "The closed set of `:reason' symbols a `dorg-mutate-error' may carry.")
 
 (defun dorg-mutate--raise (reason message &rest data)
@@ -158,6 +180,10 @@ isolation is preserved while the plist extraction lives in one place."
 ;; wrong mutation).  The digest is a pure function of the typed patches and the
 ;; store's STABLE root identity (never the client path), so it is identical
 ;; across re-plans and across path/symlink/worktree aliases of one store.
+
+(defconst dorg-mutate--settled-planning-error-reasons
+  '(invalid-target invariant)
+  "Planning failures eligible for digest-bound settled replay recovery.")
 
 (defun dorg-mutate--canonical-intent (patches source)
   "Return a canonical, path-independent string form of the mutation INTENT.
@@ -238,7 +264,16 @@ A malformed value signals `invalid-target' `:detail identity-policy-malformed'."
    ((eq value 'none) 'none)
    ((and (consp value) (eq (car value) :property)
          (stringp (cadr value)) (null (cddr value)))
-    (list :property (cadr value)))
+    (let ((key (cadr value)))
+      ;; A protected key is DOrg-owned metadata, not an addressable user
+      ;; identity.  Registered families remain explicit so this holds if their
+      ;; storage namespace ever stops being a subset of the DORG_ rule.
+      (when (or (dorg-protected-keyword-p key)
+                (dorg-owned-metadata-key-p key))
+        (dorg-mutate--raise 'invalid-target
+                            "protected metadata cannot be an identity policy"
+                            :detail 'identity-policy-protected :key key))
+      (list :property key)))
    (t (dorg-mutate--raise 'invalid-target
                           (format "invalid identity policy: %S" value)
                           :detail 'identity-policy-malformed :value value))))
@@ -416,6 +451,7 @@ resolved to a backing storage binding."
   "Return non-nil when model ITEM belongs to typed TARGET's collection."
   (pcase (car target)
     ((or :text :texts) (cl-typep item 'dorg-text-item))
+    (:item t)
     ((or :keyword :keywords)
      (and (cl-typep item 'dorg-keyword-item)
           (equal (dorg-keyword-item-keyword item)
@@ -428,7 +464,7 @@ Single-occurrence targets refuse with `invalid-target'/`missing'."
   (let* ((matches (cl-loop for item in items for index from 0
                            when (dorg-mutate--item-matches-target-p item target)
                            collect index))
-         (occurrence (when (memq (car target) '(:keyword :text))
+         (occurrence (when (memq (car target) '(:keyword :text :item))
                        (dorg-mutate--patch-tget target :occurrence)))
          ;; Named occurrences become list indexes only at this final step.
          (index (if occurrence (1- occurrence) 0)))
@@ -482,9 +518,18 @@ caller's input items."
    ((>= idx (length list)) (append list (list elem)))
    (t (append (cl-subseq list 0 idx) (list elem) (nthcdr idx list)))))
 
-(defun dorg-mutate--item-batch-context ()
-  "Return an explicit request-local mutation cursor context."
-  (make-hash-table :test 'equal))
+(defconst dorg-mutate--identity-context-key
+  '(:dorg-mutate-context :source-identity-property)
+  "Private key for a source identity property in request-local context.")
+
+(defun dorg-mutate--item-batch-context (&optional identity-key)
+  "Return an explicit request-local mutation cursor context.
+
+IDENTITY-KEY is the source's protected property identity, when configured."
+  (let ((context (make-hash-table :test 'equal)))
+    (when identity-key
+      (puthash dorg-mutate--identity-context-key identity-key context))
+    context))
 
 (defun dorg-mutate--item-insert-cursor-key (target position)
   "Return the request-local cursor key for TARGET/POSITION."
@@ -496,7 +541,7 @@ caller's input items."
 
 (defun dorg-mutate--item-list-cursor-key-p (key)
   "Return non-nil when KEY addresses a top-level heading item cursor."
-  (memq (car key) '(:texts :keywords)))
+  (memq (car key) '(:texts :keywords :item)))
 
 (defun dorg-mutate--item-batch-context-shift-items
     (context host index delta &optional except-key)
@@ -512,6 +557,24 @@ insertion."
                   (not (equal key except-key))
                   (> cursor index))
          (puthash key (+ cursor delta) context)))
+     context)))
+
+(defun dorg-mutate--item-batch-context-shift-drawer-lines
+    (context host name index &optional except-key)
+  "Shift held drawer-line cursors after an insertion at INDEX.
+The context key includes target host, drawer name, selector and position.
+Different positions in the same drawer therefore need the same slot-following
+update as top-level item cursors; otherwise an insertion ahead of a held slot
+would make the next repeated insertion reverse declaration order."
+  (when context
+    (maphash
+     (lambda (key cursor)
+       (when (and (eq (car key) :drawer-lines)
+                  (equal (nth 1 key) host)
+                  (equal (nth 2 key) name)
+                  (not (equal key except-key))
+                  (> cursor index))
+         (puthash key (1+ cursor) context)))
      context)))
 
 (defun dorg-mutate--item-batch-context-remove-items
@@ -550,11 +613,23 @@ positions so repeated same-batch insertions preserve declaration order."
                  (:before-first (if matches (car matches) (length items)))
                  (:after-last (if matches (1+ (car (last matches)))
                                 (length items)))
+                 (`(:before ,n)
+                  (if (and (integerp n) (<= 1 n) (<= n (length matches)))
+                      (nth (1- n) matches)
+                    (dorg-mutate--raise
+                     'invalid-target "insertion anchor is missing"
+                     :operation 'insert :detail 'missing :position position)))
+                 (`(:after ,n)
+                  (if (and (integerp n) (<= 1 n) (<= n (length matches)))
+                      (1+ (nth (1- n) matches))
+                    (dorg-mutate--raise
+                     'invalid-target "insertion anchor is missing"
+                     :operation 'insert :detail 'missing :position position)))
                  (_ (dorg-mutate--raise
                      'invalid-op "unsupported item insertion position"
                      :operation 'insert :detail 'invalid-position
                      :position position)))))
-    (if (and context (eq position :before-first))
+    (if (and context (not (eq position :after-last)))
         (let* ((key (dorg-mutate--item-insert-cursor-key target position))
                (cursor (gethash key context))
                (idx (or cursor base)))
@@ -587,7 +662,7 @@ position, or at host end when the collection is empty."
          (value (plist-get patch :value))
          (position (plist-get patch :position))
          (cursor-key (and batch-context
-                          (eq position :before-first)
+                          (not (eq position :after-last))
                           (dorg-mutate--item-insert-cursor-key
                            target position)))
          (new (dorg-mutate--item-from-value
@@ -595,7 +670,8 @@ position, or at host end when the collection is empty."
                  (:texts (list :kind 'text :text value))
                  (:keywords (list :kind 'keyword
                                   :keyword (dorg-mutate--patch-tget target :name)
-                                  :value value))))))
+                                  :value value))
+                 (:item (plist-get patch :item))))))
     (let* ((idx (dorg-mutate--item-insert-index
                  copy target position batch-context))
            (inserted (dorg-mutate--list-insert-at copy idx new)))
@@ -617,9 +693,293 @@ position, or at host end when the collection is empty."
                  (:text (list :kind 'text :text value))
                  (:keyword (list :kind 'keyword
                                  :keyword (dorg-mutate--patch-tget target :name)
-                                 :value value)))
+                                 :value value))
+                 (:item (plist-get patch :item)))
                (dorg-item-post-blank existing))))
+    (when (and (eq (car target) :item)
+               (cl-typep existing 'dorg-keyword-item)
+               (dorg-protected-keyword-p
+                (dorg-keyword-item-keyword existing)))
+      (dorg-mutate--raise 'invalid-target "selected item is a protected keyword"
+                          :operation 'replace :detail 'protected-keyword
+                          :target target))
     (setf (nth index copy) new)
+    copy))
+
+(defun dorg-mutate--body-literal-refuse (count patch)
+  "Refuse a body-literal PATCH with capped match COUNT before mutation."
+  (dorg-mutate--raise 'invalid-target
+                      "body literal must match exactly once"
+                      :operation (plist-get patch :op)
+                      :target (plist-get patch :target)
+                      :detail 'body-literal-count :count count))
+
+(defun dorg-mutate--body-literal-replacement (heading patch)
+  "Return HEADING's canonical body view after its exact literal PATCH.
+
+Matching is deliberately performed on the one model-owned body view before
+either backend considers source mapping.  The result is a string so the plain
+adapter can prove a byte mapping independently of the Dolt model adapter."
+  (let* ((literal (dorg-mutate--patch-tget (plist-get patch :target) :literal))
+         (view (dorg-model-body-view heading))
+         (match (dorg-model-body-view-literal-match view literal)))
+    (pcase (plist-get match :count)
+      (0 (dorg-mutate--body-literal-refuse 0 patch))
+      (1 (concat (substring view 0 (plist-get match :begin))
+                 (plist-get patch :value)
+                 (substring view (plist-get match :end))))
+      (_ (dorg-mutate--body-literal-refuse 2 patch)))))
+
+(defun dorg-mutate--body-leading-metadata (items)
+  "Return the leading planning/local-PROPERTIES prefix of ITEMS.
+This is the part excluded by `dorg-model-body-view' and therefore immutable to
+a body-literal replacement."
+  (let ((rest items) prefix)
+    (while (and rest (cl-typep (car rest) 'dorg-planning-item))
+      (push (car rest) prefix)
+      (setq rest (cdr rest)))
+    (when (and rest
+               (cl-typep (car rest) 'dorg-drawer-item)
+               (equal "PROPERTIES" (dorg-drawer-item-name (car rest))))
+      (push (car rest) prefix))
+    (nreverse prefix)))
+
+(defun dorg-mutate--body-view-protected-metadata (view &optional identity-key)
+  "Return protected keyword/property signatures physically present in VIEW."
+  (let (out drawer)
+    (dolist (line (split-string view "\n"))
+      (cond
+       ((string-match "\\`[ \t]*#\\+\\([^:\n]+\\):" line)
+        (let ((key (match-string 1 line)))
+          (when (dorg-protected-keyword-p key)
+            (push (list :keyword key line) out))))
+       ((string-match "\\`[ \t]*:\\([[:alnum:]_@#%:-]+\\):[ \t]*\\'" line)
+        (setq drawer (match-string 1 line))
+        (when (equal drawer "END") (setq drawer nil)))
+       ((and drawer
+             (string-match "\\`[ \t]*:\\([^: \t\n]+\\):[ \t]*\\(.*\\)\\'" line))
+        (let ((key (match-string 1 line)))
+          (when (or (and identity-key
+                         (string-equal (upcase key) (upcase identity-key)))
+                    (dorg-mutate--protected-body-property-p key))
+            (push (list :drawer drawer key (match-string 2 line)) out))))))
+    (nreverse out)))
+
+(defun dorg-mutate--protected-body-property-p (key)
+  "Return non-nil when body drawer KEY is DOrg-owned metadata.
+
+The body feature is based on the existing DOrg ownership predicate: today
+registered families are all in the case-insensitive DORG_ namespace, and the
+local identity key is named separately for clarity."
+  (or (equal key dorg-id-property)
+      (dorg-protected-keyword-p key)
+      ;; Keep the registered-family seam explicit even while every current
+      ;; family lives beneath DORG_.  A body postimage must remain protected
+      ;; if the generic namespace rule ever narrows.
+      (dorg-owned-metadata-key-p key)))
+
+(defun dorg-mutate--parse-body-view-items-raw (view patch)
+  "Parse canonical body VIEW using DOrg's item grammar.
+
+PATCH supplies only typed diagnostic context.  Callers decide which semantic
+postimage invariant to compare with the parsed result."
+  (with-temp-buffer
+    ;; DOrg's model parser intentionally admits only identity-bearing headings.
+    ;; Give the temporary constructor an identity, then remove that synthetic
+    ;; leading metadata from the returned body items.
+    (insert "* DOrg literal body\n:PROPERTIES:\n:DORG_ID: 1\n:END:\n" view)
+    (let ((org-inhibit-startup t)) (org-mode))
+    (let* ((org-headings (dorg-mutate--org-heading-shape))
+           (parsed (dorg-parse-buffer (current-buffer)))
+           (headings (dorg-parse-result-headings parsed))
+           (heading (cl-find "DOrg literal body" headings
+                             :key #'dorg-heading-title :test #'equal)))
+      (unless (and heading (= (length org-headings) 1))
+        (dorg-mutate--raise 'invalid-target
+                            "body replacement is not representable"
+                            :operation (plist-get patch :op)
+                            :detail 'structural-payload-boundary
+                            :value (plist-get patch :value)))
+      (let* ((items (dorg-heading-items heading))
+             (prefix (dorg-mutate--body-leading-metadata items)))
+        (nthcdr (length prefix) items)))))
+
+(defun dorg-mutate--parse-body-view-items
+    (view patch &optional before-items before-view identity-key)
+  "Parse canonical body VIEW after validating PATCH's literal-body boundary.
+The temporary heading delegates the item grammar to DOrg's parser instead of
+maintaining a second body parser in the mutation engine."
+  (unless (equal (dorg-mutate--body-view-protected-metadata before-view identity-key)
+                 (dorg-mutate--body-view-protected-metadata view identity-key))
+    (dorg-mutate--raise 'invalid-target
+                        "body replacement changes protected metadata"
+                        :operation (plist-get patch :op)
+                        :detail 'structural-payload-boundary))
+  (let ((items (dorg-mutate--parse-body-view-items-raw view patch)))
+    (dorg-mutate--validate-body-postimage items before-items patch identity-key)
+    items))
+
+(defun dorg-mutate--body-nontext-shape (items)
+  "Return the ordered constructor shape of non-text body ITEMS."
+  (cl-loop for item in items
+           unless (cl-typep item 'dorg-text-item)
+           collect (cond ((cl-typep item 'dorg-keyword-item)
+                          (list :keyword (dorg-keyword-item-keyword item)))
+                         ((cl-typep item 'dorg-drawer-item)
+                          (list :drawer (dorg-drawer-item-name item)))
+                         (t (list (type-of item))))))
+
+(defun dorg-mutate--body-protected-metadata (items &optional identity-key)
+  "Return the protected body metadata carried by ITEMS, in source order.
+
+The value is deliberately a full signature, not merely a set of names: an
+edit may not rewrite a protected value just because the corresponding item
+already existed in the preimage."
+  (cl-loop for item in items append
+           (cond
+            ((and (cl-typep item 'dorg-keyword-item)
+                  (dorg-protected-keyword-p
+                   (dorg-keyword-item-keyword item)))
+             (list (list :keyword
+                         (dorg-keyword-item-keyword item)
+                         (dorg-keyword-item-value item))))
+            ((cl-typep item 'dorg-drawer-item)
+             (cl-loop for cell in (dorg-drawer-item-properties item)
+                      when (or (and identity-key
+                                    (string-equal (upcase (car cell))
+                                                  (upcase identity-key)))
+                               (dorg-mutate--protected-body-property-p (car cell)))
+                      collect (list :drawer
+                                    (dorg-drawer-item-name item)
+                                    (car cell) (cdr cell)))))))
+
+(defun dorg-mutate--validate-body-postimage
+    (items before-items patch &optional identity-key)
+  "Refuse unsafe constructor or protected-metadata changes in body ITEMS.
+
+This is the shared composed-postimage guard for the literal-body and
+positional-text doors.  Literal body edits add the non-text shape rule;
+positional text edits retain their existing payload rule and use the common
+heading/protected-metadata portion after the physical splice."
+  (when (and before-items
+             (not (equal (dorg-mutate--body-nontext-shape before-items)
+                         (dorg-mutate--body-nontext-shape items))))
+    (dorg-mutate--raise 'invalid-target "body replacement changes constructors"
+                        :operation (plist-get patch :op)
+                        :detail 'structural-payload-boundary))
+  (unless (equal (dorg-mutate--body-protected-metadata before-items identity-key)
+                 (dorg-mutate--body-protected-metadata items identity-key))
+    (dorg-mutate--raise 'invalid-target
+                        "postimage changes protected body metadata"
+                        :operation (plist-get patch :op)
+                        :detail 'structural-payload-boundary)))
+
+(defun dorg-mutate--validate-item-postimage
+    (items before-items patch &optional batch-context)
+  "Refuse ITEM PATCH when its rendered body changes protected metadata.
+
+Unlike the model-only item transform, this reparses the serialized body.  The
+declared item model must survive that reparse: a text payload that becomes a
+keyword/drawer, or a drawer line that becomes a heading, refuses.  In contrast
+a declared ordinary keyword or drawer remains a legal item-door payload.
+
+Protected metadata is compared over the complete item sequences.  In contrast,
+the render/reparse constructor check operates on each image's own body: a
+leading planning/local-PROPERTIES prefix is not body grammar.  Keeping these
+boundaries distinct makes dropping or forging such a prefix visible to the
+protected-signature comparison."
+  (let* ((after-prefix (dorg-mutate--body-leading-metadata items))
+         (after-body (nthcdr (length after-prefix) items))
+         (before-full-view (dorg-mutate--body-items-view before-items))
+         (after-full-view (dorg-mutate--body-items-view items))
+         (after-view (dorg-mutate--body-items-view after-body)))
+    (let ((identity-key (and batch-context
+                             (gethash dorg-mutate--identity-context-key
+                                      batch-context))))
+      (unless (equal (dorg-mutate--body-view-protected-metadata
+                      before-full-view identity-key)
+                     (dorg-mutate--body-view-protected-metadata
+                      after-full-view identity-key))
+      (dorg-mutate--raise 'invalid-target
+                          "item postimage changes protected body metadata"
+                          :operation (plist-get patch :op)
+                          :detail 'structural-payload-boundary))
+      (let ((reparsed (dorg-mutate--parse-body-view-items-raw after-view patch)))
+        (unless (equal (dorg-mutate--body-nontext-shape after-body)
+                       (dorg-mutate--body-nontext-shape reparsed))
+          (dorg-mutate--raise 'invalid-target
+                              "item postimage changes constructors"
+                              :operation (plist-get patch :op)
+                              :detail 'structural-payload-boundary))))))
+
+(defun dorg-mutate--org-heading-shape ()
+  "Return the complete Org headline shape of the current buffer.
+
+Unlike DOrg's persistence model, this includes an injected idless headline.
+It is therefore suitable for proving constructor-boundary preservation."
+  (org-element-map (org-element-parse-buffer) 'headline
+    (lambda (headline)
+      (list (org-element-property :level headline)
+            (org-element-property :raw-value headline)))))
+
+(defun dorg-mutate--body-items-view (items)
+  "Return the canonical view for ITEMS already known to be body-only."
+  (mapconcat #'dorg-model--body-view-item items ""))
+
+(defun dorg-mutate--apply-body-literal-to-items (items patch &optional batch-context)
+  "Apply PATCH to body-only ITEMS, returning parsed replacement items."
+  (let* ((view (dorg-mutate--body-items-view items))
+         (literal (dorg-mutate--patch-tget (plist-get patch :target) :literal))
+         (match (dorg-model-body-view-literal-match view literal)))
+    (pcase (plist-get match :count)
+      (0 (dorg-mutate--body-literal-refuse 0 patch))
+      (1 (dorg-mutate--parse-body-view-items
+          (concat (substring view 0 (plist-get match :begin))
+                  (plist-get patch :value)
+                  (substring view (plist-get match :end)))
+          patch items view
+          (and batch-context
+               (gethash dorg-mutate--identity-context-key batch-context))))
+      (_ (dorg-mutate--body-literal-refuse 2 patch)))))
+
+(defun dorg-mutate--apply-body-literal-to-items-for-source-plan
+    (items patch &optional batch-context)
+  "Simulate a body literal PATCH for an ordered plain-source plan.
+
+Use the parsed postimage, not a synthetic text placeholder: later ordinary
+item selectors must see the same item sequence that phase two will apply."
+  (let* ((view (dorg-mutate--body-items-view items))
+         (literal (dorg-mutate--patch-tget (plist-get patch :target) :literal))
+         (match (dorg-model-body-view-literal-match view literal)))
+    (pcase (plist-get match :count)
+      (0 (dorg-mutate--body-literal-refuse 0 patch))
+      (1 (dorg-mutate--parse-body-view-items
+          (concat (substring view 0 (plist-get match :begin))
+                  (plist-get patch :value)
+                  (substring view (plist-get match :end)))
+          patch items view
+          (and batch-context
+               (gethash dorg-mutate--identity-context-key batch-context))))
+      (_ (dorg-mutate--body-literal-refuse 2 patch)))))
+
+(defun dorg-mutate--apply-body-literal-to-heading
+    (heading patch &optional batch-context)
+  "Return a deep copy of HEADING with one exact body literal replaced.
+Leading planning and the immediate local PROPERTIES drawer remain verbatim in
+the model.  The body is reparsed by the existing DOrg parser, so structural
+payload is refused at the same boundary as other text mutations."
+  (let* ((replacement (dorg-mutate--body-literal-replacement heading patch))
+         (prefix (dorg-mutate--body-leading-metadata (dorg-heading-items heading)))
+         (copy (dorg-heading-deep-copy heading)))
+    (setf (dorg-heading-items copy)
+          (append prefix
+                  (dorg-mutate--parse-body-view-items
+                   replacement patch
+                   (nthcdr (length prefix) (dorg-heading-items heading))
+                   (dorg-model-body-view heading)
+                   (and batch-context
+                        (gethash dorg-mutate--identity-context-key batch-context)))))
+    (dorg-heading-compute-items-hash copy)
     copy))
 
 (defun dorg-mutate--apply-delete-item
@@ -628,7 +988,15 @@ position, or at host end when the collection is empty."
   (let* ((copy (dorg-mutate--items-copy items))
          (target (plist-get patch :target))
          (index (dorg-mutate--resolve-item-index
-                 copy target patch)))
+                 copy target patch))
+         (existing (nth index copy)))
+    (when (and (eq (car target) :item)
+               (cl-typep existing 'dorg-keyword-item)
+               (dorg-protected-keyword-p
+                (dorg-keyword-item-keyword existing)))
+      (dorg-mutate--raise 'invalid-target "selected item is a protected keyword"
+                          :operation 'delete :detail 'protected-keyword
+                          :target target))
     (dorg-mutate--item-batch-context-remove-items
      batch-context (dorg-mutate--patch-tget target :host) (list index))
     (append (cl-subseq copy 0 index) (nthcdr (1+ index) copy))))
@@ -651,24 +1019,37 @@ position, or at host end when the collection is empty."
 (defun dorg-mutate--apply-replace-keywords
     (items patch &optional batch-context)
   "Replace a same-key keyword collection with PATCH's ordered values.
-The replacement sequence occupies host end, preserving the established public
-behavior while executing it as one typed patch."
+The replacement sequence occupies the first matching member's slot.  The
+unmatched sequence keeps its order; an absent key materializes at host end."
   (let* ((target (plist-get patch :target))
          (copy (dorg-mutate--items-copy items))
          (removed nil)
          (kept nil)
+         (first-index nil)
          (key (dorg-mutate--patch-tget target :name)))
     (cl-loop for item in copy for index from 0
              if (dorg-mutate--item-matches-target-p item target)
-             do (push index removed)
+             do (progn
+                  (unless first-index (setq first-index index))
+                  (push index removed))
              else do (push item kept))
     (setq kept (nreverse kept))
     (dorg-mutate--item-batch-context-remove-items
      batch-context (dorg-mutate--patch-tget target :host) (nreverse removed))
-    (append kept
-            (mapcar (lambda (value)
-                      (dorg-keyword-item :keyword key :value value :post-blank 0))
-                    (plist-get patch :values)))))
+    (let ((replacement
+           (mapcar (lambda (value)
+                     (dorg-keyword-item :keyword key :value value :post-blank 0))
+                   (plist-get patch :values))))
+      (if first-index
+          ;; FIRST-INDEX is in COPY; subtract prior removed members to obtain
+          ;; its index in KEPT, then fill that slot with the new run.
+          (let ((kept-index
+                 (cl-count-if (lambda (i) (< i first-index)) removed)))
+            (setq kept-index (- first-index kept-index))
+            (append (cl-subseq kept 0 kept-index)
+                    replacement
+                    (nthcdr kept-index kept)))
+        (append kept replacement)))))
 
 (defun dorg-mutate--apply-replace-items (_items patch &optional batch-context)
   "Return a fresh list built from typed whole-items PATCH."
@@ -700,6 +1081,19 @@ never treats a later/generic raw-lines PROPERTIES block as metadata."
            idx)
        0))
     (:after-last (length lines))
+    ((or `(:before ,n) `(:after ,n))
+     (let ((base (if (and (integerp n) (<= 1 n) (<= n (length lines)))
+                     (+ (1- n) (if (eq (car position) :after) 1 0))
+                   (dorg-mutate--raise
+                    'invalid-target "drawer-line insertion anchor is missing"
+                    :operation 'insert :detail 'missing :position position))))
+       (if context
+           (let* ((key (dorg-mutate--item-insert-cursor-key target position))
+                  (cursor (gethash key context))
+                  (index (or cursor base)))
+             (puthash key (1+ index) context)
+             index)
+         base)))
     (_ (dorg-mutate--raise 'invalid-op "unsupported drawer-line position"
                            :operation 'insert :detail 'invalid-position
                            :position position))))
@@ -724,12 +1118,17 @@ drawer's post-blank are preserved."
                   copy)))
     (if drawer
         (let* ((lines (dorg-drawer-item-lines drawer))
-               (idx (dorg-mutate--drawer-line-index
-                     lines target position batch-context)))
+               (cursor-key (and batch-context
+                                (not (eq position :after-last))
+                                (dorg-mutate--item-insert-cursor-key target position)))
+               (idx (dorg-mutate--drawer-line-index lines target position batch-context)))
           (setf (dorg-drawer-item-lines drawer)
                 (dorg-mutate--list-insert-at
-                 lines idx (copy-sequence line))))
-      (if (eq (plist-get patch :missing) :create)
+                 lines idx (copy-sequence line)))
+          (dorg-mutate--item-batch-context-shift-drawer-lines
+           batch-context (dorg-mutate--patch-tget target :host) name idx cursor-key))
+      (if (and (eq (plist-get patch :missing) :create)
+               (memq position '(:before-first :after-last)))
           (let* ((idx (dorg-mutate--drawer-line-create-index copy))
                  (cursor-key (and batch-context
                                   (eq position :before-first)
@@ -750,6 +1149,52 @@ drawer's post-blank are preserved."
          :operation 'insert :target target :detail 'missing)))
     copy))
 
+(defun dorg-mutate--apply-drawer-line-selection (items patch)
+  "Apply a private replace/delete drawer-line PATCH to ITEMS.
+An absent drawer is materialized only for an all-lines replacement; an all
+delete is a no-op.  Occurrence operations require an existing selected line."
+  (let* ((copy (dorg-mutate--items-copy items))
+         (target (plist-get patch :target))
+         (name (dorg-mutate--patch-tget target :name))
+         (occurrence (dorg-mutate--patch-tget target :occurrence))
+         (op (plist-get patch :op))
+         (drawer (cl-find-if
+                  (lambda (item)
+                    (and (cl-typep item 'dorg-drawer-item)
+                         (null (dorg-drawer-item-properties item))
+                         (equal name (dorg-drawer-item-name item))))
+                  copy)))
+    (cond
+     ((and occurrence (null drawer))
+      (dorg-mutate--raise 'invalid-target "drawer-line target drawer is missing"
+                          :operation op :target target :detail 'missing))
+     ((and occurrence (> occurrence (length (dorg-drawer-item-lines drawer))))
+      (dorg-mutate--raise 'invalid-target "drawer-line occurrence is missing"
+                          :operation op :target target :detail 'missing))
+     (occurrence
+      (let* ((index (1- occurrence))
+             (lines (dorg-drawer-item-lines drawer)))
+        (setf (dorg-drawer-item-lines drawer)
+              (if (eq op 'delete)
+                  (append (cl-subseq lines 0 index) (nthcdr (1+ index) lines))
+                (append (cl-subseq lines 0 index)
+                        (list (copy-sequence (plist-get patch :value)))
+                        (nthcdr (1+ index) lines))))))
+     ((eq op 'delete) copy)
+     (drawer
+      (setf (dorg-drawer-item-lines drawer)
+            (mapcar #'copy-sequence (plist-get patch :values))))
+     (t
+      (let ((index (dorg-mutate--drawer-line-create-index copy)))
+        (setq copy
+              (dorg-mutate--list-insert-at
+               copy index
+               (dorg-drawer-item :name (copy-sequence name)
+                                 :lines (mapcar #'copy-sequence
+                                                (plist-get patch :values))
+                                 :post-blank 0))))))
+    copy))
+
 (defun dorg-mutate--apply-item-patch (items patch &optional batch-context)
   "Apply one typed item PATCH to ITEMS, returning a new item list.
 ITEMS is never mutated.  Occurrence resolution errors signal
@@ -761,15 +1206,30 @@ list is produced, so a failed patch makes no partial change."
     (`(insert :keywords)
      (dorg-mutate--apply-insert-item items patch batch-context))
     (`(replace :text)       (dorg-mutate--apply-replace-item items patch))
+    (`(delete :text)
+     (dorg-mutate--apply-delete-item items patch batch-context))
     (`(replace :keyword)    (dorg-mutate--apply-replace-item items patch))
     (`(delete :keyword)
      (dorg-mutate--apply-delete-item items patch batch-context))
+    (`(replace :item)      (dorg-mutate--apply-replace-item items patch))
+    (`(delete :item)
+     (dorg-mutate--apply-delete-item items patch batch-context))
+    (`(insert :item)
+     (dorg-mutate--apply-insert-item items patch batch-context))
     (`(delete :keywords)
      (dorg-mutate--apply-delete-keywords items patch batch-context))
     (`(replace :keywords)
+     (dorg-mutate--item-batch-context-clear-host
+      batch-context (dorg-mutate--patch-tget (plist-get patch :target) :host))
      (dorg-mutate--apply-replace-keywords items patch batch-context))
     (`(replace :items)
      (dorg-mutate--apply-replace-items items patch batch-context))
+    (`(replace :drawer-lines)
+     (dorg-mutate--item-batch-context-clear-host
+      batch-context (dorg-mutate--patch-tget (plist-get patch :target) :host))
+     (dorg-mutate--apply-drawer-line-selection items patch))
+    (`(delete :drawer-lines)
+     (dorg-mutate--apply-drawer-line-selection items patch))
     (`(insert :drawer-lines)
      (dorg-mutate--apply-insert-drawer-line items patch batch-context))
     (_ (dorg-mutate--raise 'invalid-op "not a typed item patch"
@@ -787,6 +1247,10 @@ so the result is render/parse stable.  HEADING is not mutated."
     (setf (dorg-heading-items copy)
           (dorg-mutate--apply-item-patch
            (dorg-heading-items copy) patch batch-context))
+    (when (memq (cadr (dorg-mutate--patch-signature patch))
+                '(:text :texts :item :items :drawer-lines))
+      (dorg-mutate--validate-item-postimage
+       (dorg-heading-items copy) (dorg-heading-items heading) patch batch-context))
     (dorg-heading-compute-items-hash copy)
     copy))
 
@@ -866,10 +1330,12 @@ Dolt cons =(unsupported . REASON-STRING)=.
 
 Plain-org is backend-derived source-preserving: it consults the single identity
 resolver and the C3 cell, so a surgical verb is supported only at a heading
-host.  One field-granular S1 exception supports an exact :commented boolean
-heading update; its root and every other structural/heading/planning form refuse
-with `no-source-preserving-editor' + the exact C3 `:variant', and a `none'
-policy refuses every cell with `identity-none'.
+host.  The field-granular S1 heading-line family supports nonempty subsets of
+:title, :todo, :priority, :tags and :commented at that host; the S2 planning
+editor is likewise concrete-heading only.  Its root and every other
+structural/heading form refuses with `no-source-preserving-editor'
++ the exact C3 `:variant', and a `none' policy refuses every cell with
+`identity-none'.
 The Dolt executor supports same-root typed subtree moves and a bounded
 same-repo cross-root archive move (one move-only batch); a cross-repo
 destination, a Dolt/plain-org mixed move, or a multi-move batch is
@@ -882,7 +1348,7 @@ that a non-dry-run apply would reject at dispatch."
      ;; Fidelity is backend-derived: EVERY plain-org edit is source-preserving.
      ;; The single identity resolver + the C3 cell classify each (verb, host)
      ;; cell — a surgical verb is supported only at a heading host, its root
-     ;; variant and every structural/heading/planning whole-verb have no
+     ;; variant and every structural/heading whole-verb have no
      ;; source-preserving editor (NO whole-tree route), and a `none' policy is
      ;; read-only fail-closed.  Returns a STRUCTURED unsupported record
      ;; (`:unsupported' + `:reason' + `:message' + exact C3 `:variant') so the
@@ -933,9 +1399,11 @@ the exact `:variant' the runtime error must carry."
 ;; Capability is classified per (verb, host-variant) CELL, not per bare verb.
 ;; A plain-org (source-preserving) landing supports the surgical verbs only at a
 ;; concrete heading host; the same verb at the level-0 root has no in-place
-;; editor.  Structural and planning verbs have none at all.  Heading updates
-;; have two field-granular exceptions: exact boolean COMMENTED on a concrete
-;; heading, and an explicit-commented constructor under a concrete heading.
+;; editor.  Structural verbs have none at all; planning updates have their
+;; own concrete-heading S2 editor.  Heading updates
+;; admit nonempty subsets of the five intrinsic line fields at a concrete
+;; heading; the separate constructor admits one concrete-parent child whose
+;; section can be rendered and reparsed without ambiguity.
 ;; Dolt is a full backend and supports every cell.  ONE classifier
 ;; (`dorg-mutate--c3-refusal') projects the cell into the one complete refusal
 ;; record consumed by plan and apply, so both reject in lockstep (D4).
@@ -944,12 +1412,13 @@ the exact `:variant' the runtime error must carry."
   '((put :property) (delete :property)
     (replace :keyword) (replace :keywords) (insert :keywords)
     (delete :keyword) (delete :keywords)
-    (insert :texts) (replace :text) (replace :items)
-    (insert :drawer-lines))
+    (insert :texts) (replace :text) (replace :body) (delete :text) (replace :items)
+    (replace :item) (delete :item) (insert :item)
+    (insert :drawer-lines) (replace :drawer-lines) (delete :drawer-lines))
   "Typed patch signatures with a source-preserving heading editor.")
 
 (defconst dorg-mutate--c3-whole-patch-slices
-  '(((update :heading) . S1) ((update :planning) . S2)
+  '(((update :heading) . S1)
     ((insert :tree) . S3) ((delete :heading) . S3)
     ((delete :subtree) . S3) ((move :subtree) . S3))
   "Typed patch signatures with no plain-org editor and their C3 slice.")
@@ -958,44 +1427,37 @@ the exact `:variant' the runtime error must carry."
   '((((update :heading) heading (:commented))
      :status supported :slice S1
      :variant (:host heading :fields (:commented)))
-    (((insert :tree) heading (:commented))
+    (((insert :tree) heading (:constructor))
      :status supported :slice S3
-     :variant (:host heading :constructor (:commented))))
+     :variant (:host heading :constructor :plain-child)))
   "Field-granular exceptions to whole-signature plain-org C3 cells.
 Each key is (SIGNATURE HOST FIELD-KEYS); its plist is the complete cell fact.
-The two exceptions are the ratified boolean COMMENTED intrinsic slot and the
-explicit-commented, concrete-parent, unanchored public constructor.  General
-heading-line/tree editing remains parked under tracked-regression, tracked-regression,
-and tracked-regression")
+The complete nonempty five-field heading-line family is recognized by
+`dorg-mutate--c3-field-cell'; the concrete-parent, unanchored public
+constructor is the other field-granular cell.  Tree editing remains outside
+this table.")
 
-(defun dorg-mutate--c3-public-property-items-p (items)
-  "Non-nil when ITEMS is the public constructor's coalesced property drawer."
-  (or (null items)
-      (and (= (length items) 1)
-           (let ((item (car items)))
-             (and (eq (plist-get item :kind) 'drawer)
-                  (equal (plist-get item :name) "PROPERTIES")
-                  (listp (plist-get item :properties))
-                  (null (plist-get item :lines)))))))
+(defconst dorg-mutate--c3-heading-line-fields
+  '(:title :todo :priority :tags :commented)
+  "Intrinsic headline slots with a source-preserving plain-org editor.")
 
-(defun dorg-mutate--c3-commented-constructor-p (patch)
-  "Non-nil when PATCH is the bounded public COMMENTED constructor cell.
-The clause must be explicitly present as a boolean.  The parent is classified
-separately by the C3 host; anchors and raw typed payload extensions are outside
-the ratified cell."
+(defun dorg-mutate--c3-plain-constructor-p (patch)
+  "Non-nil when PATCH is the bounded public plain-child constructor cell.
+The parent is classified separately by the C3 host.  Anchors, recursive
+children, and raw typed payload extensions stay outside this ratified cell;
+section representability is checked separately during phase one."
   (let* ((target (plist-get patch :target))
          (payload (plist-get patch :heading))
          (keys (cl-loop for (key _value) on payload by #'cddr collect key)))
     (and (equal (dorg-mutate--patch-signature patch) '(insert :tree))
          (not (plist-member (cdr target) :before))
          (not (plist-member (cdr target) :after))
-         (plist-member payload :commented)
-         (memq (plist-get payload :commented) '(nil t))
+         (not (plist-member (cdr target) :offset))
+         (or (not (plist-member payload :commented))
+             (memq (plist-get payload :commented) '(nil t)))
          (cl-every (lambda (key)
                      (memq key '(:title :todo :priority :tags :commented :items)))
-                   keys)
-         (dorg-mutate--c3-public-property-items-p
-          (plist-get payload :items)))))
+                   keys))))
 
 (defun dorg-mutate--c3-field-keys (patch)
   "Return PATCH's bounded C3 field-cell discriminator, or nil."
@@ -1004,13 +1466,14 @@ the ratified cell."
      (cl-loop for (key _value) on (plist-get patch :fields) by #'cddr
               collect key))
     (`(insert :tree)
-     (and (dorg-mutate--c3-commented-constructor-p patch) '(:commented)))))
+     (and (dorg-mutate--c3-plain-constructor-p patch) '(:constructor)))))
 
 (defun dorg-mutate--c3-patch-host (patch)
   "Return PATCH C3 host variant, either `heading' or `root'."
   (let ((signature (dorg-mutate--patch-signature patch)))
     (if (and (or (member signature dorg-mutate--c3-surgical-patches)
                  (equal signature '(update :heading))
+                 (equal signature '(update :planning))
                  (equal signature '(insert :tree)))
              (eq (dorg-mutate--source-preserving-patch-host patch) :root))
         'root
@@ -1018,15 +1481,26 @@ the ratified cell."
 
 (defun dorg-mutate--c3-field-cell (patch host)
   "Return field-granular C3 data for PATCH at HOST, or nil."
-  (alist-get (list (dorg-mutate--patch-signature patch) host
-                   (dorg-mutate--c3-field-keys patch))
-             dorg-mutate--c3-field-cells nil nil #'equal))
+  (let* ((signature (dorg-mutate--patch-signature patch))
+         (fields (dorg-mutate--c3-field-keys patch)))
+    (or (alist-get (list signature host fields)
+                  dorg-mutate--c3-field-cells nil nil #'equal)
+        (when (and (equal signature '(update :heading))
+                   (eq host 'heading)
+                   fields
+                   (cl-every (lambda (field)
+                               (memq field dorg-mutate--c3-heading-line-fields))
+                             fields))
+          (list :status 'supported :slice 'S1
+                :variant (list :host 'heading :fields fields))))))
 
 (defun dorg-mutate--c3-cell (patch host)
   "Return the plain-org C3 (STATUS . SLICE) for PATCH at HOST."
   (let* ((signature (dorg-mutate--patch-signature patch))
          (field-cell (dorg-mutate--c3-field-cell patch host)))
     (cond
+     ((equal signature '(update :planning))
+      (if (eq host 'heading) (cons 'supported 'S2) (cons 'unsupported 'S4)))
      (field-cell (cons (plist-get field-cell :status)
                        (plist-get field-cell :slice)))
      ((not (member signature dorg-mutate--c3-surgical-patches))
@@ -1044,7 +1518,8 @@ Whole-verb-collapsed patches carry the empty variant nil; a surgical verb carrie
   (let ((signature (dorg-mutate--patch-signature patch)))
     (if-let ((field-cell (dorg-mutate--c3-field-cell patch host)))
         (plist-get field-cell :variant)
-      (when (member signature dorg-mutate--c3-surgical-patches)
+      (when (or (member signature dorg-mutate--c3-surgical-patches)
+                (equal signature '(update :planning)))
         (list :host host)))))
 
 (defun dorg-mutate--c3-refusal (patch)
@@ -1199,8 +1674,33 @@ distinct plain-org sources that share a tick/mtime."
 Retained for the Dolt executor (the surgical plain-org path does not use it).
 HEADINGS is a hash id -> `dorg-heading' (every heading, including the
 level-0 root).  ROOT-ID is the synthetic root's id.  CREATED/CHANGED/
-DELETED accumulate affected heading ids for the result diagnostics."
-  headings root-id created changed deleted)
+DELETED accumulate affected heading ids for the result diagnostics.
+ORDER-FACTS-FN, when the load was sparse, returns a parent's complete ordered
+\(ID . SORT-KEY) child facts from the store at the attempt HEAD, keys only;
+nil means HEADINGS is complete.  FACTS-CACHE memoizes those reads per parent.
+REKEYS maps a heading id to (PARENT-ID . SORT-KEY) for rows this batch rekeyed
+without otherwise touching them; they lower to one key-only statement per
+parent and never enter CREATED/CHANGED.  VACATED maps a parent id to the
+hash set of sort keys this batch freed under it (deleted, moved or rekeyed
+rows): the store still holds those keys until commit, so no placement under
+that parent may reuse them.  ORIG is the pristine snapshot hash the headings
+were copied from (nil for an in-memory model); ordering derives the rows this
+batch changed from it (`dorg-mutate--ps-order-delta').
+MOVED is the hash set of ids whose ancestry this batch changed: a moved
+subtree and each promoted child's subtree.  Their stored offsets may be
+unchanged, so index classification takes them from here, not from a level
+diff.  FACT-OFFSETS maps an id the ordering facts reported to its stored
+level offset, so a sparse candidate can check representability against a
+neighbour it never loaded.  PLACEMENT-NEIGHBOURS is (LEFT-ID . RIGHT-ID), the
+immediate siblings the latest single-row key allocation placed between (nil
+where there is none), so the check reuses that allocation's reads."
+  headings root-id created changed deleted
+  order-facts-fn orig
+  (rekeys (make-hash-table :test 'eql))
+  (vacated (make-hash-table :test 'eql))
+  (moved (make-hash-table :test 'eql))
+  (fact-offsets (make-hash-table :test 'eql))
+  placement-neighbours)
 
 (defun dorg-mutate--result-assert-unique-ids (result)
   "Signal `invariant' if parse RESULT carries two headings with the same id.
@@ -1329,90 +1829,326 @@ declared anchor is used."
         (push (dorg-heading-id child) frontier)))
     out))
 
-(defun dorg-mutate--ps-shift-levels (ps heading delta)
-  "Shift HEADING's level and all descendants' levels by DELTA in PS.
-Record each shifted descendant so Dolt persistence writes its new level."
-  (unless (zerop delta)
-    (cl-incf (dorg-heading-level heading) delta)
-    (dolist (d (dorg-mutate--ps-descendants ps (dorg-heading-id heading)))
-      (cl-incf (dorg-heading-level d) delta)
-      (push (dorg-heading-id d) (dorg-mutate--ps-changed ps)))))
+(defun dorg-mutate--ps-reparent-closure (ps heading)
+  "Record HEADING's subtree as MOVED in PS and re-derive its effective levels.
+Called after HEADING's parent or offset changed.  No stored offset below
+HEADING changes, so nothing here is written; each loaded level is derived
+top-down as its parent's level plus its own offset (nil when the parent's
+level is unknown), never patched by arithmetic on a previous value."
+  (let ((moved (dorg-mutate--ps-moved ps))
+        (parent (gethash (dorg-heading-parent-id heading)
+                         (dorg-mutate--ps-headings ps))))
+    (dolist (h (dorg-mutate--derive-closure
+                heading (and parent (dorg-heading-level parent))
+                (lambda (h) (dorg-mutate--ps-children ps (dorg-heading-id h)))))
+      (puthash (dorg-heading-id h) t moved))))
 
-(defun dorg-mutate--ps-rebalance-order (ps ordered)
-  "Assign fresh strictly-ordered, width-uniform sort keys to ORDERED in PS.
-ORDERED is the intended final sibling sequence (`dorg-heading' objects) for
-one parent, in document order.  Each heading's sort key is rewritten with
-`dorg-sortkey-from-integer' at a width sized for the whole group, and its id
-is recorded in the PS `changed' set so the net-membership diff lowers it to
-an UPDATE (a freshly `created' id still routes to INSERT via the db-ops
-union).  This is the complete-parent rebalance backstop reached only when a
-bounded midpoint would exceed the VARBINARY(64) storage budget; it re-opens
-even spacing for the whole group so an aged sibling list can absorb an
-append/prepend/promotion instead of refusing at the storage cliff."
-  (let ((w (dorg-sortkey-width-for-count (length ordered)))
-        (n 0))
-    (dolist (h ordered)
-      (cl-incf n)
-      (setf (dorg-heading-sort-key h) (dorg-sortkey-from-integer n w))
-      (push (dorg-heading-id h) (dorg-mutate--ps-changed ps)))))
+(defun dorg-mutate--derive-closure (heading base children-fn)
+  "Derive HEADING's subtree levels via `dorg-model-derive-closure'.
+BASE and CHILDREN-FN are as there.  A heading in the closure with an
+invalid stored offset refuses the mutation as an `invariant' failure, so a
+move can neither resurrect a numeric level through it nor commit over it."
+  (condition-case err
+      (dorg-model-derive-closure heading base children-fn)
+    (dorg-model-invalid-offset
+     (dorg-mutate--raise 'invariant
+                         (format "heading %S has invalid level offset %S"
+                                 (nth 1 err) (nth 2 err))
+                         :heading (nth 1 err) :detail 'invalid-level-offset))))
 
-(defun dorg-mutate--ps-sibling-order-with (siblings node before-id after-id)
-  "Return SIBLINGS with NODE spliced at its target slot, in document order.
-BEFORE-ID/AFTER-ID (heading ids, or nil) anchor NODE relative to an existing
-sibling exactly as `dorg-mutate--position-key' does; with neither, NODE is
-appended.  SIBLINGS is the sorted sibling list excluding NODE.  Used to build
-the final order handed to `dorg-mutate--ps-rebalance-order' when a bounded
-placement exhausts."
-  (cond
-   (before-id
-    (let (out placed)
-      (dolist (s siblings)
-        (when (and (not placed) (eql (dorg-heading-id s) before-id))
-          (push node out) (setq placed t))
-        (push s out))
-      (unless placed (push node out))
-      (nreverse out)))
-   (after-id
-    (let (out)
-      (dolist (s siblings)
-        (push s out)
-        (when (eql (dorg-heading-id s) after-id)
-          (push node out)))
-      (nreverse out)))
-   (t (append siblings (list node)))))
+(defun dorg-mutate--ps-sibling-offset (ps id)
+  "Return sibling ID's stored level offset in PS, or nil when ID is nil.
+A loaded sibling answers from the candidate; an unloaded one from the
+offsets its ordering facts reported.  An offset that is unknown signals
+rather than being assumed."
+  (when id
+    (let* ((h (gethash id (dorg-mutate--ps-headings ps)))
+           (offset (if h
+                       (dorg-heading-level-offset h)
+                     (gethash id (dorg-mutate--ps-fact-offsets ps)))))
+      (unless (integerp offset)
+        (dorg-mutate--raise 'invariant
+                            (format "sibling %S has no known level offset" id)
+                            :detail 'unknown-neighbour-offset :heading id))
+      offset)))
 
-(defun dorg-mutate--position-key (siblings before-id after-id patch)
-  "Return a sort key positioning a node among SIBLINGS.
-SIBLINGS is the sorted sibling list excluding the node being placed.
-BEFORE-ID/AFTER-ID, when non-nil, anchor the node relative to an
-existing sibling; with neither, the node is appended after the last
-sibling.  Signals `invalid-target' when an anchor is not a sibling.
+(defun dorg-mutate--ps-assert-representable (ps heading patch)
+  "Refuse HEADING's final placement in PS unless Org can render it faithfully.
+Direct-sibling offsets must not increase in render order, or Org re-parents
+the later heading.  The neighbours are the two rows the placement's key
+allocation already found (`dorg-mutate--ps-placement-neighbours'), so the
+check adds no read.  The diagnostic names both neighbours' offsets and, for a
+too-small offset, the smallest valid explicit one; nothing is auto-picked."
+  (let* ((id (dorg-heading-id heading))
+         (pid (dorg-heading-parent-id heading))
+         (offset (dorg-heading-level-offset heading))
+         (neighbours (dorg-mutate--ps-placement-neighbours ps))
+         (pred (dorg-mutate--ps-sibling-offset ps (car neighbours)))
+         (succ (dorg-mutate--ps-sibling-offset ps (cdr neighbours))))
+    (unless (dorg-model-placement-representable-p offset pred succ)
+      (dorg-mutate--raise
+       'invariant
+       (format (concat "placing heading %S at level offset %d under %S would "
+                       "re-parent a sibling when rendered as Org (previous "
+                       "sibling offset %S, next sibling offset %S)%s")
+               id offset pid pred succ
+               (if (and succ (< offset succ))
+                   (format "; supply (offset N) with N >= %d" succ)
+                 ""))
+       :operation (plist-get patch :op) :heading id
+       :detail 'nonrepresentable-sibling-order
+       :offset offset :previous-offset pred :next-offset succ))))
 
-Allocation is bounded: `dorg-sortkey-midpoint-limited' signals
-`dorg-sortkey-exhausted' when the candidate key would reach the storage
-cliff, so callers can complete-parent rebalance instead of writing a key the
-SQL guard would refuse after the core rows commit.  Argument/order errors
-propagate unchanged."
-  (cl-flet ((anchor-index (id)
-              (or (cl-position id siblings :key #'dorg-heading-id :test #'eql)
+;;; Sibling placement
+;;
+;; One ordering path with no correctness-bearing cache.  For a parent P at
+;; the attempt snapshot S, let T be the ids whose stored ordering this batch
+;; replaces or removes and D the current candidate rows under P.  The
+;; effective order is (S \ T) ∪ D, and both sets are derived on demand from
+;; records the PS already keeps: the pristine snapshot, the headings, the
+;; deleted ids and the pending rekeys.  A neighbour of a candidate key is the
+;; better of the indexed store answer (T excluded by id) and the D answer.
+;; No sibling body, tag or extension row is ever hydrated for ordering.
+
+(defconst dorg-mutate-rebalance-neighbourhood 64
+  "Rows read on each side of an exhausted gap before a local rebalance.
+A tunable, not a correctness condition: a cluster that does not fit in this
+neighbourhood falls back to the whole sibling group through the same
+rebalance function.")
+
+(defun dorg-mutate--ps-vacate (ps parent-id key)
+  "Record KEY as freed under PARENT-ID by this batch; the store holds it until commit."
+  (when key
+    (let ((table (dorg-mutate--ps-vacated ps)))
+      (puthash key t (or (gethash parent-id table)
+                         (puthash parent-id (make-hash-table :test 'equal) table))))))
+
+(defun dorg-mutate--ps-vacated-under (ps parent-id)
+  "Return the hash set of keys this batch vacated under PARENT-ID, or nil."
+  (gethash parent-id (dorg-mutate--ps-vacated ps)))
+
+(defun dorg-mutate--ps-order-delta (ps parent-id &optional exclude-ids)
+  "Return (T . D) for PARENT-ID: excluded stored ids and current candidate rows.
+T lists ids whose stored ordering under PARENT-ID this batch replaced or
+removed: deleted rows and repositioned or departed rows (their snapshot
+parent or key differs from their candidate), pending rekeys under
+PARENT-ID, and EXCLUDE-IDS.  D lists (ID . KEY) for every row currently
+under PARENT-ID in the candidate: loaded headings with their current keys
+and pending rekeys of unloaded rows, minus EXCLUDE-IDS, deduplicated by id.
+Unchanged loaded rows appear in both sources with the same key, which is
+harmless.  Derived on demand from the PS; nothing is cached."
+  (let ((orig (dorg-mutate--ps-orig ps))
+        (excluded (make-hash-table :test 'eql))
+        (rows (make-hash-table :test 'eql)))
+    (dolist (id exclude-ids) (puthash id t excluded))
+    (maphash (lambda (id cell)
+               (when (eql (car cell) parent-id)
+                 (puthash id t excluded)
+                 (puthash id (cdr cell) rows)))
+             (dorg-mutate--ps-rekeys ps))
+    ;; A deleted row is excluded from S and never a pending row of D.
+    (dolist (id (dorg-mutate--ps-deleted ps))
+      (puthash id t excluded)
+      (remhash id rows))
+    (maphash (lambda (id h)
+               (let ((o (and orig (gethash id orig))))
+                 (when (and o
+                            (eql (dorg-heading-parent-id o) parent-id)
+                            (not (and (eql (dorg-heading-parent-id h) parent-id)
+                                      (equal (dorg-heading-sort-key h)
+                                             (dorg-heading-sort-key o)))))
+                   (puthash id t excluded)))
+               (if (eql (dorg-heading-parent-id h) parent-id)
+                   (puthash id (dorg-heading-sort-key h) rows)
+                 (remhash id rows)))
+             (dorg-mutate--ps-headings ps))
+    (dolist (id exclude-ids) (remhash id rows))
+    (let (ids cells)
+      (maphash (lambda (id _) (push id ids)) excluded)
+      (maphash (lambda (id key) (push (cons id key) cells)) rows)
+      (cons ids cells))))
+
+(defun dorg-mutate--ps-dedupe-rows (rows)
+  "Return ROWS ((ID . KEY) ...) with each id once, first occurrence kept, in linear time."
+  (let ((seen (make-hash-table :test 'eql))
+        out)
+    (dolist (cell rows (nreverse out))
+      (unless (gethash (car cell) seen)
+        (puthash (car cell) t seen)
+        (push cell out)))))
+
+(defun dorg-mutate--ps-neighbours (ps parent-id bound side limit &optional exclude-ids)
+  "Return up to LIMIT (ID . KEY) rows under PARENT-ID on SIDE of BOUND, nearest first.
+SIDE is `before' (keys strictly below BOUND, greatest first) or `after' (keys
+strictly above, smallest first); a nil BOUND means the fan end on that side.
+The store answers from the attempt snapshot through the indexed sibling
+order with T excluded by id; the pending rows D answer from the PS; the two
+ordered lists are merged.  Ordinary placement transfers at most LIMIT rows
+from the store regardless of how many siblings the parent has."
+  (let* ((delta (and (> limit 0)
+                     (dorg-mutate--ps-order-delta ps parent-id exclude-ids)))
+         (fn (dorg-mutate--ps-order-facts-fn ps))
+         (less (if (eq side 'before)
+                   (lambda (a b) (string> a b))
+                 (lambda (a b) (string< a b))))
+         (inside (lambda (key)
+                   (or (null bound)
+                       (if (eq side 'before)
+                           (string< key bound)
+                         (string< bound key)))))
+         (pending (cl-remove-if-not (lambda (cell) (funcall inside (cdr cell)))
+                                    (cdr delta)))
+         (stored (and fn (> limit 0)
+                      (funcall fn parent-id bound side limit (car delta)))))
+    ;; An unchanged loaded row answers from both sources with the same key;
+    ;; keep it once so a rebalance window never carries a row twice.
+    (seq-take (sort (dorg-mutate--ps-dedupe-rows (append stored pending))
+                    (lambda (a b) (funcall less (cdr a) (cdr b))))
+              limit)))
+
+(defun dorg-mutate--ps-group (ps parent-id &optional exclude-ids)
+  "Return PARENT-ID's whole effective order as an ascending (ID . KEY) vector.
+Used only by the whole-group rebalance fallback; never for ordinary placement."
+  (let* ((delta (dorg-mutate--ps-order-delta ps parent-id exclude-ids))
+         (fn (dorg-mutate--ps-order-facts-fn ps))
+         (stored (and fn (funcall fn parent-id nil nil nil (car delta)))))
+    (apply #'vector
+           (sort (dorg-mutate--ps-dedupe-rows (append stored (cdr delta)))
+                 (lambda (a b) (string< (cdr a) (cdr b)))))))
+
+(defun dorg-mutate--ps-retire-rekey (ps id)
+  "Drop ID's pending rekey: a later semantic change now owns its final key.
+The row's own row op (or its deletion) carries the final state; an
+intermediate rekey must not survive into lowering or projector images."
+  (remhash id (dorg-mutate--ps-rekeys ps)))
+
+(defun dorg-mutate--ps-apply-rekeys (ps parent-id old-keys rekeys)
+  "Record REKEYS ((ID . KEY) ...) under PARENT-ID without touching content.
+OLD-KEYS maps each rekeyed id to the key it held before, which is vacated.  A
+loaded heading takes its new key; every rekey is recorded for the key-only
+lowering.  Rekeyed rows are not marked changed: their order is preserved, so
+no projection needs to see them."
+  (dolist (cell rekeys)
+    (let* ((id (car cell))
+           (h (gethash id (dorg-mutate--ps-headings ps))))
+      (dorg-mutate--ps-vacate ps parent-id (gethash id old-keys))
+      (when h
+        (setf (dorg-heading-sort-key h) (cdr cell)))
+      (puthash id (cons parent-id (cdr cell)) (dorg-mutate--ps-rekeys ps)))))
+
+(defun dorg-mutate--ps-rebalance (ps parent-id rows index count left-bound right-bound)
+  "Rebalance ROWS to place COUNT keys after INDEX; return the new keys.
+ROWS is an ascending (ID . KEY) vector; LEFT-BOUND and RIGHT-BOUND are the
+unchanged keys just outside it (nil at a fan end).  Signals
+`dorg-sortkey-exhausted' when ROWS cannot fit between the bounds."
+  (let* ((plan (dorg-model-plan-window
+                rows index count (dorg-mutate--ps-vacated-under ps parent-id)
+                left-bound right-bound))
+         (old (make-hash-table :test 'eql)))
+    (cl-loop for cell across rows do (puthash (car cell) (cdr cell) old))
+    (dorg-mutate--ps-apply-rekeys ps parent-id old (plist-get plan :rekeys))
+    (plist-get plan :keys)))
+
+(defun dorg-mutate--ps-allocate-keys (ps parent-id slot ids &optional exclude-ids)
+  "Return fresh keys placing IDS under PARENT-ID at SLOT, in order.
+SLOT is (:after ID . KEY), (:before ID . KEY), `:head' or `:tail'; ID is the
+anchor row itself, or nil when KEY is only a bound (a slot a deleted row
+vacated).  The immediate neighbours come from `dorg-mutate--ps-neighbours'
+\(one row per side) and the pure allocator places between them.  On
+exhaustion, a neighbourhood of `dorg-mutate-rebalance-neighbourhood' rows per
+side with the next rows as explicit outside bounds is rebalanced; if it cannot
+fit, the whole sibling group is, through the same function.  Every key is
+fresh for the parent: distinct from every live key and from every key this
+batch vacated under it, so no statement order can violate the sibling unique
+index.  EXCLUDE-IDS are rows being placed that still carry stale keys."
+  (pcase-let* ((count (length ids))
+               (`(,kind ,anchor-id ,key)
+                (pcase slot
+                  (`(,kind ,id . ,key) (list kind id key))
+                  (:head (list :head nil nil))
+                  (:tail (list :tail nil nil))
+                  (_ (error "Unknown placement slot %S" slot))))
+               (anchor (and anchor-id (cons anchor-id key)))
+               (vacated (dorg-mutate--ps-vacated-under ps parent-id)))
+    (cl-flet ((below (n)
+                ;; Rows strictly below the slot, nearest first.
+                (cond ((eq kind :head) nil)
+                      ((and (eq kind :after) anchor)
+                       (cons anchor (dorg-mutate--ps-neighbours
+                                     ps parent-id key 'before (1- n) exclude-ids)))
+                      (t (dorg-mutate--ps-neighbours
+                          ps parent-id key 'before n exclude-ids))))
+              (above (n)
+                (cond ((eq kind :tail) nil)
+                      ((and (eq kind :before) anchor)
+                       (cons anchor (dorg-mutate--ps-neighbours
+                                     ps parent-id key 'after (1- n) exclude-ids)))
+                      (t (dorg-mutate--ps-neighbours
+                          ps parent-id key 'after n exclude-ids)))))
+      (let ((left (car (below 1)))
+            (right (car (above 1))))
+        ;; The same two rows bound the placed heading in render order, so the
+        ;; representability check reuses them instead of reading again.
+        (setf (dorg-mutate--ps-placement-neighbours ps)
+              (cons (car left) (car right)))
+        (condition-case nil
+            (dorg-model-plan-gap (cdr left) (cdr right) count vacated)
+          (dorg-sortkey-exhausted
+           (let* ((n dorg-mutate-rebalance-neighbourhood)
+                  (lows (below (1+ n)))
+                  (highs (above (1+ n)))
+                  (left-bound (and (> (length lows) n) (cdr (nth n lows))))
+                  (right-bound (and (> (length highs) n) (cdr (nth n highs))))
+                  (low-part (nreverse (seq-take lows n)))
+                  (window (vconcat low-part (seq-take highs n))))
+             (condition-case nil
+                 (dorg-mutate--ps-rebalance
+                  ps parent-id window (1- (length low-part)) count
+                  left-bound right-bound)
+               (dorg-sortkey-exhausted
+                (let* ((group (dorg-mutate--ps-group ps parent-id exclude-ids))
+                       (gindex (cond ((eq kind :head) -1)
+                                     ((eq kind :tail) (1- (length group)))
+                                     (t (dorg-mutate--ps-group-index
+                                         group key (eq kind :after))))))
+                  (dorg-mutate--ps-rebalance
+                   ps parent-id group gindex count nil nil)))))))))))
+
+(defun dorg-mutate--ps-group-index (group key inclusive)
+  "Return the index of the last GROUP entry below KEY (at or below with INCLUSIVE), or -1."
+  (let ((lo 0) (hi (length group)))
+    (while (< lo hi)
+      (let* ((mid (/ (+ lo hi) 2))
+             (cell-key (cdr (aref group mid))))
+        (if (if inclusive (not (string< key cell-key)) (string< cell-key key))
+            (setq lo (1+ mid))
+          (setq hi mid))))
+    (1- lo)))
+
+(defun dorg-mutate--ps-slot (ps parent-id before-id after-id patch)
+  "Return the placement slot under PARENT-ID for BEFORE-ID / AFTER-ID.
+The slot carries the anchor id and its key; with neither anchor it is `:tail'.  Signals `invalid-target' when an
+anchor is not a loaded sibling under PARENT-ID."
+  (cl-flet ((anchor-key (id)
+              (let ((h (gethash id (dorg-mutate--ps-headings ps))))
+                (unless (and h (eql (dorg-heading-parent-id h) parent-id))
                   (dorg-mutate--raise
                    'invalid-target
                    (format "position anchor %S is not a sibling here" id)
-                   :operation (plist-get patch :op) :target id :detail 'missing)))
-            (key-at (i) (dorg-heading-sort-key (nth i siblings))))
+                   :operation (plist-get patch :op) :target id
+                   :detail 'missing))
+                (dorg-heading-sort-key h))))
     (cond
-     (before-id
-      (let ((idx (anchor-index before-id)))
-        (dorg-sortkey-midpoint-limited (and (> idx 0) (key-at (1- idx))) (key-at idx))))
-     (after-id
-      (let ((idx (anchor-index after-id)))
-        (dorg-sortkey-midpoint-limited
-         (key-at idx)
-         (and (< (1+ idx) (length siblings)) (key-at (1+ idx))))))
-     (siblings
-      (dorg-sortkey-midpoint-limited
-       (dorg-heading-sort-key (car (last siblings))) nil))
-     (t (dorg-sortkey-from-integer 1)))))
+     (before-id (cons :before (cons before-id (anchor-key before-id))))
+     (after-id (cons :after (cons after-id (anchor-key after-id))))
+     (t :tail))))
+
+(defun dorg-mutate--ps-place (ps parent-id id before-id after-id patch
+                                 &optional exclude-ids)
+  "Return one fresh key placing ID under PARENT-ID at the anchored slot."
+  (car (dorg-mutate--ps-allocate-keys
+        ps parent-id (dorg-mutate--ps-slot ps parent-id before-id after-id patch)
+        (list id) exclude-ids)))
 
 ;;; Typed-patch model mutations
 
@@ -1421,7 +2157,7 @@ propagate unchanged."
   (let ((target (plist-get patch :target)))
     (pcase (car target)
       ((or :heading :subtree) (dorg-mutate--patch-target-host target))
-      ((or :property :keyword :keywords :planning :text :texts :items
+    ((or :property :keyword :keywords :planning :body :text :texts :items :item
            :drawer-lines)
        (dorg-mutate--patch-host (dorg-mutate--patch-tget target :host)))
       (:tree (dorg-mutate--patch-host
@@ -1443,8 +2179,7 @@ propagate unchanged."
       (dorg-mutate--raise 'invalid-target
                           (format "inserted heading id %S already exists" id)
                           :operation 'insert :target id))
-    (let* ((siblings (dorg-mutate--ps-children ps pid))
-           (before-id (dorg-mutate--ps-anchor-id
+    (let* ((before-id (dorg-mutate--ps-anchor-id
                        ps (and (plist-member (cdr target) :before)
                                (dorg-mutate--patch-anchor-address
                                 (dorg-mutate--patch-tget target :before))) patch))
@@ -1455,40 +2190,31 @@ propagate unchanged."
            (effective-after-id
             (dorg-mutate--ps-effective-after-id
              ps pid after-id id batch-context))
-           ;; Bounded placement.  Unlike move/delete, the insert executor
-           ;; deliberately hydrates only the parent plus the exact placement
-           ;; neighbors (tracked-regression — never the full sibling fan), so a
-           ;; complete-parent rebalance is not available here.  At the storage
-           ;; cliff we therefore FAIL CLOSED before any core row is staged —
-           ;; killing the core-without-projection orphan class the raw midpoint
-           ;; produced when the SQL guard refused post-commit.  Restoring
-           ;; head/tail insert SUCCESS onto an aged list is the deferred
-           ;; asymmetric-allocator + lazy-normalization work (see Resolution).
-           (key (condition-case nil
-                    (dorg-mutate--position-key
-                     siblings before-id effective-after-id patch)
-                  (dorg-sortkey-exhausted
-                   (dorg-mutate--raise
-                    'invariant
-                    (concat "destination sibling order is exhausted; a "
-                            "prepend/append onto this aged group needs a "
-                            "rebalance not available on the minimal-scope "
-                            "insert path")
-                    :operation 'insert :target pid
-                    :detail 'sort-key-exhausted))))
+           (offset (or (dorg-mutate--patch-tget target :offset) 1))
            (h (make-dorg-heading
-               :id id :parent-id pid :sort-key key
-               :level (1+ (dorg-heading-level parent))
+               :id id :parent-id pid
+               ;; A new heading sits OFFSET levels below its parent (1 unless
+               ;; history restores a skipped level); its effective level is
+               ;; derived from the parent's.
+               :level (dorg-model-offset-level (dorg-heading-level parent)
+                                               offset)
+               :level-offset offset
                :todo (plist-get payload :todo)
                :priority (plist-get payload :priority)
                :commented (and (plist-get payload :commented) t)
                :title (plist-get payload :title)
                :post-blank (or (plist-get payload :post-blank) 0)
                :tags (plist-get payload :tags)
-               :items (mapcar (lambda (v) (dorg-mutate--item-from-value v 0))
-                              (plist-get payload :items)))))
+               :items (mapcar (lambda (v) (dorg-mutate--item-from-value v))
+                               (plist-get payload :items)))))
+      ;; Placement in the parent's fan (keys only, never hydrated content);
+      ;; a gap without room rekeys the smallest window with room.
+      (setf (dorg-heading-sort-key h)
+            (dorg-mutate--ps-place
+             ps pid id before-id effective-after-id patch))
       (dorg-heading-compute-items-hash h)
       (puthash id h (dorg-mutate--ps-headings ps))
+      (dorg-mutate--ps-assert-representable ps h patch)
       (push id (dorg-mutate--ps-created ps))
       (unless before-id
         (dorg-mutate--ps-record-after-cursor
@@ -1525,10 +2251,15 @@ propagate unchanged."
 (defun dorg-mutate--ps-move (ps patch &optional batch-context)
   "Apply typed subtree PATCH reparent+reposition.
 In the tree model a subtree follows its node automatically (descendants
-reference the node by id); descendant levels track the new depth."
+reference the node by id).  The moved root's level offset becomes the
+patch's :offset, or 1 when omitted, even when the parent is unchanged; no
+descendant offset changes.  The final placement must be representable as
+Org, and the moved closure's effective levels are then re-derived."
   (let* ((to (plist-get patch :to))
          (h (dorg-mutate--ps-heading ps (dorg-mutate--patch-address patch) patch))
-         (parent-host (dorg-mutate--patch-host (plist-get to :under))))
+         (parent-host (dorg-mutate--patch-host (plist-get to :under)))
+         (old-parent-id (dorg-heading-parent-id h))
+         (old-key (dorg-heading-sort-key h)))
     (when parent-host
       (let ((np (dorg-mutate--ps-heading ps parent-host patch)))
         (when (or (eql (dorg-heading-id np) (dorg-heading-id h))
@@ -1539,15 +2270,10 @@ reference the node by id); descendant levels track the new depth."
                               "cannot move a heading under itself or a descendant"
                               :operation (plist-get patch :op)
                               :heading (dorg-heading-id h)))
-        (dorg-mutate--ps-shift-levels
-         ps h (- (1+ (dorg-heading-level np)) (dorg-heading-level h)))
+        (setf (dorg-heading-level-offset h) (or (plist-get to :offset) 1))
         (setf (dorg-heading-parent-id h) (dorg-heading-id np))))
     (when (or parent-host (plist-member to :before) (plist-member to :after))
-      (let* ((siblings (cl-remove (dorg-heading-id h)
-                                  (dorg-mutate--ps-children
-                                   ps (dorg-heading-parent-id h))
-                                  :key #'dorg-heading-id :test #'eql))
-             (before-id (dorg-mutate--ps-anchor-id
+      (let* ((before-id (dorg-mutate--ps-anchor-id
                          ps (and (plist-member to :before)
                                  (dorg-mutate--patch-anchor-address
                                   (plist-get to :before))) patch))
@@ -1559,72 +2285,67 @@ reference the node by id); descendant levels track the new depth."
               (dorg-mutate--ps-effective-after-id
                ps (dorg-heading-parent-id h) after-id
                (dorg-heading-id h) batch-context)))
-        ;; Bounded reposition; on storage-cliff exhaustion complete-parent
-        ;; rebalance the destination group with the mover in its target slot.
-        (condition-case nil
-            (setf (dorg-heading-sort-key h)
-                  (dorg-mutate--position-key
-                   siblings before-id effective-after-id patch))
-          (dorg-sortkey-exhausted
-           (dorg-mutate--ps-rebalance-order
-            ps (dorg-mutate--ps-sibling-order-with
-                siblings h before-id effective-after-id))))
+        ;; The mover leaves its old slot (its key stays vacated until commit)
+        ;; and is placed under the destination, excluded from that parent's
+        ;; pending rows since it still carries its old key.  Its final key is
+        ;; now this move's; an earlier rekey of it is retired.
+        (dorg-mutate--ps-vacate ps old-parent-id old-key)
+        (dorg-mutate--ps-retire-rekey ps (dorg-heading-id h))
+        (setf (dorg-heading-sort-key h)
+              (dorg-mutate--ps-place
+               ps (dorg-heading-parent-id h) (dorg-heading-id h) before-id
+               effective-after-id patch (list (dorg-heading-id h))))
         (unless before-id
           (dorg-mutate--ps-record-after-cursor
            (dorg-heading-parent-id h) after-id
            (dorg-heading-id h) batch-context))))
+    (dorg-mutate--ps-assert-representable ps h patch)
+    (dorg-mutate--ps-reparent-closure ps h)
     (push (dorg-heading-id h) (dorg-mutate--ps-changed ps))))
 
 (defun dorg-mutate--ps-delete-heading (ps patch)
   "Apply typed heading/subtree delete PATCH to PS.
 A subtree target removes the heading and descendants.  A heading target
 the heading is removed and its direct children are promoted to the
-deleted heading's parent, keeping their order and adjusting levels."
+deleted heading's parent, keeping their order; each takes the removed
+heading's level offset and its subtree is recorded as MOVED."
   (let* ((h (dorg-mutate--ps-heading ps (dorg-mutate--patch-address patch) patch))
          (id (dorg-heading-id h))
          (hash (dorg-mutate--ps-headings ps)))
     (if (eq (car (plist-get patch :target)) :subtree)
         (progn
           (dolist (d (dorg-mutate--ps-descendants ps id))
+            (dorg-mutate--ps-retire-rekey ps (dorg-heading-id d))
             (remhash (dorg-heading-id d) hash)
             (push (dorg-heading-id d) (dorg-mutate--ps-deleted ps)))
+          (dorg-mutate--ps-vacate
+           ps (dorg-heading-parent-id h) (dorg-heading-sort-key h))
+          (dorg-mutate--ps-retire-rekey ps id)
           (remhash id hash)
           (push id (dorg-mutate--ps-deleted ps)))
       (let* ((gp (dorg-heading-parent-id h))
              (kids (dorg-mutate--ps-children ps id))
-             (hkey (dorg-heading-sort-key h))
-             (siblings (cl-remove id (dorg-mutate--ps-children ps gp)
-                                  :key #'dorg-heading-id :test #'eql))
-             (left nil) (right nil))
-        (dolist (s siblings)
-          (if (string< (dorg-heading-sort-key s) hkey)
-              (setq left (dorg-heading-sort-key s))
-            (unless right (setq right (dorg-heading-sort-key s)))))
-        ;; Re-home each promoted child to the grandparent and adjust its level;
-        ;; this is independent of key allocation and always applies.
-        (dolist (k kids)
-          (dorg-mutate--ps-shift-levels
-           ps k (- (dorg-heading-level h) (dorg-heading-level k)))
-          (setf (dorg-heading-parent-id k) gp)
-          (push (dorg-heading-id k) (dorg-mutate--ps-changed ps)))
-        ;; Allocate bounded keys in the deleted heading's gap.  Promoting many
-        ;; children into a narrow gap is its own exhaustion vector, so on the
-        ;; storage cliff complete-parent rebalance the merged sibling order
-        ;; (left siblings ++ promoted kids ++ right siblings).
-        (condition-case nil
-            (let ((lo left))
-              (dolist (k kids)
-                (let ((nkey (dorg-sortkey-midpoint-limited lo right)))
-                  (setf (dorg-heading-sort-key k) nkey)
-                  (setq lo nkey))))
-          (dorg-sortkey-exhausted
-           (dorg-mutate--ps-rebalance-order
-            ps (append
-                (cl-remove-if-not
-                 (lambda (s) (string< (dorg-heading-sort-key s) hkey)) siblings)
-                kids
-                (cl-remove-if
-                 (lambda (s) (string< (dorg-heading-sort-key s) hkey)) siblings)))))
+             (hkey (dorg-heading-sort-key h)))
+        ;; The deleted heading's key becomes a bare bound (it is excluded
+        ;; from the effective order); the children are placed at that slot
+        ;; BEFORE they are re-homed, so no stale key enters the pending rows.
+        (dorg-mutate--ps-vacate ps gp hkey)
+        (dorg-mutate--ps-retire-rekey ps id)
+        (let ((keys (dorg-mutate--ps-allocate-keys
+                     ps gp (cons :before (cons nil hkey))
+                     (mapcar #'dorg-heading-id kids)
+                     (list id))))
+          (dolist (k kids)
+            ;; A promoted child takes the removed heading's place, and so
+            ;; its offset; its own descendants keep theirs.  The promoted run
+            ;; o, o, ... sits between neighbours that already bracketed o, so
+            ;; it is always representable.
+            (setf (dorg-heading-level-offset k) (dorg-heading-level-offset h))
+            (setf (dorg-heading-parent-id k) gp)
+            (setf (dorg-heading-sort-key k) (pop keys))
+            (dorg-mutate--ps-retire-rekey ps (dorg-heading-id k))
+            (dorg-mutate--ps-reparent-closure ps k)
+            (push (dorg-heading-id k) (dorg-mutate--ps-changed ps))))
         (remhash id hash)
         (push id (dorg-mutate--ps-deleted ps))))))
 
@@ -1702,20 +2423,28 @@ a key/value drawer and drop its lines."
 
 (defun dorg-mutate--ps-update-planning (ps patch &optional batch-context)
   "Apply typed planning-update PATCH to PS.
-Replaces the heading's planning line with the supplied fields; an
-all-nil planning request removes the planning line entirely."
+Updates only the planning fields present in PATCH.  An explicit clear removes
+the planning item only when all three resulting fields are nil."
   (let* ((target (plist-get patch :target))
          (address (dorg-mutate--patch-address patch))
          (host (dorg-mutate--patch-tget target :host))
          (h (dorg-mutate--ps-heading ps address patch))
-         (s (plist-get patch :scheduled))
-         (d (plist-get patch :deadline))
-         (c (plist-get patch :closed))
+         (has-s (plist-member patch :scheduled))
+         (has-d (plist-member patch :deadline))
+         (has-c (plist-member patch :closed))
          (planning (cl-find-if (lambda (it) (cl-typep it 'dorg-planning-item))
                                (dorg-heading-items h))))
     (cond
-     ((and (null s) (null d) (null c))
-      (when planning
+     (planning
+      (when has-s
+        (setf (dorg-planning-item-scheduled planning) (plist-get patch :scheduled)))
+      (when has-d
+        (setf (dorg-planning-item-deadline planning) (plist-get patch :deadline)))
+      (when has-c
+        (setf (dorg-planning-item-closed planning) (plist-get patch :closed)))
+      (when (and (null (dorg-planning-item-scheduled planning))
+                 (null (dorg-planning-item-deadline planning))
+                 (null (dorg-planning-item-closed planning)))
         (let* ((items (dorg-heading-items h))
                (idx (cl-position planning items :test #'eq)))
           (when idx
@@ -1723,18 +2452,18 @@ all-nil planning request removes the planning line entirely."
              batch-context host (list idx)))
           (setf (dorg-heading-items h)
                 (cl-remove planning items)))))
-     (planning
-      (setf (dorg-planning-item-scheduled planning) s)
-      (setf (dorg-planning-item-deadline planning) d)
-      (setf (dorg-planning-item-closed planning) c))
      (t
-      ;; Planning is the first line of a heading's section.
-      (dorg-mutate--item-batch-context-shift-items
-       batch-context host 0 1)
-      (setf (dorg-heading-items h)
-            (cons (dorg-planning-item :post-blank 0 :scheduled s
-                                      :deadline d :closed c)
-                  (dorg-heading-items h)))))
+      (when (or (plist-get patch :scheduled) (plist-get patch :deadline)
+                (plist-get patch :closed))
+        ;; Planning is the first line of a heading's section.
+        (dorg-mutate--item-batch-context-shift-items
+         batch-context host 0 1)
+        (setf (dorg-heading-items h)
+              (cons (dorg-planning-item :post-blank 0
+                                        :scheduled (plist-get patch :scheduled)
+                                        :deadline (plist-get patch :deadline)
+                                        :closed (plist-get patch :closed))
+                    (dorg-heading-items h))))))
     (dorg-heading-compute-items-hash h)
     (push (dorg-heading-id h) (dorg-mutate--ps-changed ps))))
 
@@ -1777,8 +2506,17 @@ and signals `unsupported'; a same-source move reparents the subtree."
     (`(update :planning) (dorg-mutate--ps-update-planning ps patch batch-context))
     ((or `(replace :keyword) `(replace :keywords) `(insert :keywords)
          `(delete :keyword) `(delete :keywords) `(insert :texts)
-         `(replace :text) `(replace :items) `(insert :drawer-lines))
+         `(replace :text) `(replace :items) `(replace :item) `(delete :item)
+         `(insert :item) `(insert :drawer-lines) `(replace :drawer-lines)
+         `(delete :drawer-lines))
      (dorg-mutate--ps-item-patch ps patch batch-context))
+    (`(replace :body)
+     (let* ((host (dorg-mutate--item-patch-host patch))
+            (heading (dorg-mutate--ps-heading ps host patch))
+            (new (dorg-mutate--apply-body-literal-to-heading
+                  heading patch batch-context)))
+       (puthash (dorg-heading-id heading) new (dorg-mutate--ps-headings ps))
+       (push (dorg-heading-id heading) (dorg-mutate--ps-changed ps))))
     (_ (dorg-mutate--raise 'unsupported
                            "executor cannot apply typed patch"
                            :operation (plist-get patch :op)
@@ -1811,15 +2549,14 @@ and signals `unsupported'; a same-source move reparents the subtree."
 ;; edit; (2) snapshot the buffer; (3) apply the surgical edits; (4) restore the
 ;; snapshot on any mid-batch failure — preserving the "missing target leaves the
 ;; source unchanged" atomicity guarantee.  Property and keyword/text/item
-;; patches on an identified heading are supported surgically.  An exact boolean
-;; COMMENTED update is the sole whole-heading exception and edits only the
-;; literal `COMMENT ' span.  One explicit-commented constructor cell appends a
-;; child under a concrete heading; omitted-commented, root, anchor, and broader
-;; typed constructors remain refused.  General heading-line/tree editing stays
-;; parked under tracked-regression, tracked-regression, and tracked-regression  All other
-;; heading updates/deletes, subtree moves, planning updates, and root-host
-;; variants have no in-place editor and FAIL CLOSED `unsupported' before any
-;; write — there is no whole-tree fallback for plain-org.
+;; patches on an identified heading are supported surgically.  A nonempty
+;; subset of the five intrinsic heading-line fields is the sole whole-heading
+;; exception and edits only its affected token spans.  One explicit-commented
+;; constructor cell appends a child under a concrete heading; omitted-commented,
+;; root, anchor, and broader typed constructors remain refused.  Heading
+;; deletion, subtree moves, and root-host variants have no
+;; in-place editor and FAIL CLOSED `unsupported' before any write — there is no
+;; whole-tree fallback for plain-org.
 
 (defun dorg-mutate--source-preserving-heading-key (key)
   "Return the local value of PROPERTIES KEY at point (a heading), or nil."
@@ -1984,7 +2721,7 @@ constructors in this batch.  Return the new (KEY . VALUE) pair, or nil for a
   "Return a new heading model for public constructor PATCH at LEVEL and ID."
   (let ((payload (plist-get patch :heading)))
     (make-dorg-heading
-     :id id :level level
+     :id id :level level :level-offset 1
      :todo (plist-get payload :todo)
      :priority (plist-get payload :priority)
      :commented (and (plist-get payload :commented) t)
@@ -1992,12 +2729,156 @@ constructors in this batch.  Return the new (KEY . VALUE) pair, or nil for a
      :post-blank 0
      :tags (plist-get payload :tags)
      :items (mapcar (lambda (value)
-                      (dorg-mutate--item-from-value value 0))
+                      (dorg-mutate--item-from-value value))
                     (plist-get payload :items)))))
+
+(defun dorg-mutate--source-preserving-constructor-refuse (value)
+  "Refuse a constructor section VALUE which does not round-trip through Org."
+  (dorg-mutate--raise 'invalid-target
+                      "constructor section cannot represent requested content"
+                      :value value :detail 'constructor-section-unrepresentable))
+
+(defun dorg-mutate--source-preserving-heading-grammar-apply (grammar)
+  "Install captured source headline GRAMMAR in the current temporary buffer."
+  (setq-local org-todo-regexp (plist-get grammar :todo-regexp)
+              org-todo-keywords-1 (plist-get grammar :todo-keywords)
+              org-done-keywords (plist-get grammar :done-keywords)
+              org-odd-levels-only (plist-get grammar :odd-levels-only)))
+
+(defun dorg-mutate--source-preserving-constructor-line-fields (patch)
+  "Return PATCH's headline slots as a complete line-validator plist."
+  (let ((payload (plist-get patch :heading)))
+    (list :title (or (plist-get payload :title) "")
+          :todo (plist-get payload :todo)
+          :priority (plist-get payload :priority)
+          :tags (plist-get payload :tags)
+          :commented (and (plist-get payload :commented) t))))
+
+(defun dorg-mutate--source-preserving-constructor-item-contents (items)
+  "Return the independent ordered item-content expectation for ITEMS.
+`dorg-parse-buffer' retains the section's terminal newline in a final text
+item.  Account for that documented parser convention without deriving the
+expected side from the private reparse."
+  (let ((contents (mapcar #'dorg-item-content-string items))
+        (last (car (last items))))
+    (when (and (cl-typep last 'dorg-text-item)
+               (not (string-suffix-p "\n" (dorg-text-item-text last))))
+      (setf (car (last contents))
+            (concat (car (last contents)) "\n")))
+    contents))
+
+(defun dorg-mutate--source-preserving-constructor-section-check
+    (patch level grammar)
+  "Validate PATCH's whole new section at LEVEL under captured GRAMMAR.
+The headline goes through the shared 1qdtb editor's field guard first.  A
+fresh render is then reparsed in a private buffer and must yield exactly one
+heading at LEVEL with the independently constructed item sequence."
+  (let* ((heading (dorg-mutate--source-preserving-constructor-heading
+                   patch level nil))
+         (fields (dorg-mutate--source-preserving-constructor-line-fields patch))
+         (line (concat (make-string level ?*) " placeholder"))
+         (expected-items
+          (dorg-mutate--source-preserving-constructor-item-contents
+           (dorg-heading-items heading)))
+         ;; Phase one validates source grammar, not the allocator's future
+         ;; DORG_ID.  Physical injection remains exclusively in phase two.
+         (rendered (concat (dorg-model--render-heading heading) "\n"
+                           (dorg-mutate--source-preserving-render-items
+                            (dorg-heading-items heading))))
+         ;; The model reader cannot represent an Org-legal skipped level in
+         ;; an odd-level file.  Re-render the same requested section at level
+         ;; one under ordinary grammar for item validation; this is deliberately
+         ;; independent of the source-grammar org-element facet check below.
+         (item-rendered
+          (let ((item-heading
+                 (dorg-mutate--source-preserving-constructor-heading
+                  patch 1 nil)))
+            (concat (dorg-model--render-heading item-heading) "\n"
+                    (dorg-mutate--source-preserving-render-items
+                     (dorg-heading-items item-heading)))))
+         ;; `dorg-parse-buffer' needs a valid ancestor chain for a standalone
+         ;; child.  These private parent lines supply parser context only;
+         ;; validation below selects exactly the one requested child.
+         (parse-prefix
+          (let ((parent-level 1)
+                (odd (plist-get grammar :odd-levels-only))
+                lines)
+            (while (< parent-level level)
+              (push (concat (make-string parent-level ?*) " validator parent\n")
+                    lines)
+              (setq parent-level (+ parent-level (if odd 2 1))))
+            (apply #'concat (nreverse lines))))
+         (parse-text (concat parse-prefix rendered)))
+    ;; This uses the shared editor's check and semantic facet assertion rather
+    ;; than a constructor-only approximation of headline grammar.
+    (dorg-mutate--source-preserving-heading-line-simulate line fields grammar)
+    (with-temp-buffer
+      (org-mode)
+      (dorg-mutate--source-preserving-heading-grammar-apply grammar)
+      (org-set-regexps-and-options)
+      (insert parse-text)
+      (goto-char (point-min))
+      (let* ((org-headings
+              (org-element-map (org-element-parse-buffer) 'headline #'identity))
+             (org-new
+              (cl-remove-if-not
+               (lambda (candidate)
+                 ;; `org-element' reports a logical level under
+                 ;; `org-odd-levels-only'; the constructor's level is its
+                 ;; physical star count.  Count physical headings so an
+                 ;; injected sibling cannot hide behind that remapping.
+                 (save-excursion
+                   (goto-char (org-element-property :begin candidate))
+                   (= (org-outline-level) level)))
+               org-headings))
+             (org-actual (car org-new))
+             (org-valid
+              (and (= (length org-new) 1)
+                   (equal (org-element-property :raw-value org-actual)
+                          (dorg-heading-title heading))
+                   (equal (org-element-property :todo-keyword org-actual)
+                          (dorg-heading-todo heading))
+                   (equal (when-let ((priority
+                                      (org-element-property :priority org-actual)))
+                            (char-to-string priority))
+                          (dorg-heading-priority heading))
+                   (equal (org-element-property :tags org-actual)
+                          (dorg-heading-tags heading))
+                   (equal (and (org-element-property :commentedp org-actual) t)
+                          (dorg-heading-commented heading))))
+             (parsed
+              (with-temp-buffer
+                (org-mode)
+                (insert item-rendered)
+                (org-set-regexps-and-options)
+                (goto-char (point-min))
+                (dorg-parse-buffer (current-buffer))))
+             (headings
+              (cl-remove-if-not
+               (lambda (candidate) (= (dorg-heading-level candidate) 1))
+               (dorg-parse-result-headings parsed)))
+             (actual (car headings))
+             (actual-items
+              (and actual
+                   (dorg-mutate--source-preserving-constructor-item-contents
+                    (dorg-heading-items actual))))
+             (valid
+              (and org-valid
+                   (= (length headings) 1)
+                   (= (dorg-heading-level actual) 1)
+                   (equal actual-items expected-items))))
+        (unless valid
+          (dorg-mutate--raise
+           'invalid-target "constructor section cannot represent requested content"
+           :value patch :detail 'constructor-section-unrepresentable
+           :expected expected-items :actual actual-items :rendered rendered
+           :org-levels (mapcar (lambda (candidate)
+                                 (org-element-property :level candidate))
+                               org-headings)))))))
 
 (defun dorg-mutate--source-preserving-insert-commented-child
     (patch parent-marker source)
-  "Append one public COMMENTED constructor PATCH below PARENT-MARKER.
+  "Append one public constructor PATCH below PARENT-MARKER.
 Return the physically written DORG_ID, or nil for a property-identity faithful
 file.  The C3 cell and phase-1 identity guard have already accepted PATCH."
   (let* ((dorg-p (dorg-mutate--identity-dorg-p source))
@@ -2005,9 +2886,12 @@ file.  The C3 cell and phase-1 identity guard have already accepted PATCH."
          (parent-level (save-excursion
                          (goto-char parent-marker)
                          (org-outline-level)))
+         (child-level
+          (let ((org-odd-levels-only org-odd-levels-only))
+            (org-get-valid-level parent-level 1)))
          (heading
           (dorg-mutate--source-preserving-constructor-heading
-           patch (1+ parent-level) id))
+           patch child-level id))
          (text
           (if dorg-p
               ;; DOrg identity is injected into the same local PROPERTIES
@@ -2036,6 +2920,11 @@ DUPLICATES it, fails closed before any edit.  `none' (no protected key, never
 writes) passes."
   (let ((idkey (dorg-mutate--identity-protected-key source)))
     (when (and idkey
+               ;; Literal-body validation compares the composed pre/postimage,
+               ;; so it can distinguish an unchanged ordinary body PROPERTIES
+               ;; drawer from a forged protected key.  The older generic item
+               ;; guard cannot make that distinction.
+               (not (equal (dorg-mutate--patch-signature patch) '(replace :body)))
                ;; The heading's authoritative PROPERTIES drawer is preserved
                ;; OUT-OF-BAND, so a body payload must carry NO PROPERTIES drawer
                ;; at all — FIELD-INDEPENDENT.  One holding the identity key would
@@ -2119,7 +3008,7 @@ empty-old or all-changed splice."
 
 (defconst dorg-mutate--source-preserving-item-patches
   (cl-remove-if (lambda (signature)
-                  (eq (cadr signature) :property))
+                  (memq (cadr signature) '(:property :body)))
                 dorg-mutate--c3-surgical-patches)
   "Faithful typed signatures applied by item-span splice.")
 
@@ -2151,19 +3040,215 @@ is the position AFTER the property drawer's `:END:' line, located PHYSICALLY via
 span (a DORG_ID-only drawer under `dorg') and even when a planning line PRECEDES
 the drawer (where a span-filter would leave a non-contiguous body and delete the
 metadata between).  BODY-SPANS are the item spans at/after BODY-BEGIN.  With no
-property drawer the pre-existing items-begin body boundary is kept."
+property drawer, leading planning item spans still advance BODY-BEGIN."
   (let* ((scan (dorg-mutate--source-preserving-scan marker))
          (items-begin (nth 0 scan))
          (section-end (nth 1 scan))
-         (body-begin (save-excursion
-                       (goto-char marker)
-                       (let ((pblock (org-get-property-block)))
-                         (if pblock
-                             (progn (goto-char (cdr pblock)) (forward-line 1) (point))
-                           items-begin))))
+         (spans (nth 2 scan))
+         (planning-end
+          (let ((rest spans) end)
+            (while (and rest (cl-typep (caar rest) 'dorg-planning-item))
+              (setq end (nth 3 (car rest))
+                    rest (cdr rest)))
+            end))
+         (body-begin
+          (max (or planning-end items-begin)
+               (save-excursion
+                 (goto-char marker)
+                 (let ((pblock (org-get-property-block)))
+                   (if pblock
+                       (progn (goto-char (cdr pblock)) (forward-line 1) (point))
+                     items-begin)))))
          (body-spans (cl-remove-if (lambda (sp) (< (nth 1 sp) body-begin))
-                                   (nth 2 scan))))
+                                   spans)))
     (list body-begin section-end body-spans)))
+
+(defun dorg-mutate--source-preserving-model-body-view (marker source)
+  "Return the canonical model body view for the heading at MARKER.
+
+The source scanner has one extra duty: it must prove that its body-item view
+is the same match surface seen by direct-model and Dolt callers."
+  (save-excursion
+    (goto-char marker)
+    ;; The byte-span helper is also a lower-level test seam, where SOURCE is
+    ;; nil because there is no registered backing store to resolve.  Nil has
+    ;; the same declared default policy as every resolved source: `dorg'.
+    ;; This chooses the identity key before lookup; a missing matching heading
+    ;; still refuses below and is never recovered through another key.
+    (let* ((policy (if (dorg-mutate-source-p source)
+                       (dorg-mutate--source-identity source)
+                     'dorg))
+           (key (pcase policy
+                  (`(:property ,property) property)
+                  ('dorg dorg-id-property)
+                  (_ nil)))
+           (value (and key (org-entry-get (point) key)))
+           (parsed (dorg-parse-buffer (current-buffer)))
+           (heading
+            (and key value
+                 (cl-find-if
+                  (lambda (candidate)
+                    (pcase policy
+                      ('dorg
+                       ;; The canonical DOrg identity is typed on the model,
+                       ;; rather than retained in its generic property alist.
+                       (when-let ((id (dorg-heading-id candidate)))
+                         (equal value (number-to-string id))))
+                      (`(:property ,property)
+                       (equal value
+                              (dorg-mutate--heading-property candidate property)))
+                      (_ nil)))
+                  (dorg-parse-result-headings parsed)))))
+      (unless heading
+        (dorg-mutate--raise 'invalid-target
+                            "body literal host has no canonical model heading"
+                            :detail 'body-literal-unmappable))
+      (dorg-model-body-view heading))))
+
+(defun dorg-mutate--source-preserving-body-literal-span (patch marker source)
+  "Return PATCH's verified plain source range at MARKER, or refuse.
+
+The match always happens first on DOrg's canonical model view.  Plain Org maps
+only the selected model range: every intersected item's model serialization
+must be byte-identical to its source span and the participating spans must be
+contiguous.  Thus an unrelated lossy block does not reject a safe replacement,
+but escaped or whitespace-collapsed selected text refuses rather than falling
+back to a second source-language.
+Return (BEGIN END REPLACEMENT), with positions valid until the next edit."
+  (let* ((scan (dorg-mutate--source-preserving-body-scan marker source))
+         (spans (nth 2 scan))
+         (items (mapcar #'car spans))
+         ;; BODY-SCAN has already removed the physical leading planning and
+         ;; local drawer.  Do not run `dorg-model-body-view' again here: an
+         ;; ordinary body lookalike PROPERTIES drawer is body content.
+         (view (dorg-mutate--body-items-view items))
+         (literal (dorg-mutate--patch-tget (plist-get patch :target) :literal))
+         (match (dorg-model-body-view-literal-match view literal)))
+    (unless (equal view (dorg-mutate--source-preserving-model-body-view marker source))
+      (dorg-mutate--raise 'invalid-target "body source and model views disagree"
+                          :operation (plist-get patch :op)
+                          :target (plist-get patch :target)
+                          :detail 'body-literal-unmappable))
+    (pcase (plist-get match :count)
+      (0 (dorg-mutate--body-literal-refuse 0 patch))
+      ((pred (lambda (n) (> n 1)))
+       (dorg-mutate--body-literal-refuse 2 patch)))
+    (let ((model-pos 0)
+          (match-begin (plist-get match :begin))
+          (match-end (plist-get match :end))
+          source-begin source-end previous-end)
+      (dolist (span spans)
+        (let* ((item (car span))
+               (segment (dorg-model--body-view-item item))
+               (segment-begin model-pos)
+               (segment-end (+ model-pos (length segment)))
+               (source-beginning (nth 1 span))
+               (source-ending (nth 3 span)))
+          (when (and (< segment-begin match-end) (> segment-end match-begin))
+            (unless (and (equal segment
+                                (buffer-substring-no-properties
+                                 source-beginning source-ending))
+                         (or (null previous-end) (= previous-end source-beginning)))
+              (dorg-mutate--raise 'invalid-target "body literal cannot map to source"
+                                  :operation (plist-get patch :op)
+                                  :target (plist-get patch :target)
+                                  :detail 'body-literal-unmappable))
+            (unless source-begin
+              (setq source-begin (+ source-beginning
+                                    (- match-begin segment-begin))))
+            (setq source-end (+ source-beginning
+                                (- (min match-end segment-end) segment-begin))
+                  previous-end source-ending))
+          (setq model-pos segment-end)))
+      (unless (and source-begin source-end)
+        (dorg-mutate--raise 'invalid-target "body literal cannot map to source"
+                            :operation (plist-get patch :op)
+                            :target (plist-get patch :target)
+                            :detail 'body-literal-unmappable))
+      (list source-begin source-end (plist-get patch :value)))))
+
+(defun dorg-mutate--source-preserving-body-literal-postimage-check
+    (patch marker source)
+  "Refuse a source BODY PATCH that changes the document headline shape.
+
+This is phase-one evidence for dry-run as well as apply.  It uses the same
+mapped physical span as phase two, but in a disposable copy of the complete
+source so a splice boundary at the beginning of a line cannot manufacture an
+idless Org headline."
+  (pcase-let ((`(,begin ,end ,replacement)
+               (dorg-mutate--source-preserving-body-literal-span
+                patch marker source))
+              (text (buffer-substring-no-properties (point-min) (point-max))))
+    (with-temp-buffer
+      (insert text)
+      (let ((org-inhibit-startup t)) (org-mode))
+      (let ((before-shape (dorg-mutate--org-heading-shape)))
+        (goto-char begin)
+        (delete-region begin end)
+        (insert replacement)
+        (org-element-cache-reset)
+        (unless (equal before-shape (dorg-mutate--org-heading-shape))
+          (dorg-mutate--raise 'invalid-target
+                              "body replacement is not representable"
+                              :operation (plist-get patch :op)
+                              :target (plist-get patch :target)
+                              :detail 'structural-payload-boundary
+                              :value (plist-get patch :value)))))))
+
+(defun dorg-mutate--source-preserving-apply-body-literal (patch marker source)
+  "Apply one verified body literal PATCH at MARKER without re-rendering source."
+  ;; The byte span is only a faithful transport for the model operation.  It is
+  ;; not itself sufficient proof that Org will retain the same constructor
+  ;; boundary: a payload can turn body text into a heading.  Reparse the whole
+  ;; postimage after the splice and compare the document heading shape and
+  ;; canonical body view.  The comparison is against the canonical view before
+  ;; this physical splice, not against a reparsed synthetic source: unrelated
+  ;; escaped Org bytes outside the selected range remain intentionally lossy.
+  (let* ((before-shape (dorg-mutate--source-preserving-heading-shape))
+         (before-items
+          (mapcar #'car
+                  (nth 2 (dorg-mutate--source-preserving-body-scan
+                          marker source))))
+         (before-view (dorg-mutate--body-items-view before-items))
+         (literal (dorg-mutate--patch-tget (plist-get patch :target) :literal))
+         (match (dorg-model-body-view-literal-match before-view literal))
+         (expected-view
+          (concat (substring before-view 0 (plist-get match :begin))
+                  (plist-get patch :value)
+                  (substring before-view (plist-get match :end)))))
+    (pcase-let ((`(,begin ,end ,replacement)
+                 (dorg-mutate--source-preserving-body-literal-span
+                  patch marker source)))
+      (goto-char begin)
+      (delete-region begin end)
+      (insert replacement)
+      (org-element-cache-reset))
+    (unless (equal before-shape (dorg-mutate--source-preserving-heading-shape))
+      (dorg-mutate--raise 'invalid-target
+                          "body replacement is not representable"
+                          :operation (plist-get patch :op)
+                          :target (plist-get patch :target)
+                          :detail 'structural-payload-boundary
+                          :value (plist-get patch :value)))
+    (unless (equal expected-view
+                   (dorg-mutate--body-items-view
+                    (mapcar #'car
+                            (nth 2 (dorg-mutate--source-preserving-body-scan
+                                    marker source)))))
+      (dorg-mutate--raise 'invalid-target
+                          "body literal postimage does not match its model view"
+                          :operation (plist-get patch :op)
+                          :target (plist-get patch :target)
+                          :detail 'body-literal-unmappable
+                          :value (plist-get patch :value)))))
+
+(defun dorg-mutate--source-preserving-heading-shape ()
+  "Return the complete parsed heading identity/shape of the current buffer.
+
+This is intentionally whole-document evidence: a plain-source body splice is
+valid only when it leaves every constructor boundary intact, not merely when
+the selected source range looks plausible in isolation."
+  (dorg-mutate--org-heading-shape))
 
 (defun dorg-mutate--source-preserving-splice-patch
     (patch marker source &optional batch-context)
@@ -2173,29 +3258,489 @@ the buffer) and splices only the body region AFTER the out-of-band identity
 drawer — a whole body-region replace for typed items replacement, a minimal
 content-diff middle splice otherwise.  The identity drawer's bytes are never
 touched.  The guard and selector/ordinal resolution already ran in Phase 1."
-  (let* ((bscan (dorg-mutate--source-preserving-body-scan marker source))
+  (if (equal (dorg-mutate--patch-signature patch) '(replace :body))
+      (dorg-mutate--source-preserving-apply-body-literal patch marker source)
+    (let* ((bscan (dorg-mutate--source-preserving-body-scan marker source))
          (body-begin (nth 0 bscan))
          (section-end (nth 1 bscan))
          (body-spans (nth 2 bscan))
          (old-items (mapcar #'car body-spans))
+         (text-p (equal (dorg-mutate--patch-signature patch) '(replace :text)))
+         (before-shape (and text-p (dorg-mutate--source-preserving-heading-shape)))
          (new-items (dorg-mutate--source-preserving-patch-new-items
                      patch old-items batch-context)))
-    (if (equal (dorg-mutate--patch-signature patch) '(replace :items))
-        (dorg-mutate--source-preserving-region-replace body-begin section-end new-items)
-      (dorg-mutate--source-preserving-diff-splice body-spans new-items body-begin section-end))))
+      (if (equal (dorg-mutate--patch-signature patch) '(replace :items))
+          (dorg-mutate--source-preserving-region-replace body-begin section-end new-items)
+        (dorg-mutate--source-preserving-diff-splice body-spans new-items body-begin section-end))
+      (when text-p
+        (org-element-cache-reset)
+        (unless (equal before-shape (dorg-mutate--source-preserving-heading-shape))
+          (dorg-mutate--raise-structural-payload 'replace (plist-get patch :value)))
+        (dorg-mutate--validate-body-postimage
+         (mapcar #'car (nth 2 (dorg-mutate--source-preserving-body-scan marker source)))
+         old-items patch
+         (and batch-context
+              (gethash dorg-mutate--identity-context-key batch-context)))))))
 
-(defun dorg-mutate--source-preserving-update-commented (patch)
-  "Apply exact boolean COMMENTED PATCH at the current heading.
-Only `org-toggle-comment' may edit the heading, and only when the current local
-COMMENT state differs from the requested value.  Org inserts or removes the
-literal `COMMENT ' span without realigning tags or rewriting other bytes."
-  (let* ((desired (plist-get (plist-get patch :fields) :commented))
-         (element (org-element-at-point))
-         (current (and (eq (org-element-type element) 'headline)
-                       (org-element-property :commentedp element)
-                       t)))
-    (unless (eq desired current)
-      (org-toggle-comment))))
+(defun dorg-mutate--source-preserving-heading-line-facets ()
+  "Return Org's semantic intrinsic facets for the heading at point.
+The byte editor uses this before and after each local splice: requested fields
+must acquire their requested value and every omitted field must retain this
+exact parsed value."
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((element (org-element-at-point)))
+      (unless (eq (org-element-type element) 'headline)
+        (dorg-mutate--source-preserving-heading-line-refuse 'heading nil))
+      (list :title (or (org-element-property :raw-value element) "")
+            :todo (org-element-property :todo-keyword element)
+            :priority (when-let ((priority (org-element-property :priority element)))
+                        (char-to-string priority))
+            :tags (org-element-property :tags element)
+            :commented (and (org-element-property :commentedp element) t)))))
+
+(defun dorg-mutate--source-preserving-heading-line-spans ()
+  "Return parser-grammar spans for the heading line at point.
+The returned plist names the intrinsic heading tokens and their exact buffer
+ranges.  It deliberately follows `org-element--headline-parse-title': Org's
+configured TODO regexp and its COMMENT/tag grammar decide what is a token;
+the editor only owns the returned ranges and their minimal separators.  The
+COMMENT regexp is Org's pinned private parser constant; the semantic
+cross-check below makes that dependency fail closed if it ever diverges."
+  (save-excursion
+    (org-back-to-heading t)
+    (let* ((line-end (line-end-position))
+           (star-begin (point))
+           (star-end (progn (skip-chars-forward "*") (point)))
+           (content-begin (progn (skip-chars-forward " \t") (point)))
+           todo-begin todo-end priority-begin priority-end
+           comment-begin comment-end tags-begin tags-end
+           title-begin title-end)
+      (when (and org-todo-regexp
+                 (let ((case-fold-search nil))
+                   (looking-at (concat org-todo-regexp "\\(?: \\|$\\)"))))
+        (setq todo-begin (match-beginning 1) todo-end (match-end 1))
+        (goto-char (match-end 0))
+        (skip-chars-forward " \t"))
+      (when (looking-at "\\[#.\\][ \t]*")
+        (setq priority-begin (point) priority-end (+ (point) 4))
+        (goto-char (match-end 0)))
+      (when (let ((case-fold-search nil))
+              (looking-at org-element--headline-comment-re))
+        (setq comment-begin (point) comment-end (+ (point) (length "COMMENT")))
+        (goto-char (match-end 0))
+        (skip-chars-forward " \t"))
+      (setq title-begin (point) title-end line-end)
+      (when (re-search-forward "\\(:[[:alnum:]_@#%:]+:\\)[ \t]*$" line-end 'move)
+        (setq tags-begin (match-beginning 1) tags-end (match-end 1)
+              title-end tags-begin))
+      (let ((raw-begin (save-excursion (goto-char title-begin)
+                                        (skip-chars-forward " \t" title-end) (point)))
+            (raw-end (save-excursion (goto-char title-end)
+                                      (skip-chars-backward " \t" title-begin) (point))))
+        (let* ((spans (list :star-begin star-begin :star-end star-end
+                            :content-begin content-begin
+                            :todo-begin todo-begin :todo-end todo-end
+                            :priority-begin priority-begin :priority-end priority-end
+                            :comment-begin comment-begin :comment-end comment-end
+                            :title-begin title-begin :title-end title-end
+                            :raw-begin raw-begin :raw-end raw-end
+                            :tags-begin tags-begin :tags-end tags-end))
+               (facets (dorg-mutate--source-preserving-heading-line-facets))
+               (span-text (lambda (begin end)
+                            (and begin end
+                                 (buffer-substring-no-properties begin end))))
+               (same-or-absent
+                (lambda (begin end expected)
+                  (if expected
+                      (equal (funcall span-text begin end) expected)
+                    (and (null begin) (null end))))))
+          ;; Positions are derived from Org's grammar but never trusted on
+          ;; their own: a disagreement with Org's semantic parser fails closed
+          ;; before this editor changes any byte.
+          (unless
+              (and (funcall same-or-absent todo-begin todo-end
+                            (plist-get facets :todo))
+                   (funcall same-or-absent priority-begin priority-end
+                            (when-let ((priority (plist-get facets :priority)))
+                              (format "[#%s]" priority)))
+                   (funcall same-or-absent comment-begin comment-end
+                            (and (plist-get facets :commented) "COMMENT"))
+                   (equal (funcall span-text raw-begin raw-end)
+                          (plist-get facets :title))
+                   (funcall same-or-absent tags-begin tags-end
+                            (when-let ((tags (plist-get facets :tags)))
+                              (concat ":" (mapconcat #'identity tags ":") ":"))))
+            (dorg-mutate--source-preserving-heading-line-refuse 'heading facets))
+          spans)))))
+
+(defun dorg-mutate--source-preserving-heading-line-refuse (field value)
+  "Raise the stable representability refusal for FIELD and VALUE."
+  (dorg-mutate--raise 'invalid-target "heading line cannot represent requested field"
+                      :field field :value value :detail 'heading-line-unrepresentable))
+
+(defun dorg-mutate--source-preserving-heading-line-check-fields (fields)
+  "Refuse heading FIELDS which cannot round-trip through one Org headline.
+The bounded plain-org editor deliberately supports alphabetic A-Z priorities;
+numeric Org priority syntax remains outside this source-preserving contract."
+  (dolist (field '(:title :todo :priority :tags))
+    (when (plist-member fields field)
+      (let ((value (plist-get fields field))
+            (bad nil))
+        (pcase field
+          (:title
+           (setq bad (or (not (stringp value))
+                         (string-match-p "[\r\n]" value)
+                         (string-match-p "\\`[ \t]\\|[ \t]\\'" value)
+                         (string-match-p "\\`\\(?:COMMENT\\|\\[#.\\]\\)\\(?:[ \t]\\|$\\)" value)
+                         (string-match-p "[ \t]:[[:alnum:]_@#%:]+:\\'" value))))
+          (:todo
+           (setq bad (and (not (null value)) (not (equal value ""))
+                          (or (not (stringp value))
+                              (not (member value org-todo-keywords-1))))))
+          (:priority
+           (setq bad (and value (not (and (stringp value)
+                                           (= (length value) 1)
+                                           (>= (aref value 0) ?A)
+                                           (<= (aref value 0) ?Z))))))
+          (:tags
+           (setq bad (or (not (listp value))
+                         (not (cl-every (lambda (tag)
+                                          (and (stringp tag)
+                                               (string-match-p "\\`[[:alnum:]_@#%]+\\'" tag)))
+                                        value))))))
+        (when bad
+          (dorg-mutate--source-preserving-heading-line-refuse field value))))))
+
+(defun dorg-mutate--source-preserving-heading-line-delete (begin end)
+  "Delete owned token BEGIN END and one following ASCII space, if present."
+  (goto-char begin)
+  (delete-region begin end)
+  (when (eq (char-after begin) ?\s) (delete-char 1)))
+
+(defun dorg-mutate--source-preserving-heading-line-apply-fields (fields)
+  "Apply validated intrinsic heading FIELDS at point.
+This is deliberately the one line-editing primitive for both a private
+phase-one copy and phase two.  It recomputes Org-derived spans after each
+field, since an earlier token edit can move every later span."
+  (dorg-mutate--source-preserving-heading-line-check-fields fields)
+  (let ((before (dorg-mutate--source-preserving-heading-line-facets)))
+    (dolist (field '(:todo :priority :commented :title :tags))
+      (when (plist-member fields field)
+        (let* ((value (plist-get fields field))
+               (spans (dorg-mutate--source-preserving-heading-line-spans))
+               (span-field (if (eq field :commented) :comment field))
+               (begin (plist-get spans (intern (format "%s-begin" span-field))))
+               (end (plist-get spans (intern (format "%s-end" span-field)))))
+          (cond
+           ((eq field :todo)
+            (if (or (null value) (equal value ""))
+                (when begin
+                  (dorg-mutate--source-preserving-heading-line-delete begin end))
+              (if begin
+                  (replace-region-contents begin end (lambda () value))
+                (goto-char (plist-get spans :content-begin))
+                (insert value " "))))
+           ((eq field :priority)
+            (if (null value)
+                (when begin
+                  (dorg-mutate--source-preserving-heading-line-delete begin end))
+              (if begin
+                  (replace-region-contents begin end
+                                           (lambda () (format "[#%s]" value)))
+                (goto-char (or (plist-get spans :todo-end)
+                               (plist-get spans :content-begin)))
+                (skip-chars-forward " \t")
+                (insert (format "[#%s] " value)))))
+           ((eq field :commented)
+            (if value
+                (unless begin
+                  (goto-char (or (plist-get spans :priority-end)
+                                 (plist-get spans :todo-end)
+                                 (plist-get spans :content-begin)))
+                  (skip-chars-forward " \t")
+                  (insert "COMMENT "))
+              (when begin
+                (dorg-mutate--source-preserving-heading-line-delete begin end))))
+           ((eq field :title)
+            (if (> (plist-get spans :raw-end) (plist-get spans :raw-begin))
+                (replace-region-contents (plist-get spans :raw-begin)
+                                         (plist-get spans :raw-end)
+                                         (lambda () value))
+              (goto-char (plist-get spans :title-begin))
+              (when (and (plist-get spans :tags-begin) (eq (char-before) ?\s))
+                (delete-char -1))
+              (insert value (if (plist-get spans :tags-begin) " " ""))))
+           ((eq field :tags)
+            (let ((rendered (concat ":" (mapconcat #'identity value ":") ":")))
+              (cond
+               (begin
+                (if value
+                    (replace-region-contents begin end (lambda () rendered))
+                  (delete-region (if (eq (char-before begin) ?\s)
+                                     (1- begin)
+                                   begin)
+                                 end)))
+               (value
+                (goto-char (plist-get spans :raw-end))
+                (insert " " rendered)))))))))
+    (goto-char (line-beginning-position))
+    (dorg-mutate--source-preserving-heading-line-assert-fields fields before)))
+
+(defun dorg-mutate--source-preserving-heading-line-fields-match-p (fields before)
+  "Return non-nil when the heading at point preserves BEFORE under FIELDS.
+This is the semantic half of the faithful editor: a byte splice is accepted
+only if Org still reads every requested field as requested and each omitted
+field exactly as it read before the splice."
+  (let ((after (dorg-mutate--source-preserving-heading-line-facets)))
+    (cl-every
+     (lambda (field)
+       (let ((expected
+              (if (plist-member fields field)
+                  (pcase field
+                    (:todo (let ((value (plist-get fields field)))
+                             (and (stringp value) (not (equal value "")) value)))
+                    (:priority (when-let ((value (plist-get fields field))) value))
+                    (_ (plist-get fields field)))
+                (plist-get before field))))
+         (equal (plist-get after field) expected)))
+     dorg-mutate--c3-heading-line-fields)))
+
+(defun dorg-mutate--source-preserving-heading-line-assert-fields (fields before)
+  "Refuse FIELDS when the edited heading does not round-trip from BEFORE."
+  (unless (dorg-mutate--source-preserving-heading-line-fields-match-p fields before)
+    (dorg-mutate--source-preserving-heading-line-refuse
+     'heading fields)))
+
+(defun dorg-mutate--source-preserving-heading-line-grammar ()
+  "Capture the current buffer's effective Org headline parse grammar.
+These are the buffer-local values consumed by Org's headline parser after it
+has read any #+TODO, #+SEQ_TODO or #+TYP_TODO source directives."
+  (list :todo-regexp org-todo-regexp
+        :todo-keywords org-todo-keywords-1
+        :done-keywords org-done-keywords
+        :odd-levels-only org-odd-levels-only))
+
+(defun dorg-mutate--source-preserving-heading-line-simulate (line fields grammar)
+  "Return LINE after private faithful FIELDS edit under GRAMMAR.
+No part of the live source buffer is touched.  The final parse assertion
+rejects title text which would become a TODO, COMMENT, priority, or tag token."
+  (with-temp-buffer
+    (org-mode)
+    (dorg-mutate--source-preserving-heading-grammar-apply grammar)
+    (insert line)
+    (goto-char (point-min))
+    (dorg-mutate--source-preserving-heading-line-apply-fields fields)
+    (buffer-string)))
+
+(defun dorg-mutate--source-preserving-update-heading-line (patch)
+  "Apply source-preserving intrinsic heading PATCH at point.
+Each operation recomputes Org-derived spans after the preceding one, so mixed
+field updates never reuse shifted positions."
+  (let ((fields (plist-get patch :fields)))
+    (dorg-mutate--source-preserving-heading-line-apply-fields fields)))
+
+(defconst dorg-mutate--source-preserving-planning-fields
+  '(:scheduled :deadline :closed)
+  "Planning fields in the stable physical insertion order.")
+
+(defun dorg-mutate--source-preserving-planning-refuse (detail &optional field value)
+  "Raise a typed refusal for an unrepresentable plain planning edit."
+  (dorg-mutate--raise
+   'invalid-target "planning line cannot represent requested field"
+   :detail detail :field field :value value))
+
+(defun dorg-mutate--source-preserving-planning-line-state ()
+  "Return the validated immediate planning-line state at the current heading.
+The line is either absent or entirely a run of uppercase Org planning tokens
+and horizontal separators.  Returning byte positions makes the caller's edits
+surgical; malformed, duplicate, or unterminated candidates fail before a byte
+is changed."
+  (org-back-to-heading t)
+  (unless (eq (char-before (point-max)) ?\n)
+    (dorg-mutate--source-preserving-planning-refuse 'planning-line-unterminated))
+  (let ((section-end (save-excursion (outline-next-heading) (point))))
+    (forward-line 1)
+    (let ((line-begin (point))
+          (line-end (line-end-position)))
+      (cond
+       ((or (>= line-begin section-end) (org-at-heading-p))
+        (list :present nil :insert-at line-begin))
+       ;; A non-planning first body line is not a planning line.  It remains
+       ;; body text and insertion happens before it.
+       ((not (save-excursion
+               (skip-chars-forward " \t" line-end)
+               (let ((case-fold-search t))
+                 (looking-at "\\(?:scheduled\\|deadline\\|closed\\):"))))
+        (list :present nil :insert-at line-begin))
+       (t
+        ;; Org's planning element retains only the last occurrence of a
+        ;; repeated keyword.  Detect repetition in the physical line first so
+        ;; it remains an ambiguity instead of looking like an unparsed token.
+        (let ((keywords nil))
+          (save-excursion
+            (goto-char line-begin)
+            (let ((case-fold-search nil))
+              (while (re-search-forward "\\(SCHEDULED\\|DEADLINE\\|CLOSED\\):" line-end t)
+                (let ((field (intern (concat ":" (downcase (match-string-no-properties 1))))) )
+                  (when (memq field keywords)
+                    (dorg-mutate--source-preserving-planning-refuse
+                     'planning-line-ambiguous field))
+                  (push field keywords))))))
+        (let ((element (org-element-context))
+              (fields nil))
+          (goto-char line-begin)
+          (while (< (point) line-end)
+            (skip-chars-forward " \t" line-end)
+            (unless (or (= (point) line-end)
+                        (looking-at "\\(SCHEDULED\\|DEADLINE\\|CLOSED\\):[ \t]*"))
+              (dorg-mutate--source-preserving-planning-refuse
+               'planning-line-malformed))
+            (unless (= (point) line-end)
+              (let* ((token-begin (point))
+                     (field (intern (concat ":" (downcase (match-string-no-properties 1)))) )
+                     (timestamp (org-element-property field element)))
+                (goto-char (match-end 0))
+                (let ((raw-end (and timestamp
+                                    (+ (point)
+                                       (length (org-element-property :raw-value timestamp))))))
+                  (unless (and timestamp
+                               (= (point) (org-element-property :begin timestamp))
+                               (<= raw-end line-end))
+                  (dorg-mutate--source-preserving-planning-refuse
+                   'planning-line-malformed field))
+                  (push (list :field field :token-begin token-begin
+                              :value-begin (point) :value-end raw-end
+                              :raw (org-element-property :raw-value timestamp))
+                        fields)
+                  (goto-char raw-end)))))
+          (list :present t :line-begin line-begin :line-end line-end
+                :line-after (min (point-max) (1+ line-end))
+                :fields (nreverse fields))))))))
+
+(defun dorg-mutate--source-preserving-planning-field (state field)
+  "Return FIELD's physical planning token from STATE, or nil."
+  (cl-find field (plist-get state :fields)
+           :key (lambda (entry) (plist-get entry :field))))
+
+(defun dorg-mutate--source-preserving-planning-value (state field)
+  "Return FIELD's raw planning value in STATE, or nil."
+  (when-let ((entry (dorg-mutate--source-preserving-planning-field state field)))
+    (plist-get entry :raw)))
+
+(defun dorg-mutate--source-preserving-planning-assert (fields before)
+  "Assert the requested FIELDS and all omitted planning facets after an edit."
+  (let ((after
+         (condition-case _err
+             (dorg-mutate--source-preserving-planning-line-state)
+           (dorg-mutate-error
+            (let ((field (cl-find-if (lambda (candidate)
+                                       (plist-get fields candidate))
+                                     dorg-mutate--source-preserving-planning-fields)))
+              (dorg-mutate--source-preserving-planning-refuse
+               'planning-line-unrepresentable field (plist-get fields field)))))))
+    (dolist (field dorg-mutate--source-preserving-planning-fields)
+      (let ((expected (if (plist-member fields field)
+                          (plist-get fields field)
+                        (dorg-mutate--source-preserving-planning-value before field))))
+        (unless (equal expected
+                       (dorg-mutate--source-preserving-planning-value after field))
+          (dorg-mutate--source-preserving-planning-refuse
+           'planning-line-unrepresentable field expected))))))
+
+(defun dorg-mutate--source-preserving-planning-assert-value (field value)
+  "Refuse requested FIELD VALUE unless it is exactly one Org timestamp.
+
+This is deliberately a candidate-value check, before any splice: malformed is
+reserved for existing source bytes, while an unrepresentable request is not a
+source defect.  Org decides the timestamp kind; inactive and diary raw forms
+are accepted when their raw value is exactly VALUE."
+  (when value
+    (condition-case _err
+        (with-temp-buffer
+          (insert "* Probe\n" (upcase (substring (symbol-name field) 1))
+                  ": " value "\n")
+          (let ((org-inhibit-startup t)) (org-mode))
+          (goto-char (point-min))
+          (let ((state (dorg-mutate--source-preserving-planning-line-state)))
+            (unless (equal value
+                           (dorg-mutate--source-preserving-planning-value
+                            state field))
+              (dorg-mutate--source-preserving-planning-refuse
+               'planning-line-unrepresentable field value))))
+      (dorg-mutate-error
+       (dorg-mutate--source-preserving-planning-refuse
+        'planning-line-unrepresentable field value)))))
+
+(defun dorg-mutate--source-preserving-planning-apply-fields (fields)
+  "Apply raw planning FIELDS at the current heading by minimal byte splices."
+  (dolist (field dorg-mutate--source-preserving-planning-fields)
+    (when (plist-member fields field)
+      (dorg-mutate--source-preserving-planning-assert-value
+       field (plist-get fields field))))
+  (let ((before (dorg-mutate--source-preserving-planning-line-state)))
+    (dolist (field dorg-mutate--source-preserving-planning-fields)
+      (when (plist-member fields field)
+        (let* ((value (plist-get fields field))
+               (state (dorg-mutate--source-preserving-planning-line-state))
+               (entry (dorg-mutate--source-preserving-planning-field state field)))
+          (cond
+           ((not (plist-get state :present))
+            (when value
+              (goto-char (plist-get state :insert-at))
+              (insert (upcase (substring (symbol-name field) 1)) ": " value "\n")))
+           (entry
+            (if value
+                (replace-region-contents
+                 (plist-get entry :value-begin) (plist-get entry :value-end)
+                 (lambda () value))
+              (let* ((all (plist-get state :fields))
+                     (tail (cdr (memq entry all)))
+                     (previous (car (last (cl-subseq all 0 (cl-position entry all))))) )
+                (cond
+                 ((= (length all) 1)
+                  (delete-region (plist-get state :line-begin)
+                                 (plist-get state :line-after)))
+                 (tail
+                  ;; First and middle tokens own the whole following run.
+                  (delete-region (plist-get entry :token-begin)
+                                 (plist-get (car tail) :token-begin)))
+                 (t
+                  ;; The final token owns the whole preceding run.
+                  (delete-region (plist-get previous :value-end)
+                                 (plist-get entry :value-end)))))))
+           (value
+            ;; Append before the existing trailing horizontal whitespace.
+            (goto-char (plist-get state :line-end))
+            (skip-chars-backward " \t" (plist-get state :line-begin))
+            (insert " " (upcase (substring (symbol-name field) 1)) ": " value))))))
+    (dorg-mutate--source-preserving-planning-assert fields before)))
+
+(defun dorg-mutate--source-preserving-planning-section-string (marker)
+  "Return MARKER's complete heading section for no-write planning simulation."
+  (save-excursion
+    (goto-char marker)
+    (let ((begin (point)) (end (save-excursion (outline-next-heading) (point))))
+      (buffer-substring-no-properties begin end))))
+
+(defun dorg-mutate--source-preserving-planning-simulate (section patch)
+  "Return SECTION after applying PATCH through the real planning editor."
+  (with-temp-buffer
+    (insert section)
+    (org-mode)
+    (goto-char (point-min))
+    (dorg-mutate--source-preserving-planning-apply-fields
+     (cl-loop for field in dorg-mutate--source-preserving-planning-fields
+              when (plist-member patch field)
+              append (list field (plist-get patch field))))
+    (buffer-string)))
+
+(defun dorg-mutate--source-preserving-update-planning-line (patch)
+  "Apply one validated plain-Org planning PATCH at the current heading."
+  (dorg-mutate--source-preserving-planning-apply-fields
+   (cl-loop for field in dorg-mutate--source-preserving-planning-fields
+            when (plist-member patch field)
+            append (list field (plist-get patch field)))))
 
 (defun dorg-mutate--source-preserving-apply-patch
     (patch marker source &optional batch-context)
@@ -2213,7 +3758,10 @@ Return a newly written DORG_ID for the bounded constructor, otherwise nil."
       (point) (dorg-mutate--patch-tget (plist-get patch :target) :name))
      nil)
     (`(update :heading)
-     (dorg-mutate--source-preserving-update-commented patch)
+     (dorg-mutate--source-preserving-update-heading-line patch)
+     nil)
+    (`(update :planning)
+     (dorg-mutate--source-preserving-update-planning-line patch)
      nil)
     (`(insert :tree)
      (dorg-mutate--source-preserving-insert-commented-child
@@ -2232,18 +3780,56 @@ item transform."
   (save-restriction
     (widen)
     (let ((sim (make-hash-table :test 'eql))       ; heading position -> items
+          (line-sim (make-hash-table :test 'eql))  ; heading position -> line bytes
+          (planning-sim (make-hash-table :test 'eql)) ; heading position -> section bytes
+          (heading-grammar (dorg-mutate--source-preserving-heading-line-grammar))
           (pending-identities (make-hash-table :test 'equal))
           (plan nil)
           ;; Resolve the identity policy ONCE (not per patch): only a `dorg' policy
           ;; makes an integer-id miss on an idless source a bootstrap attempt.
           (dorg-p (dorg-mutate--identity-dorg-p source)))
       ;; ── Phase 1: validate + resolve + simulate + guard, no writes ──
-      (let ((phase1-context (dorg-mutate--item-batch-context)))
+      (let ((phase1-context
+             (dorg-mutate--item-batch-context
+              (dorg-mutate--identity-protected-key source))))
         (dolist (patch patches)
           (dorg-mutate--source-preserving-validate-patch patch)
           (let ((marker (dorg-mutate--source-preserving-resolve
                          (dorg-mutate--source-preserving-patch-host patch)
                          patch dorg-p)))
+            ;; Heading-line representability deliberately follows target and
+            ;; identity resolution: an identity-none/missing/ambiguous refusal
+            ;; remains authoritative, but a later invalid line field prevents
+            ;; every patch in this batch from entering phase two.
+            (when (equal (dorg-mutate--patch-signature patch) '(update :heading))
+              ;; Simulate each heading line in its own temporary buffer.  A
+              ;; cached result is the input to a later patch at the same
+              ;; marker, so validation covers the whole ordered batch while
+              ;; phase one leaves the source buffer byte-for-byte untouched.
+              (let* ((key (marker-position marker))
+                     (cached (gethash key line-sim 'dorg-mutate--uncached))
+                     (line (if (eq cached 'dorg-mutate--uncached)
+                               (save-excursion
+                                 (goto-char marker)
+                                 (buffer-substring-no-properties
+                                  (line-beginning-position) (line-end-position)))
+                             cached)))
+                (puthash key
+                         (dorg-mutate--source-preserving-heading-line-simulate
+                          line (plist-get patch :fields) heading-grammar)
+                         line-sim)))
+            (when (equal (dorg-mutate--patch-signature patch) '(update :planning))
+              ;; Planning uses the same no-write editor as phase two.  Cache
+              ;; the complete section because a prior planning splice can
+              ;; shift the immediate line while a later patch targets it.
+              (let* ((key (marker-position marker))
+                     (cached (gethash key planning-sim 'dorg-mutate--uncached))
+                     (section (if (eq cached 'dorg-mutate--uncached)
+                                  (dorg-mutate--source-preserving-planning-section-string marker)
+                                cached)))
+                (puthash key
+                         (dorg-mutate--source-preserving-planning-simulate section patch)
+                         planning-sim)))
             (when (member (dorg-mutate--patch-signature patch)
                           dorg-mutate--source-preserving-item-patches)
               (let* ((key (marker-position marker))
@@ -2264,6 +3850,37 @@ item transform."
                            patch cur phase1-context)))
                 (dorg-mutate--source-preserving-identity-guard
                  new marker source patch)
+                (when (memq (cadr (dorg-mutate--patch-signature patch))
+                            '(:text :texts :item :items :drawer-lines))
+                  (dorg-mutate--validate-item-postimage
+                   new cur patch phase1-context))
+                (puthash key new sim)))
+            ;; Body literals have their own source-to-model mapping proof.  It
+            ;; runs in phase one so an unmappable/missing/ambiguous match
+            ;; refuses the whole batch before phase two writes anything.
+            (when (equal (dorg-mutate--patch-signature patch) '(replace :body))
+              ;; Simulate against the per-heading body cache, never the live
+              ;; buffer: later body/text actions must observe earlier actions
+              ;; while phase one remains byte-for-byte non-mutating.
+              (let* ((key (marker-position marker))
+                     (cached (gethash key sim 'dorg-mutate--uncached))
+                     ;; The first body edit at this heading still maps the
+                     ;; live source to a disposable whole-document postimage.
+                     ;; Later edits use the ordered simulation; their source
+                     ;; bytes do not yet contain the earlier simulated literal.
+                     (_postimage
+                      (when (eq cached 'dorg-mutate--uncached)
+                        (dorg-mutate--source-preserving-body-literal-postimage-check
+                         patch marker source)))
+                     (cur (if (eq cached 'dorg-mutate--uncached)
+                              (mapcar #'car
+                                      (nth 2 (dorg-mutate--source-preserving-body-scan
+                                              marker source)))
+                            cached))
+                     (new (dorg-mutate--apply-body-literal-to-items-for-source-plan
+                           cur patch phase1-context)))
+                (dorg-mutate--source-preserving-identity-guard
+                 new marker source patch)
                 (puthash key new sim)))
             ;; Property patches carry identity too: a faithful binding's external
             ;; key must not be changed/deleted via set/delete-property.
@@ -2271,6 +3888,15 @@ item transform."
               (dorg-mutate--source-preserving-property-identity-guard
                patch marker source))
             (when (equal (dorg-mutate--patch-signature patch) '(insert :tree))
+              (let* ((parent-level (save-excursion
+                                     (goto-char marker)
+                                     (org-outline-level)))
+                     (child-level
+                      (let ((org-odd-levels-only
+                             (plist-get heading-grammar :odd-levels-only)))
+                        (org-get-valid-level parent-level 1))))
+                (dorg-mutate--source-preserving-constructor-section-check
+                 patch child-level heading-grammar))
               (when-let ((identity
                           (dorg-mutate--source-preserving-constructor-identity-guard
                            patch source pending-identities)))
@@ -2290,7 +3916,9 @@ item transform."
   (save-restriction
     (widen)
     ;; ── Phase 2: apply.  Markers stay valid across localized edits ──
-    (let ((phase2-context (dorg-mutate--item-batch-context))
+    (let ((phase2-context
+          (dorg-mutate--item-batch-context
+           (dorg-mutate--identity-protected-key source)))
           created)
       (dolist (entry plan)
         (when-let ((id
@@ -2308,6 +3936,29 @@ DORG_ID values and HOSTS are the changed target host tokens."
   (dorg-mutate--source-preserving-apply-plan
    (dorg-mutate--source-preserving-plan patches source)
    source))
+
+(defun dorg-mutate--source-preserving-preflight (patches source)
+  "Run the no-write faithful source planner for plain-org PATCHES.
+
+Generic planning classifies backend support, but body-literal dry runs must
+also validate the actual source mapping and the whole simulated postimage.
+This helper deliberately discards the plan: its only effects are typed
+refusals, and it never edits a live buffer or a file."
+  (let ((buffer (dorg-mutate-source-buffer source))
+        (file (dorg-mutate-source-file source)))
+    (cond
+     ((buffer-live-p buffer)
+      (with-current-buffer buffer
+        (dorg-mutate--source-preserving-plan patches source)))
+     ((and (stringp file) (file-readable-p file))
+      (with-temp-buffer
+        (insert-file-contents file)
+        (let ((org-inhibit-startup t)) (org-mode))
+        (dorg-mutate--source-preserving-plan patches source)))
+     (t
+      (dorg-mutate--raise 'invalid-target
+                          "faithful plain-org source is not readable"
+                          :source-kind 'plain-org :file file)))))
 
 ;;; ─── Dry-run projections (D5) ─────────────────────────────────────────
 ;; A dry-run previews, per target, the exact owned source region BEFORE and
@@ -2392,7 +4043,7 @@ addresses no heading."
                   return (cadr (dorg-mutate--patch-signature patch)))
     (:property 'property)
     ((or :keyword :keywords) 'keyword)
-    ((or :text :texts :items :drawer-lines) 'item)
+    ((or :text :texts :items :item :drawer-lines) 'item)
     (_ 'body)))
 
 (defun dorg-mutate--plain-org-projections (source patches)
@@ -2451,10 +4102,10 @@ caller restricts this to supported plain-org dry-runs)."
 ;;
 ;; Each step is a plain-Lisp seam so a deterministic fault-injection test can
 ;; `cl-letf' DOrg code (never a native subr — native-comp trampoline hazard).
-;; No OS lock is taken; a writer landing between recheck and rename is not
-;; excluded, but the destination is always a COMPLETE old-or-new byte image
-;; (rename atomicity), never partial.  Cross-process serialization is a layer
-;; above DOrg, which DOrg does not learn.
+;; Saved local plain-Org applies hold DOrg's per-canonical-file gate across
+;; fresh read, validation, splice, fingerprint check, rename, and buffer
+;; coherence.  External editors that do not use the gate remain subject to
+;; the content-fingerprint check immediately before rename.
 
 (defvar-local dorg-mutate--plain-org-baseline nil
   "Content fingerprint of the on-disk bytes this visiting buffer is trusted
@@ -2485,12 +4136,18 @@ does not exist.  Reads literally (no decoding) so the hash matches
 
 (defun dorg-mutate--persist-coding (coding)
   "Normalize CODING to a concrete on-disk coding system for encode/decode.
-A nil, `undecided', or `prefer-utf-8' CODING resolves to `utf-8-unix' — the
-DOrg on-disk default — so nil never leaks into `encode-coding-string' as a
+A nil or plain `undecided' CODING resolves to `utf-8-unix', DOrg's on-disk
+default.  A detected `undecided-<eol>' preserves its EOL conversion while
+choosing UTF-8, so nil never leaks into `encode-coding-string' as a
 no-conversion request (which would mis-handle multibyte content)."
   (let ((cs (or coding 'utf-8-unix)))
     (if (memq (coding-system-base cs) '(undecided prefer-utf-8))
-        'utf-8-unix
+        ;; Detection supplies an `undecided-<eol>' coding system for a raw
+        ;; existing file.  Preserve that EOL conversion while selecting the
+        ;; concrete UTF-8 encoder: otherwise a byte-faithful CRLF source is
+        ;; incorrectly re-encoded as LF before the fidelity gate can compare it.
+        (coding-system-change-eol-conversion
+         'utf-8 (or (coding-system-eol-type cs) 0))
       cs)))
 
 (defun dorg-mutate--persist-encode (text coding)
@@ -2544,7 +4201,8 @@ or converted EOL, canonicalized form) makes a surgical re-encode rewrite bytes
 outside the requested change, so DOrg declines rather than corrupt untouched
 regions.  This is stronger than a text-level `decode(encode TEXT)==TEXT' check,
 which a byte-drifting coding can still pass."
-  (let* ((text (decode-coding-string raw 'undecided))
+  (let* ((detected (or (car (detect-coding-string raw)) 'utf-8-unix))
+         (text (decode-coding-string raw detected))
          (coding (dorg-mutate--persist-coding last-coding-system-used)))
     (unless (equal raw (dorg-mutate--persist-encode text coding))
       (dorg-mutate--raise
@@ -2625,6 +4283,7 @@ the committed fingerprint."
                "plain-org destination changed under an in-flight commit"
                :detail 'destination-drift :source-kind 'plain-org
                :baseline baseline :current current)))
+          (dorg-mutate--assert-held-plain-file-gate)
           ;; Commit point: rename then set the committed flag with NOTHING that
           ;; can error/quit in between, all under `inhibit-quit' so a real C-g is
           ;; deferred until after the flag is set.
@@ -2701,6 +4360,149 @@ token."
    :changed (mapcar (lambda (id) (dorg-ext-index-entry-create :kind 'change :id id))
                     changed)))
 
+(defun dorg-mutate--plain-org-index-identity (source heading)
+  "Return HEADING's immutable identity value under plain SOURCE.
+
+The ordinary DOrg policy has numeric ids already.  A property-identity source
+has no fabricated DORG_ID, so its external property is the stable key used
+only to bind this bounded candidate context together."
+  (pcase (dorg-mutate--source-identity source)
+    ('dorg (dorg-heading-id heading))
+    (`(:property ,key)
+     (cdr (assoc-string key
+                        (dorg-model-heading-property-snapshot heading) t)))))
+
+(defun dorg-mutate--plain-org-index-id-map (source before after)
+  "Return SOURCE's candidate-local numeric map for property identities.
+
+`dorg-ext-index-context' entries carry numeric ids.  For a property-bound
+plain source these are opaque, deterministic keys local to this simulation;
+the source's declared external identity remains in every heading snapshot.
+Duplicate property identities are not representable as one immutable entry,
+so refuse instead of silently collapsing one candidate heading into another."
+  (when (pcase (dorg-mutate--source-identity source)
+          (`(:property ,_) t))
+    (let (values)
+      (dolist (parsed (list before after))
+        (let (image-values)
+          (dolist (heading (dorg-parse-result-headings parsed))
+            (when-let ((value (dorg-mutate--plain-org-index-identity source heading)))
+              (push value image-values)))
+          (let ((unique-image
+                 (delete-dups (sort (copy-sequence image-values) #'string<))))
+            (unless (= (length image-values) (length unique-image))
+              (dorg-mutate--raise
+               'invalid-target "property identity is ambiguous in candidate"
+               :detail 'ambiguous :identity (dorg-mutate--source-identity source)))
+            (setq values (nconc unique-image values)))))
+      (let ((unique (delete-dups (sort values #'string<))))
+        (let ((map (make-hash-table :test 'equal))
+              (next 1))
+          (dolist (value unique map)
+            (puthash value next map)
+            (setq next (1+ next))))))))
+
+(defun dorg-mutate--plain-org-index-image (source parsed id-map)
+  "Return plain SOURCE's immutable image from already PARSED candidate bytes.
+
+ID-MAP is required only for a property identity; it maps the real external
+identity to a candidate-local numeric entry id without adding a DORG_ID to the
+source or exposing a synthetic id as its public identity."
+  (let ((image (make-hash-table :test 'eql)))
+    (dorg-parse-assert-unique-ids parsed)
+    (dolist (heading (dorg-parse-result-headings parsed))
+      (when-let* ((identity (dorg-mutate--plain-org-index-identity source heading))
+                  (id (if id-map (gethash identity id-map) identity)))
+        (puthash id (dorg-heading-deep-copy heading) image)))
+    image))
+
+(defun dorg-mutate--plain-org-index-touched-ids (source hosts id-map)
+  "Map source-preserving HOSTS to immutable candidate ids for SOURCE."
+  (delete-dups
+   (delq nil
+         (mapcar
+          (lambda (host)
+            (pcase (dorg-mutate--source-identity source)
+              ('dorg (and (integerp host) host))
+              (`(:property ,key)
+               (and (dorg-mutate--typed-external-address-p host)
+                    (equal key (plist-get (cdr host) :key))
+                    (gethash (plist-get (cdr host) :value) id-map)))))
+          hosts))))
+
+(defun dorg-mutate--plain-org-index-context-from-parsed
+    (source patches base-s0 before-parsed after-parsed created changed)
+  "Build immutable owner context from plain before/after parse results.
+
+CREATED and CHANGED are the physical result of the one authoritative source
+plan.  Keeping image construction separate from planning lets apply validate
+the already-spliced candidate rather than invoking the splice seam a second
+time."
+  (let* ((id-map (dorg-mutate--plain-org-index-id-map
+                  source before-parsed after-parsed))
+         (before (dorg-mutate--plain-org-index-image source before-parsed id-map))
+         (after (dorg-mutate--plain-org-index-image source after-parsed id-map))
+         (parts (dorg-mutate--index-classify
+                 before after
+                 (dorg-mutate--plain-org-index-touched-ids source created id-map)
+                 (dorg-mutate--plain-org-index-touched-ids source changed id-map)
+                 nil nil)))
+    (dorg-ext-index-context-create
+     :source-kind 'plain-org
+     :root-id (dorg-mutate-source-root-id source)
+     :file (dorg-mutate-source-file source)
+     :base-commit base-s0
+     :patches patches
+     :created (plist-get parts :created)
+     :changed (plist-get parts :changed)
+     :moved (plist-get parts :moved)
+     :deleted (plist-get parts :deleted)
+     :base-image (dorg-mutate--index-host-safe-image before)
+     :candidate-postimage (dorg-mutate--index-host-safe-image after))))
+
+(defun dorg-mutate--plain-org-parse-text (text)
+  "Parse plain Org TEXT without borrowing the caller's live source buffer."
+  (with-temp-buffer
+    (insert text)
+    (let ((org-inhibit-startup t)) (org-mode))
+    (dorg-parse-buffer (current-buffer) nil)))
+
+(defun dorg-mutate--plain-org-planned-index-context (source patches base-s0)
+  "Simulate plain PATCHES into the immutable owner-validation context.
+
+This is the non-mutating planning path.  Apply builds the same context from
+its one authoritative splice instead, avoiding a second trip through the
+public splice seam."
+  (with-temp-buffer
+    (insert (dorg-mutate--plain-org-source-text source))
+    (let ((org-inhibit-startup t)) (org-mode))
+    (widen)
+    (let* ((proxy (dorg-mutate--source-make
+                   :kind 'plain-org :buffer (current-buffer)
+                   :file (dorg-mutate-source-file source)
+                   :root-id (dorg-mutate-source-root-id source)
+                   :identity (dorg-mutate-source-identity source)))
+           (before-parsed (dorg-parse-buffer (current-buffer) nil))
+           (run (dorg-mutate--source-preserving-run patches proxy))
+           (after-parsed (dorg-parse-buffer (current-buffer) nil)))
+      (dorg-mutate--plain-org-index-context-from-parsed
+       source patches base-s0 before-parsed after-parsed
+       (plist-get run :created) (plist-get run :changed)))))
+
+(defun dorg-mutate--plain-org-applied-index-context
+    (source patches base-s0 before-text created changed)
+  "Build owner context after one faithful splice, before its persistence.
+
+BEFORE-TEXT is the exact S0 text whose plan has just changed in the current
+buffer.  A validator refusal is still precommit: the caller restores the live
+buffer or discards the temporary file buffer before re-signalling."
+  (let ((before-parsed (dorg-mutate--plain-org-parse-text before-text)))
+    (save-restriction
+      (widen)
+      (dorg-mutate--plain-org-index-context-from-parsed
+       source patches base-s0 before-parsed
+       (dorg-parse-buffer (current-buffer) nil) created changed))))
+
 (defun dorg-mutate--plain-org-source-preserving-execute (source patches options)
   "Surgically apply typed PATCHES to a source-preserving plain-org SOURCE.
 Byte-identical to an in-place `org-entry-put'; see the section commentary.
@@ -2754,7 +4556,7 @@ temp sibling, and an atomic rename commits it.  Returns the apply result plist."
                   index-context
                   (dorg-mutate--plain-org-index-context
                    source patches base-s0 nil changed))
-            (dorg-ext-run-index-validators index-context 'plain-prewrite)
+            (dorg-ext-run-index-validators index-context 'plain-prewrite :all)
             (dorg-projection-with-programmatic-changes
               (let ((snapshot (buffer-string))
                     (snap-modified (buffer-modified-p))
@@ -2766,6 +4568,12 @@ temp sibling, and an atomic rename commits it.  Returns the apply result plist."
                                   plan source)))
                         (setq created (plist-get run :created)
                               changed (plist-get run :changed)))
+                      ;; Validate the immutable owner view built from this
+                      ;; single physical splice.  A refusal remains precommit
+                      ;; and therefore falls through the snapshot restore.
+                      (dorg-mutate--validate-owned-metadata-context
+                       (dorg-mutate--plain-org-applied-index-context
+                        source patches base-s0 snapshot created changed))
                       ;; Construct the projection context BEFORE any persistence.
                       (setq index-context
                             (dorg-mutate--plain-org-index-context
@@ -2830,12 +4638,18 @@ temp sibling, and an atomic rename commits it.  Returns the apply result plist."
           (let ((run (dorg-mutate--source-preserving-run patches source)))
             (setq created (plist-get run :created)
                   changed (plist-get run :changed)))
+          ;; This temporary buffer contains the one authoritative splice.
+          ;; Owner validation precedes encoding and the atomic rename, so a
+          ;; refusal leaves the destination untouched.
+          (dorg-mutate--validate-owned-metadata-context
+           (dorg-mutate--plain-org-applied-index-context
+            source patches base-s0 text created changed))
           ;; Construct the projection context BEFORE any persistence (the commit
           ;; below), so it is a valid precommit projector input (tracked-case).
           (setq index-context
                 (dorg-mutate--plain-org-index-context
                  source patches base-s0 created changed))
-          (dorg-ext-run-index-validators index-context 'plain-prewrite)
+          (dorg-ext-run-index-validators index-context 'plain-prewrite :all)
           ;; FAITHFUL encode of the RESULT: a mutation that introduces text
           ;; unrepresentable/lossy under the file's coding fails closed before
           ;; any write (the entry raw round-trip only proved the PRE-mutation
@@ -2931,10 +4745,23 @@ ORIG.  IDS nil preserves the whole-root fallback.  Signals
       (dorg-mutate--raise 'invalid-target
                           (format "root id %S is not present in Dolt source" root-id)
                           :dolt-dir dolt-dir :root-id root-id :detail 'missing))
-    (let ((hash (make-hash-table :test 'eql)))
+    (let ((hash (make-hash-table :test 'eql))
+          (fact-offsets (make-hash-table :test 'eql)))
       (maphash (lambda (id h) (puthash id (dorg-heading-deep-copy h) hash)) orig)
       (cons orig
-            (dorg-mutate--ps-create :headings hash :root-id root-id)))))
+            (dorg-mutate--ps-create
+             :headings hash :root-id root-id :orig orig
+             :fact-offsets fact-offsets
+             ;; A sparse load answers order questions with keys-only facts
+             ;; read at the same AS-OF through the indexed sibling order; a
+             ;; whole-root load is complete and needs none.  The same read
+             ;; records each reported sibling's stored offset.
+             :order-facts-fn
+             (and ids
+                  (lambda (parent-id &optional bound side limit exclude-ids)
+                    (dorg-mutate--dolt-order-facts
+                     dolt-dir root-id parent-id as-of
+                     bound side limit exclude-ids fact-offsets))))))))
 
 (defun dorg-mutate--dolt-parent-predicate (parent-id)
   "Return a SQL predicate matching PARENT-ID in headings.parent_id."
@@ -2954,93 +4781,46 @@ ORIG.  IDS nil preserves the whole-root fallback.  Signals
   (alist-get 'parent_id
              (dorg-mutate--dolt-heading-row dolt-dir root-id id as-of)))
 
+(defun dorg-mutate--dolt-order-facts (dolt-dir root-id parent-id &optional as-of
+                                                bound side limit exclude-ids
+                                                offsets-sink)
+  "Return (ID . SORT-KEY) facts for PARENT-ID's children in ROOT-ID at AS-OF.
+Keys only, never content.  Without BOUND, SIDE and LIMIT this is the complete
+ascending sibling order.  With SIDE `before' (keys strictly below BOUND,
+greatest first) or `after' (keys strictly above, smallest first), at most
+LIMIT rows nearest the bound come back; a nil BOUND means the fan end on that
+side.  EXCLUDE-IDS are left out by id, so a candidate key is a valid bound
+against the remaining unchanged rows.  The predicate and ordering match the
+composite sibling index (parent_id, sort_key).  OFFSETS-SINK, when a hash, also
+receives each returned id's stored level offset from the same statement, so a
+sparse candidate can check representability without another read."
+  (let* ((desc (eq side 'before))
+         (sql (concat
+               (format "SELECT id, HEX(sort_key) AS sort_key_hex, level_offset FROM headings%s WHERE root_id = %d AND %s"
+                       (dorg-sql-gen--as-of-suffix as-of)
+                       root-id
+                       (dorg-mutate--dolt-parent-predicate parent-id))
+               (when (and bound side)
+                 (format " AND sort_key %s %s" (if desc "<" ">")
+                         (dorg-sql-gen--sort-key-hex bound)))
+               (when exclude-ids
+                 (format " AND id NOT IN (%s)"
+                         (mapconcat #'number-to-string exclude-ids ", ")))
+               (if desc
+                   " ORDER BY sort_key DESC, id DESC"
+                 " ORDER BY sort_key, id")
+               (when limit (format " LIMIT %d" limit)))))
+    (mapcar
+     (lambda (row)
+       (when offsets-sink
+         (puthash (alist-get 'id row) (alist-get 'level_offset row) offsets-sink))
+       (cons (alist-get 'id row)
+             (dorg-sortkey-from-hex (alist-get 'sort_key_hex row))))
+     (dorg-sql dolt-dir sql))))
+
 (defun dorg-mutate--dolt-child-ids (dolt-dir root-id parent-id &optional as-of)
   "Return direct child ids under PARENT-ID in ROOT-ID at AS-OF."
-  (mapcar
-   (lambda (row) (alist-get 'id row))
-   (dorg-sql
-    dolt-dir
-    (format "SELECT id FROM headings%s WHERE root_id = %d AND %s"
-            (dorg-sql-gen--as-of-suffix as-of)
-            root-id
-            (dorg-mutate--dolt-parent-predicate parent-id)))))
-
-(defun dorg-mutate--dolt-placement-row
-    (dolt-dir root-id heading-id &optional as-of)
-  "Return HEADING-ID's parent and hex sort key in ROOT-ID at AS-OF.
-The row comes from DOLT-DIR and is a structural placement fact, not a hydrated
-heading model."
-  (car
-   (dorg-sql
-    dolt-dir
-    (format
-     (concat "SELECT id, parent_id, HEX(sort_key) AS sort_key_hex "
-             "FROM headings%s WHERE root_id = %d AND id = %d")
-     (dorg-sql-gen--as-of-suffix as-of) root-id heading-id))))
-
-(defun dorg-mutate--dolt-placement-neighbor-id
-    (dolt-dir root-id parent-id sort-key-hex direction &optional as-of)
-  "Return the immediate sibling next to SORT-KEY-HEX under PARENT-ID.
-DIRECTION is `before' or `after'.  The lookup is an exact structural fact at
-AS-OF in DOLT-DIR/ROOT-ID and never hydrates the sibling partition."
-  (unless (memq direction '(before after))
-    (error "Invalid placement-neighbor direction: %S" direction))
-  (let ((op (if (eq direction 'before) "<" ">"))
-        (order (if (eq direction 'before) "DESC" "ASC")))
-    (alist-get
-     'id
-     (car
-      (dorg-sql
-       dolt-dir
-       (format
-        (concat "SELECT id FROM headings%s WHERE root_id = %d AND %s "
-                "AND sort_key %s X'%s' ORDER BY sort_key %s, id %s LIMIT 1")
-        (dorg-sql-gen--as-of-suffix as-of)
-        root-id
-        (dorg-mutate--dolt-parent-predicate parent-id)
-        op sort-key-hex order order))))))
-
-(defun dorg-mutate--dolt-last-child-id
-    (dolt-dir root-id parent-id &optional as-of)
-  "Return the last direct child under PARENT-ID in DOLT-DIR/ROOT-ID at AS-OF."
-  (alist-get
-   'id
-   (car
-    (dorg-sql
-     dolt-dir
-     (format
-      (concat "SELECT id FROM headings%s WHERE root_id = %d AND %s "
-              "ORDER BY sort_key DESC, id DESC LIMIT 1")
-      (dorg-sql-gen--as-of-suffix as-of)
-      root-id
-      (dorg-mutate--dolt-parent-predicate parent-id))))))
-
-(defun dorg-mutate--dolt-insert-placement-ids
-    (dolt-dir root-id parent-id before-id after-id patch &optional as-of)
-  "Return the exact existing heading ids needed to place insert PATCH.
-Unanchored insertion needs only the last child.  BEFORE-ID needs the anchor and
-its predecessor; AFTER-ID needs the anchor and its successor.  Anchor ownership
-is checked from the same AS-OF snapshot in DOLT-DIR/ROOT-ID and fails with the
-existing typed missing/non-sibling refusal instead of widening to the full
-sibling fan."
-  (if (or before-id after-id)
-      (let* ((anchor-id (or before-id after-id))
-             (row (dorg-mutate--dolt-placement-row
-                   dolt-dir root-id anchor-id as-of)))
-        (unless (and row (eql parent-id (alist-get 'parent_id row)))
-          (dorg-mutate--raise
-           'invalid-target
-           (format "position anchor %S is not a sibling here" anchor-id)
-           :operation (plist-get patch :op) :target anchor-id :detail 'missing))
-        (let* ((direction (if before-id 'before 'after))
-               (neighbor
-                (dorg-mutate--dolt-placement-neighbor-id
-                 dolt-dir root-id parent-id
-                 (alist-get 'sort_key_hex row) direction as-of)))
-          (delq nil (list anchor-id neighbor))))
-    (let ((last (dorg-mutate--dolt-last-child-id
-                 dolt-dir root-id parent-id as-of)))
-      (and last (list last)))))
+  (mapcar #'car (dorg-mutate--dolt-order-facts dolt-dir root-id parent-id as-of)))
 
 (defun dorg-mutate--dolt-subtree-ids (dolt-dir root-id node-id &optional as-of)
   "Return NODE-ID and descendant ids in ROOT-ID at AS-OF."
@@ -3110,7 +4890,7 @@ sibling fan."
       (setq out (plist-put out :target
                            (dorg-mutate--dolt-resolve-typed-host
                             source root-id target patch head))))
-     ((memq kind '(:property :keyword :keywords :planning :text :texts :items
+     ((memq kind '(:property :keyword :keywords :planning :text :texts :items :item
                     :drawer-lines))
       (let ((copy (copy-sequence (cdr target))))
         (setq copy
@@ -3156,24 +4936,17 @@ sibling fan."
   "Return a bounded id slice for same-root Dolt PATCHES at HEAD.
 The slice is a conservative superset of every heading read by the
 simulation/diff/lowering path: direct targets, root row, structural
-subtrees/children, anchors, current parents, and affected-parent sibling
-fans."
+subtrees/children, anchors and current parents.  A parent's sibling fan is
+never hydrated: placement reads its complete order as keys only, once per
+batch (`dorg-mutate--ps-neighbours')."
   (let ((dolt-dir (dorg-mutate-source-dolt-dir source))
-        (ids nil)
-        (affected-parents nil))
+        (ids nil))
     (cl-labels
         ((add (id) (when (integerp id) (cl-pushnew id ids :test #'eql)))
-         (affect (id) (when (integerp id)
-                        (cl-pushnew id affected-parents :test #'eql)))
          (resolve (host patch)
            (dorg-mutate--dolt-resolve-host-id source root-id host patch head))
          (add-host (host patch)
-           (add (resolve host patch)))
-         (add-parent-siblings (parent-id)
-           (when (integerp parent-id)
-             (dolist (id (dorg-mutate--dolt-child-ids
-                          dolt-dir root-id parent-id head))
-               (add id)))))
+           (add (resolve host patch))))
       (add root-id)
       (dolist (patch patches)
         (dolist (host (dorg-mutate--dolt-patch-hosts patch))
@@ -3193,9 +4966,8 @@ fans."
                          (dorg-mutate--patch-anchor-address
                           (dorg-mutate--patch-tget target :after)) patch))))
              (add parent)
-             (dolist (id (dorg-mutate--dolt-insert-placement-ids
-                          dolt-dir root-id parent before after patch head))
-               (add id))))
+             (add before)
+             (add after)))
           (`(move :subtree)
            (let* ((to (plist-get patch :to))
                   (id (resolve (dorg-mutate--patch-address patch) patch))
@@ -3209,8 +4981,6 @@ fans."
                (add sid))
              (add old-parent)
              (add new-parent)
-             (affect old-parent)
-             (affect new-parent)
              (when (plist-member to :before)
                (add (resolve (dorg-mutate--patch-anchor-address
                               (plist-get to :before)) patch)))
@@ -3222,18 +4992,13 @@ fans."
                   (parent (dorg-mutate--dolt-parent-id
                            dolt-dir root-id id head)))
              (add parent)
-             (affect parent)
-             (if (eq (cadr (dorg-mutate--patch-signature patch)) :subtree)
-                 (dolist (sid (dorg-mutate--dolt-subtree-ids
-                               dolt-dir root-id id head))
-                   (add sid))
-               (progn
-                 (dolist (cid (dorg-mutate--dolt-child-ids
-                               dolt-dir root-id id head))
-                   (add cid))
-                 (affect id)))))))
-      (dolist (parent affected-parents)
-        (add-parent-siblings parent))
+             ;; Both delete forms need the deleted heading and every descendant:
+             ;; a heading delete promotes its direct children and shifts each
+             ;; loaded subtree through the existing planner.  One recursive
+             ;; snapshot read is therefore the bounded shared scope.
+             (dolist (sid (dorg-mutate--dolt-subtree-ids
+                           dolt-dir root-id id head))
+               (add sid))))))
       (delete-dups (nreverse ids)))))
 
 (defun dorg-mutate--dolt-db-ops (orig ps root-id)
@@ -3268,296 +5033,205 @@ AND touched (created/changed/deleted accumulators) is an
      orig)
     (nreverse db-ops)))
 
-(defun dorg-mutate--dolt-freed-slots (db-ops orig)
-  "Return a hash of `(PARENT-ID . SORT-KEY)' slots freed by DB-OPS deletes.
-For every `:delete-heading' op, the deleted heading's ORIGINAL sibling
-slot (looked up in the ORIG snapshot) becomes free once that delete runs.
-Keys are `equal'-compared conses; values are t.  An inserted or updated
-heading whose FINAL slot matches a freed slot cannot occupy its final
-`(parent_id, sort_key)' until the freeing delete has run, or it would
-race the `uq_heading_sibling_order' unique key — those headings are
-STAGED by `dorg-mutate--dolt-assemble-sql'."
-  (let ((freed (make-hash-table :test 'equal)))
-    (dolist (op db-ops)
-      (when (eq (car op) :delete-heading)
-        (when-let ((dh (gethash (cadr op) orig)))
-          (puthash (cons (dorg-heading-parent-id dh)
-                         (dorg-heading-sort-key dh))
-                   t freed))))
-    freed))
-
-(defun dorg-mutate--dolt-staged-slot-p (heading freed)
-  "Return non-nil when HEADING's final sibling slot is in FREED.
-FREED is a `dorg-mutate--dolt-freed-slots' hash.  Such a heading needs
-its final sort key staged until the freeing delete has run."
-  (gethash (cons (dorg-heading-parent-id heading)
-                 (dorg-heading-sort-key heading))
-           freed))
-
-(defun dorg-mutate--dolt-temp-sort-key (id)
-  "Return the deterministic 8-byte id-derived staging sort key for ID.
-Big-endian encoding of ID, identical to the bytes the core lowerer's
-divergent staging writes via `UNHEX(LPAD(HEX(id), 16, ''0''))'.  Distinct
-per ID, but NOT guaranteed disjoint from an existing sibling's ALLOCATED
-sort key — a midpoint key may, in principle, equal a small id's
-big-endian form.  Callers must therefore verify the slot is free for the
-affected parent: `dorg-mutate--dolt-free-temp-key' searches for a free
-key (used for staged inserts, where the temp key is unconstrained), while
-a staged update is pinned to this value by the core lowerer's divergent
-staging and so must fail closed when it collides."
-  (apply #'unibyte-string
-         (mapcar (lambda (shift) (logand (ash id shift) #xff))
-                 '(-56 -48 -40 -32 -24 -16 -8 0))))
-
-(defun dorg-mutate--dolt-sibling-keys (db-ops orig parent-id)
-  "Return a hash set of sort keys coexisting under PARENT-ID mid-batch.
-The set unions, for PARENT-ID, every ORIG row's sort key (survivors and
-not-yet-run deletes sit at their original slot until the DELETE phase)
-and every FINAL row's sort key carried by an insert/update DB op
-(non-staged rows are written at their final slot in the insert/update
-phases).  A staging temp key absent from this set is free under
-PARENT-ID at every phase of `dorg-mutate--dolt-assemble-sql', so it never
-races the `uq_heading_sibling_order' unique key while the batch is
-in-flight.  Conservative by construction (a superset of the keys actually
-live at any single phase)."
-  (let ((keys (make-hash-table :test 'equal)))
-    (maphash (lambda (_id h)
-               (when (equal (dorg-heading-parent-id h) parent-id)
-                 (puthash (dorg-heading-sort-key h) t keys)))
-             orig)
-    (dolist (op db-ops)
-      (when (memq (car op) '(:insert-heading :update-heading))
-        (let ((h (cadr op)))
-          (when (equal (dorg-heading-parent-id h) parent-id)
-            (puthash (dorg-heading-sort-key h) t keys)))))
-    keys))
-
-(defun dorg-mutate--dolt-sibling-key-conflict-p (db-ops orig parent-id key owner-id)
-  "Return non-nil if a heading OTHER THAN OWNER-ID holds KEY under PARENT-ID.
-Scans the same coexisting set as `dorg-mutate--dolt-sibling-keys' (every
-ORIG row at its original slot ∪ every DB-OPS insert/update final slot) but is
-OWNER-AWARE: the staged heading's own row is excluded.  A staged
-`:update-heading' is pinned to its id-derived staging key
-\(`dorg-mutate--dolt-temp-sort-key'); when that key equals the heading's
-OWN current sort key the core lowerer's phase-1 staging merely rewrites
-the same slot back to the same row, which never races the
-`uq_heading_sibling_order' unique key.  Only a DISTINCT non-staged sibling
-already occupying the staging slot is a real collision, so the
-fail-closed decision must ignore the moving heading itself."
-  (catch 'conflict
-    (maphash (lambda (id h)
-               (when (and (not (equal id owner-id))
-                          (equal (dorg-heading-parent-id h) parent-id)
-                          (equal (dorg-heading-sort-key h) key))
-                 (throw 'conflict t)))
-             orig)
-    (dolist (op db-ops)
-      (when (memq (car op) '(:insert-heading :update-heading))
-        (let ((h (cadr op)))
-          (when (and (not (equal (dorg-heading-id h) owner-id))
-                     (equal (dorg-heading-parent-id h) parent-id)
-                     (equal (dorg-heading-sort-key h) key))
-            (throw 'conflict t)))))
-    nil))
-
-(defun dorg-mutate--dolt-free-temp-key (id occupied)
-  "Return an id-derived staging sort key for ID free in OCCUPIED.
-OCCUPIED is a `dorg-mutate--dolt-sibling-keys' hash for the staged
-heading's parent.  Prefers the plain id-derived key
-\(`dorg-mutate--dolt-temp-sort-key'), so a batch with no pre-existing
-collision keeps byte-identical SQL; when an existing sibling already
-holds that slot, a big-endian disambiguator is appended and retried until
-a free key is found.  Terminates because OCCUPIED is finite and each
-iteration yields a distinct, strictly longer key (bounded well under
-`dorg-sortkey-max-bytes')."
-  (let ((base (dorg-mutate--dolt-temp-sort-key id)))
-    (if (not (gethash base occupied))
-        base
-      (let ((n 1) key)
-        (while (progn
-                 (setq key (concat base (dorg-mutate--dolt-temp-sort-key n)))
-                 (gethash key occupied))
-          (setq n (1+ n)))
-        key))))
-
-(defun dorg-mutate--dolt-stage-heading-copy (heading temp-key)
-  "Return a shallow copy of HEADING carrying TEMP-KEY as its sort key.
-Only the sort key is rewritten; parent/level/content/tags/items keep
-their FINAL values, so the staged INSERT/UPDATE writes a fully consistent
-row at the collision-free temporary slot TEMP-KEY.  The original
-HEADING — and thus the `ps' model and result plan — is left untouched."
-  (let ((copy (copy-dorg-heading heading)))
-    (setf (dorg-heading-sort-key copy) temp-key)
-    copy))
-
-(defun dorg-mutate--dolt-finalize-stmt (heading)
-  "Return the sort-key-only finalize UPDATE for a staged HEADING.
-Run AFTER the deletes have freed the target slot, this rewrites the row
-from its temporary staging key to HEADING's final sort key.  Only the
-sort key changed during staging, so no other column is touched."
-  (format "UPDATE headings SET sort_key = %s WHERE id = %d"
-          (dorg-sql-gen--sort-key-hex (dorg-heading-sort-key heading))
-          (dorg-heading-id heading)))
+(defun dorg-mutate--ps-rekey-ops (ps orig)
+  "Return (:rekey PARENT-ID ((ID . SORT-KEY) ...)) ops for PS's pending rekeys.
+One op per parent, ids ascending.  A row this batch created, changed or
+deleted carries its key in its own row op and is left out; so is a row whose
+pending key equals its ORIG key."
+  (let ((touched (make-hash-table :test 'eql))
+        (by-parent nil))
+    (dolist (id (append (dorg-mutate--ps-created ps)
+                        (dorg-mutate--ps-changed ps)
+                        (dorg-mutate--ps-deleted ps)))
+      (puthash id t touched))
+    (maphash
+     (lambda (id cell)
+       (let ((o (gethash id orig)))
+         (unless (or (gethash id touched)
+                     (and o (equal (dorg-heading-sort-key o) (cdr cell))))
+           (push (cons id (cdr cell))
+                 (alist-get (car cell) by-parent nil nil #'eql)))))
+     (dorg-mutate--ps-rekeys ps))
+    (mapcar (lambda (entry)
+              (list :rekey (car entry)
+                    (sort (cdr entry) (lambda (a b) (< (car a) (car b))))))
+            (sort by-parent (lambda (a b) (< (or (car a) 0) (or (car b) 0)))))))
 
 (defun dorg-mutate--dolt-assemble-sql (db-ops orig id-gen)
-  "Lower tagged DB-OPS to SQL in dependency/collision-safe phases.
-Reuses `dorg-sql-gen-lower-heading-ops' and the `dorg-sql-gen' helpers — this
-is FK-/collision-safe phasing of the EXISTING lowerer, not a public
-raw-SQL surface.  ORIG is the snapshot hash (for tag/item diffing);
-ID-GEN allocates `heading_items' ids.
-
-A heading is STAGED when its final `(parent_id, sort_key)' slot was freed
-by a `:delete-heading' in the same batch (see
-`dorg-mutate--dolt-freed-slots').  Staged inserts/updates are lowered
-from a temp-key heading COPY so their final slot is not written until the
-freeing delete has run.  Phases emitted in order:
-
-  1. INSERTS  — new parent rows exist before an update reparents an
-                existing child under them; a staged insert lands at a
-                collision-free temp key chosen for its parent.
-  2. UPDATES  — surviving headings (incl. `:delete-heading' child
-                promotion moving children out from under a doomed parent,
-                and the core lowerer's divergent-sort-key staging); a
-                staged update lands at its id-derived temp key.
-  3. DELETES  — removed rows, freeing their `(parent_id, sort_key)' slots.
-  4. FINALIZE — staged headings move from their temp key to the now-free
-                final sort key (sort-key-only UPDATE).
-
-Staging temp keys are verified collision-free against the affected
-parent's coexisting sibling set (`dorg-mutate--dolt-sibling-keys'), not
-merely against other staged headings.  A staged INSERT is free to pick
-any unoccupied key, so `dorg-mutate--dolt-free-temp-key' searches for
-one.  A staged UPDATE is pinned to its id-derived key by the core
-lowerer's divergent staging (`UNHEX(LPAD(HEX(id), 16, ''0''))'); when an
-existing sibling already occupies that slot the batch FAILS CLOSED with a
-deterministic `unsupported' error here — before any SQL — so
-typed plan and apply agree (both run this assembler via
-`dorg-mutate--dolt-simulate') instead of reporting the batch supported
-and relying on transaction rollback."
-  (let ((freed (dorg-mutate--dolt-freed-slots db-ops orig))
-        (occupied (make-hash-table :test 'equal))
-        inserts updates deletes finalize)
-    (cl-labels ((occ (pid)
-                  (or (gethash pid occupied)
-                      (puthash pid (dorg-mutate--dolt-sibling-keys db-ops orig pid)
-                               occupied))))
-      (dolist (op db-ops)
-        (pcase (car op)
-          (:insert-heading
-           (let ((h (cadr op)))
-             (if (dorg-mutate--dolt-staged-slot-p h freed)
-                 (let* ((keys (occ (dorg-heading-parent-id h)))
-                        (temp (dorg-mutate--dolt-free-temp-key
-                               (dorg-heading-id h) keys)))
-                   (puthash temp t keys)
-                   (push (list :insert-heading
-                               (dorg-mutate--dolt-stage-heading-copy h temp)
-                               (caddr op))
-                         inserts)
-                   (push h finalize))
-               (push op inserts))))
-          (:update-heading
-           (let ((h (cadr op)))
-             (if (dorg-mutate--dolt-staged-slot-p h freed)
-                 (let* ((final-parent (dorg-heading-parent-id h))
-                        (orig-h (gethash (dorg-heading-id h) orig))
-                        (orig-parent (and orig-h
-                                          (dorg-heading-parent-id orig-h)))
-                        (keys (occ final-parent))
-                        (temp (dorg-mutate--dolt-temp-sort-key
-                               (dorg-heading-id h))))
-                   ;; A staged UPDATE's transient key is forced to the
-                   ;; id-derived value by the core lowerer's divergent
-                   ;; staging, so it cannot be perturbed.  The core lowerer
-                   ;; (`dorg-sql-gen-lower-heading-ops') parks the row at that
-                   ;; key in a phase-1 pass that runs BEFORE parent_id is
-                   ;; changed, so for a REPARENTING move the temp key is
-                   ;; briefly live under the ORIGINAL parent and then under
-                   ;; the FINAL parent until finalize.  It must therefore be
-                   ;; free against the coexisting sibling set of BOTH
-                   ;; parents; otherwise refuse before SQL so plan and apply
-                   ;; agree instead of relying on transaction rollback.  A
-                   ;; final-parent-only check misses the source-parent
-                   ;; collision (reviewer repro).  The check is
-                   ;; OWNER-AWARE: when the moving heading already sits at
-                   ;; be8(id) the phase-1 staging rewrites its OWN slot back
-                   ;; to itself — not a collision — so only a DISTINCT
-                   ;; sibling at that key fails closed.
-                   (when (or (dorg-mutate--dolt-sibling-key-conflict-p
-                              db-ops orig final-parent temp (dorg-heading-id h))
-                             (and orig-parent
-                                  (not (equal orig-parent final-parent))
-                                  (dorg-mutate--dolt-sibling-key-conflict-p
-                                   db-ops orig orig-parent temp
-                                   (dorg-heading-id h))))
-                     (dorg-mutate--raise
-                      'unsupported
-                      (format "delete-freed staging collision: an existing sibling already occupies the id-derived staging slot for heading %d (checked both its original parent %s and final parent %s); moving it into the freed slot is unsupported"
-                              (dorg-heading-id h)
-                              orig-parent
-                              final-parent)
-                      :detail 'delete-freed-sort-key-reuse
-                      :operation 'update
-                      :target (dorg-heading-id h)))
-                   (puthash temp t keys)
-                   (push (list :update-heading
-                               (dorg-mutate--dolt-stage-heading-copy h temp))
-                         updates)
-                   (push h finalize))
-               (push op updates))))
-          (:update-sort-key (push op updates))
-          (:delete-heading (push op deletes)))))
+  "Lower tagged DB-OPS to SQL in FK-safe phases.
+Phases: INSERTS (new parent rows exist before an update reparents a child
+under them), UPDATES including key-only `:rekey' ops, then DELETES.  Every key
+any op writes is fresh for its parent (`dorg-mutate--ps-allocate-keys'), so no
+phase order can violate the sibling unique index and no temporary keys exist.
+ORIG is the snapshot hash (for tag/item diffing); ID-GEN allocates
+`heading_items' ids."
+  (let (inserts updates deletes)
+    (dolist (op db-ops)
+      (pcase (car op)
+        (:insert-heading (push op inserts))
+        ((or :update-heading :rekey) (push op updates))
+        (:delete-heading (push op deletes))))
     (append
      (dorg-sql-gen-lower-heading-ops (nreverse inserts) orig id-gen)
      (dorg-sql-gen-lower-heading-ops (nreverse updates) orig id-gen)
-     (dorg-sql-gen-lower-heading-ops (nreverse deletes) orig id-gen)
-     (mapcar #'dorg-mutate--dolt-finalize-stmt (nreverse finalize)))))
+     (dorg-sql-gen-lower-heading-ops (nreverse deletes) orig id-gen))))
 
-(defun dorg-mutate--dolt-simulate (source patches options)
+;; Accumulator effects are folded at plan time against derived rows read AS
+;; OF the plan base.  The commit gate lands an attempt only while the in-gate
+;; HEAD still equals that base, and otherwise replans with fresh priors, so a
+;; folded literal row is exactly the base row plus the plan's own deltas.
+;; Priors are never read from the live head or the working set.
+
+(defun dorg-mutate--accumulator-request-sql (table keys)
+  "Return one keyed SELECT of TABLE's rows for KEYS (column alists).
+Keys sharing every column but the last are grouped into one IN list."
+  (let (groups)
+    (dolist (key keys)
+      (let ((prefix (butlast key)) (last (car (last key))))
+        (push (cdr last) (alist-get (cons prefix (car last)) groups nil nil #'equal))))
+    (format "SELECT * FROM %s WHERE %s" table
+            (mapconcat
+             (lambda (group)
+               (let* ((prefix (car (car group))) (column (cdr (car group)))
+                      (values (reverse (cdr group))))
+                 (format "(%s)"
+                         (mapconcat
+                          #'identity
+                          (append (mapcar (lambda (cell)
+                                            (format "%s = %s" (car cell)
+                                                    (dorg-sql--literal-sql (cdr cell))))
+                                          prefix)
+                                  (list (format "%s IN (%s)" column
+                                                (mapconcat #'dorg-sql--literal-sql
+                                                           values ", "))))
+                          " AND "))))
+             (reverse groups) " OR "))))
+
+(defun dorg-mutate--read-accumulator-priors (dolt-dir revision requests)
+  "Return (TABLE . ROW) priors for REQUESTS in DOLT-DIR AS OF REVISION.
+REQUESTS come from `dorg-ext-accumulator-prior-requests'; each table is one
+keyed revision read."
+  (unless (and (stringp revision) (not (string-empty-p revision)))
+    (dorg-mutate--raise 'unsupported
+                        "accumulator priors need an exact plan-base revision"))
+  (let (priors)
+    (dolist (request requests)
+      (dolist (row (dorg-sql--at-revision
+                    dolt-dir revision
+                    (dorg-mutate--accumulator-request-sql (car request) (cdr request))))
+        (push (cons (car request) row) priors)))
+    (nreverse priors)))
+
+(defun dorg-mutate--roots-empty-at-base (dolt-dir revision roots)
+  "Return the ROOTS that had no non-root heading in DOLT-DIR AS OF REVISION."
+  (cl-remove-if
+   (lambda (root)
+     (dorg-sql--at-revision
+      dolt-dir revision
+      (format "SELECT 1 AS present FROM headings WHERE root_id = %d AND id <> %d LIMIT 1"
+              root root)))
+   roots))
+
+(defun dorg-mutate--accumulator-fold-port (dolt-dir revision)
+  "Return the fold port binding accumulator priors to plan base REVISION."
+  (list :priors (lambda (requests)
+                  (dorg-mutate--read-accumulator-priors dolt-dir revision requests))
+        :empty-roots (lambda (roots)
+                       (dorg-mutate--roots-empty-at-base dolt-dir revision roots))))
+
+(defun dorg-mutate--dolt-extension-installed-p (dolt-dir extension)
+  "Return non-nil when EXTENSION is installed in DOLT-DIR's metadata.
+
+The extension registry is process-global while schema installation is per
+store.  This small pre-simulation metadata read prevents a registered aggregate
+projector from widening or participating in an unrelated store."
+  (let ((key (format "ext:%s:version" (dorg-extension-name extension))))
+    (car (dorg-sql dolt-dir
+                   (format "SELECT value FROM dorg_meta WHERE `key` = %s"
+                           (dorg-sql-quote key))))))
+
+(defun dorg-mutate--dolt-installed-index-extension-names (dolt-dir)
+  "Return registered projectors installed in DOLT-DIR for Dolt mutation."
+  (delq nil
+        (mapcar (lambda (extension)
+                  (and (dorg-extension-project extension)
+                       (memq 'dolt (dorg-ext--effective-capabilities extension))
+                       (dorg-mutate--dolt-extension-installed-p dolt-dir extension)
+                       (dorg-extension-name extension)))
+                (dorg-registered-extensions))))
+
+(defun dorg-mutate--dolt-simulate (source patches _options &optional owner-plan)
   "Apply typed PATCHES to a fresh SOURCE snapshot and lower row diffs to SQL.
 Returns a plist (:head-commit HEAD :scope-ids SCOPE :db-ops DB-OPS :sql SQL
-:ps PS :orig ORIG :created IDS :changed IDS :deleted IDS).  Any missing-target / non-sibling
-anchor / move-under-self error signals HERE, in memory, before any write.
-A same-batch delete that frees a sibling `(parent_id, sort_key)' slot an
-insert/update wants is handled by the staged-slot scheduler in
-`dorg-mutate--dolt-assemble-sql' — it commits, it is no longer rejected.
-OPTIONS is accepted for symmetry; the executor reads `:base-commit'
-itself."
-  (ignore options)
+:ps PS :orig ORIG :created IDS :changed IDS :deleted IDS).  Any missing-target /
+non-sibling anchor / move-under-self error signals HERE, in memory, before
+any write.  Placement never widens the load: a gap without room rekeys a
+window of the parent's key facts (keys only), lowered as `:rekey' ops.
+The owner request comes only from a verified private capability."
   (let* ((dolt-dir (dorg-mutate-source-dolt-dir source))
          (root-id (dorg-mutate-source-root-id source))
+         (owner-request (dorg-mutate--planning-owner-request owner-plan))
          (head (dorg-head-commit dolt-dir))
          (resolved-patches (dorg-mutate--dolt-resolve-patches-externs
                             source root-id patches head))
-         (scope-ids (dorg-mutate--dolt-scope-ids
-                     source resolved-patches root-id head))
+         (bounded-scope-ids
+          (unless (eq (plist-get owner-request :action) 'restore)
+            (delete-dups
+             (append
+              (dorg-mutate--dolt-scope-ids
+               source resolved-patches root-id head)
+              (when owner-request
+                (list (string-to-number
+                       (plist-get owner-request :scope-id))))))))
+         ;; Most projectors receive the normal bounded candidate image.  A
+         ;; registered root-aggregate projector (BM25 df/N, for example)
+         ;; declares that requirement before simulation, so DOrg loads the
+         ;; complete root itself rather than letting a projector read a store.
+         (scope-ids (unless (or (eq (plist-get owner-request :action) 'restore)
+                                (dorg-ext-index-projector-requires-whole-root-p
+                                 'dolt
+                                 (lambda (extension)
+                                   (dorg-mutate--dolt-extension-installed-p
+                                    dolt-dir extension))))
+                      bounded-scope-ids))
          (loaded (dorg-mutate--dolt-load source head scope-ids))
          (orig (car loaded))
-         (ps (cdr loaded)))
-    (let ((batch-context (dorg-mutate--item-batch-context)))
-      (dolist (patch resolved-patches)
-        (dorg-mutate--ps-apply-patch ps patch source batch-context)))
-    (let* ((db-ops (dorg-mutate--dolt-db-ops orig ps root-id))
+         (ps (cdr loaded))
+         (batch-context (dorg-mutate--item-batch-context
+                         (dorg-mutate--identity-protected-key source))))
+    (dolist (patch resolved-patches)
+      (dorg-mutate--ps-apply-patch ps patch source batch-context))
+    (let* ((db-ops (append (dorg-mutate--dolt-db-ops orig ps root-id)
+                           (dorg-mutate--ps-rekey-ops ps orig)))
            (sql (dorg-mutate--dolt-assemble-sql
                  db-ops orig dorg-mutate--dolt-item-id-generator))
-           (sim (list :head-commit head
-                      :scope-ids (and scope-ids
-                                      (sort (delete-dups (copy-sequence scope-ids))
-                                            #'<))
-                      :patches resolved-patches
-                      :db-ops db-ops
-                      :sql sql
-                      :ps ps
-                      :orig orig
-                      :created (nreverse (delete-dups (dorg-mutate--ps-created ps)))
-                      :changed (nreverse (delete-dups (dorg-mutate--ps-changed ps)))
-                      :deleted (nreverse (delete-dups (dorg-mutate--ps-deleted ps))))))
-      ;; Expose the immutable post-mutation projection context built from this
-      ;; simulation, after core simulation and before persistence (tracked-case).
+           (sim (list
+                 :head-commit head
+                 :scope-ids
+                 (and scope-ids
+                      (sort (delete-dups (copy-sequence scope-ids)) #'<))
+                 :patches resolved-patches
+                 :db-ops db-ops
+                 :sql sql
+                 :ps ps
+                 :orig orig
+                 :created (nreverse (delete-dups (dorg-mutate--ps-created ps)))
+                 :changed (nreverse (delete-dups (dorg-mutate--ps-changed ps)))
+                 :deleted (nreverse (delete-dups (dorg-mutate--ps-deleted ps)))
+                 ;; Ancestry this batch changed (moved subtrees and promoted
+                 ;; children's subtrees): their stored offsets may be
+                 ;; unchanged, so index classification takes them from here.
+                 :moved (let (ids)
+                          (maphash (lambda (id _) (push id ids))
+                                   (dorg-mutate--ps-moved ps))
+                          (sort ids #'<)))))
+      ;; Expose the immutable post-mutation projection context built from
+      ;; this simulation, after core simulation and before persistence
+      ;; (tracked-case).
       (nconc sim
              (list :index-context
                    (dorg-mutate--dolt-index-context
-                    source resolved-patches sim head))))))
+                    source resolved-patches sim head owner-request))))))
 
 ;;; ─── Immutable post-mutation projection context (tracked-case) ──────────
 ;; DOrg builds ONE immutable candidate-state context after typed core
@@ -3571,9 +5245,11 @@ itself."
   "Return an immutable id -> `dorg-heading' snapshot of HEADINGS."
   (dorg-ext--index-host-safe-image headings))
 
-(defun dorg-mutate--index-classify (orig ps-headings created changed deleted)
-  "Partition a mutation into create/change/move/delete `dorg-ext-index-entry's."
-  (dorg-ext--index-classify orig ps-headings created changed deleted))
+(defun dorg-mutate--index-classify (orig ps-headings created changed deleted
+                                          &optional moved)
+  "Partition a mutation into create/change/move/delete `dorg-ext-index-entry's.
+MOVED lists ids whose ancestry changed; see `dorg-ext--index-classify'."
+  (dorg-ext--index-classify orig ps-headings created changed deleted moved))
 
 (defun dorg-mutate--index-heading-canonical (h)
   "Return a COMPLETE canonical tuple of `dorg-heading' H's persisted state."
@@ -3829,37 +5505,84 @@ QUERY-FN optionally replaces the implicit read path (see
                                          :affected-paths (list path)))
                  owners)))))
 
+(defun dorg-mutate--index-image-children (image)
+  "Return IMAGE parent id -> child id lists without loading or copying rows."
+  (let ((children (make-hash-table :test 'eql)))
+    (maphash
+     (lambda (id heading)
+       (when-let ((parent-id (dorg-heading-parent-id heading)))
+         (push id (gethash parent-id children))))
+     image)
+    children))
+
+(defun dorg-mutate--index-image-owner-local-ids (source image children root-id)
+  "Return ROOT-ID and its owner-local descendants already in IMAGE.
+Property identity traversal is transitive but stops before a descendant carrying
+the identity property: that heading owns its own partition and neither it nor
+its descendants belong in the outer partition.  Under `dorg' identity every
+heading is its own owner, so the result is ROOT-ID alone.  IMAGE is an
+already-materialized simulation image; this helper never loads headings or
+queries the store."
+  (if (eq (dorg-mutate--source-identity source) 'dorg)
+      (and (gethash root-id image) (list root-id))
+    (let ((owner-key (dorg-mutate--index-owner-key source))
+          (seen (make-hash-table :test 'eql))
+          (queue (list root-id))
+          ids)
+      (while queue
+        (let ((id (pop queue)))
+          (unless (gethash id seen)
+            (puthash id t seen)
+            (when (gethash id image)
+              (push id ids)
+              (dolist (child-id (gethash id children))
+                (let ((child (gethash child-id image)))
+                  (unless (and child
+                               (assoc owner-key
+                                      (dorg-model-heading-property-snapshot child)))
+                    (push child-id queue))))))))
+      (sort ids #'<))))
+
 (defun dorg-mutate--index-overlay-owner-candidate
-    (image entries owner source root-id candidate-postimage base sides)
-  "Overlay affected ENTRIES for OWNER onto owner-local IMAGE."
-  (let ((owner-id (plist-get owner :owner-id)))
-    (dolist (entry entries)
-      (let ((after (dorg-ext-index-entry-after entry))
-            (before (dorg-ext-index-entry-before entry)))
-        (when (and before (memq 'before sides))
-          (when-let ((before-owner
-                      (dorg-mutate--index-nearest-owner
-                       source root-id image (dorg-heading-id before) base)))
-            (when (eql owner-id (plist-get before-owner :owner-id))
-              (remhash (dorg-heading-id before) image))))
-        (when (and after (memq 'after sides))
-          (when-let ((after-owner
-                      (dorg-mutate--index-nearest-owner
-                       source root-id candidate-postimage
-                       (dorg-heading-id after) base)))
-            (when (eql owner-id (plist-get after-owner :owner-id))
-              (puthash (dorg-heading-id after)
-                       (dorg-heading-deep-copy after)
-                       image))))))))
+    (image source owner base-image base-children candidate-image candidate-children)
+  "Overlay OWNER's already-resolved entry sides onto owner-local IMAGE.
+Membership was resolved against the complete before/after images while
+collecting OWNER's affected paths.  Resolving it again against each partial,
+changing partition both repeats unrelated SQL reads and can misclassify a moved
+descendant.  BASE-IMAGE and CANDIDATE-IMAGE are complete already-materialized
+simulation images; BASE-CHILDREN and CANDIDATE-CHILDREN index each image once.
+SOURCE supplies the identity boundary for each closure."
+  (let ((paths (plist-get owner :affected-paths)))
+    ;; Remove the old membership before installing any new membership; order
+    ;; of hash traversal and ancestor/descendant entries must not affect this.
+    (dolist (path paths)
+      (when (eq 'before (plist-get path :side))
+        (dolist (id (dorg-mutate--index-image-owner-local-ids
+                     source base-image base-children (plist-get path :id)))
+          (remhash id image))))
+    (dolist (path paths)
+      (when (eq 'after (plist-get path :side))
+        (dolist (id (dorg-mutate--index-image-owner-local-ids
+                     source candidate-image candidate-children (plist-get path :id)))
+          (when-let ((after (gethash id candidate-image)))
+            (puthash id (dorg-heading-deep-copy after) image)))))))
 
 (defun dorg-mutate--index-owner-partitions
-    (source root-id parts base-image candidate-postimage base &optional sides)
-  "Return affected owner partitions for SOURCE/ROOT-ID and index PARTS."
+    (source root-id parts base-image candidate-postimage base
+            &optional sides rekeys)
+  "Return affected owner partitions for SOURCE/ROOT-ID and index PARTS.
+REKEYS, when non-nil, is the batch's pending rekey table (id -> (PARENT-ID .
+SORT-KEY)); an owner-local row hydrated from the store carries its final key
+in the candidate image, so projections and the readback assert see the
+candidate order, not the base order."
   (let ((sides (or sides '(before after)))
+        (owner-key (dorg-mutate--index-owner-key source))
         (owners (make-hash-table :test 'equal))
+        (entries-by-id (make-hash-table :test 'eql))
         (entries (dorg-mutate--index-all-entries parts)))
-    (when (dorg-mutate--index-owner-key source)
+    (when owner-key
       (dolist (entry entries)
+        (puthash (dorg-ext-index-entry-id entry) entry entries-by-id)
         (when (memq 'before sides)
           (dorg-mutate--index-put-owner
            owners
@@ -3873,7 +5596,12 @@ QUERY-FN optionally replaces the implicit read path (see
             source root-id candidate-postimage entry 'after base)
            (dorg-ext-index-entry-id entry)
            'after))))
-    (let (partitions)
+    (let ((base-children (and (memq 'before sides)
+                              (dorg-mutate--index-image-children base-image)))
+          (candidate-children (and (memq 'after sides)
+                                   (dorg-mutate--index-image-children
+                                    candidate-postimage)))
+          partitions)
       (maphash
        (lambda (_key owner)
          (let* ((owner-id (plist-get owner :owner-id))
@@ -3891,8 +5619,16 @@ QUERY-FN optionally replaces the implicit read path (see
                 (candidate-owner-image
                  (dorg-ext--copy-image base-owner-image)))
            (dorg-mutate--index-overlay-owner-candidate
-            candidate-owner-image entries owner source root-id
-            candidate-postimage base sides)
+            candidate-owner-image source owner
+            base-image base-children candidate-postimage candidate-children)
+           ;; Pending rekeys reach rows the semantic entries did not touch;
+           ;; an entry's final key always wins over an earlier rekey.
+           (when rekeys
+             (maphash (lambda (id cell)
+                        (unless (gethash id entries-by-id)
+                          (when-let ((h (gethash id candidate-owner-image)))
+                            (setf (dorg-heading-sort-key h) (cdr cell)))))
+                      rekeys))
            (push
             (dorg-ext-owner-partition-create
              :root-id root-id
@@ -3912,7 +5648,7 @@ QUERY-FN optionally replaces the implicit read path (see
               (< (dorg-ext-owner-partition-owner-id a)
                  (dorg-ext-owner-partition-owner-id b)))))))
 
-(defun dorg-mutate--dolt-index-context (source patches sim base)
+(defun dorg-mutate--dolt-index-context (source patches sim base &optional owner-request)
   "Build the immutable `dorg-ext-index-context' for a Dolt mutation.
 SOURCE, resolved PATCHES, the `dorg-mutate--dolt-simulate' SIM, and the exact
 plan-base CAS token BASE (the immutable S0 identity) supply the DOrg-owned
@@ -3928,17 +5664,20 @@ and never a future commit token."
                  orig ps-headings
                  (plist-get sim :created)
                  (plist-get sim :changed)
-                 (plist-get sim :deleted)))
+                 (plist-get sim :deleted)
+                 (plist-get sim :moved)))
          (owner-partitions
           (dorg-mutate--index-owner-partitions
            source (dorg-mutate-source-root-id source)
-           parts base-image candidate-postimage base)))
-    (dorg-ext-index-context-create
+           parts base-image candidate-postimage base nil
+           (and ps (dorg-mutate--ps-rekeys ps)))))
+    (let ((context (dorg-ext-index-context-create
      :source-kind 'dolt
      :root-id (dorg-mutate-source-root-id source)
      :dolt-dir (dorg-mutate-source-dolt-dir source)
      :file (dorg-mutate-source-file source)
      :base-commit base
+     :owner-request owner-request
      :candidate-id (dorg-mutate--index-candidate-id
                     candidate-postimage owner-partitions)
      :patches patches
@@ -3949,6 +5688,110 @@ and never a future commit token."
      :base-image base-image
      :candidate-postimage candidate-postimage
      :owner-partitions owner-partitions)))
+      (dorg-mutate--assert-structural-owned-metadata-available context)
+      (dorg-mutate--validate-owned-metadata-context context)
+      context)))
+
+(defun dorg-mutate--structural-patch-p (patch)
+  "Non-nil when PATCH can remove or relocate existing heading membership."
+  (member (dorg-mutate--patch-signature patch)
+          '((delete :heading) (delete :subtree) (move :subtree))))
+
+(defun dorg-mutate--heading-owned-metadata-families (heading)
+  "Return registered metadata prefixes stored by HEADING's drawer properties."
+  (let (families)
+    (dolist (cell (dorg-model-heading-property-snapshot heading))
+      (when-let ((family (dorg-owned-metadata-family (car cell))))
+        (cl-pushnew (car family) families :test #'equal)))
+    (sort families #'string<)))
+
+(defun dorg-mutate--index-context-owned-metadata-families (context)
+  "Return every registered metadata family touched by immutable CONTEXT.
+
+Both sides of every classified entry participate.  A removal therefore remains
+visible through its S0 tombstone, and an ordinary edit to an already-managed
+heading cannot bypass its owner merely because the request did not name a
+family key."
+  (let (families)
+    (dolist (entry
+             (append (dorg-ext-index-context-created context)
+                     (dorg-ext-index-context-changed context)
+                     (dorg-ext-index-context-moved context)
+                     (dorg-ext-index-context-deleted context)))
+      (dolist (heading (list (dorg-ext-index-entry-before entry)
+                             (dorg-ext-index-entry-after entry)))
+        (when heading
+          (dolist (family
+                   (dorg-mutate--heading-owned-metadata-families heading))
+            (cl-pushnew family families :test #'equal)))))
+    (sort families #'string<)))
+
+(defun dorg-mutate--validate-owned-metadata-context (context)
+  "Run each touched metadata owner's validator once against CONTEXT.
+
+The owner sees only DOrg's sealed immutable index context.  An absent owner or
+validator fails closed as `owner-unavailable'; any owner signal is normalized
+to the public `owner-refused' diagnostic without retaining a condition object
+or exposing a mutable simulation handle."
+  (unless (and (hash-table-p (dorg-ext-index-context-base-image context))
+               (hash-table-p
+                (dorg-ext-index-context-candidate-postimage context)))
+    (dorg-mutate--raise
+     'invalid-target "owned metadata validation requires both immutable images"
+     :detail 'owner-context-images-missing))
+  (dolist (family (dorg-mutate--index-context-owned-metadata-families context))
+    (let* ((participants
+            (condition-case err
+                (dorg-owned-metadata-participants family)
+              (error
+               (apply #'dorg-mutate--raise
+                      'invalid-target "owned metadata owner refused the candidate"
+                      :family family
+                      (dorg-owned-metadata-normalize-owner-signal
+                       family nil err)))))
+           (validate (and (listp participants)
+                          (plist-get participants :validate))))
+      (unless (functionp validate)
+        (dorg-mutate--raise 'invalid-target
+                            "owned metadata owner is unavailable"
+                            :family family :detail 'owner-unavailable))
+      (condition-case err
+          (funcall validate context)
+        (error
+         (apply #'dorg-mutate--raise
+                'invalid-target "owned metadata owner refused the candidate"
+                :family family
+                (dorg-owned-metadata-normalize-owner-signal
+                 family participants err)))))))
+
+(defun dorg-mutate--assert-structural-owned-metadata-available (context)
+  "Refuse structural CONTEXT changes involving an unavailable metadata owner.
+
+Only classified entries are inspected.  The simulator may load an unchanged
+ancestor for placement, but that read must not turn an unrelated child edit
+into a metadata operation.  Before and candidate entry sides cover deletion,
+promotion, and same-store reparenting without consulting a mutable live view."
+  (when (cl-some #'dorg-mutate--structural-patch-p
+                 (dorg-ext-index-context-patches context))
+    (let (families)
+      (dolist (entry
+               (append (dorg-ext-index-context-created context)
+                       (dorg-ext-index-context-changed context)
+                       (dorg-ext-index-context-moved context)
+                       (dorg-ext-index-context-deleted context)))
+        (dolist (heading (list (dorg-ext-index-entry-before entry)
+                               (dorg-ext-index-entry-after entry)))
+          (when heading
+            (dolist (family
+                     (dorg-mutate--heading-owned-metadata-families heading))
+              (cl-pushnew family families :test #'equal)))))
+      (when families
+        (setq families (sort families #'string<))
+        (dorg-mutate--raise
+         'invalid-target
+         "structural mutation requires the registered metadata owner"
+         :operation 'structural :detail 'owner-unavailable
+         :family (car families) :families families)))))
 
 (defun dorg-mutate--index-merge-images (a b)
   "Return a new host-safe image hash merging images A and B.
@@ -4008,8 +5851,9 @@ AFTER is the re-homed destination heading."
               parts
               (dorg-mutate--index-host-safe-image dst-orig)
               candidate-postimage
-              base '(after))))))
-    (dorg-ext-index-context-create
+              base '(after)
+              (and dst-ps (dorg-mutate--ps-rekeys dst-ps)))))))
+    (let ((context (dorg-ext-index-context-create
      :source-kind 'dolt
      :root-id (plist-get sim :to-root-id)
      :from-root-id (plist-get sim :from-root-id)
@@ -4024,73 +5868,29 @@ AFTER is the re-homed destination heading."
      :base-image base-image
      :candidate-postimage candidate-postimage
      :owner-partitions owner-partitions)))
+      (dorg-mutate--assert-structural-owned-metadata-available context)
+      (dorg-mutate--validate-owned-metadata-context context)
+      context)))
 
-;;; ─── Canonical postimage receipt + pre-commit transaction proof (2ij34) ────
-;; Contract C (tracked-regression): a committed apply carries one versioned receipt
-;; entry per affected owner partition, and the commit is guarded by an
-;; in-transaction proof in the existing typed transaction-read validate window
+;;; ─── Full pre-commit transaction proof ────────────────────────────────────
+;; The commit is guarded by an in-transaction proof in the existing typed
+;; transaction-read validate window
 ;; (post-statements, pre-DOLT_COMMIT):
 ;;   assert (1) readback core rows == the candidate canonical, and
 ;;   assert (2) readback extension rows == the validated typed effects.
 ;; Both abort pre-commit (rollback, zero durable writes).  Effects are
 ;; project(candidate), so (1) makes (2) transitively rows == project(core S1)
 ;; — the generic parity invariant — while each leg compares READBACK against
-;; an independent pre-commit value (neither is a recomputation).  The receipt
-;; digest is computed PRE-transaction from the candidate canonical (the
-;; mutation-log INSERT precedes the validate window) and is ENTITLED by
-;; assert (1): an aborted transaction rolls the digest row back, so no
-;; unentitled digest survives.
-
-(defun dorg-mutate--postimage-digest (partition)
-  "Return the sha256 receipt digest of owner PARTITION's canonical form.
-The digest is over the EXISTING full persisted canonical representation
-\(`dorg-mutate--index-owner-partition-canonical') — the contract wires the
-one canon, it invents no second one.  Printer depth/length limits are bound
-off so the printed canonical is total and deterministic."
-  (let ((print-level nil) (print-length nil) (print-circle nil))
-    (secure-hash 'sha256
-                 (prin1-to-string
-                  (dorg-mutate--index-owner-partition-canonical partition)))))
-
-(defun dorg-mutate--postimage-entry (partition candidate-id)
-  "Return the versioned `:postimages' receipt entry for PARTITION.
-CANDIDATE-ID is the apply's transaction-scoped candidate-state identity.
-`:deleted' is t when this apply removes the owner heading itself — the owner
-id no longer appears in the partition's candidate image."
-  (let ((owner-id (dorg-ext-owner-partition-owner-id partition))
-        (cand (dorg-ext-owner-partition-candidate-postimage partition)))
-    (list :version 1
-          :root (dorg-ext-owner-partition-root-id partition)
-          :owner-heading owner-id
-          :parent-owner-heading (dorg-ext-owner-partition-parent-owner-id partition)
-          :candidate-id candidate-id
-          :digest (dorg-mutate--postimage-digest partition)
-          :deleted (not (and cand (gethash owner-id cand))))))
-
-(defun dorg-mutate--postimage-log-payload (entries)
-  "Return the serialized `postimages_v1' evidence payload for ENTRIES, or nil.
-The operational row stores positional (ROOT OWNER-HEADING PARENT-OWNER
-CANDIDATE-ID DIGEST DELETED) tuples — scope and digests only, no caller
-payload; the envelope's own `:version' field (inside each receipt entry)
-governs compatibility."
-  (when entries
-    (let ((print-level nil) (print-length nil) (print-circle nil))
-      (prin1-to-string
-       (mapcar (lambda (e)
-                 (list (plist-get e :root)
-                       (plist-get e :owner-heading)
-                       (plist-get e :parent-owner-heading)
-                       (plist-get e :candidate-id)
-                       (plist-get e :digest)
-                       (plist-get e :deleted)))
-               entries)))))
+;; an independent pre-commit value (neither is a recomputation).  Full owner
+;; parity and persisted item identity are checked independently of the compact
+;; operation receipt; no derived per-owner evidence is persisted.
 
 (defun dorg-mutate--postimage-expectations (context partitions)
   "Return (EXPECTED-HT . ABSENT-IDS) for CONTEXT and its PARTITIONS.
 EXPECTED-HT maps each heading id the transaction proof must find to its
 candidate canonical tuple; ABSENT-IDS are the ids the apply deletes, whose
 rows must be GONE at readback.  Coverage is the union of every partition's
-candidate image (so each receipt digest's rows sit inside assert (1)) and
+candidate image (so every owner's rows sit inside assert (1)) and
 every per-heading effect entry — the latter also covers identity-less
 sources, which materialize no owner partitions."
   (let ((cand (dorg-ext-index-context-candidate-postimage context))
@@ -4128,6 +5928,23 @@ value."
                 (and hit (equal (cdr hit) (cdr cell)))))
             where))
 
+(defun dorg-mutate--postimage-scope-index (entries table columns)
+  "Return a fresh scope index of the live ENTRIES of TABLE for COLUMNS.
+An index maps the values of COLUMNS, in that order, to the entries whose
+rows hold every one of those columns; see `dorg-mutate--postimage-row-checks'."
+  (let ((index (make-hash-table :test 'equal)))
+    (dolist (entry entries)
+      (when (and (aref entry 2) (equal (aref entry 0) table))
+        (dorg-mutate--postimage-scope-add index columns entry)))
+    index))
+
+(defun dorg-mutate--postimage-scope-add (index columns entry)
+  "Add ENTRY to scope INDEX over COLUMNS when its row holds every column."
+  (let* ((row (aref entry 1))
+         (cells (mapcar (lambda (column) (assq column row)) columns)))
+    (unless (memq nil cells)
+      (push entry (gethash (mapcar #'cdr cells) index)))))
+
 (defun dorg-mutate--postimage-row-checks (effects)
   "Return net-effect readback checks for the validated typed EFFECTS.
 Walks EFFECTS in execution order per table, maintaining the surviving insert
@@ -4137,43 +5954,117 @@ one — a projector's delete-then-rebuild pattern nets to its inserts.
 Returns (:present ((TABLE ROW COUNT)…) :absent ((TABLE WHERE COUNT)…)):
 each surviving ROW must match at least COUNT readback rows; each delete
 WHERE scope must hold exactly COUNT readback rows (its surviving matching
-inserts)."
-  (let (survivors deletes)
+inserts).
+
+The walk is linear in EFFECTS times the number of distinct delete column
+lists per table.  Each insert becomes an entry [TABLE ROW LIVE].  A delete's
+column list, in its own order, names a scope index from those columns'
+values to the entries holding all of them, built from the live entries the
+first time that column list appears and extended by every later insert.  A
+delete kills the live entries of its bucket and empties it, so a bucket
+holds exactly the live entries matching its predicate that arrived after
+its last delete.  Every candidate is still confirmed with
+`dorg-mutate--postimage-row-matches-p', the one definition of a match."
+  (let ((entries nil)
+        (scopes (make-hash-table :test 'equal))
+        (deletes nil))
     (dolist (effect effects)
       (let ((table (plist-get effect :table)))
         (cond
          ((plist-member effect :insert)
-          (push (cons table (plist-get effect :insert)) survivors))
+          (let ((entry (vector table (plist-get effect :insert) t)))
+            (push entry entries)
+            (maphash (lambda (scope index)
+                       (when (equal (car scope) table)
+                         (dorg-mutate--postimage-scope-add index (cdr scope) entry)))
+                     scopes)))
          ((plist-member effect :delete)
-          (let ((where (plist-get effect :delete)))
-            (setq survivors
-                  (cl-delete-if (lambda (pr)
-                                  (and (equal (car pr) table)
-                                       (dorg-mutate--postimage-row-matches-p
-                                        (cdr pr) where)))
-                                survivors))
-            (push (cons table where) deletes))))))
-    (setq survivors (nreverse survivors)
-          deletes (nreverse deletes))
-    (let (present)
-      (dolist (pr survivors)
-        (let ((hit (cl-find-if (lambda (c)
-                                 (and (equal (nth 0 c) (car pr))
-                                      (equal (nth 1 c) (cdr pr))))
-                               present)))
-          (if hit (cl-incf (nth 2 hit))
-            (push (list (car pr) (cdr pr) 1) present))))
+          (let* ((where (plist-get effect :delete))
+                 (scope (cons table (mapcar #'car where)))
+                 (index (or (gethash scope scopes)
+                            (puthash scope (dorg-mutate--postimage-scope-index
+                                            entries table (cdr scope))
+                                     scopes)))
+                 (key (mapcar #'cdr where)))
+            (dolist (entry (gethash key index))
+              (when (and (aref entry 2)
+                         (dorg-mutate--postimage-row-matches-p (aref entry 1) where))
+                (aset entry 2 nil)))
+            (remhash key index)
+            (push (list table where scope key) deletes))))))
+    (let ((survivors (cl-remove-if-not (lambda (entry) (aref entry 2))
+                                       (nreverse entries)))
+          (counts (make-hash-table :test 'equal))
+          (absent-counts (make-hash-table :test 'equal))
+          present)
+      (dolist (entry survivors)
+        (let* ((identity (cons (aref entry 0) (aref entry 1)))
+               (hit (gethash identity counts)))
+          (if hit
+              (cl-incf (nth 2 hit))
+            (let ((check (list (aref entry 0) (aref entry 1) 1)))
+              (puthash identity check counts)
+              (push check present)))))
       (list :present (nreverse present)
             :absent
-            (mapcar (lambda (d)
-                      (list (car d) (cdr d)
-                            (cl-count-if
-                             (lambda (pr)
-                               (and (equal (car pr) (car d))
-                                    (dorg-mutate--postimage-row-matches-p
-                                     (cdr pr) (cdr d))))
-                             survivors)))
-                    deletes)))))
+            (mapcar (pcase-lambda (`(,table ,where ,scope ,key))
+                      (list table where
+                            (let ((memo (cons scope key)))
+                              (or (gethash memo absent-counts)
+                                  (puthash memo
+                                           (cl-count-if
+                                            (lambda (entry)
+                                              (and (aref entry 2)
+                                                   (dorg-mutate--postimage-row-matches-p
+                                                    (aref entry 1) where)))
+                                            (gethash key (gethash scope scopes)))
+                                           absent-counts)))))
+                    (nreverse deletes))))))
+
+(defun dorg-mutate--postimage-read-batched (read)
+  "Return a read function over READ that submits oversized id sets in chunks.
+The transaction read port refuses any single request whose `:ids' exceed
+`dorg-sql-transaction-read-port-max-ids'; that cap is transport policy and
+stays.  A complete candidate proof can legitimately name more ids than the
+cap (a bootstrap import, a large delete), so this wrapper, applied once at the
+proof hand-off, splits ONLY the `:ids' of the four id-bearing ops into
+consecutive chunks of at most the cap, issues the same request with each
+chunk inside the caller's transaction and snapshot, and merges the results
+by the op's shape: row ops keep input order; `owner-model' folds every
+chunk's image into one table.  No request grammar lives here: a request the
+port would refuse still reaches the port, either untouched (any other op, an
+empty or non-integer id set) or as its first chunk, so the port's own
+refusal governs and nothing becomes accepted by chunking.  Linear in the id
+count."
+  (lambda (request)
+    (let ((op (plist-get request :op))
+          (ids (plist-get request :ids))
+          (cap dorg-sql-transaction-read-port-max-ids))
+      (if (and (memq op '(core-heading-rows core-heading-tags
+                          core-heading-ids owner-model))
+               (consp ids)
+               (> (length ids) cap)
+               (cl-every (lambda (id) (and (integerp id) (> id 0))) ids))
+          (let ((rest ids)
+                (results nil))
+            (while rest
+              (let ((chunk nil)
+                    (k 0))
+                (while (and rest (< k cap))
+                  (push (pop rest) chunk)
+                  (setq k (1+ k)))
+                (push (funcall read (plist-put (copy-sequence request)
+                                               :ids (nreverse chunk)))
+                      results)))
+            (setq results (nreverse results))
+            (if (eq op 'owner-model)
+                (let ((merged (make-hash-table :test 'eql)))
+                  (dolist (image results)
+                    (when (hash-table-p image)
+                      (maphash (lambda (id h) (puthash id h merged)) image)))
+                  merged)
+              (apply #'append (mapcar #'copy-sequence results))))
+        (funcall read request)))))
 
 (defun dorg-mutate--postimage-abort (plane message &rest facts)
   "Signal the typed in-transaction parity abort for PLANE with MESSAGE.
@@ -4189,8 +6080,8 @@ durable writes.  FACTS carry only closed values (ids, table names)."
   "Assert (1): in-transaction readback core rows equal the candidate canonical.
 READ is the typed transaction-local read port.  EXPECTED maps
 heading id → candidate canonical tuple; ABSENT-IDS must have no readback
-row.  Readback rows are normalized through the SAME `dorg-sql--coerce-types'
-+ `dorg-model-from-db-row' path every loader uses, then canonicalized by the
+row.  Readback rows keep the decoder's types and go through the SAME
+`dorg-model-from-db-row' path every loader uses, then canonicalized by the
 SAME `dorg-mutate--index-heading-canonical' — so the two compared values
 share one construction convention and one canon.  UNION-ROOT, when non-nil
 \(every same-root apply), root-scopes the readback SELECT: a row re-homed
@@ -4242,142 +6133,107 @@ partition instead (K#025 B1)."
                               rows)
                       #'<)))))))
 
-(defun dorg-mutate--postimage-readback-count (read table pred)
-  "Return the readback row count in TABLE matching predicate PRED (or all)."
-  (funcall read (list :version 1 :op 'extension-row-count
-                      :table table :where pred)))
-
 (defun dorg-mutate--postimage-assert-rows (read checks)
   "Assert (2): in-transaction readback extension rows equal the typed effects.
 READ is the typed transaction-local read port; CHECKS is the
 net-effect expectation from `dorg-mutate--postimage-row-checks'.  Row
 predicates remain typed equality alists here; DOrg lowers them inside the
-transaction read port, so the proof path receives no SQL predicate text."
-  (dolist (check (plist-get checks :present))
-    (pcase-let ((`(,table ,row ,count) check))
-      (when (< (dorg-mutate--postimage-readback-count
-                read table row)
-               count)
-        (dorg-mutate--postimage-abort
-         'rows
-         "a validated derived row is missing or altered at readback"
-         :table table))))
-  (dolist (check (plist-get checks :absent))
-    (pcase-let ((`(,table ,where ,count) check))
-      (when (/= (dorg-mutate--postimage-readback-count
-                 read table where)
-                count)
-        (dorg-mutate--postimage-abort
-         'rows
-         "a deleted derived scope holds unexpected rows at readback"
-         :table table)))))
+transaction read port, so the proof path receives no SQL predicate text.
 
-(defun dorg-mutate--postimage-wire-item (item)
-  "Serialize model ITEM to its public-constructor typed form (wire v1).
-The head vocabulary is EXACTLY `dorg-api--item-value's input grammar —
-\(text S), (keyword K V), (planning :scheduled/:deadline/:closed …) with
-present-only fields in fixed order, (drawer NAME (K V)…) for property-form
-drawers and (drawer NAME :lines (L…)) for line-form ones (the loader's own
-detail-table discriminator) — and every form carries an ALWAYS-PRESENT
-`:post-blank' tail (K#025 B2): item-level post-blank is persisted and
-participates in the items digest, so the unchanged-complement checker must
-see it on the wire."
-  (let ((pb (list :post-blank (dorg-item-post-blank item))))
-    (cond
-     ((cl-typep item 'dorg-text-item)
-      (append (list 'text (dorg-text-item-text item)) pb))
-     ((cl-typep item 'dorg-keyword-item)
-      (append (list 'keyword (dorg-keyword-item-keyword item)
-                    (dorg-keyword-item-value item))
-              pb))
-     ((cl-typep item 'dorg-planning-item)
-      (append '(planning)
-              (when-let ((s (dorg-planning-item-scheduled item)))
-                (list :scheduled s))
-              (when-let ((d (dorg-planning-item-deadline item)))
-                (list :deadline d))
-              (when-let ((c (dorg-planning-item-closed item)))
-                (list :closed c))
-              pb))
-     ((cl-typep item 'dorg-drawer-item)
-      (let ((name (dorg-drawer-item-name item))
-            (props (dorg-drawer-item-properties item)))
-        (if props
-            (append (list 'drawer name)
-                    (mapcar (lambda (kv) (list (car kv) (cdr kv))) props)
-                    pb)
-          (append (list 'drawer name :lines
-                        (copy-sequence (dorg-drawer-item-lines item)))
-                  pb))))
-     (t (dorg-mutate--raise
-         'invariant "wire serializer met an unknown item kind"
-         :detail 'postimage-wire :item-type (type-of item))))))
+The present checks and then the absent checks form one ordered list, read
+in consecutive chunks of at most `dorg-sql-transaction-read-port-max-checks'
+through one batched count each.  Each chunk is judged in order, and the
+first failing check aborts before any later chunk is read, so a successful
+readback reports exactly the failure a check-by-check proof would."
+  (let ((ordered (append (mapcar (lambda (check) (cons 'present check))
+                                 (plist-get checks :present))
+                         (mapcar (lambda (check) (cons 'absent check))
+                                 (plist-get checks :absent))))
+        ;; The chunk size is the read port's own cap (dorg-dolt.el), loaded
+        ;; with the transport before any proof runs.
+        (cap (with-suppressed-warnings
+                 ((free-vars dorg-sql-transaction-read-port-max-checks))
+               dorg-sql-transaction-read-port-max-checks)))
+    (while ordered
+      (let* ((chunk (seq-take ordered cap))
+             (counts (funcall read
+                              (list :version 1 :op 'extension-row-counts
+                                    :checks (mapcar (lambda (check)
+                                                      (cons (nth 1 check) (nth 2 check)))
+                                                    chunk)))))
+        (setq ordered (nthcdr cap ordered))
+        (cl-loop
+         for (kind table _where count) in chunk
+         for n in counts
+         do (if (eq kind 'present)
+                (when (< n count)
+                  (dorg-mutate--postimage-abort
+                   'rows
+                   "a validated derived row is missing or altered at readback"
+                   :table table))
+              (when (/= n count)
+                (dorg-mutate--postimage-abort
+                 'rows
+                 "a deleted derived scope holds unexpected rows at readback"
+                 :table table))))))))
 
-(defun dorg-mutate--postimage-wire-node (heading children)
-  "Serialize HEADING with serialized CHILDREN into the v1 wire NODE.
-THE single wire serializer: every persisted heading field the delta checker
-consumes crosses here (level derives from tree position and is omitted by
-contract).  Properties are sorted by name; items keep model order."
-  (list 'heading
-        :id (dorg-heading-id heading)
-        :title (dorg-heading-title heading)
-        :todo (dorg-heading-todo heading)
-        :priority (dorg-heading-priority heading)
-        :tags (copy-sequence (dorg-heading-tags heading))
-        :post-blank (dorg-heading-post-blank heading)
-        :commented (and (dorg-heading-commented heading) t)
-        :properties (sort (copy-sequence
-                           (dorg-model-heading-property-snapshot heading))
-                          (lambda (a b) (string< (car a) (car b))))
-        :items (mapcar #'dorg-mutate--postimage-wire-item
-                       (dorg-heading-items heading))
-        :children children))
+(defun dorg-mutate--postimage-item-row-canonical (heading)
+  "Return HEADING's persisted item row identity vector.
+The heading-row core proof sees only `headings' columns.  The partition proof
+reloads complete model rows and therefore also verifies item row ids and final
+sort keys, which `items_hash' intentionally does not cover."
+  (mapcar (lambda (item)
+            (list (dorg-item-id item)
+                  (dorg-item-sort-key item)))
+          (dorg-heading-items heading)))
 
-(defun dorg-mutate--postimage-wire-tree (image owner-id)
-  "Serialize owner OWNER-ID's subtree from owner-local IMAGE to a wire NODE.
-IMAGE is an id → `dorg-heading' hash of the owner-local slice; children
-order is semantic (sort-key), matching every render/model path."
-  (let ((kids (make-hash-table :test 'eql)))
-    (maphash (lambda (id h)
-               (unless (eql id owner-id)
-                 (push h (gethash (dorg-heading-parent-id h) kids))))
-             image)
-    (letrec ((build
-              (lambda (h)
-                (dorg-mutate--postimage-wire-node
-                 h
-                 (mapcar build
-                         (sort (copy-sequence
-                                (gethash (dorg-heading-id h) kids))
-                               (lambda (a b)
-                                 (string< (dorg-heading-sort-key a)
-                                          (dorg-heading-sort-key b)))))))))
-      (funcall build (gethash owner-id image)))))
+(defun dorg-mutate--postimage-partition-unions (owner-specs)
+  "Return ((ROOT-ID . IDS) ...) for the present partitions of OWNER-SPECS.
+Roots keep their first appearance and each root's ids their first
+appearance, each id once.  Root ids are BIGINT values that may be equal
+bignums without being `eq', so roots are grouped by an `eql' hash, as ids
+are.  One pass, linear in the specs' id occurrences.  OWNER-SPECS is read,
+never mutated."
+  (let ((by-root (make-hash-table :test 'eql))
+        (roots nil))
+    (pcase-dolist (`(,root-id ,_owner-id ,ids ,_expected ,deleted) owner-specs)
+      (unless deleted
+        ;; ENTRY is (SEEN-HASH . IDS-NEWEST-FIRST).
+        (let ((entry (gethash root-id by-root)))
+          (unless entry
+            (setq entry (list (make-hash-table :test 'eql)))
+            (puthash root-id entry by-root)
+            (push root-id roots))
+          (dolist (id ids)
+            (unless (gethash id (car entry))
+              (puthash id t (car entry))
+              (setcdr entry (cons id (cdr entry))))))))
+    (mapcar (lambda (root-id) (cons root-id (reverse (cdr (gethash root-id by-root)))))
+            (nreverse roots))))
 
-(defun dorg-mutate--postimage-assert-partitions
-    (read owner-specs want-models models-store)
-  "Assert (1) in FULL for every affected owner partition, unconditionally.
-OWNER-SPECS is a list of (ROOT-ID OWNER-ID IDS EXPECTED-HT DELETED) — one
-per receipt entry, receipt-ordered.  For each present partition the
-committed rows are rebuilt THROUGH THE ONE LOADER over the typed transaction
-read port; the loader's root-scoped id filter binds every expected row to the
-partition's root, so a row deleted, misplaced, or re-homed to the wrong
-root is MISSING at readback and aborts.  For every expected id: the row
-must exist, the digest recomputed from its committed item rows must equal
-the stored items_hash (item-row corruption with an intact hash column
-aborts — K#025 B1), and its canonical must equal the partition's candidate
-canonical.  Receipt strength never depends on the model-return opt-in;
-WANT-MODELS only additionally serializes each verified image into
-MODELS-STORE, keyed (ROOT . OWNER), for the wire.  Deleted owners store a
-nil model (their row absence is asserted by the union scope check)."
-  (let (built)
-    (pcase-dolist (`(,root-id ,owner-id ,ids ,expected ,deleted) owner-specs)
-      (if deleted
-          (when want-models
-            (push (cons (cons root-id owner-id) nil) built))
-        (let ((image (funcall read
-                              (list :version 1 :op 'owner-model
-                                    :root-id root-id :ids ids))))
+(defun dorg-mutate--postimage-assert-partitions (read owner-specs)
+  "Assert full parity for every affected owner partition, unconditionally.
+OWNER-SPECS contains (ROOT-ID OWNER-ID IDS EXPECTED-HT DELETED).  For every
+present partition, root-bound readback must contain every expected row;
+recomputed item digests, candidate canonical and persisted item identity
+must all match.  Deleted owners are covered by the union absence proof.
+
+Each root is read once, as the union of its present partitions' ids
+\(`dorg-mutate--postimage-partition-unions'), through READ, which chunks a
+large union.  An owner image is a per-row load, so a heading's image does
+not depend on which other ids are read with it.  The partitions are then
+checked in their own order, and each one's ids in theirs, so a successful
+read reports the first failure a partition-by-partition proof would; a
+failed read raises before any check."
+  (let ((images (make-hash-table :test 'eql)))
+    (dolist (union (dorg-mutate--postimage-partition-unions owner-specs))
+      (puthash (car union)
+               (funcall read (list :version 1 :op 'owner-model
+                                   :root-id (car union) :ids (cdr union)))
+               images))
+    (pcase-dolist (`(,root-id ,_owner-id ,ids ,expected ,deleted) owner-specs)
+      (unless deleted
+        (let ((image (gethash root-id images)))
           (dolist (id ids)
             (let ((h (gethash id image)))
               (unless h
@@ -4392,180 +6248,73 @@ nil model (their row absence is asserted by the union scope check)."
                    'core
                    "committed item rows diverge from their stored digest"
                    :ids (list id))))
-              (unless (equal (gethash id expected)
-                             (dorg-mutate--index-heading-canonical h))
-                (dorg-mutate--postimage-abort
-                 'core
-                 "readback model diverges from the validated candidate"
-                 :ids (list id)))))
-          (when want-models
-            (push (cons (cons root-id owner-id)
-                        (dorg-mutate--postimage-wire-tree image owner-id))
-                  built)))))
-    (when want-models (setcar models-store built))))
+              (let ((expected-row (gethash id expected)))
+                (unless (equal (car expected-row)
+                               (dorg-mutate--index-heading-canonical h))
+                  (dorg-mutate--postimage-abort
+                   'core
+                   "readback model diverges from the validated candidate"
+                   :ids (list id)))
+                (unless (equal (cdr expected-row)
+                               (dorg-mutate--postimage-item-row-canonical h))
+                  (dorg-mutate--postimage-abort
+                   'core
+                   "committed item row identity diverges from the validated candidate"
+                   :ids (list id)))))))))))
 
-(defun dorg-mutate--postimage-models (entries models-store)
-  "Return the `:candidate-models' wire list for receipt ENTRIES.
-MODELS-STORE holds the (ROOT . OWNER) → NODE alist the validator built from
-the verified committed readback; a `:deleted' entry carries `:model nil'."
-  (mapcar (lambda (e)
-            (list :version 1
-                  :root (plist-get e :root)
-                  :owner-heading (plist-get e :owner-heading)
-                  :parent-owner-heading (plist-get e :parent-owner-heading)
-                  :model (cdr (assoc (cons (plist-get e :root)
-                                           (plist-get e :owner-heading))
-                                     (car models-store)))))
-          entries))
-
-(defun dorg-mutate--postimage-tuple-entry (tu)
-  "Return the receipt entry for a well-typed stored tuple TU, else nil.
-The closed field grammar (K#025 B3): integer root and owner-heading,
-integer-or-nil parent-owner, 40-lowercase-hex candidate-id, 64-lowercase-hex
-digest, boolean deleted.  Any other shape is malformed evidence."
-  (and (proper-list-p tu) (= (length tu) 6)
-       (integerp (nth 0 tu))
-       (integerp (nth 1 tu))
-       (or (null (nth 2 tu)) (integerp (nth 2 tu)))
-       (stringp (nth 3 tu))
-       (string-match-p "\\`[0-9a-f]\\{40\\}\\'" (nth 3 tu))
-       (stringp (nth 4 tu))
-       (string-match-p "\\`[0-9a-f]\\{64\\}\\'" (nth 4 tu))
-       (memq (nth 5 tu) '(nil t))
-       (list :version 1
-             :root (nth 0 tu)
-             :owner-heading (nth 1 tu)
-             :parent-owner-heading (nth 2 tu)
-             :candidate-id (nth 3 tu)
-             :digest (nth 4 tu)
-             :deleted (nth 5 tu))))
-
-(defun dorg-mutate--postimage-entries-from-payload (payload)
-  "Parse a stored `postimages_v1' PAYLOAD back into receipt entries, or nil.
-nil (malformed, mistyped, or unreadable) makes the row behave as LEGACY
-evidence rather than fabricating receipt entries — fail closed.  Three
-fences make this one of the two vetted raw reader seams the CLI
-reader-census test pins: (1) the closed tuple grammar contains only
-integers, lowercase-hex strings, nil, and t, so a `#' ANYWHERE in the
-payload is malformed before the reader runs — this bans read-time
-evaluation (`#.'), object/bytecode syntax, and cyclic labels wholesale
-without binding reader state; (2) exactly ONE form is consumed — trailing
-bytes after it are malformed; (3) every tuple passes the closed field-type
-validation of `dorg-mutate--postimage-tuple-entry'."
-  (when (and (stringp payload)
-             (not (string-match-p "#" payload)))
-    (pcase (condition-case nil (read-from-string payload) (error nil))
-      (`(,tuples . ,end)
-       (when (and (string-match-p "\\`[[:space:]]*\\'" (substring payload end))
-                  (proper-list-p tuples)
-                  tuples)
-         (let ((entries (mapcar #'dorg-mutate--postimage-tuple-entry tuples)))
-           (unless (memq nil entries) entries)))))))
-
-(defun dorg-mutate--postimage-reconstruct-models (source commit entries
-                                                         &optional query-fn)
-  "Rebuild `:candidate-models' AS OF settled COMMIT over ENTRIES' owner scope.
-The settled-replay reconstruction (tracked-regression C2): legitimate evidence
-because assert (1) proved committed == candidate at apply time, so the
-committed rows AT THAT COMMIT are the candidate models.  Reads are bound to
-the exact recovered commit — never current state — and flow through the one
-loader and the one wire serializer.  QUERY-FN routes the reads (the replay
-seam runs under the held store gate, where ordinary SQL is lease-refused,
-so it supplies the leased session's read function)."
-  (let ((dolt-dir (dorg-mutate-source-dolt-dir source)))
-    (mapcar
-     (lambda (e)
-       (let ((root (plist-get e :root))
-             (owner (plist-get e :owner-heading)))
-         (list :version 1
-               :root root
-               :owner-heading owner
-               :parent-owner-heading (plist-get e :parent-owner-heading)
-               :model
-               (unless (plist-get e :deleted)
-                 (let* ((ids (dorg-mutate--index-owner-local-ids
-                              source root owner commit query-fn))
-                        (image (dorg-model-load-headings
-                                dolt-dir root ids commit nil query-fn)))
-                   (dorg-mutate--postimage-wire-tree image owner))))))
-     entries)))
-
-(defun dorg-mutate--postimage-plan (index-context effects &optional want-models)
-  "Return the receipt entries and transaction-proof validator for one attempt.
-INDEX-CONTEXT is the attempt's immutable candidate-state context; EFFECTS are
-the validated typed row effects its projection produced.  Returns
-\(:entries RECEIPT-ENTRIES :validate VALIDATE-FN [:models-fn MODELS-FN]):
-ENTRIES is the versioned `:postimages' receipt (one entry per affected owner
-partition — nil for an identity-less source, which materializes none), and
-VALIDATE-FN is the typed transaction-read-port wrapper running assert (1) then
-assert (2).  Both are computed HERE, from the same single reads of the vault-copied
-context, so the digested candidate rows and the asserted candidate rows
-cannot drift.
-
-The per-partition proof (`dorg-mutate--postimage-assert-partitions') is
-UNCONDITIONAL — root-bound row presence, item-rows digest recomputation,
-and canonical equality run for every affected partition on every apply
-\(K#025 B1).  WANT-MODELS (tracked-regression AC4) only additionally serializes
-the verified readback into MODELS-FN (nullary, called only after the batch
-returns) for the wire `:candidate-models'."
+(defun dorg-mutate--postimage-plan (index-context effects)
+  "Return the transaction-proof validator for one immutable attempt.
+INDEX-CONTEXT supplies the full candidate and affected owner partitions;
+EFFECTS supplies independently validated row expectations.  Every core,
+owner, item-identity and extension proof remains unconditional.  No derived
+receipt or wire model is built or persisted."
   (let* ((partitions (dorg-ext-index-context-owner-partitions index-context))
-         (candidate-id (dorg-ext-index-context-candidate-id index-context))
-         (entries (mapcar (lambda (p)
-                            (dorg-mutate--postimage-entry p candidate-id))
-                          partitions))
          (expectations (dorg-mutate--postimage-expectations
                         index-context partitions))
          (row-checks (dorg-mutate--postimage-row-checks effects))
          (extension-tables
           (delete-dups
            (delq nil (mapcar (lambda (effect)
-                               (plist-get effect :table))
-                             effects))))
-         ;; For an ordinary same-root apply every union-scope row must sit
-         ;; under the context root; a cross-root aggregate spans two roots,
-         ;; where root placement is bound per partition by the loader's
-         ;; root-scoped filter instead.
+                              (plist-get effect :table))
+                            effects))))
+         ;; A cross-root aggregate binds placement per partition rather than
+         ;; forcing its union into the ordinary same-root context root.
          (union-root (unless (dorg-ext-index-context-from-root-id
                               index-context)
                        (dorg-ext-index-context-root-id index-context)))
          (owner-specs
-          (cl-mapcar
-           (lambda (p e)
+          (mapcar
+           (lambda (p)
              (let ((img (dorg-ext-owner-partition-candidate-postimage p))
+                   (owner-id (dorg-ext-owner-partition-owner-id p))
                    (expected (make-hash-table :test 'eql))
                    (ids nil))
                (when img
                  (maphash (lambda (id h)
                             (push id ids)
-                            (puthash id (dorg-mutate--index-heading-canonical h)
+                            (puthash id
+                                     (cons
+                                      (dorg-mutate--index-heading-canonical h)
+                                      (dorg-mutate--postimage-item-row-canonical h))
                                      expected))
                           img))
-               (list (plist-get e :root)
-                     (plist-get e :owner-heading)
-                     (sort ids #'<)
-                     expected
-                     (plist-get e :deleted))))
-           partitions entries))
-         (models-store (list nil)))
-    (append
-     (list :entries entries
-           :validate
-           (list
-            :mode 'transaction-read-port
-            :extension-tables extension-tables
-            :function
-            (lambda (read)
-              (dorg-ext-run-index-validators index-context 'transaction)
-              (dorg-mutate--postimage-assert-core
-               read (car expectations) (cdr expectations) union-root)
-              (dorg-mutate--postimage-assert-partitions
-               read owner-specs want-models models-store)
-              (dorg-mutate--postimage-assert-rows read row-checks))))
-     (when want-models
-       (list :models-fn
-             (lambda ()
-               (dorg-mutate--postimage-models entries models-store)))))))
-
+               (list (dorg-ext-owner-partition-root-id p)
+                     owner-id (sort ids #'<) expected
+                     (not (and img (gethash owner-id img))))))
+           partitions)))
+    (list :validate
+          (list
+           :mode 'transaction-read-port
+           :extension-tables extension-tables
+           :function
+           (lambda (read)
+             ;; The existing bounded hand-off applies to EVERY proof read.
+             (let ((read (dorg-mutate--postimage-read-batched read)))
+               (dorg-ext-run-index-validators index-context 'transaction :all)
+               (dorg-mutate--postimage-assert-core
+                read (car expectations) (cdr expectations) union-root)
+               (dorg-mutate--postimage-assert-partitions read owner-specs)
+               (dorg-mutate--postimage-assert-rows read row-checks)))))))
 
 ;;; ─── Per-store mutation gate + HEAD-equality CAS + bounded re-plan (rsuwn) ─
 ;; The DOrg-owned narrow mutation-linearization boundary.  Both Dolt executors
@@ -4739,7 +6488,20 @@ recorded explicitly for the auditable equal-HEAD planner-defect verdict."
    (when (plist-member facts :db-code)
      (list :db-code (plist-get facts :db-code)))
    (when (plist-member facts :constraint)
-     (list :constraint (plist-get facts :constraint)))))
+     (list :constraint (plist-get facts :constraint)))
+   ;; Closed diagnostic correlation from the batch executor:
+   ;; the failed statement's execution ordinal, its closed verb/table class,
+   ;; and the private-capture status/id.  All are value-free by construction
+   ;; (`dorg-sql--statement-class' and the capture id carry no prose or SQL),
+   ;; so they cross the same sanitized boundary as the classifier facts.
+   (when (plist-member facts :statement-index)
+     (list :statement-index (plist-get facts :statement-index)))
+   (when (plist-member facts :statement-class)
+     (list :statement-class (plist-get facts :statement-class)))
+   (when (plist-member facts :capture)
+     (list :capture (plist-get facts :capture)))
+   (when (plist-member facts :capture-id)
+     (list :capture-id (plist-get facts :capture-id)))))
 
 (defun dorg-mutate--rolled-back-decision
     (receipt plan observed-head head-equal op-id deadline)
@@ -4799,10 +6561,18 @@ conditions never enter this function: RECEIPT carries classifier facts only."
      ((eq class 'postimage-parity)
       (apply #'dorg-mutate--raise
              'invariant
-             "committed state diverged from the validated candidate; aborted pre-commit"
+             "in-transaction readback diverged; rolled back pre-commit"
              (append (list :source-kind 'dolt :detail 'postimage-parity)
                      (when (plist-member facts :parity-plane)
                        (list :parity-plane (plist-get facts :parity-plane)))
+                     ;; Parity IDs are classifier-validated closed facts.  They
+                     ;; are projected only by this confirmed parity branch, so
+                     ;; rollback-failed and every non-parity refusal remain
+                     ;; byte-identical diagnostic contracts.
+                     (when (plist-member facts :parity-ids)
+                       (list :parity-ids (plist-get facts :parity-ids)))
+                     (when (plist-member facts :parity-id-count)
+                       (list :parity-id-count (plist-get facts :parity-id-count)))
                      data (when op-id (list :op-id op-id)))))
      ((eq class 'mutation-validator)
       (apply #'dorg-mutate--raise
@@ -4835,73 +6605,37 @@ is OUTSIDE the lock), so the read plane can attribute latency (A11)."
     result))
 
 (defun dorg-mutate--dolt-idempotent-result
-    (lease gen-id op-id orig-base root-id &optional source want-models)
-  "Build the idempotent :ok result for an already-committed OP-ID under LEASE.
-GEN-ID is the current evidence row's generation nonce; the original creation
-commit is recovered generation-safely (§2.6.3) so a replay returns the SAME
-commit it first produced, WITHOUT re-applying any SQL.  The affected-id lists
-are nil: a settled replay reconstructs no core deltas — its load-bearing
-outputs are the recovered `:commit', the echoed `:op-id', the `:idempotent'
-flag, and the stored postimage evidence (tracked-regression).
+    (lease gen-id op-id orig-base root-id)
+  "Return the compact settled result, recovering the original commit on LEASE.
+GEN-ID identifies the immutable added transition, so recovery remains
+generation-safe and fail-closed.  No data is replayed, no payload is read,
+and historical derived evidence does not affect the response."
+  (let ((commit (dorg-sql--mutation-log-recover-commit lease gen-id)))
+    (list :ok t :dry-run nil :source-kind 'dolt :root-id root-id
+          :base-commit orig-base :commit commit
+          :op-id op-id :idempotent t
+          :created nil :changed nil :deleted nil
+          :extensions nil :invalidation nil)))
 
-Evidence law: a row carrying `postimages_v1' re-emits its `:postimages'
-verbatim, and WANT-MODELS additionally reconstructs `:candidate-models' AS
-OF the recovered commit over the stored owner scope (SOURCE supplies the
-identity policy).  A LEGACY row (no stored payload) with WANT-MODELS is the
-typed `legacy-evidence-unavailable' refusal carrying the settled commit and
-op identity — never a verified success; without WANT-MODELS the old
-idempotent result is returned unchanged."
-  (let* ((commit (dorg-sql--mutation-log-recover-commit lease gen-id))
-         (stored (dorg-sql--mutation-log-postimages lease op-id))
-         (entries (and stored
-                       (dorg-mutate--postimage-entries-from-payload stored))))
-    (when (and want-models (null entries))
-      (dorg-mutate--raise
-       'legacy-evidence-unavailable
-       "settled evidence predates postimage receipts; adjudicate via the settled commit"
-       :source-kind 'dolt :op-id op-id :commit commit
-       :root-id root-id :base-commit orig-base))
-    (append
-     (list :ok t :dry-run nil :source-kind 'dolt :root-id root-id
-           :base-commit orig-base
-           :commit commit
-           :op-id op-id :idempotent t
-           :created nil :changed nil :deleted nil
-           :extensions nil :invalidation nil)
-     (when entries (list :postimages entries))
-     (when (and want-models entries source)
-       (list :candidate-models
-             (dorg-mutate--postimage-reconstruct-models
-              source commit entries
-              ;; Under the held gate ordinary SQL is lease-refused; the
-              ;; AS-OF reconstruction reads on the leased session.
-              (lambda (sql)
-                (dorg-sql--coerce-types
-                 (dorg-sql--lease-exec lease sql)))))))))
-
-(defun dorg-mutate--dolt-op-id-settled (source options op-id intent-digest orig-base)
+(defun dorg-mutate--dolt-op-id-settled (source _options op-id intent-digest orig-base)
   "Return an idempotent :ok result if OP-ID's matching evidence is settled, else nil.
 The planning-failure reconciliation seam: acquires the store gate on a fresh
-lease (so any in-flight prior commit under this op-id has settled), ensures the
-log (and its postimage evidence column), and looks up OP-ID.  Present +
-matching INTENT-DIGEST -> idempotent result (recovered original commit, with
-the stored postimage evidence law of `dorg-mutate--dolt-idempotent-result');
+lease (so any in-flight prior commit under this op-id has settled), verifies the
+versioned receipt schema read-only, and looks up OP-ID.  Present +
+matching INTENT-DIGEST -> compact idempotent result (recovered original commit);
 present with a DIFFERENT digest -> terminal `idempotency-key-mismatch';
-absent -> nil (the caller re-raises its genuine planning failure).  SOURCE and
-OPTIONS carry the identity policy and the caller's evidence request."
+absent -> nil (the caller re-raises its genuine planning failure)."
   (dorg-mutate-call-with-store-gate
    (dorg-mutate-source-dolt-dir source)
    (lambda (lease _key)
-     (dorg-sql--ensure-mutation-log lease)
-     (dorg-sql--ensure-mutation-log-postimages lease)
+     (dorg-sql--require-mutation-log-schema lease)
      (let ((ev (dorg-sql--mutation-log-lookup lease op-id)))
        (cond
         ((null ev) nil)
         ((equal (cdr ev) intent-digest)
          (dorg-mutate--dolt-idempotent-result
           lease (car ev) op-id orig-base
-          (dorg-mutate-source-root-id source)
-          source (plist-get options :return-candidate-models)))
+          (dorg-mutate-source-root-id source)))
         (t (dorg-mutate--raise
             'idempotency-key-mismatch
             "op-id replayed with a different intent digest than its evidence"
@@ -4989,7 +6723,7 @@ condition."
                          ;; commit.  Consult settled evidence before surfacing it.
                          (if (and op-id
                                   (memq (dorg-mutate-error-reason perr)
-                                        '(invalid-target invariant)))
+                                        dorg-mutate--settled-planning-error-reasons))
                              (let ((hit (dorg-mutate--dolt-op-id-settled
                                          source options op-id intent-digest
                                          orig-base)))
@@ -5012,20 +6746,15 @@ condition."
                    (lambda (lease _key)
                      ;; ── Gate-first idempotency preflight (§2.6.4) ──
                      (when op-id
-                       (dorg-sql--ensure-mutation-log lease)
-                       ;; Additive postimage evidence column (tracked-regression);
-                       ;; working-set DDL outside the transaction, persisted
-                       ;; by this mutation's own DOLT_COMMIT.
-                       (dorg-sql--ensure-mutation-log-postimages lease)
+                       ;; Receipt storage is core schema v7.  Ordinary apply
+                       ;; only verifies it and never mutates the working set.
+                       (dorg-sql--require-mutation-log-schema lease)
                        (let ((ev (dorg-sql--mutation-log-lookup lease op-id)))
                          (when ev
                            (if (equal (cdr ev) intent-digest)
                                (throw 'dorg-mutate--gate-done
                                       (dorg-mutate--dolt-idempotent-result
-                                       lease (car ev) op-id orig-base root-id
-                                       source
-                                       (plist-get options
-                                                  :return-candidate-models)))
+                                       lease (car ev) op-id orig-base root-id))
                              (dorg-mutate--raise
                               'idempotency-key-mismatch
                               "op-id replayed with a different intent digest than its evidence"
@@ -5081,19 +6810,15 @@ condition."
                            ;; only branch allowed to execute generated SQL.
                            (let* ((sql0 (float-time))
                                   (batch
+                                   ;; Compact operation identity lands atomically
+                                   ;; with the data; owner proofs stay below.
                                    (if op-id
                                        (append
                                         (plist-get plan :sql)
                                         (list
                                          (dorg-sql--mutation-log-insert-sql
                                           op-id gen-id intent-digest
-                                          (truncate (float-time))
-                                          ;; Candidate-canonical digests, in
-                                          ;; the SAME transaction as the data;
-                                          ;; entitled by the validator's
-                                          ;; assert (1) below (tracked-regression).
-                                          (dorg-mutate--postimage-log-payload
-                                           (plist-get plan :postimages)))))
+                                          (truncate (float-time)))))
                                      (plist-get plan :sql))))
                              (unwind-protect
                                  (condition-case e
@@ -5328,16 +7053,18 @@ attempt rather than replaying this SQL."
       ;; transaction; a manifest/validate refusal propagates before the gate and
       ;; before any write.  EXT-INPUTS is retired (superseded, fail-closed at the
       ;; API boundary) and no longer participates.
-      (let* ((proj (dorg-ext-collect-index-projection
-                    (plist-get sim :index-context)))
+      (let* ((installed-extensions
+              (dorg-mutate--dolt-installed-index-extension-names dolt-dir))
+             (proj (dorg-ext-collect-index-projection
+                    (plist-get sim :index-context) installed-extensions
+                    (dorg-mutate--accumulator-fold-port
+                     dolt-dir (plist-get sim :head-commit))))
              (full-sql (append sql (plist-get proj :sql)))
-             ;; Postimage receipt + pre-commit transaction proof (tracked-regression):
-             ;; entries and validator derive from the SAME immutable context and
-             ;; the SAME validated effects this attempt commits.
+             ;; Full pre-commit proof from the immutable candidate context and
+             ;; independently validated effects this attempt commits.
              (postimage (dorg-mutate--postimage-plan
                          (plist-get sim :index-context)
-                         (plist-get proj :effects)
-                         (plist-get options :return-candidate-models))))
+                         (plist-get proj :effects))))
         (list :sql full-sql
               :caller-base base
               :plan-base (plist-get sim :head-commit)
@@ -5348,7 +7075,6 @@ attempt rather than replaying this SQL."
               :write-set (dorg-mutate--heading-write-set sim)
               :sim sim
               :projection proj
-              :postimages (plist-get postimage :entries)
               :validate (plist-get postimage :validate)
               :make-result
               (lambda (new-head)
@@ -5358,21 +7084,8 @@ attempt rather than replaying this SQL."
                        :patches patches
                        :created (plist-get sim :created)
                        :changed (plist-get sim :changed)
-                       :deleted (plist-get sim :deleted))
-                 ;; A receipt entry attests a NEW commit's postimage.  Under
-                 ;; the held gate HEAD advanced iff this apply committed; a
-                 ;; value-identical batch Dolt answers "nothing to commit"
-                 ;; mints no commit and must emit no postimages (the
-                 ;; zero-effect law, tracked-regression).
-                 (when (and (plist-get postimage :entries)
-                            (not (equal new-head
-                                        (plist-get sim :head-commit))))
-                   (append
-                    (list :postimages (plist-get postimage :entries))
-                    ;; Wire v1 (AC4): serialized from the exact structs the
-                    ;; validator read back and asserted in this transaction.
-                    (when-let ((models-fn (plist-get postimage :models-fn)))
-                      (list :candidate-models (funcall models-fn)))))
+                       :deleted (plist-get sim :deleted)
+                       :moved (plist-get sim :moved))
                  (list :extensions (plist-get proj :extensions)
                        :invalidation (list :roots (list root-id)
                                            :ext-dirty (plist-get proj :ext-dirty)
@@ -5381,12 +7094,12 @@ attempt rather than replaying this SQL."
                                            :file
                                            (dorg-mutate-source-file source))))))))))
 
-(defun dorg-mutate--dolt-build-attempt (source patches options)
+(defun dorg-mutate--dolt-build-attempt (source patches options &optional owner-plan)
   "Build one attempt for SOURCE/PATCHES with OPTIONS.
 The attempt is based on exactly one simulation."
   (dorg-mutate--dolt-attempt-from-sim
    source patches options
-   (dorg-mutate--dolt-simulate source patches options)))
+   (dorg-mutate--dolt-simulate source patches options owner-plan)))
 
 (defun dorg-mutate--dolt-attempt-plan-data (attempt)
   "Return dry-run semantic fields derived from private ATTEMPT.
@@ -5401,7 +7114,8 @@ public API reshaper never exposes it."
                           :db-ops (plist-get sim :db-ops)
                           :created (plist-get sim :created)
                           :changed (plist-get sim :changed)
-                          :deleted (plist-get sim :deleted))))
+                          :deleted (plist-get sim :deleted)
+                          :moved (plist-get sim :moved))))
     (if (null (plist-get attempt :sql))
         base-plan
       (append
@@ -5414,14 +7128,15 @@ public API reshaper never exposes it."
              :ext-dirty (plist-get proj :ext-dirty)
              :created (plist-get sim :created)
              :changed (plist-get sim :changed)
-             :deleted (plist-get sim :deleted))
+             :deleted (plist-get sim :deleted)
+             :moved (plist-get sim :moved))
        (when (plist-get proj :extensions)
          (list :invalidation
                (list :roots (list root-id)
                      :ext-dirty (plist-get proj :ext-dirty))))))))
 
 (defun dorg-mutate--dolt-execute
-    (source patches options &optional initial-attempt)
+    (source patches options &optional initial-attempt owner-plan)
   "Execute typed PATCHES against Dolt SOURCE, linearized per store.
 Loads + simulates the batch in memory OUTSIDE the per-store mutation gate (so a
 missing target / invariant violation signals before any write, and the scoped
@@ -5450,7 +7165,7 @@ safe full-replan decision and builds a fresh attempt from the new HEAD."
        (if initial
            (prog1 initial (setq initial nil))
          (dorg-mutate--dolt-build-attempt
-          source patches options))))))
+          source patches options owner-plan))))))
 
 ;;; ─── Dolt Cross-Root (Archive) Move ──────────────────────────────────
 
@@ -5520,13 +7235,13 @@ plan honest."
 attributes; the cross-root archive move additionally re-homes the moved
 rows into the destination root.  All other mutable fields are written
 from HEADING unchanged so the row is fully consistent after the move."
-  (format "UPDATE headings SET root_id = %d, parent_id = %s, sort_key = %s, level = %d, todo_keyword = %s, priority = %s, commented = %s, title = %s, post_blank = %d, items_hash = %s WHERE id = %d"
+  (format "UPDATE headings SET root_id = %d, parent_id = %s, sort_key = %s, level_offset = %d, todo_keyword = %s, priority = %s, commented = %s, title = %s, post_blank = %d, items_hash = %s WHERE id = %d"
           root-id
           (if (dorg-heading-parent-id heading)
               (number-to-string (dorg-heading-parent-id heading))
             "NULL")
           (dorg-sql-gen--sort-key-hex (dorg-heading-sort-key heading))
-          (dorg-heading-level heading)
+          (dorg-sql-gen--level-offset heading)
           (dorg-sql-quote (dorg-heading-todo heading))
           (dorg-sql-quote (dorg-heading-priority heading))
           (if (dorg-heading-commented heading) "TRUE" "FALSE")
@@ -5538,25 +7253,23 @@ from HEADING unchanged so the row is fully consistent after the move."
 (defun dorg-mutate--dolt-cross-root-scope-ids (source dest patch head)
   "Return (SRC-IDS . DST-IDS) for cross-root PATCH at HEAD.
 Each side is an independent bounded load slice.  Nil on either side is
-reserved for that root's whole-root fallback."
+reserved for that root's whole-root fallback.  An installed root-aggregate
+projector requires the complete image of BOTH participating roots: its source
+corpus loses moved rows while its destination corpus gains them.  Process-global
+registration alone never widens an unrelated store."
   (let* ((dolt-dir (dorg-mutate-source-dolt-dir source))
          (src-root (dorg-mutate-source-root-id source))
          (dst-root (dorg-mutate-source-root-id dest))
          (src-ids nil)
          (dst-ids nil))
-    (cl-labels
+    (if (dorg-ext-index-projector-requires-whole-root-p
+         'dolt
+         (lambda (extension)
+           (dorg-mutate--dolt-extension-installed-p dolt-dir extension)))
+        (cons nil nil)
+      (cl-labels
         ((src-add (id) (when (integerp id) (cl-pushnew id src-ids :test #'eql)))
-         (dst-add (id) (when (integerp id) (cl-pushnew id dst-ids :test #'eql)))
-         (src-siblings (parent-id)
-           (when (integerp parent-id)
-             (dolist (id (dorg-mutate--dolt-child-ids
-                          dolt-dir src-root parent-id head))
-               (src-add id))))
-         (dst-siblings (parent-id)
-           (when (integerp parent-id)
-             (dolist (id (dorg-mutate--dolt-child-ids
-                          dolt-dir dst-root parent-id head))
-               (dst-add id)))))
+         (dst-add (id) (when (integerp id) (cl-pushnew id dst-ids :test #'eql))))
       (let* ((to (plist-get patch :to))
              (moving (dorg-mutate--dolt-resolve-host-id
                       source src-root (dorg-mutate--patch-address patch)
@@ -5573,24 +7286,22 @@ reserved for that root's whole-root fallback."
           (src-add id))
         (src-add moving)
         (src-add src-parent)
-        (src-siblings src-parent)
         (dst-add dst-root)
         (dst-add dst-parent)
+        ;; Destination placement locates its slot in the destination parent's
+        ;; fan (keys only); the anchors themselves are hydrated to validate.
         (when (plist-member to :before)
-          (dst-add
-           (dorg-mutate--dolt-resolve-host-id
-            dest dst-root
-            (dorg-mutate--patch-anchor-address (plist-get to :before))
-            patch head)))
+          (dst-add (dorg-mutate--dolt-resolve-host-id
+                    dest dst-root
+                    (dorg-mutate--patch-anchor-address (plist-get to :before))
+                    patch head)))
         (when (plist-member to :after)
-          (dst-add
-           (dorg-mutate--dolt-resolve-host-id
-            dest dst-root
-            (dorg-mutate--patch-anchor-address (plist-get to :after))
-            patch head)))
-        (dst-siblings dst-parent)
+          (dst-add (dorg-mutate--dolt-resolve-host-id
+                    dest dst-root
+                    (dorg-mutate--patch-anchor-address (plist-get to :after))
+                    patch head)))
         (cons (delete-dups (nreverse src-ids))
-              (delete-dups (nreverse dst-ids)))))))
+              (delete-dups (nreverse dst-ids))))))))
 
 (defun dorg-mutate--dolt-cross-root-simulate (source patch options)
   "Simulate a bounded cross-root move PATCH on Dolt SOURCE.
@@ -5628,7 +7339,7 @@ OPTIONS is accepted for symmetry; the executor reads `:base-commit'."
          (moved-root (dorg-mutate--ps-heading
                       src-ps (dorg-mutate--patch-address patch) patch)))
     ;; The source level-0 root heading is structural, not movable.
-    (when (= (dorg-heading-level moved-root) 0)
+    (when (dorg-model-root-p moved-root)
       (dorg-mutate--raise 'invariant
                           "cannot move the source root heading across roots"
                           :operation 'move :target-kind :subtree
@@ -5668,40 +7379,30 @@ OPTIONS is accepted for symmetry; the executor reads `:base-commit'."
            (format "moved heading id %S already exists in the destination root" id)
            :operation 'move :target-kind :subtree
            :heading id :detail 'overlap)))
-      (let* ((siblings (dorg-mutate--ps-children dst-ps dst-parent-id))
-             ;; Anchors are validated as destination siblings here; an
+      (let* (;; Anchors are validated as destination siblings here; an
              ;; anchor in another root or inside the moved set is not a
-             ;; sibling and signals `invalid-target' before any write.
-             ;; Cross-root placement is bounded like the same-root seam, but the
-             ;; cross-root SQL/db-ops are built by mapping over the MOVED rows
-             ;; only (not a net-membership diff), so a destination
-             ;; complete-parent rebalance would need to emit destination-sibling
-             ;; UPDATEs it currently does not.  Rather than orphan or silently
-             ;; truncate, fail closed BEFORE any write with a structured
-             ;; invariant — the whole move is simulated outside the gate, so no
-             ;; core row is committed.  Full cross-root destination rebalance is
-             ;; the follow-up (see tracked-regression Resolution).
-             (key (condition-case nil
-                      (dorg-mutate--position-key siblings before after patch)
-                    (dorg-sortkey-exhausted
-                     (dorg-mutate--raise
-                      'invariant
-                      (concat "destination sibling order is exhausted; a "
-                              "cross-root move into this aged group needs a "
-                              "rebalance not yet supported on the cross-root path")
-                      :operation 'move :target-kind :subtree
-                      :heading dst-parent-id :detail 'sort-key-exhausted))))
-             (delta (- (1+ (dorg-heading-level dst-parent))
-                       (dorg-heading-level moved-root))))
+             ;; sibling and signals `invalid-target' before any write.  A
+             ;; destination gap without room rekeys a window of the
+             ;; destination parent's fan on DST-PS; those rekeys lower
+             ;; below together with the moved rows.
+             (key (dorg-mutate--ps-place
+                   dst-ps dst-parent-id (dorg-heading-id moved-root)
+                   before after patch)))
         ;; Place the moved subtree in memory: the moved root takes the
-        ;; destination parent/sort/level; descendants keep their
-        ;; parent/sort but shift level by the same delta.  Every moved row
-        ;; is re-homed into the destination root.
+        ;; destination parent and sort key and the patch's offset, or 1;
+        ;; descendants keep their parent, sort key and offset.  Every moved
+        ;; row is re-homed into the destination root, and the subtree's
+        ;; effective levels are re-derived from the destination parent.
         (setf (dorg-heading-parent-id moved-root) dst-parent-id)
         (setf (dorg-heading-sort-key moved-root) key)
-        (cl-incf (dorg-heading-level moved-root) delta)
-        (dolist (d (cdr moved))
-          (cl-incf (dorg-heading-level d) delta))
+        (setf (dorg-heading-level-offset moved-root) (or (plist-get to :offset) 1))
+        (dorg-mutate--ps-assert-representable dst-ps moved-root patch)
+        (let ((by-parent (make-hash-table :test 'eql)))
+          (dolist (d (cdr moved))
+            (push d (gethash (dorg-heading-parent-id d) by-parent)))
+          (dorg-mutate--derive-closure
+           moved-root (dorg-heading-level dst-parent)
+           (lambda (h) (gethash (dorg-heading-id h) by-parent))))
         (let ((sim (list :head-commit head
                          :from-scope-ids (and (car scopes)
                                               (sort (delete-dups
@@ -5711,12 +7412,18 @@ OPTIONS is accepted for symmetry; the executor reads `:base-commit'."
                                             (sort (delete-dups
                                                    (copy-sequence (cdr scopes)))
                                                   #'<))
-                         :sql (mapcar
-                               (lambda (h)
-                                 (dorg-mutate--dolt-cross-root-heading-update
-                                  h dst-root))
-                               moved)
-                         :db-ops (mapcar (lambda (h) (list :update-heading h)) moved)
+                         :sql (append
+                               (mapcar
+                                (lambda (h)
+                                  (dorg-mutate--dolt-cross-root-heading-update
+                                   h dst-root))
+                                moved)
+                               (dorg-sql-gen-lower-heading-ops
+                                (dorg-mutate--ps-rekey-ops dst-ps dst-orig)
+                                dst-orig dorg-mutate--dolt-item-id-generator))
+                         :db-ops (append
+                                  (mapcar (lambda (h) (list :update-heading h)) moved)
+                                  (dorg-mutate--ps-rekey-ops dst-ps dst-orig))
                          :moved moved-ids
                          :changed moved-ids
                          :from-root-id src-root
@@ -5734,7 +7441,6 @@ OPTIONS is accepted for symmetry; the executor reads `:base-commit'."
                  (list :index-context
                        (dorg-mutate--dolt-cross-root-index-context
                         source patch sim head))))))))
-
 
 (defun dorg-mutate--dolt-cross-root-execute (source patch options)
   "Execute a bounded cross-root move PATCH on Dolt SOURCE.
@@ -5776,16 +7482,17 @@ root-aggregate limitation)."
               ;; The index projector runs against the cross-root candidate-state
               ;; context (both roots aggregated, moved ids re-homed); `:validate'
               ;; may signal here, before any commit, aborting fail-closed.
+              (installed-extensions
+               (dorg-mutate--dolt-installed-index-extension-names dolt-dir))
               (proj (dorg-ext-collect-index-projection
-                     (plist-get sim :index-context)))
+                     (plist-get sim :index-context) installed-extensions
+                     (dorg-mutate--accumulator-fold-port
+                      dolt-dir (plist-get sim :head-commit))))
               (full-sql (append sql (plist-get proj :sql)))
-              ;; Postimage receipt + transaction proof (tracked-regression): the
-              ;; cross-root context aggregates both roots, so the receipt
-              ;; carries one entry per affected owner on EACH side.
+              ;; The cross-root proof covers affected owners on BOTH roots.
               (postimage (dorg-mutate--postimage-plan
                           (plist-get sim :index-context)
-                          (plist-get proj :effects)
-                          (plist-get options :return-candidate-models))))
+                          (plist-get proj :effects))))
          ;; A bounded cross-root move always yields non-empty core SQL (the
          ;; moved heading row updates), so there is no empty-net-effect branch.
          (list :sql full-sql
@@ -5797,7 +7504,6 @@ root-aggregate limitation)."
                 (list (cons src-root (plist-get sim :from-scope-ids))
                       (cons dst-root (plist-get sim :to-scope-ids))))
                :write-set (dorg-mutate--heading-write-set sim)
-               :postimages (plist-get postimage :entries)
                :validate (plist-get postimage :validate)
                :make-result
                (lambda (new-head)
@@ -5813,15 +7519,6 @@ root-aggregate limitation)."
                         :created nil
                         :changed (plist-get sim :changed)
                         :deleted nil)
-                  ;; Same entitlement law as the same-root builder: entries
-                  ;; attach only when a NEW commit landed (tracked-regression).
-                  (when (and (plist-get postimage :entries)
-                             (not (equal new-head
-                                         (plist-get sim :head-commit))))
-                    (append
-                     (list :postimages (plist-get postimage :entries))
-                     (when-let ((models-fn (plist-get postimage :models-fn)))
-                       (list :candidate-models (funcall models-fn)))))
                   (list :extensions (plist-get proj :extensions)
                         :invalidation (list :roots (list src-root dst-root)
                                             :ext-dirty (plist-get proj :ext-dirty)
@@ -5845,7 +7542,8 @@ The index projector runs OUTSIDE the repo-access-tolerant catch, so a
 When an index projector ran (`:extensions' present) the dry-run also constructs an
 invalidation PREVIEW (`:roots' + `:ext-dirty', NO advancing head token) so the
 command layer can compare the STABLE invalidation fields against apply."
-  (let ((sim (condition-case e
+  (let* ((dolt-dir (dorg-mutate-source-dolt-dir source))
+         (sim (condition-case e
                  (dorg-mutate--dolt-cross-root-simulate source patch options)
                (dorg-mutate-error (signal (car e) (cdr e)))
                (error nil))))
@@ -5858,8 +7556,12 @@ command layer can compare the STABLE invalidation fields against apply."
       ;; apply will persist.  This runs OUTSIDE the tolerant catch above so a
       ;; participant failure surfaces (D1a).  Projection SQL is surfaced as
       ;; engine-internal `:ext-sql' db-ops; reshape/D2 strips it from PUBLIC.
-      (let* ((proj (dorg-ext-collect-index-projection
-                    (plist-get sim :index-context))))
+      (let* ((installed-extensions
+              (dorg-mutate--dolt-installed-index-extension-names dolt-dir))
+             (proj (dorg-ext-collect-index-projection
+                    (plist-get sim :index-context) installed-extensions
+                    (dorg-mutate--accumulator-fold-port
+                     dolt-dir (plist-get sim :head-commit)))))
         (append
          (list :head-commit (plist-get sim :head-commit)
                :db-ops (append (plist-get sim :db-ops)
@@ -5889,7 +7591,8 @@ registration construction still loads the stack, while plain-org never does
   (require 'dorg-dolt)
   (require 'dorg-model-load))            ; hydration loaders + as-of-suffix chain (tracked-case)
 
-(defun dorg-mutate--dolt-plan-data (source patches options unsupported)
+(defun dorg-mutate--dolt-plan-data (source patches options unsupported
+                                          &optional owner-plan)
   "Return semantic Dolt plan data for SOURCE, or nil when unavailable.
 Runs a simulate (load + apply + diff + lower) so a typed plan on a
 Dolt source returns `:head-commit'/`:db-ops'/`:created'/`:changed'/
@@ -5898,9 +7601,8 @@ Dolt source returns `:head-commit'/`:db-ops'/`:created'/`:changed'/
 dir is not a readable repository directory (so the no-repo unit/plan
 tests stay classification-only and never spawn a failing CLI call).
 
-A delete-freed sibling sort-key reuse is no longer a capability gap — the
-staged-slot scheduler (`dorg-mutate--dolt-assemble-sql') simulates and
-plans it as a supported batch.  A validation / invariant
+A same-batch delete that frees a sibling slot never collides with a later
+placement: freed keys stay vacated until commit.  A validation / invariant
 `dorg-mutate-error' PROPAGATES (those are caller bugs AC1 requires to
 surface in plan and apply alike), while a repo-access `error' is
 tolerated, leaving the plan classification-only (the eventual apply
@@ -5916,10 +7618,10 @@ re-simulates and surfaces any real backend failure)."
           ;; simulator (two-root load), not the one-root same-root path.
           (dorg-mutate--dolt-cross-root-plan-data source cross options)
         (dorg-mutate--dolt-plan-data--same-root
-         source patches options)))))
+         source patches options owner-plan)))))
 
 (defun dorg-mutate--dolt-plan-data--same-root
-    (source patches options)
+    (source patches options &optional owner-plan)
   "Same-root Dolt plan data (the one-root simulate path).
 Extracted so `dorg-mutate--dolt-plan-data' can dispatch the bounded
 cross-root case to its own two-root simulator without disturbing this
@@ -5941,7 +7643,7 @@ divergence.  When EXT-INPUTS is non-empty a dry-run invalidation PREVIEW
 layer can compare the STABLE invalidation fields against apply; omitted/empty
 inputs keep the pre-change plan shape."
   (let ((sim (condition-case e
-                 (dorg-mutate--dolt-simulate source patches options)
+                 (dorg-mutate--dolt-simulate source patches options owner-plan)
                (dorg-mutate-error (signal (car e) (cdr e)))
                (error nil))))
     (when sim
@@ -6036,7 +7738,44 @@ When NON-ROOT is non-nil, the level-0 `:root' address is rejected."
                           :operation context :target host)))
   host)
 
-(defun dorg-mutate--patch-validate-target (target context)
+(defun dorg-mutate--owner-plan-capability (plan family)
+  "Return PLAN's private capability for FAMILY or signal a typed refusal.
+This is an in-process authority boundary only: public and IR inputs never
+carry PLAN, while trusted in-process Elisp can construct arbitrary records."
+  (unless plan
+    (dorg-mutate--raise 'invalid-target "owned metadata requires its typed owner"
+                        :detail 'owner-unavailable :family family))
+  (let* ((caps (append (when-let ((cap (plist-get plan :owner-capability)))
+                        (list cap))
+                      (plist-get plan :owner-capabilities)))
+         (execution-ids
+          (append (when-let ((id (plist-get plan :owner-execution-id)))
+                    (list id))
+                  (plist-get plan :owner-execution-ids))))
+    ;; Reject crafted values before reading struct accessors: callers must get
+    ;; the closed typed diagnostic, never an EIEIO/cl-defstruct type error.
+    (dolist (candidate caps)
+      (unless (cl-typep candidate 'dorg-mutate--owner-capability)
+        (dorg-mutate--raise 'invalid-target "owner capability is forged"
+                            :detail 'capability-forged :family family)))
+    ;; A trusted plan that omits its claimed private authority is as forged as
+    ;; one that supplies an arbitrary plist.  Keep this distinct from a wholly
+    ;; unavailable owner (`PLAN' nil above), which has no trusted plan at all.
+    (unless caps
+      (dorg-mutate--raise 'invalid-target "owner capability is forged"
+                          :detail 'capability-forged :family family))
+    (let ((cap (cl-find family caps
+                        :key #'dorg-mutate--owner-capability-family
+                        :test #'equal)))
+    (unless (cl-typep cap 'dorg-mutate--owner-capability)
+      (dorg-mutate--raise 'invalid-target "owner capability names another family"
+                          :detail 'capability-family-mismatch :family family))
+    (unless (memq (dorg-mutate--owner-capability-execution-id cap) execution-ids)
+      (dorg-mutate--raise 'invalid-target "owner capability belongs to another execution"
+                          :detail 'capability-forged :family family))
+      cap)))
+
+(defun dorg-mutate--patch-validate-target (target context &optional owner-plan)
   "Validate typed TARGET for CONTEXT and return it."
   (unless (consp target)
     (dorg-mutate--raise 'invalid-target "typed patch requires a tagged target"
@@ -6053,10 +7792,20 @@ When NON-ROOT is non-nil, the level-0 `:root' address is rejected."
      (unless (stringp (dorg-mutate--patch-tget target :name))
        (dorg-mutate--raise 'invalid-target "property name must be a string"
                            :operation context :target target))
-     (when (equal (dorg-mutate--patch-tget target :name) dorg-id-property)
-       (dorg-mutate--raise 'invalid-target
-                           "DORG_ID is identity and not a mutable property"
-                           :operation context :target target)))
+     (let* ((name (dorg-mutate--patch-tget target :name))
+            (family (dorg-owned-metadata-family name)))
+       (if family
+           (progn
+             (unless (dorg-owned-metadata-canonical-key-p name)
+               (dorg-mutate--raise 'invalid-target
+                                   "owned metadata key is not canonical"
+                                   :detail 'owned-metadata-noncanonical
+                                   :target target :key name))
+             (dorg-mutate--owner-plan-capability owner-plan (car family)))
+         (when (dorg-protected-keyword-p name)
+           (dorg-mutate--raise 'invalid-target
+                               "DORG_-prefixed properties are protected"
+                               :operation context :target target)))))
     ((or :keyword :keywords)
      (dorg-mutate--patch-check-keys
       (cdr target) '(:host :name :occurrence)
@@ -6079,9 +7828,28 @@ When NON-ROOT is non-nil, the level-0 `:root' address is rejected."
      (dorg-mutate--patch-check-keys (cdr target) '(:host) '(:host) context)
      (dorg-mutate--patch-validate-host
       (dorg-mutate--patch-tget target :host) context))
+    (:body
+     (dorg-mutate--patch-check-keys (cdr target) '(:host :literal)
+                                    '(:host :literal) context)
+     (dorg-mutate--patch-validate-host
+      (dorg-mutate--patch-tget target :host) context t)
+     (unless (and (stringp (dorg-mutate--patch-tget target :literal))
+                  (not (string-empty-p
+                        (dorg-mutate--patch-tget target :literal))))
+       (dorg-mutate--raise 'invalid-target
+                           "body literal must be a nonempty string"
+                           :operation context :target target)))
     (:tree
-     (dorg-mutate--patch-check-keys (cdr target) '(:under :before :after)
+     ;; :offset is internal (history restore of a skipped level); the public
+     ;; insert form never lowers one.
+     (dorg-mutate--patch-check-keys (cdr target) '(:under :before :after :offset)
                                     '(:under) context)
+     (when (plist-member (cdr target) :offset)
+       (let ((offset (dorg-mutate--patch-tget target :offset)))
+         (unless (and (fixnump offset) (> offset 0))
+           (dorg-mutate--raise 'invalid-op
+                               "insert offset must be a positive integer"
+                               :operation context :offset offset))))
      (dorg-mutate--patch-validate-host
       (dorg-mutate--patch-tget target :under) context)
      (dolist (field '(:before :after))
@@ -6096,29 +7864,43 @@ When NON-ROOT is non-nil, the level-0 `:root' address is rejected."
      (dorg-mutate--patch-check-keys (cdr target) '(:host) '(:host) context)
      (dorg-mutate--patch-validate-host
       (dorg-mutate--patch-tget target :host) context))
+    (:item
+     (dorg-mutate--patch-check-keys (cdr target) '(:host :occurrence)
+                                    '(:host :occurrence) context)
+     (dorg-mutate--patch-validate-host
+      (dorg-mutate--patch-tget target :host) context t)
+     (unless (and (integerp (dorg-mutate--patch-tget target :occurrence))
+                  (>= (dorg-mutate--patch-tget target :occurrence) 1))
+       (dorg-mutate--raise 'invalid-target "item occurrence must be positive"
+                           :operation context :target target)))
     (:text
      (dorg-mutate--patch-check-keys (cdr target) '(:host :occurrence)
                                     '(:host :occurrence) context)
      (dorg-mutate--patch-validate-host
       (dorg-mutate--patch-tget target :host) context)
-     (unless (eql 1 (dorg-mutate--patch-tget target :occurrence))
+     (unless (and (integerp (dorg-mutate--patch-tget target :occurrence))
+                  (>= (dorg-mutate--patch-tget target :occurrence) 1))
        (dorg-mutate--raise
-        'invalid-target "text target currently supports only occurrence 1"
+        'invalid-target "text occurrence must be positive"
         :operation context :target target)))
     (:drawer-lines
      (dorg-mutate--patch-check-keys (cdr target) '(:host :name :occurrence)
-                                    '(:host :name :occurrence) context)
+                                    '(:host :name) context)
      (dorg-mutate--patch-validate-host
       (dorg-mutate--patch-tget target :host) context t)
-     (unless (and (stringp (dorg-mutate--patch-tget target :name))
-                  (eql 1 (dorg-mutate--patch-tget target :occurrence)))
+     (unless (stringp (dorg-mutate--patch-tget target :name))
        (dorg-mutate--raise 'invalid-target "invalid drawer-line target"
-                           :operation context :target target)))
+                           :operation context :target target))
+     (when (plist-member (cdr target) :occurrence)
+       (unless (and (integerp (dorg-mutate--patch-tget target :occurrence))
+                    (>= (dorg-mutate--patch-tget target :occurrence) 1))
+         (dorg-mutate--raise 'invalid-target "drawer-line occurrence must be positive"
+                             :operation context :target target))))
     (_ (dorg-mutate--raise 'invalid-op "unknown typed target kind"
                            :operation context :target target)))
   target)
 
-(defun dorg-mutate--patch-validate-item-value (item context)
+(defun dorg-mutate--patch-validate-item-value (item context &optional owner-plan)
   "Validate one canonical typed ITEM value for CONTEXT.
 Every kind admits the optional `:post-blank' — the engine-boundary
 re-validation of the public grammar's trailing tail (tracked-regression).
@@ -6174,7 +7956,22 @@ default."
        (dolist (cell (plist-get item :properties))
          (unless (and (consp cell) (stringp (car cell)) (stringp (cdr cell)))
            (dorg-mutate--raise 'invalid-target "invalid drawer property"
-                               :operation context :value cell)))
+                               :operation context :value cell))
+         (let ((family (dorg-owned-metadata-family (car cell))))
+           ;; A private family capability authorizes its own registered keys,
+           ;; never system metadata carried incidentally by a whole drawer.
+           (when (and owner-plan (dorg-protected-keyword-p (car cell))
+                      (not family))
+             (dorg-mutate--raise 'invalid-target
+                                 "owner capability cannot write system metadata"
+                                 :operation context :value cell))
+           (when family
+             (unless (dorg-owned-metadata-canonical-key-p (car cell))
+               (dorg-mutate--raise 'invalid-target
+                                   "owned metadata key is not canonical"
+                                   :detail 'owned-metadata-noncanonical
+                                   :operation context :value cell))
+             (dorg-mutate--owner-plan-capability owner-plan (car family)))))
        (dolist (line (plist-get item :lines))
          (unless (stringp line)
            (dorg-mutate--raise 'invalid-target "invalid drawer line"
@@ -6183,7 +7980,8 @@ default."
                              :operation context :value item))))
   item)
 
-(defun dorg-mutate--patch-validate-heading-payload (payload context allowed)
+(defun dorg-mutate--patch-validate-heading-payload
+    (payload context allowed &optional owner-plan)
   "Validate a typed heading PAYLOAD for CONTEXT against ALLOWED fields."
   (dorg-mutate--patch-check-keys
    payload allowed nil context)
@@ -6217,7 +8015,7 @@ default."
       (dorg-mutate--raise 'invalid-target "heading :items must be a list"
                           :operation context))
     (dolist (item (plist-get payload :items))
-      (dorg-mutate--patch-validate-item-value item context)))
+      (dorg-mutate--patch-validate-item-value item context owner-plan)))
   (when (plist-member payload :children)
     (unless (listp (plist-get payload :children))
       (dorg-mutate--raise 'invalid-target "heading :children must be a list"
@@ -6226,7 +8024,8 @@ default."
       (dorg-mutate--patch-validate-heading-payload
        child context
        '(:id :title :todo :priority :tags :commented :post-blank
-             :items :children))))
+             :items :children)
+       owner-plan)))
   payload)
 
 (defconst dorg-mutate--patch-fields
@@ -6236,6 +8035,11 @@ default."
     ((replace :keywords)  (:op :target :values) (:op :target :values))
     ((insert :keywords)   (:op :target :value :position)
                            (:op :target :value :position))
+    ((insert :item)       (:op :target :item :position)
+                           (:op :target :item :position))
+    ((replace :item)      (:op :target :item :missing)
+                           (:op :target :item))
+    ((delete :item)       (:op :target :missing) (:op :target))
     ((delete :keyword)    (:op :target :missing) (:op :target))
     ((delete :keywords)   (:op :target) (:op :target))
     ((update :heading)    (:op :target :fields) (:op :target :fields))
@@ -6248,10 +8052,15 @@ default."
     ((delete :subtree)    (:op :target) (:op :target))
     ((insert :drawer-lines) (:op :target :position :missing :value)
                              (:op :target :position :missing :value))
+    ((replace :drawer-lines) (:op :target :value :values)
+                              (:op :target))
+    ((delete :drawer-lines) (:op :target) (:op :target))
     ((insert :texts)      (:op :target :value :position)
                            (:op :target :value :position))
     ((replace :text)      (:op :target :value :missing)
                            (:op :target :value :missing))
+    ((replace :body)      (:op :target :value) (:op :target :value))
+    ((delete :text)       (:op :target :missing) (:op :target :missing))
     ((replace :items)     (:op :target :items) (:op :target :items)))
   "Closed top-level fields by typed (verb target-kind) pair.")
 
@@ -6296,8 +8105,10 @@ default."
         (dorg-mutate--raise-structural-payload operation value))))
   value)
 
-(defun dorg-mutate--validate-patch (patch index)
-  "Validate typed PATCH at INDEX and return it unchanged."
+(defun dorg-mutate--validate-engine-patch (patch index &optional owner-plan)
+  "Validate executor-private PATCH at INDEX and return it unchanged.
+The public typed-patch boundary is `dorg-mutate--validate-patch'; this helper
+accepts only the executor representation produced after that boundary."
   (let* ((signature (dorg-mutate--patch-signature patch))
          (row (assoc signature dorg-mutate--patch-fields))
          (op (car signature))
@@ -6307,7 +8118,7 @@ default."
                           :operation op :target-kind (cadr signature)
                           :op-index index))
     (dorg-mutate--patch-check-keys patch (nth 1 row) (nth 2 row) op)
-    (dorg-mutate--patch-validate-target target op)
+    (dorg-mutate--patch-validate-target target op owner-plan)
     (pcase signature
       ((or `(put :property) `(replace :keyword))
        (unless (stringp (plist-get patch :value))
@@ -6329,7 +8140,10 @@ default."
          (dorg-mutate--raise 'invalid-target "typed patch value must be a string"
                              :operation op :value (plist-get patch :value)))
        (dorg-mutate--single-line-payload (plist-get patch :value) op)
-       (unless (memq (plist-get patch :position) '(:before-first :after-last))
+       (unless (or (memq (plist-get patch :position) '(:before-first :after-last))
+                   (pcase (plist-get patch :position)
+                     (`(:before ,n) (and (integerp n) (>= n 1)))
+                     (`(:after ,n) (and (integerp n) (>= n 1)))))
          (dorg-mutate--raise
           'invalid-op "keyword insert requires :before-first or :after-last"
           :operation op :detail 'invalid-position)))
@@ -6338,10 +8152,32 @@ default."
          (dorg-mutate--raise 'invalid-target "typed patch value must be a string"
                              :operation op :value (plist-get patch :value)))
        (dorg-mutate--validate-text-payload (plist-get patch :value) op)
-       (unless (memq (plist-get patch :position) '(:before-first :after-last))
+       (unless (or (memq (plist-get patch :position) '(:before-first :after-last))
+                   (pcase (plist-get patch :position)
+                     (`(:before ,n) (and (integerp n) (>= n 1)))
+                     (`(:after ,n) (and (integerp n) (>= n 1)))))
          (dorg-mutate--raise
           'invalid-op "text insert requires :before-first or :after-last"
           :operation op :detail 'invalid-position)))
+      (`(insert :item)
+       (dorg-mutate--patch-validate-item-value
+        (plist-get patch :item) op owner-plan)
+       (unless (or (memq (plist-get patch :position) '(:before-first :after-last))
+                   (pcase (plist-get patch :position)
+                     (`(:before ,n) (and (integerp n) (>= n 1)))
+                     (`(:after ,n) (and (integerp n) (>= n 1)))))
+         (dorg-mutate--raise 'invalid-op "item insert requires a sequence position"
+                             :operation op :detail 'invalid-position)))
+      (`(replace :item)
+       (dorg-mutate--patch-validate-item-value
+        (plist-get patch :item) op owner-plan)
+       (unless (eq (plist-get patch :missing) :error)
+         (dorg-mutate--raise 'invalid-op "single item mutation requires :missing :error"
+                             :operation op :detail 'invalid-missing-policy)))
+      (`(delete :item)
+       (unless (eq (plist-get patch :missing) :error)
+         (dorg-mutate--raise 'invalid-op "single item mutation requires :missing :error"
+                             :operation op :detail 'invalid-missing-policy)))
       (`(replace :text)
        (unless (stringp (plist-get patch :value))
          (dorg-mutate--raise 'invalid-target "typed patch value must be a string"
@@ -6350,17 +8186,46 @@ default."
          (dorg-mutate--raise
           'invalid-op "single text mutation requires :missing :error"
           :operation op :detail 'invalid-missing-policy)))
+      (`(replace :body)
+       (unless (stringp (plist-get patch :value))
+         (dorg-mutate--raise 'invalid-target "typed patch value must be a string"
+                             :operation op :value (plist-get patch :value))))
       (`(insert :drawer-lines)
        (unless (stringp (plist-get patch :value))
          (dorg-mutate--raise 'invalid-target "typed patch value must be a string"
                              :operation op :value (plist-get patch :value)))
        (dorg-mutate--single-line-payload (plist-get patch :value) op)
-       (unless (and (memq (plist-get patch :position)
-                          '(:before-first :after-last))
+       (unless (and (or (memq (plist-get patch :position)
+                            '(:before-first :after-last))
+                       (pcase (plist-get patch :position)
+                         (`(:before ,n) (and (integerp n) (>= n 1)))
+                         (`(:after ,n) (and (integerp n) (>= n 1)))))
                     (memq (plist-get patch :missing) '(:create :error)))
          (dorg-mutate--raise 'invalid-target "invalid drawer-line placement"
                              :operation op)))
+      (`(replace :drawer-lines)
+       (if (plist-member (cdr (plist-get patch :target)) :occurrence)
+           (unless (and (plist-member patch :value)
+                        (stringp (plist-get patch :value))
+                        (not (plist-member patch :values)))
+             (dorg-mutate--raise 'invalid-target "drawer-line occurrence replacement needs one line"
+                                 :operation op))
+         (unless (and (consp (plist-get patch :values))
+                      (not (plist-member patch :value))
+                      (cl-every #'stringp (plist-get patch :values)))
+           (dorg-mutate--raise 'invalid-target "drawer-line all replacement needs lines"
+                               :operation op))))
+      (`(delete :drawer-lines)
+       (when (or (plist-member patch :value) (plist-member patch :values))
+         (dorg-mutate--raise 'invalid-target "drawer-line delete has no payload"
+                             :operation op)))
       (`(update :planning)
+       (unless (or (plist-member patch :scheduled)
+                   (plist-member patch :deadline)
+                   (plist-member patch :closed))
+         (dorg-mutate--raise 'invalid-target
+                             "planning update requires at least one field"
+                             :operation op :target target))
        (dolist (field '(:scheduled :deadline :closed))
          (when (and (plist-member patch field)
                     (not (or (null (plist-get patch field))
@@ -6372,20 +8237,28 @@ default."
          (dorg-mutate--raise 'invalid-target "items replacement must be a list"
                              :operation op))
        (dolist (item (plist-get patch :items))
-         (dorg-mutate--patch-validate-item-value item op)))
+         (dorg-mutate--patch-validate-item-value item op owner-plan)))
       (`(insert :tree)
        (dorg-mutate--patch-validate-heading-payload
         (plist-get patch :heading) op
         '(:id :title :todo :priority :tags :commented :post-blank
-              :items :children)))
+              :items :children)
+        owner-plan))
       (`(update :heading)
        (dorg-mutate--patch-validate-heading-payload
         (plist-get patch :fields) op
-        '(:title :todo :priority :tags :commented :post-blank)))
+        '(:title :todo :priority :tags :commented :post-blank)
+        owner-plan))
       (`(move :subtree)
        (let ((to (plist-get patch :to)))
-         (dorg-mutate--patch-check-keys to '(:under :before :after)
+         (dorg-mutate--patch-check-keys to '(:under :before :after :offset)
                                         '(:under) op)
+         (when (plist-member to :offset)
+           (let ((offset (plist-get to :offset)))
+             (unless (and (fixnump offset) (> offset 0))
+               (dorg-mutate--raise 'invalid-op
+                                   "move offset must be a positive integer"
+                                   :operation op :offset offset))))
          (dorg-mutate--patch-validate-host (plist-get to :under) op)
          (dolist (field '(:before :after))
            (when (plist-member to field)
@@ -6409,15 +8282,220 @@ default."
                                  :operation op :field field))))))
     patch))
 
-(defun dorg-mutate--validate-patches (patches)
-  "Validate PATCHES as one typed batch and return it unchanged."
+(defconst dorg-mutate--retired-sequence-target-kinds
+  '(:keywords :texts :items :drawer-lines)
+  "Pre-v0.2 sequence target tags rejected at the public engine boundary.")
+
+(defun dorg-mutate--sequence-select (target required context)
+  "Validate TARGET's optional v2 selector and return it.
+REQUIRED names the selector law for CONTEXT: `all-or-occurrence' or nil."
+  (let ((select (dorg-mutate--patch-tget target :select)))
+    (if required
+        (progn
+          (unless (consp select)
+            (dorg-mutate--raise 'invalid-target "sequence selector is required"
+                                :operation context :target target))
+          (pcase select
+            (`(:all) select)
+            (`(:occurrence ,n)
+             (unless (and (integerp n) (>= n 1))
+               (dorg-mutate--raise 'invalid-target
+                                   "sequence occurrence must be positive"
+                                   :operation context :target target))
+             select)
+            (_ (dorg-mutate--raise 'invalid-target "invalid sequence selector"
+                                   :operation context :target target))))
+      (when select
+        (dorg-mutate--raise 'invalid-target "insert target has a selector"
+                            :operation context :target target)))))
+
+(defun dorg-mutate--validate-sequence-v2-patch (patch index)
+  "Validate one closed v2 sequence PATCH at INDEX and return PATCH.
+The executor sees a private lowering only after this function has rejected all
+retired target tags, `:occurrence' fields, and top-level `:missing' policies."
+  (let* ((target (plist-get patch :target))
+         (kind (car-safe target))
+         (op (plist-get patch :op))
+         (context (or op 'unknown)))
+    (unless (and (listp patch) (memq kind '(:keyword :text :item :drawer-line)))
+      (dorg-mutate--raise 'invalid-op "invalid v2 sequence patch"
+                          :operation context :op-index index))
+    (when (plist-member patch :missing)
+      (dorg-mutate--raise 'invalid-target "v2 sequence rows do not carry :missing"
+                          :operation context :detail 'retired-ir :patch patch))
+    ;; This must precede the closed target-key check below.  Otherwise an
+    ;; isolated retired `:occurrence' key leaks out as the generic `invalid-op'
+    ;; unknown-field diagnostic instead of the v0.2 hard-cut refusal.
+    (when (plist-member (cdr target) :occurrence)
+      (dorg-mutate--raise 'invalid-target "v2 sequence target uses retired :occurrence"
+                          :operation context :detail 'retired-ir :target target))
+    (pcase kind
+      (:keyword
+       (dorg-mutate--patch-check-keys (cdr target) '(:host :name :select)
+                                      '(:host :name) context)
+       (dorg-mutate--patch-validate-host (dorg-mutate--patch-tget target :host) context)
+       (let ((name (dorg-mutate--patch-tget target :name)))
+         (unless (stringp name)
+           (dorg-mutate--raise 'invalid-target "keyword name must be a string"
+                               :operation context :target target))
+         (when (dorg-protected-keyword-p name)
+           (dorg-mutate--raise 'invalid-target "protected keyword target"
+                               :operation context :target target))))
+      (:text
+       (dorg-mutate--patch-check-keys (cdr target) '(:host :select) '(:host) context)
+       (dorg-mutate--patch-validate-host (dorg-mutate--patch-tget target :host) context))
+      (:item
+       (dorg-mutate--patch-check-keys (cdr target) '(:host :select) '(:host) context)
+       (dorg-mutate--patch-validate-host (dorg-mutate--patch-tget target :host) context))
+      (:drawer-line
+       (dorg-mutate--patch-check-keys (cdr target) '(:host :name :select)
+                                      '(:host :name) context)
+       (dorg-mutate--patch-validate-host (dorg-mutate--patch-tget target :host) context)
+       (unless (stringp (dorg-mutate--patch-tget target :name))
+         (dorg-mutate--raise 'invalid-target "drawer name must be a string"
+                             :operation context :target target))))
+    (let* ((select (dorg-mutate--sequence-select
+                    target (not (eq op 'insert)) context))
+           (cell (dorg-mutate-sequence-cell kind op select))
+           (host (dorg-mutate--patch-tget target :host)))
+      (unless (and cell (plist-get cell :legal))
+        (dorg-mutate--raise 'invalid-target "unsupported sequence cell"
+                            :operation context :detail 'unsupported-selector
+                            :target target))
+      (when (and (eq host :root) (not (plist-get cell :root)))
+        (dorg-mutate--raise 'invalid-target "operation requires a heading host"
+                            :operation context :target host))
+      (pcase (list op kind select)
+      (`(replace :keyword (:all))
+       (dorg-mutate--patch-check-keys patch '(:op :target :values) '(:op :target :values) context)
+       (unless (and (consp (plist-get patch :values))
+                    (cl-every #'stringp (plist-get patch :values)))
+         (dorg-mutate--raise 'invalid-target "keyword all replacement needs strings"
+                             :operation context)))
+      (`(delete :keyword (:all))
+       (dorg-mutate--patch-check-keys patch '(:op :target) '(:op :target) context))
+      (`(replace :keyword (:occurrence ,_))
+       (dorg-mutate--patch-check-keys patch '(:op :target :value) '(:op :target :value) context))
+      (`(delete :keyword (:occurrence ,_))
+       (dorg-mutate--patch-check-keys patch '(:op :target) '(:op :target) context))
+      (`(insert :keyword nil)
+       (dorg-mutate--patch-check-keys patch '(:op :target :value :position)
+                                      '(:op :target :value :position) context))
+      (`(replace :text (:occurrence ,_))
+       (dorg-mutate--patch-check-keys patch '(:op :target :value) '(:op :target :value) context))
+      (`(delete :text (:occurrence ,_))
+       (dorg-mutate--patch-check-keys patch '(:op :target) '(:op :target) context))
+      (`(insert :text nil)
+       (dorg-mutate--patch-check-keys patch '(:op :target :value :position)
+                                      '(:op :target :value :position) context))
+      (`(replace :item (:all))
+       (dorg-mutate--patch-check-keys patch '(:op :target :items) '(:op :target :items) context)
+       (unless (consp (plist-get patch :items))
+         (dorg-mutate--raise 'invalid-target "item all replacement needs items"
+                             :operation context)))
+      (`(replace :item (:occurrence ,_))
+       (dorg-mutate--patch-check-keys patch '(:op :target :item) '(:op :target :item) context))
+      (`(delete :item (:occurrence ,_))
+       (dorg-mutate--patch-check-keys patch '(:op :target) '(:op :target) context))
+      (`(insert :item nil)
+       (dorg-mutate--patch-check-keys patch '(:op :target :item :position)
+                                      '(:op :target :item :position) context))
+      (`(replace :drawer-line (:all))
+       (dorg-mutate--patch-check-keys patch '(:op :target :values) '(:op :target :values) context))
+      (`(delete :drawer-line (:all))
+       (dorg-mutate--patch-check-keys patch '(:op :target) '(:op :target) context))
+      (`(replace :drawer-line (:occurrence ,_))
+       (dorg-mutate--patch-check-keys patch '(:op :target :value) '(:op :target :value) context))
+      (`(delete :drawer-line (:occurrence ,_))
+       (dorg-mutate--patch-check-keys patch '(:op :target) '(:op :target) context))
+      (`(insert :drawer-line nil)
+       (dorg-mutate--patch-check-keys patch '(:op :target :value :position)
+                                      '(:op :target :value :position) context))
+      (_ (dorg-mutate--raise 'invalid-target "unsupported sequence cell"
+                             :operation context :detail 'unsupported-selector
+                             :target target))))
+    patch))
+
+(defun dorg-mutate--sequence-patch->engine (patch)
+  "Lower a validated v2 sequence PATCH to the existing item executor form."
+  (let* ((target (plist-get patch :target))
+         (kind (car-safe target))
+         (host (dorg-mutate--patch-tget target :host))
+         (name (dorg-mutate--patch-tget target :name))
+         (select (dorg-mutate--patch-tget target :select))
+         (op (plist-get patch :op)))
+    (pcase (list op kind select)
+      (`(replace :keyword (:all))
+       (list :op 'replace :target (list :keywords :host host :name name)
+             :values (plist-get patch :values)))
+      (`(delete :keyword (:all))
+       (list :op 'delete :target (list :keywords :host host :name name)))
+      (`(,operation :keyword (:occurrence ,n))
+       (append (list :op operation :target (list :keyword :host host :name name :occurrence n))
+               (when (plist-member patch :value) (list :value (plist-get patch :value)))
+               (list :missing :error)))
+      (`(insert :keyword nil)
+       (list :op 'insert :target (list :keywords :host host :name name)
+             :value (plist-get patch :value) :position (plist-get patch :position)))
+      (`(,operation :text (:occurrence ,n))
+       (append (list :op operation :target (list :text :host host :occurrence n))
+               (when (plist-member patch :value) (list :value (plist-get patch :value)))
+               (list :missing :error)))
+      (`(insert :text nil)
+       (list :op 'insert :target (list :texts :host host)
+             :value (plist-get patch :value) :position (plist-get patch :position)))
+      (`(replace :item (:all))
+       (list :op 'replace :target (list :items :host host)
+             :items (plist-get patch :items)))
+      (`(,operation :item (:occurrence ,n))
+       (append (list :op operation :target (list :item :host host :occurrence n))
+               (when (plist-member patch :item) (list :item (plist-get patch :item)))
+               (list :missing :error)))
+      (`(insert :item nil)
+       (list :op 'insert :target (list :item :host host :occurrence 1)
+             :item (plist-get patch :item) :position (plist-get patch :position)))
+      (`(insert :drawer-line nil)
+       (list :op 'insert :target (list :drawer-lines :host host :name name :occurrence 1)
+             :position (plist-get patch :position) :missing :create
+             :value (plist-get patch :value)))
+      (`(,operation :drawer-line (:all))
+       (append (list :op operation :target (list :drawer-lines :host host :name name))
+               (when (plist-member patch :values) (list :values (plist-get patch :values)))))
+      (`(,operation :drawer-line (:occurrence ,n))
+       (append (list :op operation
+                     :target (list :drawer-lines :host host :name name :occurrence n))
+               (when (plist-member patch :value) (list :value (plist-get patch :value)))))
+      (_ patch))))
+
+(defun dorg-mutate--validate-patch (patch index &optional owner-plan)
+  "Validate public PATCH at INDEX, refusing every retired sequence IR shape."
+  (let ((target (plist-get patch :target)))
+    (cond
+     ((memq (car-safe target) '(:keyword :text :item :drawer-line))
+      (dorg-mutate--validate-sequence-v2-patch patch index))
+     ((memq (car-safe target) dorg-mutate--retired-sequence-target-kinds)
+      (dorg-mutate--raise 'invalid-target "retired typed sequence target"
+                          :operation (plist-get patch :op) :detail 'retired-ir
+                          :target target))
+     ((and (memq (car-safe target) '(:keyword :text))
+           (plist-member (cdr target) :occurrence))
+      (dorg-mutate--raise 'invalid-target "retired typed occurrence field"
+                          :operation (plist-get patch :op) :detail 'retired-ir
+                          :target target))
+     (t (dorg-mutate--validate-engine-patch patch index owner-plan)))))
+
+(defun dorg-mutate--validate-patches (patches &optional owner-plan)
+  "Validate public PATCHES and lower their closed v2 sequence rows for execution."
   (unless (listp patches)
     (dorg-mutate--raise 'invalid-op "typed patch batch must be a list"
                         :patches patches))
   (cl-loop for patch in patches for index from 0
-           collect (dorg-mutate--validate-patch patch index)))
+           collect
+           (let ((public (dorg-mutate--validate-patch patch index owner-plan)))
+              (dorg-mutate--validate-engine-patch
+              (dorg-mutate--sequence-patch->engine public) index owner-plan))))
 
-(defun dorg-mutate--make-plan (source patches options)
+(defun dorg-mutate--make-plan (source patches options &optional owner-plan)
   "Build a typed PATCHES plan for resolved SOURCE with OPTIONS."
   (let* ((kind (dorg-mutate-source-kind source)))
     ;; Explicit unsupported, never a silent drop (tracked-regression): a backend that
@@ -6455,7 +8533,25 @@ default."
                      :supported (null unsupported)))
          (dolt0 (float-time))
          (dolt-data (dorg-mutate--dolt-plan-data
-                     source patches options unsupported)))
+                     source patches options unsupported owner-plan)))
+    ;; Plain body literals have source-specific representability obligations
+    ;; (byte mapping and structural postimage) that static capability
+    ;; classification cannot see.  Make dry-run enter the same no-write
+    ;; planner as apply, so it cannot advertise an unexecutable mutation.
+    (when (and (eq kind 'plain-org)
+               (cl-some (lambda (patch)
+                          (equal (dorg-mutate--patch-signature patch)
+                                 '(replace :body)))
+                        patches))
+      (dorg-mutate--source-preserving-preflight patches source))
+    ;; A dry-run has no applied candidate from which to construct the owner
+    ;; context, so its one isolated simulation remains the authoritative
+    ;; no-write gate.  Apply validates after its single real splice instead.
+    (when (and (eq kind 'plain-org) (plist-get options :dry-run)
+               patches (null unsupported))
+      (dorg-mutate--validate-owned-metadata-context
+       (dorg-mutate--plain-org-planned-index-context
+        source patches (dorg-mutate--plain-org-revision source))))
     (when-let ((attempt (plist-get dolt-data :dorg-execution-attempt)))
       (plist-put attempt :precomputed-plan-seconds
                  (- (float-time) dolt0)))
@@ -6477,7 +8573,7 @@ after resolution and validation, before `dorg-mutate--make-plan'."
                         :detail 'identity-none
                         :source-kind (dorg-mutate-source-kind src))))
 
-(defun dorg-mutate--execute-patches (src patches options plan)
+(defun dorg-mutate--execute-patches (src patches options plan &optional owner-plan)
   "Execute resolved SRC's typed PATCHES given precomputed PLAN.
 The shared apply core: honors `:dry-run' (returns PLAN), surfaces the first
 unsupported classification as a deterministic `unsupported' error, else
@@ -6515,7 +8611,7 @@ is `dorg-mutate--make-plan' output."
              (dorg-mutate--dolt-cross-root-execute src cross options)
            (dorg-mutate--dolt-execute
             src patches options
-            (plist-get plan :dorg-execution-attempt)))))))))
+            (plist-get plan :dorg-execution-attempt) owner-plan))))))))
 
 ;;; ─── Native typed-patch engine boundary ───────────────────────────────
 ;; These are the only semantic engine entries.  `dorg-api' passes the exact
@@ -6534,6 +8630,13 @@ silently-ignored hint."
 automatically from candidate state and accept no caller payload"
      :detail 'extension-inputs-retired)))
 
+(defun dorg-mutate--reject-owner-request-option (options)
+  "Refuse even nil :owner-request in caller OPTIONS; capability owns it."
+  (when (plist-member options :owner-request)
+    (dorg-mutate--raise 'invalid-target
+                        "owner request cannot be passed as an option"
+                        :detail 'owner-request-forged)))
+
 (defun dorg-mutate--plan-patches (source patches &optional ext-inputs &rest options)
   "Validate typed PATCHES for SOURCE and return a non-mutating plan.
 
@@ -6542,21 +8645,187 @@ EXT-INPUTS is the RETIRED per-execution `:extension-inputs' channel
 context and accept no caller payload.  The positional parameter is kept for
 signature stability but FAILS CLOSED — a non-nil value signals `unsupported'."
   (dorg-mutate--reject-extension-inputs ext-inputs)
+  (dorg-mutate--reject-owner-request-option options)
   (let* ((src (dorg-mutate--resolve-source source))
          (patches (dorg-mutate--validate-patches patches)))
     (dorg-mutate--gate-identity-none src patches)
-    (dorg-mutate--make-plan src patches options)))
+    (let ((plan (dorg-mutate--make-plan src patches options)))
+      ;; Planning remains a no-write owner gate.  Apply builds this same
+      ;; context from its one actual splice after the established CAS and
+      ;; invariant guards, so ordinary public execution neither changes
+      ;; refusal precedence nor invokes the splice seam twice.
+      (when (and (eq (dorg-mutate-source-kind src) 'plain-org)
+                 patches (not (plist-get plan :unsupported)))
+        (dorg-mutate--validate-owned-metadata-context
+         (dorg-mutate--plain-org-planned-index-context
+          src patches (dorg-mutate--plain-org-revision src))))
+      plan)))
 
-(defun dorg-mutate--apply-patches (source patches &optional ext-inputs &rest options)
+(defvar dorg-mutate--held-plain-file-lock nil
+  "Dynamically held (canonical file, owner, alias, raise function).
+This one dynamic binding carries the token across API-to-engine re-entry.")
+
+(defun dorg-mutate--plain-gate-raise (raise reason message &rest data)
+  "Call RAISE with REASON, MESSAGE and DATA for a writer-gate refusal."
+  (apply (or raise #'dorg-mutate--raise) reason message data))
+
+(defun dorg-mutate--assert-held-plain-file-gate ()
+  "Require the saved plain-file gate and verify its alias and owner."
+  (unless dorg-mutate--held-plain-file-lock
+    (dorg-mutate--raise
+     'invariant "saved plain-org commit has no held file gate"
+     :detail 'file-gate-not-held))
+  (let* ((key (car dorg-mutate--held-plain-file-lock))
+         (record (cadr dorg-mutate--held-plain-file-lock))
+         (alias (nth 2 dorg-mutate--held-plain-file-lock))
+         (raise (nth 3 dorg-mutate--held-plain-file-lock)))
+    (unless (equal key (file-truename alias))
+      (dorg-mutate--plain-gate-raise
+       raise 'stale "plain-org source link changed" :detail 'source-retargeted))
+    (unless (equal record
+                   (file-symlink-p
+                    (dorg-file-lock--path-from-canonical key)))
+      (dorg-mutate--plain-gate-raise
+       raise 'invariant "plain-org file gate ownership was lost"
+       :detail 'file-lock-lost))))
+
+(defun dorg-mutate--canonical-locked-source (source)
+  "Return SOURCE bound to the held canonical file for an atomic saved commit."
+  (if (and dorg-mutate--held-plain-file-lock
+           (eq (dorg-mutate-source-kind source) 'plain-org))
+      (dorg-mutate--source-make
+       :kind 'plain-org
+       :buffer (dorg-mutate-source-buffer source)
+       :file (car dorg-mutate--held-plain-file-lock)
+       :root-id (dorg-mutate-source-root-id source)
+       :identity (dorg-mutate-source-identity source))
+    source))
+
+(defun dorg-mutate--known-dolt-source-p (source)
+  "Return non-nil when SOURCE is known Dolt without strict resolution."
+  (or (and (dorg-mutate-source-p source)
+           (eq (dorg-mutate-source-kind source) 'dolt))
+      (and (consp source) (keywordp (car source))
+           (plist-member source :dolt-dir)
+           (not (plist-member source :buffer))
+           (not (plist-member source :file))
+           (not (plist-member source :plain-org)))
+      (let ((buffer (cond ((null source) (current-buffer))
+                          ((bufferp source) source)
+                          ((stringp source) (get-buffer source))
+                          ((and (consp source) (keywordp (car source))
+                                (plist-member source :buffer))
+                           (get-buffer (plist-get source :buffer))))))
+        (when (buffer-live-p buffer)
+          (let ((registration (dorg--classify-registration buffer)))
+            (and registration
+                 (eq (dorg-backend-type (dorg-registration-backend registration))
+                     'dolt)))))))
+
+(defun dorg-mutate--with-saved-plain-file-gate (source mode options fn &optional raise)
+  "Call FN under SOURCE's local saved plain-Org gate when MODE is apply.
+OPTIONS supplies :save and the optional finite :lock-timeout in seconds.
+RAISE, when supplied, maps gate refusals to the public entry condition."
+  (let ((timeout (if (plist-member options :lock-timeout)
+                     (plist-get options :lock-timeout)
+                   dorg-file-lock-default-timeout)))
+    (unless (dorg-file-lock--valid-timeout-p timeout)
+      (dorg-mutate--plain-gate-raise
+       raise 'invalid-target "invalid plain-org lock timeout" :detail 'lock-timeout))
+    (if (or (not (eq mode 'apply))
+            (dorg-mutate--known-dolt-source-p source))
+        (funcall fn)
+      (let* ((src (dorg-mutate--resolve-source source))
+             (file (dorg-mutate-source-file src))
+             (buffer (dorg-mutate-source-buffer src))
+             (saving (or (not (buffer-live-p buffer))
+                         (plist-get options :save))))
+        (if (not (and (eq (dorg-mutate-source-kind src) 'plain-org)
+                      saving file))
+            (funcall fn)
+          (when (file-remote-p file)
+            (dorg-mutate--plain-gate-raise
+             raise 'unsupported "saved remote plain-org writes are unsupported"
+             :detail 'remote-file-gate))
+          (let* ((key (file-truename file))
+                 (lock (dorg-file-lock--path-from-canonical key)))
+            (if dorg-mutate--held-plain-file-lock
+                (if (and (equal key (car dorg-mutate--held-plain-file-lock))
+                         (equal (file-symlink-p lock)
+                                (cadr dorg-mutate--held-plain-file-lock)))
+                    (funcall fn)
+                  (dorg-mutate--plain-gate-raise
+                   (nth 3 dorg-mutate--held-plain-file-lock)
+                   'invariant "nested saved plain-org writes target different files"
+                   :detail (if (equal key (car dorg-mutate--held-plain-file-lock))
+                               'file-lock-lost 'nested-file-gate)))
+              (let ((result
+                     (dorg-file-lock-call
+                      lock timeout
+                      (lambda (record)
+                        (let ((dorg-mutate--held-plain-file-lock
+                               (list key record file raise)))
+                          (unless (equal key (file-truename file))
+                            (dorg-mutate--plain-gate-raise
+                             raise 'stale "plain-org source link changed"
+                             :detail 'source-retargeted))
+                          (funcall fn))))))
+                (if (eq (plist-get result :status) :acquired)
+                    (plist-get result :value)
+                  (let ((status (plist-get result :status)))
+                    (dorg-mutate--plain-gate-raise
+                     raise (if (eq status :unsupported) 'unsupported 'contended)
+                     (if (eq status :unsupported)
+                         "local filesystem cannot publish a file lock"
+                       "saved plain-org writer gate is held")
+                     :detail (if (eq status :unsupported) 'file-lock-unavailable
+                               (intern (substring (symbol-name status) 1))))))))))))))
+
+(defun dorg-mutate--apply-patches-internal
+    (source patches ext-inputs owner-authority &rest options)
+  "Apply PATCHES, acquiring the saved plain-Org file gate before planning."
+  (dorg-mutate--reject-extension-inputs ext-inputs)
+  (dorg-mutate--reject-owner-request-option options)
+  (dorg-mutate--with-saved-plain-file-gate
+   source 'apply options
+   (lambda ()
+     (apply #'dorg-mutate--apply-patches-internal-locked
+            (dorg-mutate--canonical-locked-source
+             (dorg-mutate--resolve-source source))
+            patches ext-inputs owner-authority options))))
+
+(defun dorg-mutate--apply-patches-internal-locked
+    (source patches ext-inputs owner-authority &rest options)
   "Validate and execute typed PATCHES against SOURCE, or signal.
 
 EXT-INPUTS is the RETIRED `:extension-inputs' channel (tracked-regression): index
 projectors run automatically from the candidate-state context and accept no
 caller payload.  The positional parameter is kept for signature stability but
-FAILS CLOSED — a non-nil value signals `unsupported'."
+FAILS CLOSED — a non-nil value signals `unsupported'.
+An eligible initial Dolt planning failure may be a settled op-id replay.
+After validation, recover only digest-matching evidence on a fresh gated lease;
+an evidence miss preserves the original failure.  Execution is never retried."
   (dorg-mutate--reject-extension-inputs ext-inputs)
+  (dorg-mutate--reject-owner-request-option options)
   (let* ((src (dorg-mutate--resolve-source source))
-         (patches (dorg-mutate--validate-patches patches))
+         (owner-authorities
+          (cond ((null owner-authority) nil)
+                ((cl-typep owner-authority 'dorg-mutate--owner-capability)
+                 (list owner-authority))
+                ((and (listp owner-authority)
+                      (cl-every (lambda (cap)
+                                  (cl-typep cap 'dorg-mutate--owner-capability))
+                                owner-authority))
+                 owner-authority)
+                (t (dorg-mutate--raise 'invalid-target "owner capability is forged"
+                                       :detail 'capability-forged))))
+         (owner-plan
+          (and owner-authorities
+               (list :owner-capabilities owner-authorities
+                     :owner-execution-ids
+                     (mapcar #'dorg-mutate--owner-capability-execution-id
+                             owner-authorities))))
+         (patches (dorg-mutate--validate-patches patches owner-plan))
          ;; Pin generated ids BEFORE the one reusable plan attempt is built.
          ;; Every safe replan then receives the same immutable intent/id pair;
          ;; without an op-id, a discarded uncommitted attempt may allocate a
@@ -6565,9 +8834,90 @@ FAILS CLOSED — a non-nil value signals `unsupported'."
                            (plist-get options :op-id))
                       (dorg-mutate--pin-insert-heading-ids patches)
                     patches))
-         (_ (dorg-mutate--gate-identity-none src patches))
-         (plan (dorg-mutate--make-plan src patches options)))
-    (dorg-mutate--execute-patches src patches options plan)))
+         (_ (dorg-mutate--gate-identity-none src patches)))
+    (catch 'dorg-mutate--initial-plan-settled
+      (let ((plan
+             (condition-case perr
+                 (let ((plan (dorg-mutate--make-plan src patches options owner-plan)))
+                   (when owner-authorities
+                     (setq plan (plist-put plan :owner-capabilities owner-authorities))
+                     (setq plan (plist-put plan :owner-execution-ids
+                                           (mapcar #'dorg-mutate--owner-capability-execution-id
+                                                   owner-authorities))))
+                   plan)
+               (dorg-mutate-error
+                ;; The reusable initial attempt is built BEFORE gated-apply;
+                ;; its failure cannot reach that seam's re-plan handler.
+                ;; Validation and the public intent digest already precede us.
+                (let ((op-id (plist-get options :op-id))
+                      (digest (plist-get options :intent-digest)))
+                  (when (and (eq (dorg-mutate-source-kind src) 'dolt)
+                             (not (plist-get options :dry-run))
+                             op-id (stringp digest) (not (equal digest ""))
+                             (memq (dorg-mutate-error-reason perr)
+                                   dorg-mutate--settled-planning-error-reasons))
+                    (when-let ((hit (dorg-mutate--dolt-op-id-settled
+                                    src options op-id digest
+                                    (plist-get options :base-commit))))
+                      (throw 'dorg-mutate--initial-plan-settled hit)))
+                  (signal (car perr) (cdr perr)))))))
+        ;; Only the initial plan is handled above, never execution/commit.
+        (dorg-mutate--execute-patches src patches options plan owner-plan)))))
+
+(defun dorg-mutate--apply-patches (source patches &optional ext-inputs &rest options)
+  "Validate and execute public typed PATCHES against SOURCE, or signal."
+  (apply #'dorg-mutate--apply-patches-internal
+         source patches ext-inputs nil options))
+
+(defun dorg-mutate--owner-lowering-execute (source family request &rest options)
+  "Lower owner REQUEST under the saved plain-Org gate when it will persist.
+The public API enters that gate itself and calls the -locked seam directly."
+  (dorg-mutate--reject-owner-request-option options)
+  (dorg-mutate--with-saved-plain-file-gate
+   source 'apply options
+   (lambda ()
+     (apply #'dorg-mutate--owner-lowering-execute-locked
+            source family request options))))
+
+(defun dorg-mutate--owner-lowering-execute-locked
+    (source family request &rest options)
+  "Run FAMILY's private typed lowering for REQUEST with fresh plan authority.
+The owner receives only REQUEST and returns `(:patches PATCHES)'; the registry
+mints its uninterned capability after lowering and never exposes it publicly."
+  (dorg-mutate--reject-owner-request-option options)
+  (let* ((participants
+          (condition-case err
+              (dorg-owned-metadata-participants family)
+            (error
+             (apply #'dorg-mutate--raise
+                    'invalid-target "owned metadata owner refused lowering"
+                    :family family
+                    (dorg-owned-metadata-normalize-owner-signal
+                     family nil err)))))
+         (lower (and (listp participants) (plist-get participants :lower))))
+    (unless (functionp lower)
+      (dorg-mutate--raise 'invalid-target "owned metadata owner is unavailable"
+                          :family family :detail 'owner-unavailable))
+    (let* ((lowered
+            (condition-case err
+                (funcall lower request)
+              (error
+               (apply #'dorg-mutate--raise
+                      'invalid-target "owned metadata owner refused lowering"
+                      :family family
+                      (dorg-owned-metadata-normalize-owner-signal
+                       family participants err)))))
+           (patches (plist-get lowered :patches))
+           (capability
+            (dorg-mutate--owner-capability--make
+             :family family
+             :request (dorg-ext--deep-copy request)
+             :execution-id (make-symbol "dorg-owned-metadata-execution-"))))
+      (unless (listp patches)
+        (dorg-mutate--raise 'invalid-target "owner lowering returned no patches"
+                            :family family :detail 'owner-unavailable))
+      (apply #'dorg-mutate--apply-patches-internal-locked
+             source patches nil capability options))))
 
 (provide 'dorg-mutate)
 ;;; dorg-mutate.el ends here

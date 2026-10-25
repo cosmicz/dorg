@@ -257,20 +257,29 @@ OPTIONS:
 ;;; ─── Grouped Hydration ────────────────────────────────────────────────
 
 (defun dorg-ext-read--normalize-plan (plan)
-  "Normalize a `:hydrate' PLAN to a (:sql LIST :reduce FN) plist.
+  "Normalize a `:hydrate' PLAN to a (:sql LIST :reduce/:next FN) plist.
 PLAN is nil (no query), a SQL string, a list of SQL strings, or a plist
-\(:sql SPEC :reduce FN).  Signals `dorg-ext-read-error' otherwise."
+\(:sql SPEC :reduce FN :next FN).  :NEXT receives the current stage's row
+lists and returns the next declarative plan.  DOrg, not the callback, validates
+and executes every resulting statement under the captured revision.  A stage
+uses either :REDUCE or :NEXT, never both.  Signals `dorg-ext-read-error'
+otherwise."
   (cond
    ((null plan) (list :sql nil :reduce nil))
    ((stringp plan) (list :sql (list plan) :reduce nil))
    ((and (consp plan) (cl-every #'stringp plan))
     (list :sql plan :reduce nil))
    ((and (listp plan) (plist-member plan :sql))
-    (let ((reduce (plist-get plan :reduce)))
+    (let ((reduce (plist-get plan :reduce))
+          (next (plist-get plan :next)))
       (unless (or (null reduce) (functionp reduce))
         (dorg-ext-read--error ":reduce must be a function, got %S" reduce))
+      (unless (or (null next) (functionp next))
+        (dorg-ext-read--error ":next must be a function, got %S" next))
+      (when (and reduce next)
+        (dorg-ext-read--error "a hydrate stage cannot combine :reduce and :next"))
       (list :sql (dorg-ext-normalize-sql-or-nil (plist-get plan :sql))
-            :reduce reduce)))
+            :reduce reduce :next next)))
    (t (dorg-ext-read--error "invalid hydrate plan: %S" plan))))
 
 (defun dorg-ext-read--execute (plan resolved &optional revision)
@@ -289,8 +298,10 @@ outside the scope never execute, not even partially.  When PLAN has no
 `:reduce', the per-statement row lists are appended; otherwise `:reduce'
 is applied to the list of per-statement row lists to assemble host-safe
 rows."
+  (setq plan (dorg-ext-read--normalize-plan plan))
   (let* ((dolt-dir (plist-get resolved :dolt-dir))
          (reduce (plist-get plan :reduce))
+         (next (plist-get plan :next))
          (stmts (plist-get plan :sql)))
     ;; Fail-closed plan validation: a revision-bound plan is checked WHOLE
     ;; before its FIRST statement executes, so an unsafe plan never runs
@@ -311,9 +322,14 @@ rows."
                                   (dorg-sql--at-revision dolt-dir revision sql)
                                 (dorg-sql dolt-dir sql)))
                             stmts)))
-      (if reduce
-          (funcall reduce per-stmt)
-        (apply #'append per-stmt)))))
+      (cond
+       (next
+        ;; NEXT returns only a declarative follow-up plan.  Re-entering this
+        ;; executor means its SQL is snapshot-checked and revision-bound by
+        ;; DOrg before any second-stage statement can run.
+        (dorg-ext-read--execute (funcall next per-stmt) resolved revision))
+       (reduce (funcall reduce per-stmt))
+       (t (apply #'append per-stmt))))))
 
 (defun dorg-ext-read--hydrate-entry (cache ext-name source query
                                            &optional require-committed-head)

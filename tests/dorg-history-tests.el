@@ -38,6 +38,140 @@
 
 ;;; ─── Local fixtures ───────────────────────────────────────────────────
 
+(ert-deftest dorg-test-history-update-patches-use-current-item-cells ()
+  "The restore planner's nonempty body replacement crosses the v2 validator."
+  (let* ((cur (make-dorg-heading :id 10 :items (list (dorg-text-item :text "old"))))
+         (tgt (make-dorg-heading :id 10 :items (list (dorg-text-item :text "new"))))
+         (patches (dorg-history--update-patches cur tgt)))
+    (should (equal '(:item :host (:heading :id 10) :select (:all))
+                   (plist-get (car patches) :target)))
+    (let* ((engine (dorg-mutate--validate-patches patches))
+           (out (dorg-mutate--apply-item-patch (dorg-heading-items cur) (car engine))))
+      (should (equal "new" (dorg-text-item-text (car out))))
+      (should (equal "old" (dorg-text-item-text (car (dorg-heading-items cur))))))))
+
+(ert-deftest dorg-test-history-restore-partitions-owned-drawer-properties ()
+  "Generic restore patches leave registered properties to their typed owner.
+
+The ordinary property is still restored by the generic item replacement; the
+registered property is absent from that replacement so deleting the owner
+route cannot silently rewrite it."
+  (let* ((cur (make-dorg-heading
+               :id 10
+               :items (list (dorg-drawer-item
+                             :name "PROPERTIES"
+                             :properties '(("OWNER" . "me")
+                                           ("DORG_CLOCK_START" . "old"))))))
+         (tgt (make-dorg-heading
+               :id 10
+               :items (list (dorg-drawer-item
+                             :name "PROPERTIES"
+                             :properties '(("OWNER" . "them")
+                                           ("DORG_CLOCK_START" . "new"))))))
+         (patches (dorg-history--update-patches cur tgt t))
+         (items (plist-get (car patches) :items)))
+    (should (equal '(("OWNER" . "them"))
+                   (plist-get (car items) :properties)))
+    (should-not (string-match-p "DORG_CLOCK"
+                                (prin1-to-string patches)))))
+
+(ert-deftest dorg-test-history-restore-delegates-owned-values-with-context ()
+  "Restore passes one heading's before/after family values to `:restore'."
+  (let* ((cur (make-dorg-heading
+               :id 10
+               :items (list (dorg-drawer-item
+                             :name "PROPERTIES"
+                             :properties '(("OWNER" . "me")
+                                           ("DORG_CLOCK_START" . "old"))))))
+         (tgt (make-dorg-heading
+               :id 10
+               :items (list (dorg-drawer-item
+                             :name "PROPERTIES"
+                             :properties '(("OWNER" . "them")
+                                           ("DORG_CLOCK_START" . "new"))))))
+         seen)
+    (cl-letf (((symbol-function 'dorg-clock-metadata-owner)
+               (lambda ()
+                 (list :restore
+                       (lambda (context)
+                         (setq seen context)
+                         (list :patches
+                               (list
+                                '(:op update :target (:heading :id 10)
+                                  :fields (:title "owned")))))))))
+      (let ((plan (dorg-history--owned-metadata-restore-plan
+                   cur tgt "base-commit")))
+        (should (equal "DORG_CLOCK_" (plist-get plan :family)))
+        (should (equal '(("DORG_CLOCK_START" . "old"))
+                       (plist-get seen :before)))
+        (should (equal '(("DORG_CLOCK_START" . "new"))
+                       (plist-get seen :after)))
+        (should (equal '(:heading :id 10) (plist-get seen :identity)))
+        (should (equal "base-commit" (plist-get seen :base)))
+        (should (equal '(:op update :target (:heading :id 10)
+                        :fields (:title "owned"))
+                       (car (plist-get plan :patches))))))))
+
+(ert-deftest dorg-test-history-restore-owned-values-refuse-unavailable-owner ()
+  "A family change never falls back to generic restore when its owner is absent."
+  (let* ((cur (make-dorg-heading
+               :id 10 :items (list (dorg-drawer-item
+                                     :name "PROPERTIES"
+                                     :properties '(("DORG_CLOCK_START" . "old"))))))
+         (tgt (make-dorg-heading
+               :id 10 :items (list (dorg-drawer-item
+                                     :name "PROPERTIES"
+                                     :properties '(("DORG_CLOCK_START" . "new"))))))
+         (err (cl-letf (((symbol-function 'dorg-clock-metadata-owner) nil))
+                (should-error
+                 (dorg-history--owned-metadata-restore-plan cur tgt "base")
+                 :type 'dorg-mutate-error))))
+    (let ((data (dorg-error-data err)))
+      (should (eq 'invalid-target (plist-get data :reason)))
+      (should (eq 'owner-unavailable (plist-get data :detail)))
+      (should (equal "DORG_CLOCK_" (plist-get data :family))))))
+
+(ert-deftest dorg-test-history-restore-normalizes-lazy-owner-failure ()
+  "A lazy restore-owner failure is a typed refusal, not a raw Elisp escape."
+  (let* ((cur (make-dorg-heading
+               :id 10 :items (list (dorg-drawer-item
+                                     :name "PROPERTIES"
+                                     :properties '(("DORG_CLOCK_START" . "old"))))))
+         (tgt (make-dorg-heading
+               :id 10 :items (list (dorg-drawer-item
+                                     :name "PROPERTIES"
+                                     :properties '(("DORG_CLOCK_START" . "new")))))))
+    (cl-letf (((symbol-function 'dorg-clock-metadata-owner)
+               (lambda () (error "lazy restore owner failed"))))
+      (let ((err (should-error
+                  (dorg-history--owned-metadata-restore-plan cur tgt "base")
+                  :type 'dorg-mutate-error)))
+        (should (eq 'owner-refused
+                    (plist-get (dorg-error-data err) :detail)))
+        (should (equal "lazy restore owner failed"
+                       (plist-get (dorg-error-data err) :owner-message)))))))
+
+(ert-deftest dorg-test-history-empty-body-uses-descending-deletes ()
+  "Restore clears mutable items through v2 deletes and retains protected ones."
+  (let* ((protected (dorg-keyword-item :keyword "DORG_HASH" :value "owned"))
+         (cur (make-dorg-heading
+               :id 10 :items (list (dorg-text-item :text "old") protected
+                                   (dorg-keyword-item :keyword "K" :value "old"))))
+         (tgt (make-dorg-heading :id 10 :items (list protected)))
+         (patches (dorg-history--update-patches cur tgt))
+         (out (dorg-heading-items cur)))
+    (should (equal '((:occurrence 3) (:occurrence 1))
+                   (mapcar (lambda (patch)
+                             (plist-get (cdr (plist-get patch :target)) :select)) patches)))
+    (dolist (patch (dorg-mutate--validate-patches patches))
+      (setq out (dorg-mutate--apply-item-patch out patch)))
+    (should (= 1 (length out)))
+    (should (equal "DORG_HASH" (dorg-keyword-item-keyword (car out))))
+    (should (= 3 (length (dorg-heading-items cur))))
+    (should-error (dorg-mutate--validate-patches
+                   '((:op replace :target (:item :host (:heading :id 10) :select (:all))
+                          :items nil))) :type 'dorg-mutate-error)))
+
 (defmacro dorg-test-history--with-dolt (&rest body)
   "Run BODY with `dolt-dir' bound to a temp Dolt repo, or skip."
   (declare (indent 0) (debug (body)))
@@ -57,7 +191,7 @@ Returns the root id of the imported tree."
 (defun dorg-test-history--root-id (dolt-dir)
   "Return the level-0 root id in DOLT-DIR."
   (alist-get 'id (car (dorg-sql dolt-dir
-                                "SELECT id FROM headings WHERE level = 0 LIMIT 1"))))
+                                "SELECT id FROM headings WHERE level_offset = 0 LIMIT 1"))))
 
 (defun dorg-test-history--id-by-title (dolt-dir title)
   "Return the id of the heading whose title is TITLE in DOLT-DIR (or nil)."
@@ -180,6 +314,43 @@ This red-pins resolved decision 3."
            (ht (dorg-model-load-tree dolt-dir root))
            (ids (let (acc) (maphash (lambda (k _v) (push k acc)) ht) acc)))
       (should (null (dorg-restore--patches ht ht ids))))))
+
+(ert-deftest dorg-test-7isy6-history-restore-omits-owned-body-keyword ()
+  "Restore replacement omits DOrg-owned body metadata without refusing.
+
+The mutation guard must protect public payloads, not break the history
+planner's established contract to strip DORG_* items from a restore payload."
+  (let* ((current (make-dorg-heading
+                   :id 7 :level 1 :level-offset 1 :title "H"
+                   :items (list (dorg-keyword-item :keyword "DORG_HASH"
+                                                   :value "current" :post-blank 0)
+                                (dorg-text-item :text "new" :post-blank 0))))
+         (target (make-dorg-heading
+                  :id 7 :level 1 :level-offset 1 :title "H"
+                  :items (list (dorg-keyword-item :keyword "DORG_HASH"
+                                                  :value "historic" :post-blank 0)
+                               (dorg-text-item :text "old" :post-blank 0))))
+         (patches (dorg-history--update-patches current target))
+         (replace (car patches)))
+    (should (equal 'replace (plist-get replace :op)))
+    (should (equal '(:item :host (:heading :id 7) :select (:all))
+                   (plist-get replace :target)))
+    (should (equal '((:kind text :text "old"))
+                   (plist-get replace :items)))))
+
+(ert-deftest dorg-test-7isy6-history-restore-exec-omits-owned-body-keyword ()
+  "The trusted restore executes after stripping a historic DORG_* body item."
+  (dorg-test-history--with-dolt
+    (let* ((root (dorg-test-history--import
+                  dolt-dir "* A\n#+DORG_HASH: historic\nold\n" 100 "c1"))
+           (c1 (dorg-head-commit dolt-dir))
+           (id (dorg-test-history--id-by-title dolt-dir "A")))
+      (dorg-test-history--set-body dolt-dir root id "new\n" "c2")
+      (should (string-match-p "new" (dorg-test-history--body-of dolt-dir id)))
+      (dorg-restore-to-commit dolt-dir root id c1)
+      (let ((body (dorg-test-history--body-of dolt-dir id)))
+        (should (string-match-p "old" body))
+        (should-not (string-match-p "DORG_HASH" body))))))
 
 (ert-deftest dorg-test-history-plan-update-for-title-change ()
   "Title A->B between C and HEAD yields a typed update and no delete."
@@ -361,6 +532,28 @@ criterion (the durable-undo body story, resolved decision 3)."
         (should-not (string-match-p "body two" body))))))
 
 ;;; ─── Scope isolation + guards ─────────────────────────────────────────
+
+(ert-deftest dorg-test-history-restore-empty-body-roundtrip ()
+  "Restoring an empty historical body deletes newer items in a forward commit."
+  (dorg-test-history--with-dolt
+    (let* ((root (dorg-test-history--import dolt-dir "* A\n" 100 "empty body"))
+           (c1 (dorg-head-commit dolt-dir))
+           (id (dorg-test-history--id-by-title dolt-dir "A")))
+      (dorg-test-history--set-body dolt-dir root id "later body\n" "add body")
+      (dorg-test--apply-patches
+       (list :dolt-dir dolt-dir :root-id root)
+       (list (dorg-test--keyword-patch 'insert (dorg-test--heading-address id) "K"
+                                      :position :after-last :value "later"))
+       :message "add keyword")
+      (let ((c2 (dorg-head-commit dolt-dir)))
+        (should (string-match-p "later body" (dorg-test-history--body-of dolt-dir id)))
+        (should (= 2 (length (dorg-heading-items
+                              (gethash id (dorg-model-load-tree dolt-dir root))))))
+        (dorg-restore-to-commit dolt-dir root id c1)
+        (should (equal "" (dorg-test-history--body-of dolt-dir id)))
+        (should-not (dorg-heading-items (gethash id (dorg-model-load-tree dolt-dir root))))
+        (should (equal "A" (dorg-test-history--title-of dolt-dir id)))
+        (should-not (equal c2 (dorg-head-commit dolt-dir)))))))
 
 (ert-deftest dorg-test-history-bead-scope-leaves-other-subtree ()
   "A bead-scope restore reverts only its own subtree; a change OUTSIDE
@@ -570,6 +763,115 @@ that visits the path."
         (kill-buffer origin)
         (when (get-buffer "*dorg-history*")
           (kill-buffer "*dorg-history*"))))))
+
+;;; ─── Level offsets ──────────────────────────────────────────────────────
+
+(defun dorg-test-history--offset-of (dolt-dir id)
+  "Return heading ID's stored level offset in DOLT-DIR."
+  (alist-get 'level_offset
+             (car (dorg-sql dolt-dir
+                            (format "SELECT level_offset FROM headings WHERE id = %d" id)))))
+
+(defun dorg-test-history--child-titles (dolt-dir parent)
+  "Return PARENT's child titles in DOLT-DIR in sibling order."
+  (mapcar (lambda (row) (alist-get 'title row))
+          (dorg-sql dolt-dir
+                    (format "SELECT title FROM headings WHERE parent_id = %d ORDER BY sort_key"
+                            parent))))
+
+(defun dorg-test-history--set-offsets (dolt-dir offsets message)
+  "Store OFFSETS, an alist of (ID . OFFSET), in DOLT-DIR and commit MESSAGE."
+  (dolist (pair offsets)
+    (dorg-sql dolt-dir (format "UPDATE headings SET level_offset = %d WHERE id = %d"
+                               (cdr pair) (car pair))))
+  (dorg-commit dolt-dir message))
+
+(ert-deftest dorg-test-level-offset-dolt-history-restores-gap ()
+  "A restored heading keeps its skipped level: the insert carries its offset.
+B sits two levels below A at C1; after B is deleted, a restore to C1 must
+bring it back at offset 2, rendered as `*** B', not flattened to 1."
+  (dorg-test-history--with-dolt
+    (let* ((root (dorg-test-history--import dolt-dir "* A\n*** B\n" 100 "c1"))
+           (c1 (dorg-head-commit dolt-dir))
+           (b (dorg-test-history--id-by-title dolt-dir "B")))
+      (should (eql 2 (dorg-test-history--offset-of dolt-dir b)))
+      (dorg-test--apply-patches (list :dolt-dir dolt-dir :root-id root)
+                                (list (dorg-test--delete-patch b))
+                                :message "delete B")
+      (should-not (dorg-test-history--title-of dolt-dir b))
+      (dorg-restore-to-commit dolt-dir root nil c1)
+      (should (eql 2 (dorg-test-history--offset-of dolt-dir b)))
+      (should (string-match-p "^\\*\\*\\* B$" (dorg-render dolt-dir root))))))
+
+(ert-deftest dorg-test-level-offset-dolt-history-restores-gapped-first-sibling ()
+  "A restored gapped first sibling returns at its target position.
+At C1, `** X' precedes `* Y' under the root (offsets 2 then 1).  Appending
+X after Y would need Y's offset >= 2 and be refused as unrepresentable, so
+the insert is anchored before its target successor."
+  (dorg-test-history--with-dolt
+    (let* ((root (dorg-test-history--import dolt-dir "** X\n* Y\n" 100 "c1"))
+           (c1 (dorg-head-commit dolt-dir))
+           (x (dorg-test-history--id-by-title dolt-dir "X")))
+      (dorg-test--apply-patches (list :dolt-dir dolt-dir :root-id root)
+                                (list (dorg-test--delete-patch x))
+                                :message "delete X")
+      (should (equal '("Y") (dorg-test-history--child-titles dolt-dir root)))
+      (dorg-restore-to-commit dolt-dir root nil c1)
+      (should (equal '("X" "Y") (dorg-test-history--child-titles dolt-dir root)))
+      (should (eql 2 (dorg-test-history--offset-of dolt-dir x))))))
+
+(ert-deftest dorg-test-level-offset-dolt-history-restores-gapped-sibling-pair ()
+  "Re-created siblings of different levels return in target order.
+At C1, `** X' precedes `* Y' under the root; both are deleted.  Inserts of
+one fan run in sibling order (by tree depth, not effective level), so X is
+placed first and Y after it; Y first would leave X appended below Y."
+  (dorg-test-history--with-dolt
+    (let* ((root (dorg-test-history--import dolt-dir "** X\n* Y\n* Z\n" 100 "c1"))
+           (c1 (dorg-head-commit dolt-dir))
+           (x (dorg-test-history--id-by-title dolt-dir "X"))
+           (y (dorg-test-history--id-by-title dolt-dir "Y")))
+      (dorg-test--apply-patches (list :dolt-dir dolt-dir :root-id root)
+                                (list (dorg-test--delete-patch x)
+                                      (dorg-test--delete-patch y))
+                                :message "delete X and Y")
+      (should (equal '("Z") (dorg-test-history--child-titles dolt-dir root)))
+      (dorg-restore-to-commit dolt-dir root nil c1)
+      (should (equal '("X" "Y" "Z") (dorg-test-history--child-titles dolt-dir root)))
+      (should (eql 2 (dorg-test-history--offset-of dolt-dir x)))
+      (should (eql 1 (dorg-test-history--offset-of dolt-dir y))))))
+
+(ert-deftest dorg-test-level-offset-dolt-history-offset-only-same-parent ()
+  "An offset-only difference under the same parent is restored in place.
+B and C sit at offset 2 under P at C1 and are lowered to 1 at HEAD.  The
+restore raises both back to 2 through the move door, first sibling first
+\(raising C first would put it above B), keeping their order."
+  (dorg-test-history--with-dolt
+    (let* ((root (dorg-test-history--import dolt-dir "* P\n*** B\n*** C\n" 100 "c1"))
+           (c1 (dorg-head-commit dolt-dir))
+           (p (dorg-test-history--id-by-title dolt-dir "P"))
+           (b (dorg-test-history--id-by-title dolt-dir "B"))
+           (c (dorg-test-history--id-by-title dolt-dir "C")))
+      (dorg-test-history--set-offsets dolt-dir (list (cons b 1) (cons c 1)) "lower")
+      (dorg-restore-to-commit dolt-dir root nil c1)
+      (should (eql 2 (dorg-test-history--offset-of dolt-dir b)))
+      (should (eql 2 (dorg-test-history--offset-of dolt-dir c)))
+      (should (equal '("B" "C") (dorg-test-history--child-titles dolt-dir p))))))
+
+(ert-deftest dorg-test-level-offset-dolt-history-offset-only-decrease-order ()
+  "Offset decreases are restored last sibling first, keeping order.
+B and C sit at offset 1 under P at C1 and are raised to 2 at HEAD; lowering
+B first would leave it below C, which Org cannot represent."
+  (dorg-test-history--with-dolt
+    (let* ((root (dorg-test-history--import dolt-dir "* P\n** B\n** C\n" 100 "c1"))
+           (c1 (dorg-head-commit dolt-dir))
+           (p (dorg-test-history--id-by-title dolt-dir "P"))
+           (b (dorg-test-history--id-by-title dolt-dir "B"))
+           (c (dorg-test-history--id-by-title dolt-dir "C")))
+      (dorg-test-history--set-offsets dolt-dir (list (cons b 2) (cons c 2)) "raise")
+      (dorg-restore-to-commit dolt-dir root nil c1)
+      (should (eql 1 (dorg-test-history--offset-of dolt-dir b)))
+      (should (eql 1 (dorg-test-history--offset-of dolt-dir c)))
+      (should (equal '("B" "C") (dorg-test-history--child-titles dolt-dir p))))))
 
 (provide 'dorg-history-tests)
 ;;; dorg-history-tests.el ends here

@@ -145,9 +145,11 @@ Returns the results buffer."
             (insert "No matches.\n")
           (dolist (r results)
             (let ((start (point)))
-              (insert (format "%-10s %s\n"
-                              (or (plist-get r :heading-id) "—")
-                              (or (plist-get r :title) "")))
+              (insert (if (plist-member r :values)
+                          (concat (dorg-ql-result-text r) "\n")
+                        (format "%-10s %s\n"
+                                (or (plist-get r :heading-id) "—")
+                                (or (plist-get r :title) ""))))
               (put-text-property start (point) 'dorg-command-result r))))
         (goto-char (point-min))))
     (display-buffer buf)

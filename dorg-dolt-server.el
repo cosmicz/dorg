@@ -461,6 +461,482 @@ never wedges transport selection or the server listing."
   "Return the claim alist for DOLT-DIR, or nil when absent/unreadable."
   (dorg-dolt-server--read-claim-form (dorg-dolt-server--claim-file dolt-dir)))
 
+;;; ─── Store evidence: argv, then kernel ─────────────────────────────────
+;;
+;; A claim (overlay or dolt-native `sql-server.info') is bytes on disk, so a
+;; copy made from another store names that store's pid and port.  Before any
+;; endpoint contact, `dorg-dolt-server--claim-store-verdict' asks what the live
+;; process demonstrably serves.  An explicit --data-dir in its argv answers
+;; directly.  When argv is silent (a raw `dolt sql-server' serving its working
+;; directory) or the recorded pid is dead or replaced while its port is still
+;; served, the kernel answers instead: a running server holds an open
+;; descriptor on `<store>/.dolt/noms/LOCK' for EACH database it serves, and a
+;; byte copy cannot reproduce another process's descriptor.  Store UUID/HEAD
+;; cannot distinguish a copy, which is why the evidence is a held descriptor
+;; rather than content.  The process asked is always the current owner of the
+;; claimed listening port: a claim records a pid but no start time, so a live
+;; pid that still looks like Dolt may have been reused by another server.
+;;
+;; A server serves a SET of databases, so PROVEN means the requested store is
+;; in that set and CONTRADICTORY means it is not.  The kernel probes are two
+;; separate observations (socket owner, then held files), so a verdict rests
+;; on one source-tagged process identity, re-validated after the last
+;; observation.  GNU/Linux uses pid plus boot id plus /proc start ticks plus
+;; argv; other platforms retain the existing pid plus Emacs start time plus
+;; argv source.  Every probe is scoped to one pid or one port and nothing
+;; dials the port.
+;;
+;; Compatibility choice: a probe that is missing, refused, fails, or answers
+;; anything unparseable, ambiguous, empty, or torn leaves the evidence ABSENT,
+;; which is exactly the behavior without these probes.  They may only ADD
+;; refusals they prove, never turn a failed observation into a refusal.  The
+;; residual is stated rather than hidden: a server that holds no lock yet, a
+;; host without a working probe, and a platform whose process start time is
+;; not stable between reads all stay absent.  Only attach-time classification
+;; runs this; the validated-attachment cache on the query path never does.
+
+(defun dorg-dolt-server--attrs-dolt-sql-server-p (attrs)
+  "Return non-nil when process ATTRS identify a `dolt sql-server'."
+  (let ((comm (cdr (assq 'comm attrs)))
+        (args (cdr (assq 'args attrs))))
+    (and (stringp args)
+         ;; Darwin reports the interpreter in comm for a locally named
+         ;; executable script, but preserves its invoked pathname in args.
+         ;; Accept either OS representation of the executable name.
+         (or (and (stringp comm)
+                  (equal (file-name-nondirectory comm) "dolt"))
+             (let ((argv0 (car (split-string args "[ \t]+" t))))
+               (and argv0
+                    (equal (file-name-nondirectory argv0) "dolt"))))
+         (string-match-p "\\_<sql-server\\_>" args))))
+
+(defun dorg-dolt-server--attrs-data-dir (attrs)
+  "Return the canonical explicit --data-dir in process ATTRS' argv, or nil."
+  (let* ((args (cdr (assq 'args attrs)))
+         (linux-args (eq system-type 'gnu/linux))
+         (data-dir-pattern
+          (concat "--data-dir\\(?:=\\| \\)"
+                  (if linux-args
+                      "\\(\\(?:\\\\[[:space:]\\\\]\\|[^[:space:]\\\\]\\)+\\)\\(?: \\|\\'\\)"
+                    "\\(.*?\\)\\(?: --\\|\\'\\)"))))
+    ;; GNU/Linux escapes whitespace and backslashes in each argv element.
+    ;; Darwin's display has raw spaces, so retain its next-option/EOL boundary.
+    (when (and (stringp args) (string-match data-dir-pattern args))
+      (dorg-dolt-server--canonical-dir
+       (if linux-args
+           (replace-regexp-in-string
+            "\\\\\\([[:space:]\\\\]\\)" "\\1" (match-string 1 args) t)
+         (string-trim (match-string 1 args)))))))
+
+
+(defun dorg-dolt-server--linux-proc-stat-starttime (contents)
+  "Return Linux /proc stat field 22 from CONTENTS, or nil when malformed.
+The command field is parenthesized and may contain spaces or parens, so split
+only after its final closing parenthesis."
+  (when (string-match "\\`[0-9]+ (.*) \\(.*\\)\\(?:\n\\)?\\'" contents)
+    (let ((value (nth 19 (split-string (match-string 1 contents) " " t))))
+      (and value (string-match-p "\\`[0-9]+\\'" value) value))))
+
+(defun dorg-dolt-server--linux-proc-boot-id (contents)
+  "Return the canonical Linux boot ID from CONTENTS, or nil when malformed."
+  (when (string-match-p
+         "\\`[0-9a-f]\\{8\\}-[0-9a-f]\\{4\\}-[0-9a-f]\\{4\\}-[0-9a-f]\\{4\\}-[0-9a-f]\\{12\\}\\(?:\n\\)?\\'"
+         contents)
+    (string-trim-right contents)))
+
+(defun dorg-dolt-server--linux-proc-birth (pid)
+  "Return Linux PID's exact (BOOT-ID START-TICKS) birth tuple, or nil.
+The proc reads are non-atomic.  A PID reuse between reads therefore produces a
+different tuple at recheck and fails safe rather than supporting a refusal."
+  (when (eq system-type 'gnu/linux)
+    (condition-case nil
+        (let ((boot-id
+               (with-temp-buffer
+                 (insert-file-contents-literally "/proc/sys/kernel/random/boot_id")
+                 (dorg-dolt-server--linux-proc-boot-id (buffer-string))))
+              (start-ticks
+               (with-temp-buffer
+                 (insert-file-contents-literally (format "/proc/%d/stat" pid))
+                 (dorg-dolt-server--linux-proc-stat-starttime (buffer-string)))))
+          (and boot-id start-ticks (list boot-id start-ticks)))
+      (file-error nil)
+      (error nil))))
+
+(defun dorg-dolt-server--attrs-identity (pid attrs)
+  "Return PID's source-tagged identity from process ATTRS, or nil.
+On GNU/Linux the source is `linux-proc' and its birth tuple is exact boot ID
+and /proc start ticks; there is no Emacs-start fallback.  Other platforms
+retain the existing `emacs-start' source.  ARGS tells an exec apart."
+  (let ((args (cdr (assq 'args attrs))))
+    (if (eq system-type 'gnu/linux)
+        (let ((birth (dorg-dolt-server--linux-proc-birth pid)))
+          (and birth (list :pid pid :source 'linux-proc :birth birth :args args)))
+      (let ((start (cdr (assq 'start attrs))))
+        (and start (list :pid pid :source 'emacs-start :birth start :args args))))))
+
+(defun dorg-dolt-server--identity-held-p (identity)
+  "Return non-nil when IDENTITY's process is still the one observed.
+Re-reads the process table.  Any failure, including a comparison that
+signals, answers nil, so a torn observation can never support a refusal."
+  (condition-case nil
+      (let* ((pid (plist-get identity :pid))
+             (source (plist-get identity :source))
+             (now (and (integerp pid)
+                       (memq source '(linux-proc emacs-start))
+                       (dorg-dolt-server--attrs-identity
+                        pid (process-attributes pid)))))
+        (and now
+             (eq source (plist-get now :source))
+             (equal (plist-get identity :args) (plist-get now :args))
+             (pcase source
+               ('linux-proc
+                (equal (plist-get identity :birth) (plist-get now :birth)))
+               ('emacs-start
+                (time-equal-p (plist-get identity :birth)
+                              (plist-get now :birth))))))
+    (error nil)))
+
+(defun dorg-dolt-server--run-probe (program &rest args)
+  "Run PROGRAM with ARGS; return its stdout lines on exit 0, else `unknown'.
+The single seam through which kernel-evidence probes run.  Stderr is
+discarded.  A missing PROGRAM, a nonzero or signalled exit, and any error
+all answer `unknown'."
+  (let ((exe (executable-find program)))
+    (if (not exe)
+        'unknown
+      (condition-case nil
+          (with-temp-buffer
+            (if (eql 0 (apply #'call-process exe nil (list t nil) nil args))
+                (split-string (buffer-string) "\n" t)
+              'unknown))
+        (error 'unknown)))))
+
+(defun dorg-dolt-server--lock-store (path)
+  "Return the store directory whose noms LOCK is PATH, or nil.
+A lock inside a `.dolt' directory belongs to Dolt's internal databases
+\(such as `.dolt/stats'), which are not served stores."
+  (when (and (stringp path)
+             (string-match "\\`\\(/.+\\)/\\.dolt/noms/LOCK\\'" path))
+    (let ((store (match-string 1 path)))
+      (unless (string-match-p "/\\.dolt\\(?:/\\|\\'\\)" store)
+        store))))
+
+(defun dorg-dolt-server--parse-lsof-files (pid lines)
+  "Parse `lsof -Ffn' LINES for PID into (:locks PATHS :cwd DIR), or `unknown'.
+The output must describe exactly PID once; any other process record, an
+unexpected field, or a second working directory is ambiguous."
+  (let (pids fd cwd locks bad)
+    (dolist (line lines)
+      (let ((value (substring line 1)))
+        (pcase (aref line 0)
+          (?p (push (string-to-number value) pids))
+          (?f (setq fd value))
+          (?n (cond ((equal fd "cwd")
+                     (if cwd (setq bad t) (setq cwd value)))
+                    ((dorg-dolt-server--lock-store value)
+                     (push value locks))))
+          (_ (setq bad t)))))
+    (if (or bad (not (equal pids (list pid))))
+        'unknown
+      (list :locks (nreverse locks) :cwd cwd))))
+
+(defun dorg-dolt-server--lsof-served-paths (pid)
+  "Return PID's held noms LOCK paths and cwd via `lsof -p PID', or `unknown'."
+  (let ((lines (dorg-dolt-server--run-probe
+                "lsof" "-w" "-n" "-P" "-a" "-p" (number-to-string pid) "-Ffn")))
+    (if (eq lines 'unknown)
+        'unknown
+      (dorg-dolt-server--parse-lsof-files pid lines))))
+
+(defun dorg-dolt-server--proc-served-paths (pid proc-root)
+  "Return PID's held noms LOCK paths and cwd read under PROC-ROOT, or `unknown'.
+PROC-ROOT is a procfs mount such as \"/proc/\"; only PROC-ROOT/PID is read.
+An unreadable descriptor table (another user's process) is `unknown'."
+  (condition-case nil
+      (let* ((dir (expand-file-name (number-to-string pid) proc-root))
+             (fds (directory-files (expand-file-name "fd" dir) t "\\`[0-9]+\\'" t))
+             (cwd (file-symlink-p (expand-file-name "cwd" dir)))
+             locks)
+        (dolist (fd fds)
+          (let ((target (file-symlink-p fd)))
+            (when (dorg-dolt-server--lock-store target)
+              (push target locks))))
+        (list :locks (nreverse locks) :cwd (and (stringp cwd) cwd)))
+    (error 'unknown)))
+
+(defun dorg-dolt-server--probe-served-paths (pid)
+  "Return the noms LOCK paths PID holds open and its cwd, or `unknown'.
+Answers (:locks PATHS :cwd DIR).  Scoped to PID: procfs where the platform
+has it, else `lsof -p PID'."
+  (if (file-directory-p "/proc/self/fd")
+      (dorg-dolt-server--proc-served-paths pid "/proc/")
+    (dorg-dolt-server--lsof-served-paths pid)))
+
+(defun dorg-dolt-server--probe-socket-owner (port)
+  "Return the one pid listening on TCP PORT, else `unknown'.
+Scoped to PORT and read from the kernel socket table; nothing connects to
+PORT.  lsof exits nonzero both when nothing listens and when it cannot see
+the listener, so neither is distinguishable from failure; both answer
+`unknown', as do several listening processes."
+  (let ((lines (dorg-dolt-server--run-probe
+                "lsof" "-w" "-n" "-P" (format "-iTCP:%d" port)
+                "-sTCP:LISTEN" "-Fp")))
+    (if (eq lines 'unknown)
+        'unknown
+      (let (pids bad)
+        (dolist (line lines)
+          (pcase (aref line 0)
+            (?p (let ((pid (string-to-number (substring line 1))))
+                  (unless (memql pid pids) (push pid pids))))
+            (?f nil)
+            (_ (setq bad t))))
+        (if (and (not bad) (= (length pids) 1) (> (car pids) 0))
+            (car pids)
+          'unknown)))))
+
+(defun dorg-dolt-server--parse-lsof-lock-holders (lock lines)
+  "Return the PIDs in LINES that hold canonical LOCK, or `unknown'.
+LINES are the `-Fpn' output from a file-scoped `lsof' query.  A PID record
+must precede every matching name; any malformed field makes the observation
+indeterminate rather than accidentally authorizing a launch."
+  (let (pid holders bad)
+    (dolist (line lines)
+      (if (or (not (stringp line)) (zerop (length line)))
+          (setq bad t)
+        (pcase (aref line 0)
+          (?p (let ((value (substring line 1)))
+                (if (string-match-p "\\`[1-9][0-9]*\\'" value)
+                    (setq pid (string-to-number value))
+                  (setq bad t))))
+          (?f nil)
+          (?n (when (equal (substring line 1) lock)
+                (if pid
+                    (push pid holders)
+                  (setq bad t))))
+          (_ (setq bad t)))))
+    (if bad 'unknown (delete-dups (nreverse holders)))))
+
+(defconst dorg-dolt-server--admission-lsof-script
+  "PATH=/usr/sbin:/usr/bin:/bin:$PATH\noutput=$(lsof -w -n -P -Fpn \"$1\" 2>&1); status=$?\nif [ \"$status\" -eq 0 ]; then\n  printf '%s\\n' \"$output\"\nelif [ \"$status\" -eq 1 ] && [ -z \"$output\" ]; then\n  exit 0\nelse\n  printf '%s\\n' \"$output\" >&2\n  exit \"$status\"\nfi"
+  "Run file-scoped lsof while preserving a distinguishable empty result.
+
+macOS lsof exits one for an empty file selection.  The adapter maps only its
+silent no-selection result to zero; missing lsof and every diagnostic failure
+remain nonzero so `dorg-dolt-server--run-probe' returns `unknown'.  The
+standard system lsof directory is retained on scrubbed PATHs; LOCK is passed
+as $1, never interpolated into the shell source.")
+
+(defun dorg-dolt-server--admission-lock-holders (dolt-dir)
+  "Return proven sql-server PIDs holding DOLT-DIR's noms LOCK, or `unknown'.
+This is the strict, pre-spawn census only.  It deliberately does not alter
+the permissive claim-verdict layer used by attachment and stop callers.
+
+`lsof' normally exits one when a named file has no open holders.  Its fixed
+shell adapter runs through the same probe seam and maps only that silent
+no-selection case to usable empty output.  Parsing considers only the exact
+canonical LOCK path.  Each lock hit must retain one stable process identity
+and prove either its explicit canonical `--data-dir' or its cwd-served store
+before it is an admission holder."
+  (let* ((target (dorg-dolt--target dolt-dir))
+         (store (plist-get target :canonical-repo-dir))
+         (lock (expand-file-name ".dolt/noms/LOCK" store))
+         ;; A freshly initialized store may have no noms lock until Dolt first
+         ;; opens it.  That absence is conclusively clear, unlike a failed
+         ;; probe of an existing lock (or a dangling lock symlink), which stays
+         ;; indeterminate and blocks managed start.
+         (missing-lock (and (not (file-exists-p lock))
+                            (not (file-symlink-p lock)))))
+    (if missing-lock
+        nil
+      (let ((lines (dorg-dolt-server--run-probe
+                    "sh" "-c" dorg-dolt-server--admission-lsof-script
+                    "dorg-admission-lsof" lock)))
+        (if (eq lines 'unknown)
+            'unknown
+          (let ((pids (dorg-dolt-server--parse-lsof-lock-holders lock lines))
+                holders)
+            (if (eq pids 'unknown)
+                'unknown
+              (condition-case nil
+                  (catch 'indeterminate
+                    (dolist (pid pids)
+                      (let* ((attrs (process-attributes pid))
+                             (identity (and attrs
+                                            (dorg-dolt-server--attrs-identity pid attrs)))
+                             (data-dir (and attrs
+                                            (dorg-dolt-server--attrs-data-dir attrs))))
+                        (unless (and identity
+                                     (dorg-dolt-server--attrs-dolt-sql-server-p attrs))
+                          (throw 'indeterminate 'unknown))
+                        (if data-dir
+                            (unless (equal data-dir store)
+                              (throw 'indeterminate 'unknown))
+                          (let ((paths (dorg-dolt-server--probe-served-paths pid)))
+                            (unless (and (not (eq paths 'unknown))
+                                         (let ((served (dorg-dolt-server--served-set paths t)))
+                                           (and served (member store (cdr served)))))
+                              (throw 'indeterminate 'unknown))))
+                        (unless (dorg-dolt-server--identity-held-p identity)
+                          (throw 'indeterminate 'unknown))
+                        (push pid holders)))
+                    (nreverse holders))
+                (error 'unknown)))))))))
+
+(defun dorg-dolt-server--assert-admission-clear (dolt-dir)
+  "Refuse a managed start unless DOLT-DIR's owner census is conclusively clear.
+Call only while `dorg-dolt-server--with-claim-lock' is held and before any
+child spawn, claim publication, or info rewrite."
+  (pcase (dorg-dolt-server--admission-lock-holders dolt-dir)
+    ('unknown
+     (signal 'dorg-sql-transport-error
+             (list (format (concat "dorg: owner census for %s is indeterminate; "
+                                   "refusing managed sql-server start")
+                           (dorg-dolt-server--canonical-dir dolt-dir)))))
+    (`() t)
+    (holders
+     (signal 'dorg-sql-transport-conflict
+             (list (format (concat "dorg: refusing managed sql-server start for %s; "
+                                   "live owner census holds .dolt/noms/LOCK (pid%s %s)")
+                           (dorg-dolt-server--canonical-dir dolt-dir)
+                           (if (= (length holders) 1) "" "s")
+                           (mapconcat #'number-to-string holders ", ")))))))
+
+(defun dorg-dolt-server--served-set (paths cwd-allowed)
+  "Return (BASIS . STORES): the canonical stores PATHS demonstrate, or nil.
+Held noms locks come first, BASIS `locks'.  Only when no lock names a store
+and CWD-ALLOWED (argv has no explicit --data-dir) does the working directory
+answer, BASIS `cwd': a server without --data-dir serves its cwd if that is a
+Dolt repo, and each immediate subdirectory that is one."
+  (let (stores)
+    (dolist (lock (plist-get paths :locks))
+      (let ((store (dorg-dolt-server--lock-store lock)))
+        (when store
+          (push (dorg-dolt-server--canonical-dir store) stores))))
+    (if stores
+        (cons 'locks (delete-dups (nreverse stores)))
+      (let ((cwd (plist-get paths :cwd)))
+        (when (and cwd-allowed (stringp cwd) (file-directory-p cwd))
+          (dolist (dir (cons cwd (directory-files
+                                  cwd t directory-files-no-dot-files-regexp t)))
+            (when (file-directory-p (expand-file-name ".dolt" dir))
+              (push (dorg-dolt-server--canonical-dir dir) stores)))
+          (when stores
+            (cons 'cwd (delete-dups (nreverse stores)))))))))
+
+(defun dorg-dolt-server--kernel-verdict (expected pid attrs source port recheck-port)
+  "Classify EXPECTED against what PID demonstrably serves, from the kernel.
+ATTRS is PID's already-observed process attributes, whose identity must
+still hold after the files probe.  With RECHECK-PORT, PID must also still
+own that listening socket.  SOURCE and PORT label the verdict.  Anything
+short of a coherent, non-empty served set is `absent'."
+  (let* ((identity (dorg-dolt-server--attrs-identity pid attrs))
+         (paths (if identity
+                    (dorg-dolt-server--probe-served-paths pid)
+                  'unknown))
+         (served (and (not (eq paths 'unknown))
+                      (dorg-dolt-server--identity-held-p identity)
+                      (or (null recheck-port)
+                          (eql pid (dorg-dolt-server--probe-socket-owner
+                                    recheck-port)))
+                      (dorg-dolt-server--served-set
+                       paths (null (dorg-dolt-server--attrs-data-dir attrs))))))
+    (list :evidence (cond ((null served) 'absent)
+                          ((member expected (cdr served)) 'proven)
+                          (t 'contradictory))
+          :source source :basis (car served) :served (cdr served)
+          :pid pid :port port)))
+
+(defun dorg-dolt-server--claim-store-verdict (dolt-dir claim)
+  "Classify CLAIM's process evidence for DOLT-DIR without contacting its port.
+Return a plist whose `:evidence' is `proven', `contradictory' or `absent',
+with `:source' (`argv', `recorded-pid' or `socket-owner'), `:basis'
+\(`locks' or `cwd' for kernel evidence), `:served', `:pid' and `:port'
+describing what decided it.
+
+- A live `dolt sql-server' at the recorded pid with an explicit --data-dir
+  answers from argv: `proven' when it is DOLT-DIR, else `contradictory'.
+- Otherwise the process that currently owns the claim's listening port
+  answers from the stores it holds, when that is a `dolt sql-server'.  This
+  covers a raw server without --data-dir, a dead recorded pid, and a
+  recorded pid reused by any other process, including another raw Dolt
+  server: a pid alone carries no start time in the claim, so only the
+  port's current owner is bound to the endpoint.  `:source' is
+  `recorded-pid' when that owner is the recorded pid, else `socket-owner'.
+- Everything else, including no or malformed pid, no port, an unresolved
+  port owner and every probe failure, is `absent'.
+
+Absent keeps the established claim lifecycle (including dead-claim
+recovery) intact; contradictory is the only safe basis for refusing a
+copied claim before any endpoint contact."
+  (let ((pid (alist-get :server-pid claim))
+        (port (alist-get :port claim))
+        (expected (dorg-dolt-server--canonical-dir dolt-dir)))
+    (or (and (integerp pid) (> pid 0)
+             (condition-case nil
+                 (let* ((attrs (process-attributes pid))
+                        (data-dir (and (dorg-dolt-server--attrs-dolt-sql-server-p attrs)
+                                       (dorg-dolt-server--attrs-data-dir attrs))))
+                   (if data-dir
+                       (list :evidence (if (equal expected data-dir)
+                                           'proven
+                                         'contradictory)
+                             :source 'argv :served (list data-dir)
+                             :pid pid :port port)
+                     ;; Argv is silent, the pid is dead, or it runs something
+                     ;; else: a live pid that merely looks like Dolt may have
+                     ;; been reused, so only the current owner of the claimed
+                     ;; port can say what the endpoint serves.
+                     (let* ((owner (and (integerp port)
+                                        (dorg-dolt-server--probe-socket-owner port)))
+                            (owner-attrs (cond ((not (integerp owner)) nil)
+                                               ((eql owner pid) attrs)
+                                               (t (process-attributes owner)))))
+                       (and (dorg-dolt-server--attrs-dolt-sql-server-p owner-attrs)
+                            (dorg-dolt-server--kernel-verdict
+                             expected owner owner-attrs
+                             (if (eql owner pid) 'recorded-pid 'socket-owner)
+                             port port)))))
+               (error nil)))
+        (list :evidence 'absent :pid pid :port port))))
+
+(defun dorg-dolt-server--claim-store-evidence (dolt-dir claim)
+  "Return CLAIM's store evidence for DOLT-DIR.
+The answer is `proven', `contradictory' or `absent'; see
+`dorg-dolt-server--claim-store-verdict', which also says what decided it."
+  (plist-get (dorg-dolt-server--claim-store-verdict dolt-dir claim) :evidence))
+
+(defun dorg-dolt-server--foreign-store-message (dolt-dir verdict)
+  "Return the refusal diagnostic for DOLT-DIR's contradictory VERDICT.
+It names the requested store, what the live process demonstrably serves,
+its pid and port, the deciding evidence, and a manual recovery route.
+Recovery is manual by design: DOrg deletes, signals and repairs nothing."
+  (let ((store (dorg-dolt-server--canonical-dir dolt-dir))
+        (pid (plist-get verdict :pid)))
+    (format "dorg: refusing server claim for %s: the live dolt sql-server (pid %s, port %s) demonstrably serves %s, not this store; evidence: %s.  Nothing was deleted, signalled or repaired.  Manual recovery: confirm what pid %s serves (for example with lsof -p %s); if %s or %s was copied from another store, remove the copied file by hand, then retry"
+            store pid (plist-get verdict :port)
+            (mapconcat #'identity (plist-get verdict :served) ", ")
+            (pcase (list (plist-get verdict :source) (plist-get verdict :basis))
+              (`(argv ,_) "the explicit --data-dir in its argv")
+              (`(recorded-pid locks) "store locks held open by the claim's recorded pid, which owns the claimed port")
+              (`(recorded-pid cwd) "the working directory of the claim's recorded pid, which owns the claimed port and has no --data-dir")
+              (`(socket-owner locks) "store locks held open by the process listening on the claim's port; the recorded pid is dead or replaced")
+              (`(socket-owner cwd) "the working directory of the process listening on the claim's port; the recorded pid is dead or replaced")
+              (_ "process evidence"))
+            pid pid
+            (expand-file-name ".dolt/sql-server.info" store)
+            (dorg-dolt-server--claim-file store))))
+
+(defun dorg-dolt-server--assert-claim-not-foreign-store (dolt-dir claim)
+  "Refuse a CLAIM whose live process conclusively serves another store.
+This is intentionally an attach-selector guard, rather than part of the
+total discovery reader.  It must run before claim classification, which may
+contact CLAIM's recorded port."
+  (let ((verdict (dorg-dolt-server--claim-store-verdict dolt-dir claim)))
+    (when (eq (plist-get verdict :evidence) 'contradictory)
+      (signal 'dorg-sql-transport-error
+              (list (dorg-dolt-server--foreign-store-message dolt-dir verdict)))))
+  claim)
+
 (defun dorg-dolt-server--claim-write (dolt-dir claim)
   "Atomically write CLAIM (an alist) as DOLT-DIR's claim file.
 Writes to a temp file in the runtime dir and renames it into place so a
@@ -566,18 +1042,33 @@ anchor; the store-relative DOrg overlay adds ownership.  Reconciliation
   record.
 Reconciling to a single claim also ensures a store with both an overlay and
 native info is counted once."
-  (let ((overlay (dorg-dolt-server--claim-read dolt-dir))
-        (native (dorg-dolt-server--dolt-server-info dolt-dir)))
+  (let* ((overlay (dorg-dolt-server--claim-read dolt-dir))
+         (native (dorg-dolt-server--dolt-server-info dolt-dir))
+         (native-claim (and native
+                            (dorg-dolt-server--synthesize-dolt-claim dolt-dir)))
+         ;; Preserve a contradictory candidate without probing its port.  The
+         ;; attach selector will make the terminal refusal; this reader stays
+         ;; total so lifecycle recovery and diagnostics can still inspect dead
+         ;; or otherwise unproven claims.
+         (overlay-evidence (and overlay
+                                (dorg-dolt-server--claim-store-evidence
+                                 dolt-dir overlay)))
+         (native-evidence (and native-claim
+                               (dorg-dolt-server--claim-store-evidence
+                                dolt-dir native-claim))))
     (cond
+     ((eq overlay-evidence 'contradictory) overlay)
+     ((eq native-evidence 'contradictory) native-claim)
      ((eq (alist-get :state overlay) 'probe-inconclusive)
       overlay)
      ((and overlay native
            (eql (alist-get :port overlay) (plist-get native :port)))
       overlay)
-     ((and native (dorg-dolt-server--port-live-p (plist-get native :port)))
-      (dorg-dolt-server--synthesize-dolt-claim dolt-dir))
+     ((and native-claim
+           (dorg-dolt-server--port-live-p (plist-get native :port)))
+      native-claim)
      (overlay overlay)
-     (native (dorg-dolt-server--synthesize-dolt-claim dolt-dir)))))
+     (native-claim native-claim))))
 
 (defcustom dorg-dolt-server-claim-lock-timeout 10.0
   "Seconds to wait to acquire the claim lock before attempting a stale reap.
@@ -851,6 +1342,7 @@ token."
          (now (float-time))
          (prev (dorg-dolt-server--claim-read dolt-dir))
          (derived (dorg-dolt-server--data-dir-and-db dolt-dir))
+         (server-pid (or server-pid (and prev (alist-get :server-pid prev))))
          (data-dir (or data-dir (car derived)))
          (db-name (or db-name (cdr derived)))
          (claim (append
@@ -1125,7 +1617,7 @@ closed (nil) on any connection or parse failure."
                  (sql (format (concat "SELECT f.root_id FROM `%s`.dorg_files f "
                                       "JOIN `%s`.headings h ON h.id = f.root_id "
                                       "WHERE %s%s AND h.parent_id IS NULL "
-                                      "AND h.level = 0 "
+                                      "AND h.level_offset = 0 "
                                       "AND h.root_id = f.root_id LIMIT 1")
                               quoted-db quoted-db pred
                               (if root-id
@@ -1304,7 +1796,7 @@ Fails closed: an unreadable store yields a `no-schema' failure."
                  (format (concat "SELECT f.root_id FROM dorg_files f "
                                  "JOIN headings h ON h.id = f.root_id "
                                  "WHERE %s%s AND h.parent_id IS NULL "
-                                 "AND h.level = 0 "
+                                 "AND h.level_offset = 0 "
                                  "AND h.root_id = f.root_id LIMIT 1")
                          (dorg-repo--relative-path-match
                           "f.relative_path" dolt-dir
@@ -1460,6 +1952,7 @@ one-shot CLI."
               ;; directly so we neither re-enter the mutex nor re-run the
               ;; public conflict check we have already decided here.
               (dorg-dolt-server--start-unsafe dolt-dir)
+            (dorg-dolt-server--assert-claim-not-foreign-store dolt-dir claim)
             ;; Deep classify: this is the cache-miss attach decision, so pay
             ;; for one SQL probe to distinguish a healthy owner from a wedged
             ;; one (accepts TCP, never answers) before committing to attach.
@@ -1549,7 +2042,11 @@ checks stay strict."
               (dorg-dolt-server--ensure-strict dolt-dir)
             (dorg-dolt-server--attach-only dolt-dir))
         local-port))
-     ((gethash canon dorg-dolt-server--attached-ports))
+     ;; A validated attachment is a process-local cache.  Claim identity is
+     ;; checked at its first attach decision; re-reading a claim per query
+     ;; would turn this hot path into lock/probe/subprocess work.
+     ((gethash canon dorg-dolt-server--attached-ports)
+      (gethash canon dorg-dolt-server--attached-ports))
      ((not dorg-dolt-server-autostart)
       (dorg-dolt-server--attach-only dolt-dir))
      (t
@@ -1608,17 +2105,71 @@ claim ready only after confirmation."
              (dorg-dolt-server--break-claim dolt-dir))))))
     (dorg-dolt-server--start-bootstrap-unsafe dolt-dir)))
 
+(defconst dorg-dolt-server--spawn-trampoline
+  "exec \"$0\" \"$@\" 3>&1 >\"$DORG_SERVER_LOG\" 2>&1"
+  "Constant `sh -c' script that becomes the child `dolt sql-server'.
+It replaces the shell with the dolt executable passed as $0 and its argv,
+so the process keeps its pid and the kernel reports dolt's own argv and
+cwd, while stdout and stderr go straight to the file named by
+DORG_SERVER_LOG.  No path is ever interpolated into the script.
+`3>&1' keeps the write end of Emacs's output pipe open, unused, on fd 3
+for the child's lifetime: Emacs blocks inside `accept-process-output' once
+a live child's output pipe reaches end of file, so closing it would hang
+every later wait, including the mysql client's connect.")
+
+(defun dorg-dolt-server--spawn-logged (name args logfile)
+  "Start `dolt' with ARGS as process NAME, its output sunk into LOGFILE.
+Return the process.  LOGFILE is truncated at start.  The kernel, not
+Emacs, drains the output: the mysql client waits on its own socket only,
+so output left for Emacs to read (a pty or pipe) fills up once Dolt has
+logged a few failed statements, and the server then blocks mid-reply.
+The process has no buffer; LOGFILE is recorded on it as `dorg-server-log'
+for startup diagnostics."
+  (let* ((dolt (or (executable-find "dolt")
+                   (signal 'file-missing
+                           (list "Searching for program" "No such file or directory" "dolt"))))
+         (logfile (expand-file-name logfile))
+         (process-environment (cons (concat "DORG_SERVER_LOG=" logfile)
+                                    process-environment))
+         (proc (make-process :name name
+                             :buffer nil
+                             :noquery t
+                             :connection-type 'pipe
+                             :command (append (list "/bin/sh" "-c"
+                                                    dorg-dolt-server--spawn-trampoline
+                                                    dolt)
+                                              args))))
+    (process-put proc 'dorg-server-log logfile)
+    proc))
+
+(defconst dorg-dolt-server--log-diagnostic-bytes 65536
+  "Most bytes read from the end of a server log for a diagnostic.
+The log grows for a server's whole lifetime, so a diagnostic reads only
+its tail; the reported excerpt is trimmed further to its last lines.")
+
+(defun dorg-dolt-server--read-log (logfile)
+  "Return the trimmed tail of LOGFILE, or nil when it does not exist.
+Reads at most `dorg-dolt-server--log-diagnostic-bytes' from the end.  Never
+signals: a diagnostic must not decide lifecycle cleanup, so an unreadable
+log yields a one-line note instead."
+  (when logfile
+    (condition-case err
+        (when (file-exists-p logfile)
+          (let* ((size (or (file-attribute-size (file-attributes logfile)) 0))
+                 (beg (max 0 (- size dorg-dolt-server--log-diagnostic-bytes))))
+            (with-temp-buffer
+              (insert-file-contents logfile nil beg (max beg size))
+              (dorg-dolt--trim-output (buffer-string)))))
+      (error (format "(server log unreadable: %s)" (error-message-string err))))))
+
 (defun dorg-dolt-server--child-exit-sentinel (proc _event)
   "Release PROC's registered child claim once the child is confirmed dead.
 The sentinel is installed before readiness begins, so it owns provisional as
-well as ready child claims.  It snapshots startup output on PROC before
-destroying the buffer so the synchronous start failure can still report Dolt's
-diagnostic even when the child exits before readiness."
+well as ready child claims.  Ownership cleanup comes first.  Only a child
+that dies before readiness (`dorg-server-ready' unset) then has the tail of
+its log snapshotted on PROC, so the synchronous start failure can still
+report Dolt's diagnostic; a ready child's lifetime log is never read here."
   (unless (process-live-p proc)
-    (when (buffer-live-p (process-buffer proc))
-      (process-put proc 'dorg-startup-output
-                   (with-current-buffer (process-buffer proc)
-                     (buffer-string))))
     (let ((found-key nil))
       (maphash (lambda (key entry)
                  (when (eq (car entry) proc)
@@ -1627,6 +2178,12 @@ diagnostic even when the child exits before readiness."
       (when found-key
         (remhash found-key dorg-dolt-server--procs)
         (dorg-dolt-server--release-claim found-key)))
+    (when (and (processp proc)
+               (not (process-get proc 'dorg-server-ready))
+               (not (process-get proc 'dorg-startup-output)))
+      (process-put proc 'dorg-startup-output
+                   (dorg-dolt-server--read-log
+                    (process-get proc 'dorg-server-log))))
     (when (buffer-live-p (process-buffer proc))
       (kill-buffer (process-buffer proc)))))
 
@@ -1647,6 +2204,10 @@ Signals an error if this process already runs a server for DOLT-DIR."
     ;; Clean stale entry if any
     (when existing
       (remhash key dorg-dolt-server--procs))
+    ;; Unlike the permissive claim-verdict readers, a managed start needs a
+    ;; conclusive store-owner census before it can create a second process or
+    ;; publish/rewrite any ownership metadata.  Callers hold the claim lock.
+    (dorg-dolt-server--assert-admission-clear dolt-dir)
     ;; Fail closed BEFORE launching a server: validate that the dolt-dir we
     ;; are about to serve actually carries the DOrg schema marker and — when
     ;; this start is file-backed — a `dorg_files' row for the bound file.  We
@@ -1673,9 +2234,12 @@ Signals an error if this process already runs a server for DOLT-DIR."
            ;; `default-directory' is still pinned to a real directory so the
            ;; subprocess inherits a sane cwd, but it no longer selects the repo.
            (default-directory (expand-file-name data-dir))
-           (buf (generate-new-buffer (format " *dorg-dolt-server:%d*" port)))
-           (proc (apply #'start-process "dorg-sql-server" buf "dolt"
-                        (dorg-dolt--target-sql-server-args target port))))
+           (logfile (expand-file-name
+                     "server.log" (dorg-dolt-server--ensure-dorg-dir dolt-dir)))
+           (proc (dorg-dolt-server--spawn-logged
+                  "dorg-sql-server"
+                  (dorg-dolt--target-sql-server-args target port)
+                  logfile)))
       (set-process-query-on-exit-flag proc nil)
       ;; Establish ownership before the first readiness observation.  Registry
       ;; and sentinel come first so an early child death releases the
@@ -1691,14 +2255,15 @@ Signals an error if this process already runs a server for DOLT-DIR."
         (error "DOrg dolt-server: Dolt sql-server exited before readiness began on port %d"
                port))
       (condition-case err
-          (dorg-dolt-server--wait-ready port nil proc)
+          (progn
+            (dorg-dolt-server--wait-ready port nil proc)
+            ;; From here the child's death is ordinary, not a start failure,
+            ;; so its sentinel no longer snapshots the lifetime log.
+            (process-put proc 'dorg-server-ready t))
         (error
-         ;; Capture diagnostics before cleanup destroys the buffer.
-         (let ((output (or (process-get proc 'dorg-startup-output)
-                           (when (buffer-live-p buf)
-                             (with-current-buffer buf (buffer-string)))))
-               (status (process-status proc))
-               (exit (process-exit-status proc)))
+         (let ((status (process-status proc))
+               (exit (process-exit-status proc))
+               (output nil))
            (dorg-dolt-server--kill-process proc)
            ;; Claim deletion is death-gated.  A kill seam that cannot prove the
            ;; child gone leaves both the retained process entry and the
@@ -1706,6 +2271,10 @@ Signals an error if this process already runs a server for DOLT-DIR."
            (unless (process-live-p proc)
              (remhash key dorg-dolt-server--procs)
              (dorg-dolt-server--break-claim dolt-dir))
+           ;; Diagnostics only after the lifecycle is settled; the read is
+           ;; bounded and never signals.
+           (setq output (or (process-get proc 'dorg-startup-output)
+                            (dorg-dolt-server--read-log logfile)))
            (error (concat "dorg-dolt-server: failed to start dolt sql-server "
                           "for %s on port %d (status %s, exit %s): %s\n"
                           "Command: %s\n"
@@ -1844,6 +2413,10 @@ ready server."
          (db-name (plist-get target :db-name))
          (binding (dorg-dolt-server--expected-binding dolt-dir))
          (verdict (dorg-dolt-server--dir-store-valid-p dolt-dir binding)))
+    ;; This is the daemon counterpart of `--start-child-unsafe': both are
+    ;; invoked under the claim lock and neither may spawn before the strict
+    ;; store-scoped owner census succeeds.
+    (dorg-dolt-server--assert-admission-clear dolt-dir)
     (unless (eq verdict t)
       (dorg-dolt-server--break-claim dolt-dir)
       (signal 'dorg-sql-transport-error
@@ -1855,11 +2428,7 @@ ready server."
            (dorg-dir (dorg-dolt-server--ensure-dorg-dir dolt-dir))
            (pidfile (expand-file-name "server.pid" dorg-dir))
            (logfile (expand-file-name "server.log" dorg-dir))
-           (read-log (lambda ()
-                       (when (file-exists-p logfile)
-                         (with-temp-buffer
-                           (insert-file-contents logfile)
-                           (dorg-dolt--trim-output (buffer-string)))))))
+           (read-log (lambda () (dorg-dolt-server--read-log logfile))))
       (let ((pid (dorg-dolt-server--detached-launch target port pidfile logfile)))
         (unless (and (integerp pid) (> pid 0))
           (dorg-dolt-server--break-claim dolt-dir)
@@ -2007,6 +2576,7 @@ Never starts, restarts, reaps, or breaks a claim."
         (let ((claim (dorg-dolt-server--effective-claim dolt-dir)))
           (if (null claim)
               (dorg-dolt-server--signal-no-autostart dolt-dir)
+            (dorg-dolt-server--assert-claim-not-foreign-store dolt-dir claim)
             (pcase (dorg-dolt-server--claim-classify claim t)
               ('live
                (cond
@@ -2050,7 +2620,103 @@ Never starts, restarts, reaps, or breaks a claim."
                                      dolt-dir (alist-get :owner-pid claim)
                                      (alist-get :port claim)))))))))))))
 
-(defun dorg-dolt-server--ensure-detached (dolt-dir)
+(defun dorg-dolt-server--owned-child-authority-p (dolt-dir entry)
+  "Return non-nil when the RAW lock-held claim proves ENTRY is THIS process's child.
+ENTRY is a `dorg-dolt-server--procs' value, (PROC . PORT).
+
+Every field must agree; an absent claim or any single mismatch is a refusal.
+The raw overlay claim is read rather than the native-reconciled effective one,
+because reconciliation can present a claim this process did not write."
+  (let* ((canon (dorg-dolt-server--canonical-dir dolt-dir))
+         (claim (dorg-dolt-server--claim-read dolt-dir))
+         (proc (car entry))
+         (port (cdr entry)))
+    (and claim
+         (eq (alist-get :owner-kind claim) 'emacs)
+         (dorg-dolt-server--claim-host-local-p claim)
+         (equal (alist-get :dolt-dir claim) canon)
+         (eql (alist-get :owner-pid claim) (emacs-pid))
+         (dorg-dolt-server--claim-owned-here-p claim)
+         (eql (alist-get :server-pid claim) (process-id proc))
+         (eql (alist-get :port claim) port)
+         t)))
+
+(defun dorg-dolt-server--retire-owned-child-unsafe (dolt-dir)
+  "Retire this process's session-owned child for DOLT-DIR.
+PRECONDITION: call ONLY with the claim lock held, and only for an EXPLICIT
+persistent start.
+
+A session-owned child does not satisfy detached lifetime: it dies with this
+process, so returning its port from an explicit start promises a server that
+outlives the caller and delivers one that does not.
+
+Ordering is the whole contract here.  Death is CONFIRMED first; only then is the
+exact `dorg-dolt-server--procs' entry retired and the old claim token released;
+only then may a daemon be published.  `dorg-dolt-server--child-exit-sentinel'
+keys on exact PROC membership, so retiring the entry first makes any delayed
+callback inert — it finds no entry `eq' to that process and therefore cannot
+release the DAEMON's claim under the same key.  Retiring AFTER publication, or
+publishing without confirmed death, would reintroduce exactly that hazard.
+
+Refuses, changing nothing, when another owner holds the store or when the child
+cannot be proven gone; the retained entry and its blocking claim are left for
+peers to see rather than replaced."
+  (let* ((key (dorg-dolt-server--canonical-dir dolt-dir))
+         (entry (gethash key dorg-dolt-server--procs)))
+    (when entry
+      ;; The ownership question is asked ONLY when there is a local entry to
+      ;; retire.  With no child of ours there is nothing to retire and the
+      ;; ordinary claim classification below owns the decision.
+      ;;
+      ;; Authority is the RAW lock-held claim, and it must prove the COMPLETE
+      ;; tuple.  An earlier revision refused only when a claim existed and its
+      ;; token disagreed, so an ABSENT claim proceeded to kill and release a
+      ;; process it could not prove was ours.  Token
+      ;; equality alone is also not identity: it says nothing about which store,
+      ;; host, owner or process the claim describes.
+      (unless (dorg-dolt-server--owned-child-authority-p dolt-dir entry)
+        (signal 'dorg-sql-transport-conflict
+                (list (format "dorg: the lock-held claim for %s does not prove this process owns the registered child; refusing to retire it (zero kill, release, start or memoization)"
+                              key))))
+      (let ((proc (car entry)))
+        (dorg-dolt-server--kill-process proc)
+        (when (process-live-p proc)
+          (signal 'dorg-sql-transport-error
+                  (list (format "dorg: could not confirm the session-owned sql-server for %s exited; kept its process entry and claim rather than publishing a daemon over a possibly-live server"
+                                key))))
+        (remhash key dorg-dolt-server--procs)
+        (dorg-dolt-server--release-claim dolt-dir)))
+    t))
+
+(defun dorg-dolt-server--assert-verified-detached (dolt-dir port)
+  "Return the VERIFIED detached port for DOLT-DIR, or signal.
+
+Return authority for an explicit persistent start.  It reuses the single
+ready-daemon verifier rather than keeping a second, weaker copy, so the same
+contract that governs cross-process kill authority governs what an explicit
+start is allowed to report: finalized daemon owner-kind at ready state, this
+host and store, claim and dolt-native records agreeing on server-pid, port and
+a non-empty uuid, the port live, and served-store validation confirming THIS
+store.
+
+PORT is whatever the lifecycle arm produced.  It must EQUAL the verified port:
+returning a lifecycle port that the durable records do not corroborate would
+hand the caller a number no second process can be expected to use, which is the
+whole failure this bead exists to close."
+  (let ((identity (dorg-dolt-server--verified-daemon-identity dolt-dir)))
+    (unless identity
+      (signal 'dorg-sql-transport-error
+              (list (format "dorg: explicit persistent start for %s could not verify a ready detached daemon identity (owner-kind, state, host, store, pid/port/uuid agreement, live port and served-store validation); refusing to report a server a second process may be unable to attach"
+                            (dorg-dolt-server--canonical-dir dolt-dir)))))
+    (let ((verified (plist-get identity :port)))
+      (unless (eql verified port)
+        (signal 'dorg-sql-transport-error
+                (list (format "dorg: explicit persistent start for %s produced port %s but the verified durable identity reports port %s; refusing to return or memoize an unverified port"
+                              (dorg-dolt-server--canonical-dir dolt-dir)
+                              port verified))))
+      verified)))
+
+(defun dorg-dolt-server--ensure-detached (dolt-dir &optional explicit)
   "Ensure a DETACHED, persistent `dolt sql-server' for DOLT-DIR; return port.
 The explicit-start entry behind `dorg dolt start' / `dorg-dolt-start':
 the server OUTLIVES the starting process, unlike the session-scoped
@@ -2059,15 +2725,27 @@ already owns, reuses a healthy claim already serving the expected store
 \(idempotent), reaps a wedged one, breaks a dead/stale/wrong claim, then
 starts a fresh detached daemon.  Refuses to start a duplicate over an
 unreachable (possibly still-booting) owner.  Returns only after the
-server is confirmed listening and claimed."
+server is confirmed listening and claimed.
+
+With EXPLICIT non-nil the caller is asking for the documented DETACHED promise
+rather than for any usable port.  A port this Emacs owns then does NOT satisfy
+the request: the session-owned child is retired under the lock (see
+`dorg-dolt-server--retire-owned-child-unsafe') before a daemon is published, and
+the return is gated on `dorg-dolt-server--assert-verified-detached'.  EXPLICIT
+defaults to nil, so the implicit autostart caller in
+`dorg-dolt-server--strict-port' keeps its existing behaviour exactly, and a
+future caller cannot acquire conversion authority by accident."
   (dorg-dolt--ensure-available)
-  (or (dorg-dolt-server-port dolt-dir)
+  (or (and (not explicit) (dorg-dolt-server-port dolt-dir))
       (dorg-dolt-server--with-claim-lock dolt-dir
-        (or (dorg-dolt-server-port dolt-dir)
-            (let* ((claim (dorg-dolt-server--effective-claim dolt-dir))
+        (or (and (not explicit) (dorg-dolt-server-port dolt-dir))
+            (let* ((_ (when explicit
+                        (dorg-dolt-server--retire-owned-child-unsafe dolt-dir)))
+                   (claim (dorg-dolt-server--effective-claim dolt-dir))
                    (port
                     (if (null claim)
                         (dorg-dolt-server--start-detached-unsafe dolt-dir)
+                      (dorg-dolt-server--assert-claim-not-foreign-store dolt-dir claim)
                       (pcase (dorg-dolt-server--claim-classify claim t)
                         ('live
                          ;; Foreign live daemon (owned/pending/wedged owners are
@@ -2155,7 +2833,11 @@ server is confirmed listening and claimed."
               ;; foreign detached server, so `--attached-ports' is its
               ;; correct home; `--break-claim' / `--release-claim' already
               ;; drop the entry when the claim lifecycle invalidates it.
-              (dorg-dolt-server--memo-attached-port dolt-dir port))))))
+              (dorg-dolt-server--memo-attached-port
+               dolt-dir
+               (if explicit
+                   (dorg-dolt-server--assert-verified-detached dolt-dir port)
+                 port)))))))
 
 (defun dorg-dolt-server--kill-pid (pid &optional grace)
   "Escalate SIGTERM->SIGKILL on raw PID until it exits or GRACE elapses.
@@ -2319,6 +3001,7 @@ store-relative overlay and dolt-native `sql-server.info' (via
           :protocol (and claim (alist-get :protocol claim))
           :created-at (and claim (alist-get :created-at claim))
           :last-used (and claim (alist-get :last-used claim))
+          :generation (dorg-sql--generation-fingerprint canon)
           :role (dorg-dolt-server--entry-role canon claim owned-live)
           :status (dorg-dolt-server--entry-status claim owned-live))))
 
@@ -2346,7 +3029,7 @@ ports it has attached
 `dorg-dolt-server--describe', which reconciles the store-relative overlay with
 dolt-native `sql-server.info'.  Each element is a plist with keys
 :dolt-dir (canonical), :port, :owner-pid, :server-pid, :host, :policy,
-:protocol, :created-at, :last-used, :role, and :status.
+:protocol, :created-at, :last-used, :generation, :role, and :status.
 
 Purely a reader: it never starts, stops, or mutates any server or claim.
 Stores with no running/claimed server (`:status' nil) are omitted."
@@ -2415,6 +3098,7 @@ PROMPT is used when the current buffer has no registered Dolt backend."
                      (dorg-dolt-server--fmt (plist-get e :protocol))
                      (dorg-dolt-server--fmt (plist-get e :owner-pid))
                      (dorg-dolt-server--fmt (plist-get e :server-pid))
+                     (dorg-dolt-server--fmt (plist-get e :generation))
                      (dorg-dolt-server--fmt-time (plist-get e :last-used))))))
    (dorg-dolt-server-list)))
 
@@ -2422,7 +3106,7 @@ PROMPT is used when the current buffer has no registered Dolt backend."
   "Major mode listing DOrg-managed Dolt sql-servers."
   (setq tabulated-list-format
         [("Dolt Dir" 40 t) ("Port" 6 t) ("Role" 9 t) ("Status" 12 t)
-         ("Policy" 7 t) ("Pr" 3 t) ("Owner" 7 t) ("Server" 7 t)
+         ("Policy" 7 t) ("Pr" 3 t) ("Owner" 7 t) ("Server" 7 t) ("Generation" 36 t)
          ("Last Used" 16 t)])
   (setq tabulated-list-padding 1)
   (setq tabulated-list-entries #'dorg-dolt-server--list-entries)
@@ -2465,7 +3149,7 @@ distinct from the implicit, session-scoped `dorg-dolt-server--ensure-strict' use
 auto SQL transport, which is reaped when its Emacs exits."
   (interactive
    (list (dorg-dolt-server--read-dolt-dir "Start sql-server for Dolt dir: ")))
-  (let ((port (dorg-dolt-server--ensure-detached dolt-dir)))
+  (let ((port (dorg-dolt-server--ensure-detached dolt-dir t)))
     ;; Ensure an already-running daemon created before the discovery-index
     ;; contract is immediately visible to a subsequent CLI process too.
     (dorg-dolt-server--index-register dolt-dir)
@@ -2474,8 +3158,16 @@ auto SQL transport, which is reaped when its Emacs exits."
                (dorg-dolt-server--display-dir dolt-dir) port))
     port))
 
-(defun dorg-dolt-server--verified-daemon-pid (dolt-dir)
-  "Return the verified daemon server-pid for DOLT-DIR, or nil (tracked-regression).
+(defun dorg-dolt-server--verified-daemon-identity (dolt-dir)
+  "Return the verified detached identity for DOLT-DIR as a plist, or nil.
+The plist is (:server-pid INT :port INT :uuid STR), taken from ONE lock-held
+read so a caller can return the VERIFIED port rather than whatever a lifecycle
+arm happened to produce.
+
+This is the single ready-daemon authority; `dorg-dolt-server--verified-daemon-pid'
+is its pid projection.  It was factored out rather than copied because a
+second, weaker verifier had drifted into accepting an `emacs'-owned,
+probe-inconclusive claim as a detached identity.
 The cross-process kill-authority gate: a PID is a transport handle, never
 authority, so `dorg-dolt-stop' signals a detached daemon ONLY when this
 predicate returns its pid.  PRECONDITION: call ONLY with the claim lock held
@@ -2486,7 +3178,7 @@ work between verify and actuate.
 Reads the DOrg overlay claim (`dorg-dolt-server--claim-read', NOT the
 native-reconciled effective claim) AND the dolt-native
 `<store>/.dolt/sql-server.info' (`dorg-dolt-server--dolt-server-info') and
-returns the claim's `:server-pid' IFF ALL hold:
+returns (:server-pid INT :port INT :uuid STR) IFF ALL hold:
 - the claim is a finalized `:owner-kind daemon' with `:state ready' (a
   `pending'/`probe-inconclusive'/arbitrary/absent state is NOT a finalized
   identity and REFUSES, so an unfinalized daemon is never signalled);
@@ -2520,7 +3212,17 @@ verification: it NEVER signals, breaks, or mutates a claim."
                 (let ((db-name (cdr (dorg-dolt-server--data-dir-and-db dolt-dir)))
                       (binding (dorg-dolt-server--expected-binding dolt-dir)))
                   (eq (dorg-dolt-server--store-valid-p cport db-name binding) t))
-                cpid)))))
+                (list :server-pid cpid :port cport :uuid cuuid))))))
+
+(defun dorg-dolt-server--verified-daemon-pid (dolt-dir)
+  "Return the verified daemon server-pid for DOLT-DIR, or nil.
+The pid projection of `dorg-dolt-server--verified-daemon-identity', which holds
+the full contract: finalized `:owner-kind daemon' at `:state ready', this host,
+this canonical store, claim and dolt-native records agreeing on server-pid,
+port and a NON-EMPTY uuid, the port live, and served-store validation
+confirming THIS store.  PRECONDITION unchanged: call ONLY with the claim lock
+held.  Pure verification: it NEVER signals, breaks, or mutates a claim."
+  (plist-get (dorg-dolt-server--verified-daemon-identity dolt-dir) :server-pid))
 
 ;;;###autoload
 (defun dorg-dolt-stop (dolt-dir)

@@ -1,7 +1,7 @@
 #+title: DOrg Configuration
 
 #+begin_quote
-*DOrg 0.1.0 configuration surface.*  Whole-file save/enable synchronization is
+*Current DOrg configuration.*  Whole-file save/enable synchronization is
 not installed.  Dolt-backed buffers are read-only projections and writes belong
 on the typed mutation/command API.
 #+end_quote
@@ -9,6 +9,24 @@ on the typed mutation/command API.
 This document lists the user-facing options and hooks that tune dorg's
 projection, server, and id-generation behaviour.  For their runtime roles, see
 the relevant module API tables in [[file:api.org][docs/api.org]].
+
+* Runtime installation
+
+=make install= copies DOrg, its launcher, Clime, web-server and mysql.el with
+notices into =DORG_HOME= (default =$PREFIX/share/dorg=), compiles there, checks
+the staged help/install doctor, then publishes the runtime and launcher link.
+With no caller-provided =PREFIX=, =PREFIX= defaults to =$HOME/.local= and
+=BINDIR= to =$HOME/bin=.  A caller-provided =PREFIX= keeps =BINDIR= at
+=$PREFIX/bin= by default.  =install.sh= clones source into
+=$HOME/.local/src/dorg= by default and wraps the same install target.  Keep
+bundled =lib/= dependencies intact.
+
+The installer refuses an unmanaged destination or a non-symlink launcher.
+The compile Emacs must match the one the launcher resolves.  Failure before
+the final link replacement leaves the prior install available; after that
+commit point the new install is kept.  Reinstallation replaces the owned
+runtime tree.  Extensions loaded as =dorg-extension-NAME= remain on the
+caller's =EMACSLOADPATH= rather than being discovered from a checkout.
 
 * Options and hooks
 
@@ -34,13 +52,14 @@ the relevant module API tables in [[file:api.org][docs/api.org]].
 | ~dorg-mutate-gate-acquire-timeout~         | =30=                                       | Seconds to wait for the per-store mutation gate before returning =contended=                             |
 | ~dorg-mutate-gate-deadline~                | =60=                                       | Shared wall-clock bound for Dolt gate wait, moved-HEAD replan, and op-id-authorized post-rollback replan |
 | ~dorg-ql-week-start-day~                   | =1=                                        | Week start day for date-relative ~dorg-ql~ predicates                                                    |
-| ~dorg-schema-auto-migrate~                 | =t=                                        | Automatically apply supported schema migrations                                                          |
+| ~dorg-schema-auto-migrate~                 | obsolete =t=                              | Ignored compatibility variable; ordinary access refuses stale schemas                                     |
 | ~dorg-schema-diagnostics-show-source-path~ | =nil=                                      | Include source file paths in schema diagnostic output                                                    |
 | ~dorg-serve-runtime-dir~                   | =TMPDIR/dorg/serve=                        | Per-port state/token files for the optional ~dorg serve~ HTTP daemon                                     |
 | ~dorg-sql-cli-arg-max-threshold~           | =131072=                                   | Byte length at/above which CLI SQL streams over stdin (avoids ARG_MAX)                                   |
 | ~dorg-sql-cli-timeout~                     | =30.0=                                     | Seconds bounding one-shot CLI SQL in the internal seam                                                   |
 | ~dorg-sql-connect-timeout~                 | =2.0=                                      | Seconds bounding mysql.el connection setup                                                               |
 | ~dorg-sql-read-timeout~                    | =10.0=                                     | Seconds of mysql.el read inactivity tolerated during a query                                             |
+| ~dorg-sql-capture-failed-statements~      | =t=                                        | Record the original condition of a failed batch statement in ONE private file under the owning store overlay (~<store>/.dorg/failures/~); the public receipt keeps only closed facts. Set to nil to turn the capture off |
 | ~dorg-dolt-max-retries~                    | =3=                                        | Retries for transient Dolt errors (serialization / sequencing rollbacks)                                 |
 | ~dorg-dolt-retry-base-ms~                  | =50=                                       | Base backoff delay (ms) between Dolt retries                                                             |
 
@@ -65,7 +84,7 @@ legacy and custom stores remain valid unchanged: for example, an explicitly
 bound =<project>/.tracker/dolt/= store continues to serve database =dolt=.
 There is no fallback search, alias, automatic move, or silent re-import.
 
-For an Downstream tracker projection at =<project>/.tracker/beads.org=, the source binding
+For a downstream tracker projection at =<project>/.tracker/beads.org=, the source binding
 to the canonical store is =../.dorg/dorg=, and the store-relative source
 locator is =../../.tracker/beads.org=.  A root-level
 =<project>/beads.org= source instead has locator =../../beads.org=.  Moving the
@@ -113,6 +132,21 @@ evaluating Lisp (see [[file:api.org][docs/api.org]] for return values):
 
 Starting a server with these commands is an explicit action.  Ordinary
 SQL uses strict managed-server transport.
+
+Before DOrg starts a managed server it performs a store-scoped owner census:
+it uses =lsof= on the exact =<store>/.dolt/noms/LOCK= and confirms that any
+holder is a live =dolt sql-server= for that canonical store.  This is a hard
+start prerequisite.  An absent LOCK in a fresh store is clear; a missing or
+failed =lsof= probe, malformed process evidence, or an ambiguous holder refuses
+the start rather than risking a second server.  Scrubbed environments must keep
+=/usr/sbin= available so the system =lsof= remains reachable.
+
+A server's own output — Dolt's log, including every failed statement it
+reports — goes to =<store>/.dorg/server.log=, whether this Emacs spawned
+the server or it runs as a detached daemon.  The file is truncated each
+time a server starts and is not size-bounded while that server runs.  An
+Emacs-spawned server never writes to an Emacs buffer, so a burst of logged
+errors cannot block it while a query waits for its reply.
 
 ~dorg-serve-runtime-dir~ is separate from the Dolt store-relative
 =<store>/.dorg/= overlay: it holds the per-port state and token files
@@ -175,7 +209,7 @@ transport; there is no separate bootstrap CLI transport override.
 
 ** Portable file bindings and schema migration
 
-Dolt schema v6 stores each source locator relative to the canonical Dolt
+Dolt schema v6 and later store each source locator relative to the canonical Dolt
 directory.  Moving a directory that contains both the store and its source
 therefore needs no rebind.  An ordinary bind may create only the initial root
 of an empty store; a miss in a nonempty store refuses instead of guessing or
@@ -183,11 +217,27 @@ minting a blank root.  Use explicit ~dorg import --mode bootstrap~ to add a
 document, or ~dorg dolt rebind DIR FILE --root-id N --base HASH~ to repair one
 known moved binding without touching file bytes.
 
-The first public schema is version 6.  Earlier development stores have no
-supported migration path and are refused before any write; recreate them from
-their Org source.  Future migrations can be held behind
-~dorg-schema-auto-migrate~nil= so coordinated applications advance their DOrg
-pin and required-core guard before an operator-authorized migration.
+The current public schema is version 8.  Version 6 and 7 stores have
+supported explicit migrations, walked forward one version at a time by one
+operator run: v6 to v7 adds the receipt table, and v7 to v8 converts absolute
+heading levels to parent-relative offsets, refusing an inconsistent hierarchy
+before any write and validating the result before commit (see
+[[file:schema.org][docs/schema.org]]).  History reads of commits made before
+v8 decode their own schema.  Pre-v6 development stores have no supported
+migration path and are refused before any write, so recreate only those stores
+from their Org source.  Ordinary access never upgrades an existing store,
+regardless of ~dorg-schema-auto-migrate~.  Operators run
+~M-x dorg-migrate-schema~ only after every required extension is registered in
+the running DOrg, a
+DOrg-managed sql-server is available for the store, and non-cooperating SQL
+clients are quiesced.  Offline / one-shot-CLI schema upgrade is not a supported
+operator path in this release; a CLI-pinned migration request refuses before
+lease acquisition, server startup/attachment, resolver evaluation, or writes.
+Use ~dorg dolt start PATH~ (or ~M-x dorg-dolt-start~) to establish the managed
+server route first.  Disaster-recovery CLI seams remain internal diagnostics,
+not a standing schema-upgrade mechanism; the release-incident ~dolt revert~
+exercise was a rehearsed recovery action, not an upgrade substitute or standing
+authority for future schema repair.
 
 ~dorg-sql-cli-arg-max-threshold~ (=131072=) bounds CLI argument size:
 short queries pass to =dolt= as a =-q= argument, but a large batch (for
@@ -195,6 +245,42 @@ example, a bulk import) can exceed the operating system's =ARG_MAX=
 limit and fail with "Argument list too long".  Queries whose UTF-8 byte
 length reaches this threshold are streamed to =dolt= over stdin instead,
 where no argument-length limit applies.
+
+* Managed clocks (opt-in Emacs)
+
+The optional =dorg-clock-emacs= package routes =org-clock-in=,
+=org-clock-out= and =org-clock-cancel= through a named Dolt clock scope
+before Org edits a CLOCK line.  Load it explicitly and enable it in each
+Org task buffer that should participate:
+
+#+begin_src emacs-lisp
+(require 'dorg-clock-emacs)
+(dorg-clock-emacs-enable
+ '(:dolt-dir "/path/to/clock-store" :root-id 100)
+ "71" "America/Los_Angeles")
+#+end_src
+
+The scope and every target heading need stable =DORG_ID= values.  A Dolt task
+store needs a =store-id= in =dorg_meta=, created on new-store initialization or
+by =dorg dolt identify DIR= for an older store.  A plain task file needs a
+=#+DORG_STORE_ID:= root keyword.  Clock reads never create either identity.  A plain
+file can supply a task reference while Dolt owns the clock; enabling the
+adapter never turns a plain file into a clock authority.  Reconciliation
+reads the authority on enable and periodically while Emacs is idle.  It
+does not start or stop a clock.  A dirty buffer defers direct clock actions;
+a TODO completion can stop its managed clock after the keyword edit, while
+file freshness and lock checks still apply.  A foreign lock defers actions;
+an unknown apply response retains the exact intent for
+=M-x dorg-clock-emacs-retry-pending=, preserving its operation ID and base.
+Use =M-x dorg-clock-emacs-reconcile= to refresh the local indicator.
+Native Org clock hooks, idle resolution, history selection and automatic
+TODO switching caused by clock actions do not run for managed actions.  Stock Org clocking in
+buffers without this mode remains independent of the managed authority.
+
+See [[file:api.org::*Managed clock lifecycle][the clock API]] for immutable
+requests, authority and task-reference contracts.  Enabling the adapter
+requires an existing scope heading in that authority; the numeric identities
+in the example are placeholders, not an automatically provisioned scope.
 
 * Customizing
 

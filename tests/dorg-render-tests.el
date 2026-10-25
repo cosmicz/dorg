@@ -683,7 +683,7 @@ has a different path and commit hash."
         ;; Insert an orphan heading with broken parent_id
         (dorg-sql-batch dolt-dir
           '("SET FOREIGN_KEY_CHECKS=0"
-            "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (9999, 1, 88888, X'FF', 1, FALSE, 'Orphan', 0)"
+            "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (9999, 1, 88888, X'FF', 1, FALSE, 'Orphan', 0)"
             "SET FOREIGN_KEY_CHECKS=1"))
         (dorg-commit dolt-dir "add orphan")
         ;; Render — should warn, not error
@@ -715,10 +715,10 @@ missed them; true root reachability must report them instead."
         ;; immediate parents.  None are root-reachable.
         (dorg-sql-batch dolt-dir
           '("SET FOREIGN_KEY_CHECKS=0"
-            "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (9001, 1, 9002, X'F1', 1, FALSE, 'CycA', 0)"
-            "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (9002, 1, 9001, X'F2', 1, FALSE, 'CycB', 0)"
-            "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (9003, 1, 9004, X'F3', 1, FALSE, 'IslandA', 0)"
-            "INSERT INTO headings (id, root_id, parent_id, sort_key, level, commented, title, post_blank) VALUES (9004, 1, NULL, X'F4', 2, FALSE, 'IslandB', 0)"
+            "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (9001, 1, 9002, X'F1', 1, FALSE, 'CycA', 0)"
+            "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (9002, 1, 9001, X'F2', 1, FALSE, 'CycB', 0)"
+            "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (9003, 1, 9004, X'F3', 1, FALSE, 'IslandA', 0)"
+            "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, commented, title, post_blank) VALUES (9004, 1, NULL, X'F4', 2, FALSE, 'IslandB', 0)"
             "SET FOREIGN_KEY_CHECKS=1"))
         (dorg-commit dolt-dir "add cycle and island")
         (cl-letf (((symbol-function 'display-warning)
@@ -756,9 +756,9 @@ missed them; true root reachability must report them instead."
   "Ancestor context emits heading lines only: skips level-0 root, no
 bodies, no synthetic DORG_ID drawers."
   (let ((root (make-dorg-heading :id 1 :parent-id nil :sort-key (string 1)
-                                 :level 0 :title "ROOT"))
+                                 :level 0 :level-offset 0 :title "ROOT"))
         (a (make-dorg-heading :id 2 :parent-id 1 :sort-key (string 1)
-                              :level 1 :title "A"
+                              :level 1 :level-offset 1 :title "A"
                               :items (list (dorg-text-item :text "A body."))))
         (hash (make-hash-table :test 'eql)))
     (puthash 1 root hash)
@@ -773,7 +773,7 @@ bodies, no synthetic DORG_ID drawers."
 (ert-deftest dorg-test-island-ancestor-context-empty ()
   "No non-root ancestors yields the empty string."
   (let ((root (make-dorg-heading :id 1 :parent-id nil :sort-key (string 1)
-                                 :level 0 :title "ROOT"))
+                                 :level 0 :level-offset 0 :title "ROOT"))
         (hash (make-hash-table :test 'eql)))
     (puthash 1 root hash)
     (should (equal "" (dorg-render--render-ancestor-context '(1) hash)))
@@ -782,10 +782,10 @@ bodies, no synthetic DORG_ID drawers."
 (ert-deftest dorg-test-island-subtree-renders-full ()
   "Island subtree renders the node line, its body, and descendants."
   (let ((b (make-dorg-heading :id 10 :parent-id 1 :sort-key (string 1)
-                              :level 1 :title "B"
+                              :level 1 :level-offset 1 :title "B"
                               :items (list (dorg-text-item :text "B body."))))
         (c (make-dorg-heading :id 11 :parent-id 10 :sort-key (string 1)
-                              :level 2 :title "C"))
+                              :level 2 :level-offset 1 :title "C"))
         (hash (make-hash-table :test 'eql)))
     (puthash 10 b hash)
     (puthash 11 c hash)
@@ -803,11 +803,11 @@ bodies, no synthetic DORG_ID drawers."
 (ert-deftest dorg-test-island-subtree-sort-key-order ()
   "Island children render in sort-key order, not insertion order."
   (let ((b (make-dorg-heading :id 10 :parent-id 1 :sort-key (string 1)
-                              :level 1 :title "B"))
+                              :level 1 :level-offset 1 :title "B"))
         (x (make-dorg-heading :id 12 :parent-id 10 :sort-key (string 2)
-                              :level 2 :title "XX"))
+                              :level 2 :level-offset 1 :title "XX"))
         (y (make-dorg-heading :id 13 :parent-id 10 :sort-key (string 1)
-                              :level 2 :title "YY"))
+                              :level 2 :level-offset 1 :title "YY"))
         (hash (make-hash-table :test 'eql)))
     (puthash 10 b hash)
     (puthash 12 x hash)              ; higher sort-key inserted first
@@ -841,7 +841,7 @@ bodies, no synthetic DORG_ID drawers."
 (defun dorg-render-tests--root-id (dolt-dir)
   "Return the level-0 root id in DOLT-DIR."
   (alist-get 'id (car (dorg-sql dolt-dir
-                                "SELECT id FROM headings WHERE level = 0"))))
+                                "SELECT id FROM headings WHERE level_offset = 0"))))
 
 (ert-deftest dorg-test-render-subtree-ids-public-seam ()
   "`dorg-render-subtree-ids' is the public cross-module seam; the old
@@ -1504,6 +1504,30 @@ post-fix)."
                   "* S\n:PROPERTIES:\n:DORG_ID: 200800\n:END:\nx\n"))))
     (dolist (text controls)
       (should (string= text (dorg-render-tests--pb-roundtrip text))))))
+
+(ert-deftest dorg-test-level-offset-render-uses-given-effective-level ()
+  "GUARD: renderers emit stars from the effective level slot AS GIVEN.
+Downstream detached copies rebase that slot and render without persisting,
+so the renderer must never re-derive levels from offsets.  Here the level
+slots deliberately disagree with the offsets: the stars follow the levels."
+  (let ((headings
+         (list (make-dorg-heading :id 1 :parent-id nil :level 0
+                                  :sort-key (dorg-sortkey-from-integer 1)
+                                  :post-blank 0)
+               (make-dorg-heading :id 2 :parent-id 1 :level 2
+                                  :sort-key (dorg-sortkey-from-integer 1 2)
+                                  :title "given two" :post-blank 0)
+               (make-dorg-heading :id 3 :parent-id 2 :level 5
+                                  :sort-key (dorg-sortkey-from-integer 1 2)
+                                  :title "given five" :post-blank 0))))
+    (when (fboundp 'dorg-heading-level-offset)
+      ;; Offsets that would derive 1 and 2 if a renderer ever re-derived.
+      (setf (dorg-heading-level-offset (nth 0 headings)) 0
+            (dorg-heading-level-offset (nth 1 headings)) 1
+            (dorg-heading-level-offset (nth 2 headings)) 1))
+    (let ((text (dorg-model-render-tree headings)))
+      (should (string-match-p "^\\*\\* given two$" text))
+      (should (string-match-p "^\\*\\*\\*\\*\\* given five$" text)))))
 
 (provide 'dorg-render-tests)
 ;;; dorg-render-tests.el ends here

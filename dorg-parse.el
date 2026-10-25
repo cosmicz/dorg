@@ -406,6 +406,7 @@ caller controls placement."
                    :parent-id nil
                    :sort-key (dorg-sortkey-from-integer 1)
                    :level 0
+                   :level-offset 0
                    :post-blank 0
                    :items items)))
       (dorg-heading-compute-items-hash root-h)
@@ -417,6 +418,25 @@ Each headline is handled by `dorg-parse--process-headline', which pushes
 onto CTX's accumulator slots (headings, heading-markers,
 new-heading-markers).  The caller supplies the `dorg-parse--ctx'."
   (dorg-parse--process-headlines (org-element-contents ast) parent-id 0 ctx))
+
+(defun dorg-parse--assign-offsets (headings)
+  "Set each heading's LEVEL-OFFSET in preorder HEADINGS; return HEADINGS.
+The offset is the heading's level minus its structural parent's level, where
+the parent is found with the same level stack `dorg-parse-assign-ids' uses to
+rebuild persisted parent links: pop every entry at this level or deeper, and
+the remaining top is the parent.  The synthetic root (level 0) gets offset 0.
+Without a leading root there is no base to measure from, so offsets stay nil
+rather than being guessed from absolute stars."
+  (when (and headings (eql 0 (dorg-heading-level (car headings))))
+    (let ((stack nil))
+      (dolist (heading headings)
+        (let ((level (dorg-heading-level heading)))
+          (while (and stack (>= (car stack) level))
+            (pop stack))
+          (setf (dorg-heading-level-offset heading)
+                (if stack (- level (car stack)) 0))
+          (push level stack)))))
+  headings)
 
 ;;; Public API
 
@@ -437,7 +457,8 @@ assign before use)."
         (dorg-parse--process-toplevel-headlines ast root-id ctx))
       (make-dorg-parse-result
        :root-id root-id
-       :headings (nreverse (dorg-parse--ctx-headings ctx))
+       :headings (dorg-parse--assign-offsets
+                  (nreverse (dorg-parse--ctx-headings ctx)))
        :new-heading-markers (nreverse (dorg-parse--ctx-new-heading-markers ctx))
        :heading-markers (dorg-parse--ctx-heading-markers ctx)))))
 
@@ -498,6 +519,7 @@ ignores this value."
               (when parents
                 (setf (dorg-heading-parent-id heading) (cdar parents))))
             (push (cons level (dorg-heading-id heading)) parents)))))
+    (dorg-parse--assign-offsets (dorg-parse-result-headings result))
     (dorg-parse-assert-unique-ids result)
     (let ((markers (dorg-parse-result-heading-markers result)))
       (dolist (entry (dorg-parse-result-new-heading-markers result))

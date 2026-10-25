@@ -111,6 +111,8 @@
 (require 'dorg-ql-eval)
 (require 'dorg-ql-model)
 (require 'dorg-ql-plain)
+;; `(key V)' uses the mutation source resolver even for plain-org reads.
+(require 'dorg-mutate)
 ;; B8/D6: the Dolt SQL adapter is loaded ON THE DOLT PATH ONLY — its entry point
 ;; autoloads `dorg-ql-dolt' (which pulls `dorg-dolt') when a Dolt-backed query
 ;; first dispatches, so a plain-org/model `(require 'dorg-ql)' stays Dolt-free.
@@ -118,13 +120,167 @@
 ;; whole adapter (including the point-lookup `dorg-ql--dolt-select' it reaches
 ;; internally), so no separate `dorg-ql--dolt-select' autoload is needed.
 (autoload 'dorg-ql--dolt-eval "dorg-ql-dolt")
+(autoload 'dorg-ql--dolt-validate-extension-memberships "dorg-ql-dolt")
+(autoload 'dorg-ql--dolt-bm25-search "dorg-ql-dolt")
+(declare-function dorg-head-commit "dorg-dolt")
+(autoload 'dorg-repo-root-id "dorg-repo")
 
-;; The single identity resolver lives in `dorg-mutate' (loaded via `dorg-api' at
-;; runtime); declared here to avoid a load-time cycle while the QL `(key V)' seam
-;; consults it directly (one identity interpretation, per D4).
-(declare-function dorg-mutate--source-identity "dorg-mutate")
-(declare-function dorg-mutate--resolve-source "dorg-mutate")
-(declare-function dorg-mutate--source-from-registration "dorg-mutate")
+(defun dorg-ql--resolved-dolt-registration (registration revision)
+  "Return REGISTRATION with a root suitable for REVISION-bound QL reads.
+An existing positive root remains authoritative.  A classification-only nil
+root is resolved read-only at REVISION and never creates a binding."
+  (let* ((backend (dorg-registration-backend registration))
+         (root (dorg-backend-root-id backend)))
+    (if root
+        registration
+      (let ((resolved (dorg-repo-root-id (dorg-backend-dolt-dir backend)
+                                         (dorg-registration-file registration)
+                                         revision)))
+        (unless resolved
+          (signal 'dorg-binding-error
+                  (list (format "Dolt source %s has no root at %s; run dorg-bind-dolt"
+                                (dorg-registration-file registration) revision)
+                        (list :reason 'missing-root
+                              :dolt-dir (dorg-backend-dolt-dir backend)
+                              :file (dorg-registration-file registration)
+                              :revision revision))))
+        (make-dorg-registration
+         :backend (dorg-backend-dolt (dorg-backend-dolt-dir backend) resolved)
+         :file (dorg-registration-file registration)
+         :identity (dorg-registration-identity registration))))))
+
+(defun dorg-ql--context-digest (value)
+  "Return a stable digest for the read/print-safe context VALUE."
+  (condition-case err
+      (let* ((print-length nil) (print-level nil) (print-circle nil)
+             (printed (prin1-to-string value)))
+        ;; Round-tripping rejects markers, buffers, closures, and other host
+        ;; state before it can enter an envelope or a warm cache key.
+        (read printed)
+        (secure-hash 'sha256 printed))
+    (error (dorg-ql--unsupported "extension query context is not host-safe: %s"
+                                 (error-message-string err)))))
+
+(defun dorg-ql--copy-context-value (value)
+  "Return an isolated copy of read/print-safe extension context VALUE."
+  (cond ((or (hash-table-p value) (recordp value))
+         (dorg-ql--unsupported "extension query context contains mutable host data"))
+        ((stringp value) (copy-sequence value))
+        ((vectorp value) (vconcat (mapcar #'dorg-ql--copy-context-value value)))
+        ((consp value) (cons (dorg-ql--copy-context-value (car value))
+                             (dorg-ql--copy-context-value (cdr value))))
+        (t value)))
+
+(defun dorg-ql--resolve-extension-contexts (ast invocation)
+  "Capture immutable context bundles needed by extension fields in AST.
+An extension's `:query-context' callback receives INVOCATION once per public
+invocation.  INVOCATION carries the captured `:revision', source registration,
+root, and a revision-bound `:read' function.  It returns a plist whose
+`:values' are passed to field evaluators/lowerers and whose remaining,
+read/print-safe provenance participates in the context digest."
+  (let (contexts)
+    (dolist (field (dorg-ql--extension-fields ast))
+      (let* ((descriptor (dorg-ql--query-field field))
+             (extension (plist-get descriptor :extension))
+             (needs-context (plist-get descriptor :context))
+             (existing (assq extension contexts)))
+        (when (and needs-context (not existing))
+          (let* ((registered (dorg-get-extension extension))
+                 (resolve (and registered
+                               (dorg-extension-query-context registered))))
+            (unless resolve
+              (dorg-ql--unsupported
+               "field %S requires query context but extension %S has no resolver"
+               field extension))
+            (let ((bundle (funcall resolve invocation)))
+              (unless (and (listp bundle) (plist-member bundle :values))
+                (dorg-ql--unsupported
+                 "extension %S returned invalid query context for field %S"
+                 extension field))
+              ;; Validate first so cyclic input fails before the deep copy,
+              ;; then digest the isolated representation.  Context identity
+              ;; must describe values, not the resolver's object sharing.
+              (dorg-ql--context-digest bundle)
+              (let ((captured (dorg-ql--copy-context-value bundle)))
+                (push (cons extension
+                            (list :values (plist-get captured :values)
+                                  :digest (dorg-ql--context-digest captured)))
+                      contexts)))))))
+    (setq contexts (nreverse contexts))
+    (list :contexts contexts
+          :digest (and contexts
+                       (dorg-ql--context-digest
+                        (mapcar (lambda (entry)
+                                  (list (car entry)
+                                        (plist-get (cdr entry) :digest)))
+                                contexts))))))
+
+(defun dorg-ql--make-invocation (source &optional revision)
+  "Build an extension invocation capability for SOURCE at REVISION.
+For a Dolt source, `:read' executes every resolver statement under the exact
+captured revision.  Resolver output, not this capability record, is retained
+in result envelopes and warm cache keys."
+  (let* ((reg (and (not (and source (consp source)))
+                   (dorg-ql--registration source)))
+         (backend (and reg (dorg-registration-backend reg)))
+         (type (and backend (dorg-ql--effective-backend-type backend)))
+         (dolt-dir (and backend (dorg-backend-dolt-dir backend))))
+    (list :source source :registration reg :backend type :revision revision
+          :root (and backend (dorg-backend-root-id backend))
+          :read (and (eq type 'dolt)
+                     revision
+                     (lambda (sql &rest args)
+                       (apply #'dorg-ql--dolt-query dolt-dir revision sql args))))))
+
+(defun dorg-ql--validate-canonical-string-leaves (ast field-plan)
+  "Reject legacy string leaves in AST once, using FIELD-PLAN descriptors.
+The public normalizer always emits a `:case' mode for a string comparison.
+Keeping this defensive invariant at preparation time avoids a registry lookup
+per selected heading when a caller supplies an internal AST directly."
+  (let ((dorg-ql--extension-field-plan field-plan))
+    (cl-labels ((walk (node)
+                  (pcase node
+                    (`(:cmp ,field ,_op ,_value)
+                     (when (dorg-ql--string-field-p field)
+                       (dorg-ql--error
+                        "string comparison lacks canonical :case mode: %S" node)))
+                    ((or `(:property ,_ ,op ,_value)
+                         `(:keyword ,_ ,op ,_value)
+                         `(:tag ,op ,_value))
+                     (unless (memq op '(exists missing))
+                       (dorg-ql--error
+                        "string comparison lacks canonical :case mode: %S" node)))
+                    ((pred consp) (mapc #'walk node)))))
+      (walk ast))))
+
+(defun dorg-ql--prepare-query (query source &optional invocation)
+  "Normalize QUERY and capture its invocation context once for SOURCE.
+The returned internal record is deliberately consumed by the public facade and
+the warm session layer together, so a cache-key probe cannot resolve workflow
+configuration separately from the query it subsequently serves."
+  (setq query (dorg-ql--resolve-key-refs query source))
+  (let* ((ast (dorg-ql-normalize query))
+         (field-plan-record (dorg-ql--compile-field-plan ast))
+         (field-plan (plist-get field-plan-record :field-plan))
+         (_canonical-leaves
+          (dorg-ql--validate-canonical-string-leaves ast field-plan))
+         (extension-identities
+          (plist-get field-plan-record :extension-identities))
+         ;; Model sources have no deferred backend capture.  Buffer sources
+         ;; resolve only after `dorg-ql--buffer-select-v2' captures HEAD,
+         ;; unless a warm session supplied that already-captured invocation.
+         (context (let ((dorg-ql--extension-field-plan field-plan))
+                    (and (or invocation (and source (consp source)))
+                         (dorg-ql--resolve-extension-contexts
+                          ast (or invocation (list :source source)))))))
+    (list :ast ast
+          :field-plan field-plan
+          :extension-identities extension-identities
+          :invocation invocation
+          :revision (plist-get invocation :revision)
+          :context context
+          :contexts (plist-get context :contexts)
+          :context-digest (plist-get context :digest))))
 
 ;;; ─── Dispatch ─────────────────────────────────────────────────────────
 
@@ -161,7 +317,34 @@ known type nor a Dolt directory."
     ('dolt      'dolt)
     (_ (and backend (dorg-backend-dolt-dir backend) 'dolt))))
 
-(defun dorg-ql--buffer-select-v2 (ast buffer)
+(defun dorg-ql--snapshot-source (registration type)
+  "Return explicit public source identity for REGISTRATION of backend TYPE.
+Files and Dolt stores are canonicalized only when supplied by the registration;
+non-file library sources are never assigned an invented path."
+  (let* ((backend (dorg-registration-backend registration))
+         (file (dorg-registration-file registration))
+         (store (and (eq type 'dolt) (dorg-backend-dolt-dir backend))))
+    (append (list :kind type)
+            (when file (list :file (file-truename file)))
+            (when store (list :store (file-truename store))))))
+
+(defun dorg-ql--plain-content-snapshot (buffer)
+  "Capture BUFFER's exact UTF-8 text identity before a plain query reads it."
+  (with-current-buffer buffer
+    (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+      (list :tick (buffer-chars-modified-tick)
+            :text text
+            :content-sha256
+            (secure-hash 'sha256 (encode-coding-string text 'utf-8 t))))))
+
+(defun dorg-ql--plain-content-stable-p (buffer captured)
+  "Return non-nil when BUFFER still has CAPTURED's exact text and edit tick."
+  (with-current-buffer buffer
+    (and (= (plist-get captured :tick) (buffer-chars-modified-tick))
+         (equal (plist-get captured :text)
+                (buffer-substring-no-properties (point-min) (point-max))))))
+
+(defun dorg-ql--buffer-select-v2 (ast buffer &optional snapshot-p prepared)
   "Run normalized v2 AST against BUFFER's backend, or fail closed.
 Every buffer query — a historical atomic alias or a composable v2 form —
 reaches this one dispatcher as the normalized AST from `dorg-ql-normalize'.
@@ -173,10 +356,53 @@ widening or silently emptying the result."
          (backend (dorg-registration-backend reg))
          (type (dorg-ql--effective-backend-type backend)))
     (pcase type
-      ((or 'dolt 'plain-org)
-       (if (eq type 'dolt)
-           (dorg-ql--dolt-eval ast reg)
-         (dorg-ql--plain-eval ast reg)))
+      ('dolt
+       (dorg-ql--dolt-validate-extension-memberships ast)
+       (let* ((dolt-dir (dorg-backend-dolt-dir backend))
+              ;; Capture exactly once before any data read.  A capture error
+              ;; escapes before the adapter is entered.
+              (revision (or (plist-get prepared :revision)
+                            (dorg-head-commit dolt-dir)))
+              (reg (dorg-ql--resolved-dolt-registration reg revision))
+              (backend (dorg-registration-backend reg))
+              (invocation (or (plist-get prepared :invocation)
+                              (dorg-ql--make-invocation reg revision)))
+              (context (or (plist-get prepared :context)
+                           (dorg-ql--resolve-extension-contexts ast invocation)))
+              (dorg-ql--extension-contexts (plist-get context :contexts))
+              (rows (dorg-ql--dolt-eval ast reg revision)))
+         (if snapshot-p
+             (list :rows rows
+                   :source (dorg-ql--snapshot-source reg type)
+                   :root (dorg-backend-root-id backend)
+                   :snapshot (list :kind 'dolt :head revision)
+                   :context-digest (plist-get context :digest))
+           rows)))
+      ('plain-org
+       (let* ((plain-buffer (dorg-ql--plain-org-buffer reg))
+              ;; A snapshot identifies precisely the text the planner reads.
+              ;; If a callback edits the live buffer while it runs, refuse
+              ;; rather than report this hash for different result rows.
+              (content (and snapshot-p
+                            (dorg-ql--plain-content-snapshot plain-buffer)))
+              (invocation (or (plist-get prepared :invocation)
+                              (dorg-ql--make-invocation buffer nil)))
+              (context (or (plist-get prepared :context)
+                           (dorg-ql--resolve-extension-contexts ast invocation)))
+              (dorg-ql--extension-contexts (plist-get context :contexts))
+              (rows (dorg-ql--plain-eval ast reg plain-buffer)))
+         (if snapshot-p
+             (progn
+               (unless (dorg-ql--plain-content-stable-p plain-buffer content)
+                 (dorg-ql--unsupported
+                  "plain-org source changed during snapshot evaluation"))
+               (list :rows rows
+                     :source (dorg-ql--snapshot-source reg type)
+                     :root nil
+                     :snapshot (list :kind 'plain-org
+                                     :content-sha256 (plist-get content :content-sha256))
+                     :context-digest (plist-get context :digest)))
+           rows)))
       (_ (dorg-ql--unsupported
           "dorg-ql queries are not supported on the %s backend"
           (or type "unknown"))))))
@@ -194,11 +420,26 @@ widening or silently emptying the result."
 ;; `dorg-ql-error'), never degraded to a fallback scan.
 
 (defun dorg-ql--query-references-key-p (form)
-  "Non-nil when query FORM contains a `(key …)' selector anywhere."
-  (pcase form
-    (`(key . ,_) t)
-    ((pred consp) (cl-some #'dorg-ql--query-references-key-p form))
-    (_ nil)))
+  "Non-nil when query FORM contains a well-shaped `(key V)' selector.
+Reject dotted lists and malformed key selectors before identity lookup.  This
+walks raw input, so ordinary list helpers cannot safely assume a proper list."
+  (when (consp form)
+    (let ((tail form)
+          (found nil))
+      (when (eq (car form) 'key)
+        (unless (and (consp (cdr form))
+                     (null (cddr form))
+                     (stringp (cadr form)))
+          (dorg-ql--error "(key VALUE) requires exactly one string value: %S"
+                          form))
+        (setq found t))
+      (while (consp tail)
+        (when (dorg-ql--query-references-key-p (car tail))
+          (setq found t))
+        (setq tail (cdr tail)))
+      (unless (null tail)
+        (dorg-ql--error "query contains an improper list: %S" form))
+      found)))
 
 (defun dorg-ql--identity-key-spec (source)
   "Resolve the identity spec for a `(key V)' selector against SOURCE.
@@ -261,7 +502,19 @@ No-op (and no registration lookup) when QUERY references no `(key …)'."
     query))
 
 ;;;###autoload
-(defun dorg-ql-select (query &optional source)
+(defun dorg-ql--execute-prepared (prepared source &optional snapshot-p)
+  "Execute PREPARED query once, preserving its captured context bundle."
+  (let ((dorg-ql--extension-contexts (plist-get prepared :contexts))
+        (dorg-ql--extension-field-plan (plist-get prepared :field-plan))
+        (ast (plist-get prepared :ast)))
+    (if (and source (consp source))
+        (if snapshot-p
+            (dorg-ql--unsupported "snapshot reads require a Dolt-backed registration")
+          (dorg-ql--model-eval ast source))
+      (dorg-ql--buffer-select-v2 ast source snapshot-p prepared))))
+
+;;;###autoload
+(defun dorg-ql-select (query &optional source prepared)
   "Run one validated QUERY (atomic or composable v2) and return result plists.
 
 An atomic QUERY is one of: (id ID), (property KEY VALUE), (title TITLE),
@@ -290,8 +543,10 @@ SOURCE selects the adapter:
                 filter-only pipelines run over the supplied order, while
                 traversal and `unique' require unique non-nil ids.
 
-Each result is a plist with `:heading-id', `:marker', `:title', and
-`:properties'.  Plain-org results carry live markers; model and Dolt
+Without a terminal `select' step, each result is a plist with `:heading-id',
+`:marker', `:title', and `:properties'.  A selected row retains internal
+`:heading-id'/`:marker' navigation metadata and exposes only the requested
+ordered `:values' alist.  Plain-org results carry live markers; model and Dolt
 results carry nil markers.  An empty match returns nil.
 
 Both the historical atomic aliases and the composable v2 forms —
@@ -321,11 +576,110 @@ deliberate and preserved until [[tracked-regression]]."
   ;; lookup) and lowers the historical atomic aliases onto the same executor
   ;; path the composable forms use, so there is no second atomic execution
   ;; branch.
-  (setq query (dorg-ql--resolve-key-refs query source))
-  (let ((ast (dorg-ql-normalize query)))
-    (if (and source (consp source))
-        (dorg-ql--model-eval ast source)
-      (dorg-ql--buffer-select-v2 ast source))))
+  (dorg-ql--execute-prepared (or prepared (dorg-ql--prepare-query query source))
+                             source))
+
+;;;###autoload
+(defun dorg-ql-select-snapshot (query &optional source)
+  "Run QUERY through the public QL pipeline and return rows plus snapshot.
+The result is `(:rows ROWS :source SOURCE :root ROOT-ID :snapshot SNAPSHOT
+:context-digest DIGEST)'.  SOURCE identifies its backend kind and canonical
+file when present (plus the Dolt store); SNAPSHOT is `(:kind dolt :head COMMIT)'
+or `(:kind plain-org :content-sha256 SHA256)'.  The Dolt token is captured once
+before any data statement; plain snapshots refuse a source changed while the
+query evaluates.  Extension context remains a separate identity."
+  (dorg-ql--execute-prepared (dorg-ql--prepare-query query source) source t))
+
+(defun dorg-ql--rank-bm25-step (ast)
+  "Return AST's one normalized BM25 rank step, or nil.
+
+Placement and uniqueness are normalizer invariants.  Keeping this extraction at
+the public search boundary prevents the ordinary select dispatcher from gaining
+a second result shape for a terminal rank operation."
+  (cl-find-if (lambda (step) (eq (car-safe step) :rank-bm25))
+              (and (consp ast) (cddr ast))))
+
+;;;###autoload
+(defun dorg-ql-search-snapshot (query &optional source)
+  "Run terminal BM25 QUERY and return its revision-bound search envelope.
+
+QUERY must contain one normalized terminal `(rank-bm25 ...)' step.  Ranked
+results are deliberately a sibling public envelope rather than
+`dorg-ql-select' rows: ordinary select keeps its stable four-key result plist
+shape.  The returned envelope names the captured source/root/snapshot, lexical
+profile, immutable index and corpus generations, and ordered `:matches'; each
+match carries canonical `:heading-id', title, and rounded numeric `:score'.
+
+Only a registered Dolt source is currently supported.  Plain and model sources
+signal typed QL unsupported rather than silently substituting a scan or a
+different ranker.  The conventional BM25 extension loader is entered only
+after grammar validation and backend admission; a missing or incompatible
+derived index is handled by the Dolt read adapter as a typed unavailable
+outcome."
+  (let* ((prepared (dorg-ql--prepare-query query source))
+         (ast (plist-get prepared :ast))
+         (rank (dorg-ql--rank-bm25-step ast)))
+    (unless rank
+      (dorg-ql--error "search snapshot requires one terminal rank-bm25 step: %S"
+                      query))
+    (when (and source (consp source))
+      (dorg-ql--unsupported
+       "BM25 ranked search is unavailable for model-list sources"))
+    (let* ((reg (dorg-ql--registration source))
+           (backend (dorg-registration-backend reg))
+           (type (dorg-ql--effective-backend-type backend)))
+      (unless (eq type 'dolt)
+        (dorg-ql--unsupported "BM25 ranked search is unavailable for %s sources"
+                              (or type "unknown")))
+      ;; Registration is explicit and lazy: unrelated DOrg stores do not need
+      ;; the optional schema merely because they load the public QL facade.
+      (dorg-load-extension "bm25")
+      (let* ((dolt-dir (dorg-backend-dolt-dir backend))
+             (revision (dorg-head-commit dolt-dir))
+             (reg (dorg-ql--resolved-dolt-registration reg revision))
+             (result (let ((dorg-ql--extension-contexts
+                            (plist-get prepared :contexts))
+                           (dorg-ql--extension-field-plan
+                            (plist-get prepared :field-plan)))
+                       (dorg-ql--dolt-bm25-search ast reg revision)))
+             ;; The extension reader owns the SQL snapshot pin.  On a normal
+             ;; read it equals the captured head; if it captured a later
+             ;; committed token, report that token with its rows rather than
+             ;; falsely labelling them as the earlier QL probe.
+             (snapshot (or (plist-get result :snapshot) revision)))
+        (list :command 'search
+              :source (dorg-ql--snapshot-source reg type)
+              :root (dorg-backend-root-id (dorg-registration-backend reg))
+              :snapshot (list :kind 'dolt :head snapshot)
+              :profile (plist-get result :profile)
+              :index-generation (plist-get result :index-generation)
+              :corpus-generation (plist-get result :corpus-generation)
+              :matches (plist-get result :matches)
+              :count (length (plist-get result :matches)))))))
+
+;;;###autoload
+(defun dorg-ql-snapshot-public (envelope)
+  "Return JSON-ready public query data from one internal snapshot ENVELOPE.
+This is the common pure boundary for DOrg and downstream CLI wrappers.  It
+removes internal result markers, preserves requested string column/property
+names exactly, and retains source, root, typed snapshot, context identity,
+results, and count."
+  (let ((results
+         (vconcat
+          (mapcar
+           (lambda (row)
+             (if (plist-member row :values)
+                 (plist-get row :values)
+               (list :heading-id (plist-get row :heading-id)
+                     :title (or (plist-get row :title) "")
+                     :properties (plist-get row :properties))))
+           (plist-get envelope :rows)))))
+    (list :command 'query
+          :source (plist-get envelope :source)
+          :root (plist-get envelope :root)
+          :snapshot (plist-get envelope :snapshot)
+          :context-digest (plist-get envelope :context-digest)
+          :results results :count (length results))))
 
 (provide 'dorg-ql)
 ;;; dorg-ql.el ends here

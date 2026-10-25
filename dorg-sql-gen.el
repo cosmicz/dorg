@@ -59,92 +59,129 @@ Returns e.g. X'01', X'0a80'.
 Hard storage guard: signals an error if KEY exceeds
 `dorg-sortkey-max-bytes', so an overlong key can never reach SQL
 generation and silently truncate or corrupt the VARBINARY(64) column.
-This is a backstop; the normal exhaustion path rebalances before
-allocating such a key (see `dorg-sortkey-midpoint-limited').  Keys of
-exactly `dorg-sortkey-max-bytes' remain writable for compatibility
-with existing rows."
+This is a backstop: every allocated key is exactly
+`dorg-sortkey-boundary-width' bytes.  Keys of exactly
+`dorg-sortkey-max-bytes' remain writable for compatibility with
+existing rows."
   (when (> (length key) dorg-sortkey-max-bytes)
     (error "dorg-sql-gen: sort key length %d exceeds VARBINARY(%d) limit"
            (length key) dorg-sortkey-max-bytes))
   (dorg-sortkey-to-hex key))
 
+(defun dorg-sql-gen--sort-key-value (key)
+  "Return sort KEY as a typed row value, under the same storage guard.
+The value lowers to the literal `dorg-sql-gen--sort-key-hex' returns."
+  (dorg-sql-gen--sort-key-hex key)
+  (cons :hex key))
+
+(defun dorg-sql-gen--integer (value)
+  "Return VALUE, an integer column value, or signal `wrong-type-argument'."
+  (unless (integerp value)
+    (signal 'wrong-type-argument (list 'integerp value)))
+  value)
+
 ;;; Item SQL Generation
 
-(cl-defgeneric dorg-item-to-sql (item item-id heading-id sort-n)
-  "Return a list of SQL INSERT strings for ITEM.
-ITEM-ID is the snowflake id for the heading_items row.
-HEADING-ID is the parent heading's id.
-SORT-N is the 1-based sort position among siblings.")
+(defun dorg-sql-gen--bind-item-row (item item-id sort-key)
+  "Record ITEM-ID and SORT-KEY on ITEM and return ITEM.
+SQL lowering is the point where new item rows receive database identity; binding
+that identity back onto the candidate model lets transaction postimage checks
+compare the complete persisted item-row image."
+  (setf (dorg-item-id item) item-id)
+  (setf (dorg-item-sort-key item) sort-key)
+  item)
 
-(cl-defmethod dorg-item-to-sql ((item dorg-text-item) item-id heading-id sort-n)
-  (list
-   (format "INSERT INTO heading_items (id, heading_id, sort_key, kind, post_blank) VALUES (%d, %d, %s, 'text', %d)"
-           item-id heading-id
-           (dorg-sql-gen--sort-key-hex sort-n)
-           (dorg-item-post-blank item))
-   (format "INSERT INTO text_items (item_id, text_raw) VALUES (%d, %s)"
-           item-id (dorg-sql-quote (dorg-text-item-text item)))))
+(cl-defgeneric dorg-item-to-rows (item item-id heading-id sort-key)
+  "Return the typed insert rows for ITEM, in insert order.
+ITEM-ID is the snowflake id for the heading_items row, HEADING-ID the parent
+heading's id and SORT-KEY the item's unibyte sort key among its siblings.
+The heading_items row comes first, then the item's detail rows.")
 
-(cl-defmethod dorg-item-to-sql ((item dorg-keyword-item) item-id heading-id sort-n)
-  (list
-   (format "INSERT INTO heading_items (id, heading_id, sort_key, kind, post_blank) VALUES (%d, %d, %s, 'keyword', %d)"
-           item-id heading-id
-           (dorg-sql-gen--sort-key-hex sort-n)
-           (dorg-item-post-blank item))
-   (format "INSERT INTO keyword_items (item_id, keyword, value_raw) VALUES (%d, %s, %s)"
-           item-id
-           (dorg-sql-quote (dorg-keyword-item-keyword item))
-           (dorg-sql-quote (dorg-keyword-item-value item)))))
+(defun dorg-sql-gen--item-row (item-id heading-id sort-key kind post-blank)
+  "Return the heading_items row for ITEM-ID of KIND under HEADING-ID.
+SORT-KEY is the unibyte sort key and POST-BLANK the trailing blank count."
+  (dorg-sql-row-make "heading_items" '(id heading_id sort_key kind post_blank)
+                     (list (dorg-sql-gen--integer item-id)
+                           (dorg-sql-gen--integer heading-id)
+                           (dorg-sql-gen--sort-key-value sort-key)
+                           kind
+                           (dorg-sql-gen--integer post-blank))))
 
-(cl-defmethod dorg-item-to-sql ((item dorg-planning-item) item-id heading-id sort-n)
+(cl-defmethod dorg-item-to-rows ((item dorg-text-item) item-id heading-id sort-key)
   (list
-   (format "INSERT INTO heading_items (id, heading_id, sort_key, kind, post_blank) VALUES (%d, %d, %s, 'planning', %d)"
-           item-id heading-id
-           (dorg-sql-gen--sort-key-hex sort-n)
-           (dorg-item-post-blank item))
-   (format "INSERT INTO planning_items (item_id, scheduled_raw, deadline_raw, closed_raw) VALUES (%d, %s, %s, %s)"
-           item-id
-           (dorg-sql-quote (dorg-planning-item-scheduled item))
-           (dorg-sql-quote (dorg-planning-item-deadline item))
-           (dorg-sql-quote (dorg-planning-item-closed item)))))
+   (dorg-sql-gen--item-row item-id heading-id sort-key "text"
+                           (dorg-item-post-blank item))
+   (dorg-sql-row-make "text_items" '(item_id text_raw)
+                      (list item-id (dorg-text-item-text item)))))
+
+(cl-defmethod dorg-item-to-rows ((item dorg-keyword-item) item-id heading-id sort-key)
+  (list
+   (dorg-sql-gen--item-row item-id heading-id sort-key "keyword"
+                           (dorg-item-post-blank item))
+   (dorg-sql-row-make "keyword_items" '(item_id keyword value_raw)
+                      (list item-id
+                            (dorg-keyword-item-keyword item)
+                            (dorg-keyword-item-value item)))))
+
+(cl-defmethod dorg-item-to-rows ((item dorg-planning-item) item-id heading-id sort-key)
+  (list
+   (dorg-sql-gen--item-row item-id heading-id sort-key "planning"
+                           (dorg-item-post-blank item))
+   (dorg-sql-row-make "planning_items"
+                      '(item_id scheduled_raw deadline_raw closed_raw)
+                      (list item-id
+                            (dorg-planning-item-scheduled item)
+                            (dorg-planning-item-deadline item)
+                            (dorg-planning-item-closed item)))))
+
+(defun dorg-sql-gen--drawer-detail-rows (item-id item)
+  "Return the typed rows of drawer ITEM's child rows under heading_items ITEM-ID.
+A PROPERTIES drawer (ITEM has properties) yields `property_entries' rows;
+any other drawer yields `drawer_lines' rows."
+  (let ((ord 0)
+        (rows nil))
+    (if (dorg-drawer-item-properties item)
+        (dolist (kv (dorg-drawer-item-properties item))
+          (cl-incf ord)
+          (let ((key (car kv))
+                (value (cdr kv)))
+            (push (dorg-sql-row-make
+                   "property_entries"
+                   '(drawer_item_id ordinal prop_key prop_value raw_line)
+                   (list item-id ord key value (format ":%s: %s" key value)))
+                  rows)))
+      (dolist (line (dorg-drawer-item-lines item))
+        (cl-incf ord)
+        (push (dorg-sql-row-make "drawer_lines" '(drawer_item_id ordinal line_raw)
+                                 (list item-id ord line))
+              rows)))
+    (nreverse rows)))
 
 (defun dorg-sql-gen--drawer-detail-inserts (item-id item)
   "Return INSERTs for drawer ITEM's child rows under heading_items ITEM-ID.
 A PROPERTIES drawer (ITEM has properties) emits `property_entries' rows;
 any other drawer emits `drawer_lines' rows.  Shared by full-item INSERT
 and item-level UPDATE so both forms stay consistent."
-  (let ((ord 0)
-        (stmts nil))
-    (if (dorg-drawer-item-properties item)
-        (dolist (kv (dorg-drawer-item-properties item))
-          (cl-incf ord)
-          (let* ((key (car kv))
-                 (value (cdr kv))
-                 (raw (format ":%s: %s" key value)))
-            (push (format "INSERT INTO property_entries (drawer_item_id, ordinal, prop_key, prop_value, raw_line) VALUES (%d, %d, %s, %s, %s)"
-                          item-id ord
-                          (dorg-sql-quote key)
-                          (dorg-sql-quote value)
-                          (dorg-sql-quote raw))
-                  stmts)))
-      (dolist (line (dorg-drawer-item-lines item))
-        (cl-incf ord)
-        (push (format "INSERT INTO drawer_lines (drawer_item_id, ordinal, line_raw) VALUES (%d, %d, %s)"
-                      item-id ord (dorg-sql-quote line))
-              stmts)))
-    (nreverse stmts)))
+  (mapcar #'dorg-sql-row-sql (dorg-sql-gen--drawer-detail-rows item-id item)))
 
-(cl-defmethod dorg-item-to-sql ((item dorg-drawer-item) item-id heading-id sort-n)
+(cl-defmethod dorg-item-to-rows ((item dorg-drawer-item) item-id heading-id sort-key)
   (nconc
    (list
-    (format "INSERT INTO heading_items (id, heading_id, sort_key, kind, post_blank) VALUES (%d, %d, %s, 'drawer', %d)"
-            item-id heading-id
-            (dorg-sql-gen--sort-key-hex sort-n)
-            (dorg-item-post-blank item))
-    (format "INSERT INTO drawer_items (item_id, name) VALUES (%d, %s)"
-            item-id
-            (dorg-sql-quote (dorg-drawer-item-name item))))
-   (dorg-sql-gen--drawer-detail-inserts item-id item)))
+    (dorg-sql-gen--item-row item-id heading-id sort-key "drawer"
+                            (dorg-item-post-blank item))
+    (dorg-sql-row-make "drawer_items" '(item_id name)
+                       (list item-id (dorg-drawer-item-name item))))
+   (dorg-sql-gen--drawer-detail-rows item-id item)))
+
+(cl-defgeneric dorg-item-to-sql (item item-id heading-id sort-n)
+  "Return a list of SQL INSERT strings for ITEM.
+ITEM-ID is the snowflake id for the heading_items row.
+HEADING-ID is the parent heading's id.
+SORT-N is the item's sort key among its siblings.
+Each string is one row of `dorg-item-to-rows'.")
+
+(cl-defmethod dorg-item-to-sql (item item-id heading-id sort-n)
+  (mapcar #'dorg-sql-row-sql (dorg-item-to-rows item item-id heading-id sort-n)))
 
 ;;; Item UPDATE SQL Generation
 ;;
@@ -191,33 +228,53 @@ the row id and kind are preserved."
 
 ;;; Heading SQL Generation
 
+(define-error 'dorg-sql-gen-missing-level-offset
+  "dorg: heading has no persisted level offset")
+
+(defun dorg-sql-gen--level-offset (heading)
+  "Return HEADING's persisted level offset, or signal when it is missing.
+Only the offset is ever written; an absolute level is never inferred from the
+effective LEVEL slot, so a constructed heading cannot smuggle one into storage."
+  (let ((offset (dorg-heading-level-offset heading)))
+    (unless (and (integerp offset) (>= offset 0))
+      (signal 'dorg-sql-gen-missing-level-offset
+              (list (dorg-heading-id heading) offset)))
+    offset))
+
+(defun dorg-sql-gen-heading-row (heading root-id)
+  "Return the typed headings row for HEADING under ROOT-ID.
+Includes the items_hash column."
+  (dorg-sql-row-make
+   "headings"
+   '(id root_id parent_id sort_key level_offset todo_keyword priority commented
+        title post_blank items_hash)
+   (list (dorg-sql-gen--integer (dorg-heading-id heading))
+         (dorg-sql-gen--integer root-id)
+         (and (dorg-heading-parent-id heading)
+              (dorg-sql-gen--integer (dorg-heading-parent-id heading)))
+         (dorg-sql-gen--sort-key-value (dorg-heading-sort-key heading))
+         (dorg-sql-gen--level-offset heading)
+         (dorg-heading-todo heading)
+         (dorg-heading-priority heading)
+         (if (dorg-heading-commented heading) :true :false)
+         (dorg-heading-title heading)
+         (dorg-sql-gen--integer (or (dorg-heading-post-blank heading) 0))
+         (dorg-heading-items-hash heading))))
+
 (defun dorg-sql-gen-heading-insert (heading root-id)
   "Return SQL INSERT string for HEADING under ROOT-ID.
 Includes items_hash column."
-  (format "INSERT INTO headings (id, root_id, parent_id, sort_key, level, todo_keyword, priority, commented, title, post_blank, items_hash) VALUES (%d, %d, %s, %s, %d, %s, %s, %s, %s, %d, %s)"
-          (dorg-heading-id heading)
-          root-id
-          (if (dorg-heading-parent-id heading)
-              (number-to-string (dorg-heading-parent-id heading))
-            "NULL")
-          (dorg-sql-gen--sort-key-hex (dorg-heading-sort-key heading))
-          (dorg-heading-level heading)
-          (dorg-sql-quote (dorg-heading-todo heading))
-          (dorg-sql-quote (dorg-heading-priority heading))
-          (if (dorg-heading-commented heading) "TRUE" "FALSE")
-          (dorg-sql-quote (dorg-heading-title heading))
-          (or (dorg-heading-post-blank heading) 0)
-          (dorg-sql-quote (dorg-heading-items-hash heading))))
+  (dorg-sql-row-sql (dorg-sql-gen-heading-row heading root-id)))
 
 (defun dorg-sql-gen-heading-update (heading)
   "Return SQL UPDATE string for HEADING.
 Updates all mutable attributes including items_hash."
-  (format "UPDATE headings SET parent_id = %s, sort_key = %s, level = %d, todo_keyword = %s, priority = %s, commented = %s, title = %s, post_blank = %d, items_hash = %s WHERE id = %d"
+  (format "UPDATE headings SET parent_id = %s, sort_key = %s, level_offset = %d, todo_keyword = %s, priority = %s, commented = %s, title = %s, post_blank = %d, items_hash = %s WHERE id = %d"
           (if (dorg-heading-parent-id heading)
               (number-to-string (dorg-heading-parent-id heading))
             "NULL")
           (dorg-sql-gen--sort-key-hex (dorg-heading-sort-key heading))
-          (dorg-heading-level heading)
+          (dorg-sql-gen--level-offset heading)
           (dorg-sql-quote (dorg-heading-todo heading))
           (dorg-sql-quote (dorg-heading-priority heading))
           (if (dorg-heading-commented heading) "TRUE" "FALSE")
@@ -226,48 +283,93 @@ Updates all mutable attributes including items_hash."
           (dorg-sql-quote (dorg-heading-items-hash heading))
           (dorg-heading-id heading)))
 
+(defun dorg-sql-gen-tag-rows (heading-id tags)
+  "Return the typed heading_tags rows for TAGS on HEADING-ID, in tag order."
+  (let ((ord 0))
+    (mapcar (lambda (tag)
+              (cl-incf ord)
+              (dorg-sql-row-make "heading_tags" '(heading_id ordinal tag)
+                                 (list (dorg-sql-gen--integer heading-id) ord tag)))
+            tags)))
+
 (defun dorg-sql-gen-tag-inserts (heading-id tags)
   "Return list of SQL INSERT strings for TAGS on HEADING-ID."
-  (let ((stmts nil)
-        (ord 0))
-    (dolist (tag tags)
-      (cl-incf ord)
-      (push (format "INSERT INTO heading_tags (heading_id, ordinal, tag) VALUES (%d, %d, %s)"
-                     heading-id ord (dorg-sql-quote tag))
-            stmts))
-    (nreverse stmts)))
+  (mapcar #'dorg-sql-row-sql (dorg-sql-gen-tag-rows heading-id tags)))
+
+(defun dorg-sql-gen-heading-items-rows (heading id-generator)
+  "Return the typed insert rows for all items in HEADING, in item order.
+ID-GENERATOR is a function returning the next snowflake BIGINT id; it is
+called once per inserted item, in item order, and each item is bound to its
+new id and sort key.  Skips `dorg-keyword-item' instances whose keyword
+starts with \"DORG_\" -- these are buffer-local metadata, not DB content."
+  (let* ((items (cl-remove-if #'dorg-item--db-local-p
+                              (dorg-heading-items heading)))
+         (ops (dorg-model-plan-items nil items))
+         (rows nil))
+    (dolist (op ops)
+      (pcase op
+        (`(:insert ,item ,sort-key)
+         (let ((item-id (funcall id-generator)))
+           (dorg-sql-gen--bind-item-row item item-id sort-key)
+           (setq rows (nconc rows (dorg-item-to-rows item item-id
+                                                     (dorg-heading-id heading)
+                                                     sort-key)))))))
+    rows))
 
 (defun dorg-sql-gen-heading-items-sql (heading id-generator)
   "Return flat list of SQL INSERTs for all items in HEADING.
 ID-GENERATOR is a function returning the next snowflake BIGINT id.
 Skips `dorg-keyword-item' instances whose keyword starts with
 \"DORG_\" — these are buffer-local metadata, not DB content."
-  (let* ((items (cl-remove-if #'dorg-item--db-local-p
-                              (dorg-heading-items heading)))
-         (w (dorg-sortkey-width-for-count (length items)))
-         (stmts nil)
-         (sort-n 0))
-    (dolist (item items)
-      (cl-incf sort-n)
-      (let ((item-id (funcall id-generator)))
-        (setq stmts (nconc stmts (dorg-item-to-sql item item-id
-                                                     (dorg-heading-id heading)
-                                                     (dorg-sortkey-from-integer sort-n w))))))
-    stmts))
+  (mapcar #'dorg-sql-row-sql (dorg-sql-gen-heading-items-rows heading id-generator)))
 
 ;;; Full Heading SQL (for parser backward compat)
+
+(defun dorg-sql-gen-heading-full-rows (heading root-id id-generator)
+  "Return every typed insert row for HEADING: heading, tags, then items.
+ID-GENERATOR is a function returning snowflake ids for items."
+  (append (list (dorg-sql-gen-heading-row heading root-id))
+          (dorg-sql-gen-tag-rows (dorg-heading-id heading) (dorg-heading-tags heading))
+          (dorg-sql-gen-heading-items-rows heading id-generator)))
 
 (defun dorg-sql-gen-heading-full-sql (heading root-id id-generator)
   "Return all SQL statements for HEADING: heading + tags + items.
 ID-GENERATOR is a function returning snowflake ids for items."
-  (let ((stmts (list (dorg-sql-gen-heading-insert heading root-id))))
-    (setq stmts (nconc stmts
-                        (dorg-sql-gen-tag-inserts
-                         (dorg-heading-id heading)
-                         (dorg-heading-tags heading))))
-    (setq stmts (nconc stmts
-                        (dorg-sql-gen-heading-items-sql heading id-generator)))
-    stmts))
+  (mapcar #'dorg-sql-row-sql
+          (dorg-sql-gen-heading-full-rows heading root-id id-generator)))
+
+;;; Core Table Order
+;;
+;; A whole-document import inserts many rows into each core table.  Grouping
+;; them by table gives one adjacent run per table, which the lowering merges
+;; into a few multi-row INSERTs.  The order below follows DOrg's own foreign
+;; keys (`dorg-schema-ddl'): every non-self key points from a later table to
+;; an earlier one.  The two headings self-references (parent_id and root_id)
+;; hold because the stable partition keeps headings in document pre-order,
+;; so a parent row always precedes its children.
+
+(defconst dorg-sql-gen-core-table-order
+  '("headings" "heading_tags" "heading_items" "text_items" "keyword_items"
+    "planning_items" "drawer_items" "property_entries" "drawer_lines")
+  "Core row tables in foreign-key order: parents before children.")
+
+(defun dorg-sql-gen-order-core-rows (rows)
+  "Return core ROWS grouped by `dorg-sql-gen-core-table-order', each stable.
+ROWS are typed rows of core tables in generation order; within one table
+the result keeps that order.  A row of any other table signals
+`dorg-sql-row-error' rather than being dropped.  ROWS is not modified; it
+must be a finite proper list."
+  (unless (proper-list-p rows)
+    (signal 'dorg-sql-row-error (list "core rows must be a proper list")))
+  (let ((buckets (mapcar #'list dorg-sql-gen-core-table-order)))
+    (dolist (row rows)
+      (let ((bucket (assoc (dorg-sql-row-table row) buckets)))
+        (unless bucket
+          (signal 'dorg-sql-row-error
+                  (list "row table has no place in the core order"
+                        (dorg-sql-row-table row))))
+        (push row (cdr bucket))))
+    (cl-mapcan (lambda (bucket) (nreverse (cdr bucket))) buckets)))
 
 ;;; Insert Ordering
 
@@ -327,15 +429,15 @@ correctness beats partial optimization for unexpected cache states."
 Reuses existing `heading_items.id' via `dorg-model-plan-items': removed
 items are deleted (cascading their detail rows), reused items get same-kind
 detail UPDATEs and a `heading_items' row UPDATE only when their sort_key or
-post_blank changed, and new items are inserted with fresh ids.  Divergent
-reused sort keys are first staged to collision-free id-derived temps so
-swaps/reorders never violate `uq_heading_item_order (heading_id, sort_key)'.
-ID-GEN supplies fresh snowflake ids for inserts."
+post_blank changed, and new items are inserted with fresh ids.  Every fresh
+key is distinct from every old key of the list (`dorg-model-plan-items'), so
+no statement order can violate `uq_heading_item_order (heading_id, sort_key)'
+and no temporary keys are needed.  ID-GEN supplies fresh snowflake ids for
+inserts."
   (let* ((hid (dorg-heading-id new-h))
          (ops (dorg-model-plan-items (dorg-heading-items db-h)
                                      (dorg-heading-items new-h)))
          (delete-ids nil)
-         (stage-ids nil)
          (detail-stmts nil)
          (row-stmts nil)
          (insert-stmts nil))
@@ -352,10 +454,10 @@ ID-GEN supplies fresh snowflake ids for inserts."
                 (key-diff (not (equal (dorg-item-sort-key old) final-key)))
                 (pb-diff (not (equal (dorg-item-post-blank old)
                                      (dorg-item-post-blank new)))))
+           (dorg-sql-gen--bind-item-row new id final-key)
            (when (eq kind :update)
              (setq detail-stmts
                    (nconc detail-stmts (dorg-sql-gen-item-update old new))))
-           (when key-diff (push id stage-ids))
            (when (or key-diff pb-diff)
              (push (dorg-sql-gen-item-row-update
                     id final-key (dorg-item-post-blank new))
@@ -364,6 +466,7 @@ ID-GEN supplies fresh snowflake ids for inserts."
          (let* ((new (nth 1 op))
                 (final-key (nth 2 op))
                 (item-id (funcall id-gen)))
+           (dorg-sql-gen--bind-item-row new item-id final-key)
            (setq insert-stmts
                  (nconc insert-stmts
                         (dorg-item-to-sql new item-id hid final-key)))))))
@@ -372,17 +475,28 @@ ID-GEN supplies fresh snowflake ids for inserts."
      (when delete-ids
        (list (format "DELETE FROM heading_items WHERE id IN (%s)"
                      (mapconcat #'number-to-string (nreverse delete-ids) ", "))))
-     ;; 2. Stage divergent reused sort keys to collision-free id-derived
-     ;; temps before the final keys land (mirrors heading-level staging).
-     (when stage-ids
-       (list (format "UPDATE heading_items SET sort_key = UNHEX(LPAD(HEX(id), 16, '0')) WHERE id IN (%s)"
-                     (mapconcat #'number-to-string (nreverse stage-ids) ", "))))
-     ;; 3. Detail-table updates for edited reused items.
+     ;; 2. Detail-table updates for edited reused items.
      detail-stmts
-     ;; 4. Final heading_items row updates (sort_key, post_blank).
+     ;; 3. Final heading_items row updates (sort_key, post_blank).
      (nreverse row-stmts)
-     ;; 5. Insert new items with fresh ids + planned sort keys.
+     ;; 4. Insert new items with fresh ids + planned sort keys.
      insert-stmts)))
+
+(defun dorg-sql-gen-rekey-sql (table pairs)
+  "Return one UPDATE moving every (ID . SORT-KEY) in PAIRS on TABLE to its key.
+The new keys arrive as a VALUES row set joined on the primary key, so the
+server does one index lookup per pair: linear in the window, one statement,
+no fabricated row data.  (A CASE over N arms costs N^2 per statement and a
+UNION ALL derived table does not plan; measured on Dolt 1.86.4, 10,000 rows:
+VALUES join 0.3 s, CASE 13.6 s, UNION ALL over 300 s.)  The keys are fresh: no
+row of TABLE holds any of them, so the statement cannot collide with itself in
+any row order and needs no temporary keys."
+  (format "UPDATE %s h JOIN (VALUES %s) AS v (id, k) ON v.id = h.id SET h.sort_key = v.k"
+          table
+          (mapconcat (lambda (pair)
+                       (format "ROW(%d, %s)"
+                               (car pair) (dorg-sql-gen--sort-key-hex (cdr pair))))
+                     pairs ", ")))
 
 ;;; SQL Lowering from Heading Ops
 
@@ -391,7 +505,7 @@ ID-GEN supplies fresh snowflake ids for inserts."
 DB-OPS is a list of tagged heading-level ops:
   (:insert-heading HEADING ROOT-ID)
   (:update-heading HEADING)
-  (:update-sort-key HEADING-ID SORT-KEY)
+  (:rekey PARENT-ID ((HEADING-ID . SORT-KEY) ...))
   (:delete-heading HEADING-ID)
 DB-HEADINGS is the DB snapshot heading hash (for tag/item diffing).
 ID-GEN is a function returning snowflake IDs for items.
@@ -399,8 +513,7 @@ Returns a list of SQL strings for execution inside one transaction."
   (let ((delete-stmts nil)
         (update-stmts nil)
         (insert-groups nil)
-        (insert-headings (make-hash-table :test 'eql))
-        (divergent-ids nil))
+        (insert-headings (make-hash-table :test 'eql)))
     (dolist (op db-ops)
       (pcase (car op)
         (:delete-heading
@@ -417,11 +530,6 @@ Returns a list of SQL strings for execution inside one transaction."
          (let* ((h (cadr op))
                 (hid (dorg-heading-id h))
                 (db-h (gethash hid db-headings)))
-           ;; Track divergent sort keys for Phase 1 staging
-           (when (and db-h
-                      (not (equal (dorg-heading-sort-key h)
-                                  (dorg-heading-sort-key db-h))))
-             (push hid divergent-ids))
            ;; Heading attr UPDATE
            (setq update-stmts
                  (nconc update-stmts
@@ -438,34 +546,32 @@ Returns a list of SQL strings for execution inside one transaction."
            ;; (reuse heading_items.id, minimal churn) when the DB heading
            ;; carries plan-able item ids; otherwise fall back to the
            ;; whole-heading delete+reinsert for legacy/headline snapshots.
-           (when (dorg-model-items-changed-p h db-h)
+           ;; Item plan whenever the DB snapshot makes one possible, even for
+           ;; equal content: the plan is the sole point that binds persisted
+           ;; item identities onto the candidate (`dorg-sql-gen--bind-item-row'),
+           ;; which the in-transaction partition proof compares.  Unchanged
+           ;; items lower to :keep ops and emit no SQL.  A legacy snapshot
+           ;; without item ids keeps the changed-only whole-heading fallback,
+           ;; so an unchanged metadata-poor heading never churns.
+           (cond
+            ((dorg-sql-gen--item-plan-possible-p db-h)
              (setq update-stmts
                    (nconc update-stmts
-                          (if (dorg-sql-gen--item-plan-possible-p db-h)
-                              (dorg-sql-gen--lower-item-plan h db-h id-gen)
-                            (cons (format "DELETE FROM heading_items WHERE heading_id = %d" hid)
-                                  (dorg-sql-gen-heading-items-sql h id-gen))))))))
-        (:update-sort-key
-         (let ((hid (cadr op))
-               (sort-key (caddr op)))
-           (push hid divergent-ids)
+                          (dorg-sql-gen--lower-item-plan h db-h id-gen))))
+            ((dorg-model-items-changed-p h db-h)
+             (setq update-stmts
+                   (nconc update-stmts
+                          (cons (format "DELETE FROM heading_items WHERE heading_id = %d" hid)
+                                (dorg-sql-gen-heading-items-sql h id-gen))))))))
+        (:rekey
+         (when (caddr op)
            (setq update-stmts
                  (nconc update-stmts
-                        (list (format "UPDATE headings SET sort_key = %s WHERE id = %d"
-                                      (dorg-sql-gen--sort-key-hex sort-key)
-                                      hid))))))))
+                        (list (dorg-sql-gen-rekey-sql "headings" (caddr op)))))))))
     ;; Topological sort inserts (parents before children for FK safety)
     (let ((insert-stmts (dorg-sql-gen--sort-insert-groups
                          insert-groups insert-headings)))
-      ;; Sort-key staging Phase 1: move divergent keys to collision-free
-      ;; temps (ID-derived 8-byte hex, guaranteed unique among headings).
-      ;; Phase 2 not needed: :update-heading ops set final keys via
-      ;; full-attribute UPDATE, and :update-sort-key ops set final keys
-      ;; via sort-key-only UPDATE.  Both run after Phase 1.
       (nconc (nreverse delete-stmts)
-             (when divergent-ids
-               (list (format "UPDATE headings SET sort_key = UNHEX(LPAD(HEX(id), 16, '0')) WHERE id IN (%s)"
-                             (mapconcat #'number-to-string divergent-ids ", "))))
              update-stmts
              insert-stmts))))
 

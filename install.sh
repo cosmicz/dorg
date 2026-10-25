@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # DOrg installer — fetch DOrg, build it, and put the `dorg' CLI on your PATH.
 #
-# UNRELEASED: DOrg is not currently releasable.  This script exists for
-# disposable development checkouts; it is not a released installer and must
-# not be used to adopt DOrg for production data.
+# See README.org for requirements and CHANGELOG.org for release and upgrade notes.
+# This installs the runtime; it does not migrate existing stores.
 #
 # Quick start:
 #   curl -fsSL https://raw.githubusercontent.com/cosmicz/dorg/main/install.sh | bash
@@ -14,19 +13,24 @@
 # Environment overrides:
 #   DORG_REPO   git URL to clone (set this to the DOrg repository URL)
 #   DORG_REF    branch/tag/commit to check out (default: the repo default)
-#   DORG_DIR    where to clone/build DOrg (default: $HOME/.local/share/dorg)
-#   BINDIR      where to link the `dorg' wrapper (default: $HOME/.local/bin)
+#   DORG_DIR    where to clone the DOrg SOURCE checkout (default: $HOME/.local/src/dorg)
+#   PREFIX      installation prefix (default: $HOME/.local); the runtime goes to
+#               $PREFIX/share/dorg
+#   BINDIR      where the `dorg' launcher link goes (default: $HOME/bin)
 #
-# What it does: clones (or updates) DOrg — or builds an existing checkout in
-# place — runs `make install' (verify the bundled mysql.el hard dependency,
-# check the optional Dolt binary, byte-compile, link bin/dorg onto PATH), then
-# finishes with a `dorg doctor' environment verification.
+# What it does: clones (or updates) DOrg — or uses an existing checkout —
+# then runs `make install', which copies the runtime into $PREFIX/share/dorg,
+# byte-compiles it there, verifies the staged launcher (`dorg --help' and the
+# `dorg doctor --install' environment check: mysql.el hard dependency plus
+# the optional Dolt binary) BEFORE publishing, and links $BINDIR/dorg to it.
+# The installed command does not depend on the source checkout afterwards.
 set -euo pipefail
 
 DORG_REPO="${DORG_REPO:-https://github.com/cosmicz/dorg.git}"
 DORG_REF="${DORG_REF:-}"
-DORG_DIR="${DORG_DIR:-$HOME/.local/share/dorg}"
-BINDIR="${BINDIR:-$HOME/.local/bin}"
+DORG_DIR="${DORG_DIR:-$HOME/.local/src/dorg}"
+PREFIX="${PREFIX:-$HOME/.local}"
+BINDIR="${BINDIR:-$HOME/bin}"
 
 err() { printf '%s\n' "install: $*" >&2; }
 need() {
@@ -58,15 +62,11 @@ else
 	fi
 fi
 
-# 2. Build and install: dependency checks, byte-compile, and link onto PATH.
-printf '%s\n' "Building and installing (make install BINDIR=$BINDIR) ..."
-make -C "$DORG_DIR" install BINDIR="$BINDIR"
+# 2. Install: copy, byte-compile and verify the runtime, then link onto PATH.
+printf '%s\n' "Installing (make install PREFIX=$PREFIX BINDIR=$BINDIR) ..."
+make -C "$DORG_DIR" install PREFIX="$PREFIX" BINDIR="$BINDIR"
 
-# 3. Post-install verification: mysql.el hard dep + optional Dolt.
-printf '%s\n' "Post-install verification (dorg doctor --install) ..."
-"$BINDIR/dorg" doctor --install
-
-printf '%s\n' "DOrg installed at $DORG_DIR; the dorg CLI is linked into $BINDIR."
+printf '%s\n' "DOrg installed under $PREFIX/share/dorg; the dorg CLI is linked into $BINDIR."
 case ":$PATH:" in
 	*":$BINDIR:"*) ;;
 	*) printf '%s\n' "Add $BINDIR to your PATH: export PATH=\"$BINDIR:\$PATH\"" ;;

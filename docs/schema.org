@@ -1,9 +1,9 @@
 #+title: DOrg Schema
 
 #+begin_quote
-*DOrg 0.1.0 schema.*  This document describes the first public on-disk schema.
-Schema version 6 identifies that state; future schema changes require an
-explicitly supported migration.
+*DOrg schema.*  This document describes the public on-disk schema.  Schema
+version 8 identifies the current state; DOrg 0.1.0 shipped schema version 6.
+Every schema change requires an explicitly supported migration.
 #+end_quote
 
 This document is the detailed reference for the relational schema that
@@ -12,8 +12,8 @@ model, the table catalogue, and the binary sort-key storage contract.
 
 For the current command and mutation data flow that reads and writes this
 schema, see [[file:api.org][docs/api.org]] and
-[[file:mutate.org][docs/mutate.org]].  Whole-file reconciliation is not part of
-DOrg 0.1.0; Dolt-backed buffers are read-only projections.  For the schema
+[[file:mutate.org][docs/mutate.org]].  Whole-file reconciliation is not supported;
+Dolt-backed buffers are read-only projections.  For the schema
 DDL/migration API (=dorg-schema.el=), see [[file:api.org][docs/api.org]].
 
 * Design Principles
@@ -56,7 +56,7 @@ erDiagram
         BIGINT root_id FK
         BIGINT parent_id FK
         VARBINARY sort_key UK
-        INT level
+        INT level_offset
         VARCHAR todo_keyword
         CHAR priority
         BOOLEAN commented
@@ -137,23 +137,43 @@ erDiagram
 
 * Table Descriptions
 
-| Table              | Purpose                                            |
-|--------------------+----------------------------------------------------|
-| =dorg_meta=        | Key-value metadata (schema version, etc.)          |
-| =headings=         | Heading tree; level 0 = synthetic file root        |
-| =dorg_files=       | Store-relative source locator → root_id index     |
-| =heading_tags=     | Ordered tags per heading                           |
-| =heading_items=    | Polymorphic container -- orders all content items   |
-| =text_items=       | Plain text blocks (body paragraphs, lists, etc.)   |
-| =keyword_items=    | File/heading keywords (=#+KEY: VALUE=)             |
-| =planning_items=   | SCHEDULED / DEADLINE / CLOSED timestamps           |
-| =drawer_items=     | Named drawers (~:NAME: ... :END:~)                 |
-| =drawer_lines=     | Raw lines within a drawer                          |
-| =property_entries= | Structured ~:KEY: VALUE~ pairs from PROPERTIES     |
+| Table                | Purpose                                          |
+|----------------------+--------------------------------------------------|
+| =dorg_meta=          | Key-value metadata (schema version, etc.)        |
+| =dorg_mutation_log=  | Exactly-once receipt and postimage evidence      |
+| =headings=           | Heading tree; offset 0 = synthetic file root     |
+| =dorg_files=         | Store-relative source locator → root_id index    |
+| =heading_tags=       | Ordered tags per heading                         |
+| =heading_items=      | Polymorphic container -- orders all content items |
+| =text_items=         | Plain text blocks (body paragraphs, lists, etc.)  |
+| =keyword_items=      | File/heading keywords (=#+KEY: VALUE=)            |
+| =planning_items=     | SCHEDULED / DEADLINE / CLOSED timestamps          |
+| =drawer_items=       | Named drawers (~:NAME: ... :END:~)                |
+| =drawer_lines=       | Raw lines within a drawer                         |
+| =property_entries=   | Structured ~:KEY: VALUE~ pairs from PROPERTIES    |
 
 The =heading_properties= view joins =property_entries= through
 =drawer_items= and =heading_items= for convenient heading-to-property
 lookups.
+
+* Store identity and owned metadata
+
+=dorg_meta= records =store-id= as a random 128-bit, lowercase-hex identifier.
+New-store initialization creates it.  An older compatible store remains
+unidentified until the explicit =dorg dolt identify DIR= operation; reads and
+ordinary opening do not silently add it.  =--fork= changes identity and stores
+the prior value under =store-id:prior:<new-id>= in the same commit.  A byte
+copy preserves identity unless deliberately forked.  This metadata addition
+does not change the schema version.
+
+Managed clocks use the registered =DORG_CLOCK_= property family, persisted
+in =property_entries= through ordinary property drawers.  Scope records hold
+=DORG_CLOCK_KIND= and =DORG_CLOCK_ACTIVE_ID=.  Interval records hold the scope,
+task reference, UTC start/end, IANA zone, cancellation and adoption fields.
+The clock owner validates their closed key set, canonical spelling, types and
+cross-record invariants.  Generic property mutation cannot write these fields.
+See [[file:api.org::*Managed clock lifecycle][the clock API]]; no second clock
+SQL schema or arbitrary metadata-extension registry is implied.
 
 * Versioned Raw SQL Contract
 
@@ -161,7 +181,7 @@ The raw SQL helper family documented in [[file:api.org][docs/api.org]] is a
 development extension escape hatch for callers that deliberately couple to
 this schema.  Its compatibility discriminator is the recorded schema version
 in =dorg_meta.schema_version= and ~dorg-schema-version~.  The current schema
-version is 6.
+version is 8.
 
 Within a schema version, schema-coupled callers may depend on the documented
 tables, columns, views, primary keys, foreign keys, root scoping, ordering
@@ -190,16 +210,25 @@ The =heading_items.kind= column discriminates the polymorphic type:
 * Sort-key Storage Contract
 
 =headings= and =heading_items= order rows by a =VARBINARY(64)= binary
-sort key, allocated by fractional midpoint (=dorg-sortkey.el=).  The
-storage contract:
+sort key allocated in a fixed-width coordinate domain (=dorg-sortkey.el=).
+The storage contract:
 
+- Every key the allocator produces is exactly 16 bytes
+  (~dorg-sortkey-boundary-width~), read as a big-endian unsigned integer;
+  equal-width unsigned order is bytewise lexicographic order.
 - Existing keys read from the DB whose length is at most
   ~dorg-sortkey-max-bytes~ (64 bytes, the column width) are valid,
-  including keys of exactly 64 bytes.
-- Newly allocated midpoint candidates whose length is
-  =>= dorg-sortkey-rebalance-threshold= (64 bytes) do not get written;
-  instead ~dorg-sortkey-midpoint-limited~ signals
-  ~dorg-sortkey-exhausted~ so the caller rebalances the sibling group.
+  including keys of exactly 64 bytes.  A stored key of any length is a
+  valid neighbour: ~dorg-sortkey-bounds~ derives the interval strictly
+  between two keys from their 16-byte prefixes, and every key allocated
+  inside it sorts strictly between the original byte strings.
+- Head and tail placement step at ~dorg-sortkey-boundary-step~ (2^64)
+  multiples, so appends never rebalance; interior placement spreads inside
+  the neighbours' interval.  A gap with no room rekeys the smallest window
+  of siblings that has room (~dorg-model-plan-window~), lowered as one
+  key-only =UPDATE=.  Fresh keys never equal a live key or a key freed in
+  the same transaction, so no statement order can violate the sibling
+  unique index and no temporary keys exist.
 - As a backstop, SQL generation rejects any key longer than
   ~dorg-sortkey-max-bytes~ before emission, so an overlong key can never
   reach the =VARBINARY(64)= column and silently truncate.
@@ -221,22 +250,76 @@ segments are legal, so the canonical Downstream tracker sibling layout stores
 there is no per-row kind and no compatibility alias for the absolute column.
 
 Root resolution validates the complete locator representation, requires one
-level-0 self-rooted heading, and refuses ambiguity.  An implicit bind may create
+self-rooted heading at level offset 0, and refuses ambiguity.  An implicit bind may create
 only the first root in an empty store.  A miss in a nonempty store is a typed
 =path-mismatch=; explicit =import --mode bootstrap= remains the operation that
 adds another document.  ~dorg-rebind-file~ / ~dorg dolt rebind~ changes one
 locator at an exact Dolt base without reading or writing the Org file.
 
-The first public release begins with this schema.  Earlier development stores
-have no supported upgrade path and are refused before any write; recreate them
-from their Org source.  The generic migration runner remains empty and ready
-for post-release schema changes.
+The current public schema is version 8.  Version 6 and 7 stores use the
+supported explicit migrations described below; one operator run walks each
+older store forward one version at a time.  Pre-v6 development stores have no
+supported upgrade path and are refused before any write; recreate only those
+stores from their Org source.
+
+Schema v7 adds the versioned =dorg_mutation_log= receipt table with its
+=postimages_v1 TEXT NULL= legacy column.  Fresh =dorg-init= declares it with the
+core schema.  Existing v6 stores acquire it only through the explicit operator
+=dorg-migrate-schema= path: a missing table is created, the known legacy
+four-column shape gains =postimages_v1=, and an already-compatible table is
+left intact.  A corrupt or unknown shape is refused without automatic repair.
+Ordinary apply/replay only checks this shape; it never issues receipt CREATE,
+ALTER, or repair SQL.
+
+Operation receipts now persist only =op_id=, =gen_id=, =intent_digest= and =ts=
+atomically with the mutation.  New writes omit =postimages_v1=, leaving it NULL;
+old column bytes and rows are retained but never read for replay.  The nullable
+column remains part of the compatible receipt shape in schema 7 and later.
+This retirement needed no DDL, schema bump or operator migration.  Full pre-commit owner/core/item/extension
+validation remains independent of receipt persistence.
+
+An already-v7 store with missing or damaged receipt storage is an integrity
+or schema-incompatibility refusal, not a migration candidate:
+=dorg-migrate-schema= cannot repair it and is not prescribed as a remedy.
+
+* Schema-v8 parent-relative heading levels
+
+Schema v8 replaces =headings.level= with =headings.level_offset INT NOT
+NULL=: a heading's level relative to its parent.  The synthetic file root
+stores offset 0 and every real heading a positive offset; the effective Org
+level is the sum of the offsets on the path from the root, derived when a
+model is loaded and never stored.  Direct siblings' offsets are non-increasing
+in sibling order, so the tree stays representable as Org stars.  Consequences:
+a subtree move writes only the moved root's offset (its descendants keep
+theirs), and a skipped level (=* A= then =*** B=) is an offset of 2.
+
+The v7 to v8 step runs only through the explicit operator
+=dorg-migrate-schema= path, under the same preconditions as other migrations
+(see [[file:configuration.org][docs/configuration.org]]).  It first reads the
+whole v7 hierarchy and refuses, before any statement, a store whose levels
+are inconsistent: a malformed root, a dangling or cross-root parent, a cycle,
+a non-positive level gap, or a sibling fan Org cannot represent.  Otherwise it
+adds =level_offset=, sets each heading's offset to its level minus its
+parent's, makes the column NOT NULL and drops =level=, then validates the
+converted hierarchy against the expectation inside the same lease before the
+Dolt commit.  A validation failure rolls the store back to its pre-migration
+state.
+
+History keeps its schema at each commit.  A read AS OF a commit made before
+the migration decodes that commit's absolute =level= column (each offset is
+taken against the parent row at the same commit), so restore and history
+views of pre-v8 commits keep their levels.  Such a read is detected by the
+engine's missing-column error for =level_offset= and costs one failed
+statement plus the retry; current-schema reads pay nothing extra.  Dolt logs
+each such failed statement; the server writes its log to a file (see
+[[file:configuration.org][docs/configuration.org]]), so many pre-v8 historical
+reads in one operation cannot stall it.
 
 The portable file-binding surface uses =relative_path=,
 =uq_dorg_files_relative_path=, the ~(dolt-dir root-id abs-file)~ row-builder
 signature, the locator encode/decode boundary, ~dorg-binding-error~ reasons,
 and ~dorg-rebind-file~ / ~dorg dolt rebind~.
 
-An Downstream tracker pin bump must also replace its direct =dorg_files.path= query, bump
-its required core schema to 6, migrate fixtures/docs, and certify both schema
-generations plus rollback before any separately authorized live migration.
+Downstream upgrades must align their DOrg pin, required core/extension
+schemas and fixtures.  Qualify the intended tuple before migrating a live
+store; an ordinary bind does not provide a compatibility translation.

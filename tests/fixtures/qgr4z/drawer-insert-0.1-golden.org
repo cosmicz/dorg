@@ -1,0 +1,11 @@
+* Task
+:PROPERTIES:
+:DORG_ID: 1001
+:END:
+:LOGBOOK:
+- state
+:END:
+#+K: first
+A
+#+K: second
+B

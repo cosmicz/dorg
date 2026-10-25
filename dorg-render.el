@@ -44,7 +44,7 @@
   "Find the unique synthetic root heading id in DOLT-DIR.
 Signals an error if zero or multiple roots are present."
   (let ((rows (dorg-sql dolt-dir
-                        "SELECT id FROM headings WHERE level = 0 AND parent_id IS NULL")))
+                        "SELECT id FROM headings WHERE level_offset = 0 AND parent_id IS NULL")))
     (cond ((null rows)
            (error "dorg-render: no root heading in %s" dolt-dir))
           ((> (length rows) 1)
@@ -125,7 +125,9 @@ placement; the marker only unlocks shape checks that key on a non-root
 origin."
   (maphash
    (lambda (id h)
-     (when (and (eql (dorg-heading-level h) 1)
+     ;; A direct root child one level down: offset 1 under the root is
+     ;; effective level 1, and needs no derived level.
+     (when (and (eql (dorg-heading-level-offset h) 1)
                 (eql (dorg-heading-parent-id h) rid))
        (let* ((context (make-dorg-ext-placement-context
                         :heading-id id :dorg-id id :root-id rid
@@ -157,7 +159,7 @@ as sync-state base headings.  COMMIT is the HEAD hash; RID the root id."
   (let ((headings nil))
     (maphash
      (lambda (_id h)
-       (if (= (dorg-heading-level h) 0)
+       (if (dorg-model-root-p h)
            (let ((root-copy (copy-dorg-heading h)))
              (setf (dorg-heading-items root-copy)
                    (append
@@ -272,14 +274,17 @@ AS-OF, when non-nil, selects a historical commit."
          (rows (dorg-sql
                 dolt-dir
                 (format (concat
+                         ;; Order by recursion depth (0 at the node, growing
+                         ;; toward the root), never by a stored level: an
+                         ;; offset is local and says nothing about depth.
                          "WITH RECURSIVE anc AS ("
-                         " SELECT id, parent_id, level FROM headings%s"
+                         " SELECT id, parent_id, 0 AS depth FROM headings%s"
                          " WHERE id = %d AND root_id = %d"
                          " UNION ALL"
-                         " SELECT h.id, h.parent_id, h.level FROM headings%s h"
+                         " SELECT h.id, h.parent_id, anc.depth + 1 FROM headings%s h"
                          " JOIN anc ON anc.parent_id = h.id"
                          " WHERE h.root_id = %d)"
-                         " SELECT id FROM anc WHERE id <> %d ORDER BY level")
+                         " SELECT id FROM anc WHERE id <> %d ORDER BY depth DESC")
                         sfx node-id root-id sfx root-id node-id))))
     (mapcar (lambda (r) (alist-get 'id r)) rows)))
 
@@ -308,7 +313,7 @@ string ending in a newline, or \"\" when there are no non-root ancestors."
   (let ((lines nil))
     (dolist (id ancestor-ids)
       (when-let ((h (gethash id headings)))
-        (unless (= (dorg-heading-level h) 0)
+        (unless (dorg-model-root-p h)
           (push (dorg-model--render-heading h) lines))))
     (if lines
         (concat (mapconcat #'identity (nreverse lines) "\n") "\n")

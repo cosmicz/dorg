@@ -23,6 +23,68 @@
 (require 'dorg-ql-ast)
 (require 'dorg-ql-eval)
 (require 'dorg-ql-model)
+(require 'dorg-ext)
+
+(ert-deftest dorg-test-ql-eval-extension-field-filters-and-returns-one-definition ()
+  "A declared field filters without being selected, then projects its value."
+  (let ((dorg--extensions nil))
+    (dorg-register-extension
+     'demo :schema "SELECT 1" :version 1
+     :fields
+     (list (list :name 'demo/holder :type 'identity :cardinality 'one
+                 :dependencies '((property "HOLDER"))
+                 :eval (lambda (_context read)
+                         (funcall read '(property "HOLDER"))))))
+    (let* ((headings (list (dorg-test-ql-eval--h
+                           1 nil 1 :title "Owned" :props '(("HOLDER" . "Σ")))
+                          (dorg-test-ql-eval--h 2 nil 1 :title "Unowned")))
+           (rows (dorg-ql--model-eval
+                  (dorg-ql-normalize
+                   '(pipe (where (= (field demo/holder) "ς"))
+                          (select (field title) (as (field demo/holder) owner))))
+                  headings)))
+      (should (= (length rows) 1))
+      (should (equal (plist-get (car rows) :values)
+                     '(("title" . "Owned") ("owner" . "Σ")))))))
+
+(ert-deftest dorg-test-xeq5v-case-string-extension-is-literal ()
+  "A declared string extension receives the canonical insensitive mode."
+  (let ((dorg--extensions nil))
+    (dorg-register-extension
+     'demo :schema "SELECT 1" :version 1
+     :fields (list (list :name 'demo/holder :type 'string :cardinality 'one
+                         :dependencies '((property "HOLDER"))
+                         :eval (lambda (_context read)
+                                 (funcall read '(property "HOLDER"))))))
+    (let ((headings (list (dorg-test-ql-eval--h
+                           101 nil 1 :title "Owned" :props '(("HOLDER" . "Work")))
+                          (dorg-test-ql-eval--h
+                           102 nil 1 :title "Other" :props '(("HOLDER" . "work"))))))
+      (should (equal '(101)
+                     (dorg-test-ql-eval--ids
+                      '(= (field demo/holder) "Work") headings)))
+      (should (equal '(101 102)
+                     (dorg-test-ql-eval--ids
+                      '(contains (field demo/holder) "OR" :case insensitive)
+                      headings))))))
+
+(ert-deftest dorg-test-ql-eval-extension-values-obey-declared-shape ()
+  "An extension evaluator cannot return a value outside its typed contract."
+  (let ((dorg--extensions nil)
+        (heading (dorg-test-ql-eval--h 1 nil 1 :title "Owned")))
+    (dorg-register-extension
+     'demo :schema "SELECT 1" :version 1
+     :fields (list (list :name 'demo/count :type 'integer :cardinality 'one
+                         :dependencies nil :eval (lambda (_context _read) "one"))
+                   (list :name 'demo/tags :type 'string :cardinality 'many
+                         :dependencies nil :eval (lambda (_context _read) ["tag"]))))
+    (dolist (field '(demo/count demo/tags))
+      (let ((err (should-error
+                  (dorg-ql--model-eval
+                   (dorg-ql-normalize `(pipe (select (field ,field))))
+                   (list heading))
+                  :type 'dorg-ql-error)))
+        (should (eq (dorg-error-reason err) 'unsupported))))))
 
 ;;; ─── Fixtures ──────────────────────────────────────────────────────────
 
@@ -82,6 +144,51 @@ given, supplies the full item list instead (e.g. planning/text items)."
           (dorg-ql--model-eval (dorg-ql-normalize query) headings)))
 
 ;;; ─── Envelope & result shape ───────────────────────────────────────────
+
+(ert-deftest dorg-test-ql-eval-select-keeps-only-requested-values ()
+  "Selection dependencies need not be returned; missing values stay nil."
+  (let* ((rows (dorg-ql--model-eval
+                (dorg-ql-normalize
+                 '(pipe (where (= (field todo) "TODO"))
+                        (select (as (field title) label)
+                                (property "FOO") (property "absent"))))
+                (dorg-test-ql-eval--tree)))
+         (row (car rows)))
+    (should (= (length rows) 1))
+    (should (= (plist-get row :heading-id) 2))
+    (should (equal (plist-get row :values)
+                   '(("label" . "Alpha One") ("FOO" . "bar")
+                     ("absent" . nil))))
+    (should-not (plist-member row :properties))))
+
+(ert-deftest dorg-test-ql-eval-select-basic-types-and-empty-result ()
+  "Projection preserves scalar types and does not manufacture empty rows."
+  (let ((tree (dorg-test-ql-eval--tree)))
+    (should
+     (equal (plist-get
+             (car (dorg-ql--model-eval
+                   (dorg-ql-normalize
+                    '(pipe (where (id 3))
+                           (select (field id) (field parent-id) (field level)
+                                   (field priority) (field commented)))) tree))
+             :values)
+            '(("id" . 3) ("parent-id" . 1) ("level" . 2)
+              ("priority" . "C") ("commented" . t))))
+    (should-not
+     (dorg-ql--model-eval
+      (dorg-ql-normalize '(pipe (where (id 99)) (select (field title))))
+      tree))))
+
+(ert-deftest dorg-test-ql-eval-select-one-still-checks-cardinality ()
+  "Projection cannot erase a cardinality error."
+  (let ((err
+         (should-error
+          (dorg-ql--model-eval
+           (dorg-ql-normalize '(one (pipe (where (= (field level) 2))
+                                        (select (field title)))))
+           (dorg-test-ql-eval--tree))
+          :type 'dorg-ql-error)))
+    (should (string-match-p "requires exactly one result, got 3" (cadr err)))))
 
 (ert-deftest dorg-test-ql-eval-result-shape ()
   "Evaluator returns the canonical four-key markerless plist."
@@ -589,6 +696,30 @@ one --- pinning the plain/Dolt timestamp-cache-building behavior.
   (should (> (dorg-ql--priority-rank "A") (dorg-ql--priority-rank "B")))
   (should-not (dorg-ql--priority-rank nil))
   (should-not (dorg-ql--priority-rank "")))
+
+(ert-deftest dorg-test-xeq5v-case-unicode-integer-upcase ()
+  "Insensitive literal matching is per-character standard-case upcase.
+The rows pin the no-expansion, no-locale contract: Greek final sigma and
+capital sharp-S converge, but sharp-S/SS, Turkish dotted/dotless I, accents,
+and composed/decomposed text do not."
+  (let ((case-fold-search nil))
+    (with-temp-buffer
+      ;; This buffer-local table deliberately says A/b are a case pair.  The
+      ;; matcher must bind `standard-case-table' itself rather than inherit a
+      ;; current-buffer table (or any locale-derived setting).
+      (let ((local-table (copy-case-table (standard-case-table))))
+        (set-case-syntax-pair ?A ?b local-table)
+        (set-case-table local-table))
+      (dolist (pair '(("A" "a") ("É" "é") ("Σ" "σ") ("Σ" "ς")
+                      ("ẞ" "ß") ("I" "i")))
+        (should (dorg-ql--apply-string-op '= (car pair) (cadr pair) 'insensitive)))
+      (dolist (pair '(("ß" "SS") ("I" "ı") ("İ" "i") ("é" "e")
+                      ("é" "é")))
+        (should-not (dorg-ql--apply-string-op '= (car pair) (cadr pair)
+                                              'insensitive)))
+      (should-not (dorg-ql--apply-string-op '= "A" "b" 'insensitive))
+      (should (dorg-ql--apply-string-op 'contains "Weekly Meeting" "meeting"
+                                        'insensitive)))))
 
 (ert-deftest dorg-test-ql-eval-core-order-dedup-corrects-order ()
   "`dorg-ql--order-dedup' restores input order and collapses duplicates.

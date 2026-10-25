@@ -35,7 +35,8 @@
 ;;      signal and name the artifacts instead of emitting a verdict.  A strictly
 ;;      older .elc is harmless (Mechanism A loads source) and does not trip it.
 ;;
-;; `make test'/`test-fast'/`test-medium'/`perf'/... run `clean-elc' first, so
+;; `make test'/`test-full'/`test-fast'/`test-medium'/`perf'/... run `clean-elc'
+;; first, so
 ;; their trees carry no .elc and both mechanisms are no-ops there.  The policy
 ;; scope is the project source (repo root + tests/), captured from
 ;; `load-file-name' at LOAD time so it binds to the checked-out worktree,
@@ -138,6 +139,14 @@ re-addition after setup returned is covered."
         print-level 1000
         print-length 1000)
   (setq org-element-cache-persistent nil)
+  ;; No suite run may spawn a DETACHED object-store maintenance worker.  A
+  ;; publication normally launches one and does not wait for it, which is
+  ;; correct in production and intolerable here: the worker writes into
+  ;; .git/objects/pack while the test's own fixture is deleting that repo,
+  ;; so teardown fails with "Directory not empty" in whichever unrelated
+  ;; test happens to lose the race.  Tests that need the launch opt in by
+  ;; binding this back to t (see dorg-git-maintenance-tests.el).
+  (setq dorg-git-maintenance-enabled nil)
   (with-eval-after-load 'org-persist
     (dorg-run-tests--strip-org-persist-kill-hooks))
   (message "dorg test environment setup complete."))
@@ -145,14 +154,21 @@ re-addition after setup returned is covered."
 ;;; ─── Load Test Files ──────────────────────────────────────────────────
 
 (require 'dorg-test-helpers)
+(require 'dorg-test-time-profile)
+(require 'dorg-test-time-profile-tests)
 (require 'dorg-test-scratch-tests)
+(require 'dorg-derive-families-tests)
 (require 'dorg-sortkey-tests)
 (require 'dorg-dolt-tests)
 (require 'dorg-tracker-cli-dou7f-probe-tests)
 (require 'dorg-dolt-server-tests)
+(require 'dorg-dolt-server-evidence-tests)
+(require 'dorg-level-offset-tests)
+(require 'dorg-level-offset-store-tests)
 (require 'dorg-transport-tests)
 (require 'dorg-lease-tests)
 (require 'dorg-test-infra-tests)
+(require 'dorg-test-job-tests)
 (require 'dorg-ext-tests)
 (require 'dorg-id-tests)
 (require 'dorg-freshness-tests)
@@ -160,6 +176,7 @@ re-addition after setup returned is covered."
 (require 'dorg-timestamp-tests)
 (require 'dorg-parse-tests)
 (require 'dorg-import-tests)
+(require 'dorg-install-tests)
 (require 'dorg-keywords-tests)
 (require 'dorg-git-tests)
 (require 'dorg-git-sync-tests)
@@ -178,6 +195,7 @@ re-addition after setup returned is covered."
 (require 'dorg-binding-isolation-tests)
 (require 'dorg-find-tests)
 (require 'dorg-ql-tests)
+(require 'dorg-ql-door-tests)
 (require 'dorg-mutate-tests)
 (require 'dorg-mutate-persist-tests)
 (require 'dorg-mutate-linearize-tests)
@@ -185,6 +203,7 @@ re-addition after setup returned is covered."
 (require 'dorg-roundtrip-corpus-tests)
 (require 'dorg-ql-ast-tests)
 (require 'dorg-ql-eval-tests)
+(require 'dorg-bm25-tests)
 (require 'dorg-session-tests)
 (require 'dorg-command-tests)
 (require 'dorg-cli-tests)
@@ -193,10 +212,19 @@ re-addition after setup returned is covered."
 (require 'dorg-ext-index-context-tests)
 (require 'dorg-ext-index-projector-tests)
 (require 'dorg-ext-rebuild-tests)
+(require 'dorg-git-maintenance)
+(require 'dorg-file-lock-tests)
+(require 'dorg-git-maintenance-tests)
 (require 'dorg-2ij34-postimage-tests)
+(require 'dorg-postimage-row-checks-tests)
+(require 'dorg-postimage-readback-tests)
+(require 'dorg-postimage-partitions-tests)
 (require 'dorg-ext-read-tests)
 (require 'dorg-history-tests)
 (require 'dorg-api-tests)
+(require 'dorg-clock-tests)
+(require 'dorg-clock-emacs-tests)
+(require 'dorg-qgr4z-golden-tests)
 (require 'dorg-mutate-grammar-tests)
 (require 'dorg-error-tests)
 (require 'dorg-faithful-tests)
@@ -278,6 +306,7 @@ cleanup always runs."
   (dorg-setup-test-environment)
   (dorg-run-tests--maybe-verbose)
   (dorg-run-tests--maybe-diag)
+  (dorg-test-time-profile-enable)
   (let ((exit-status 2))
     (unwind-protect
         (setq exit-status
@@ -304,6 +333,11 @@ cleanup always runs."
                       ;; Otherwise: optionally start, then ALWAYS run ERT and
                       ;; combine the test status with the stale status.
                       (let (armed baseline-pid baseline-cold)
+                        (unless start-server
+                          ;; FAST is the only production gate that deliberately
+                          ;; avoids a shared server.  Emit positive evidence so
+                          ;; its no-server property is visible in every log.
+                          (message "dorg-test: shared server not started (fast gate)"))
                         (when start-server
                           ;; A nil return is the legitimate unsupported/
                           ;; mysql-absent CLI fallback.  A SIGNAL means the
@@ -324,7 +358,11 @@ cleanup always runs."
                                     baseline-cold (plist-get
                                                    (dorg-dolt-fixture-inventory)
                                                    :cold-starts)))))
-                        (let* ((stats (ert-run-tests-batch selector))
+                        (let* ((stats (unwind-protect
+                                          (ert-run-tests-batch selector)
+                                        ;; Keep records when ERT or a late test
+                                        ;; failure unwinds before it returns.
+                                        (dorg-test-time-profile-write)))
                                ;; Sample the shared proc BEFORE the unwind
                                ;; teardown legitimately stops it, so END-PID
                                ;; reflects a TEST-caused kill/replace, not the
@@ -425,13 +463,20 @@ instead of being captured by ERT.  Starts the shared sql-server."
    (if (or (null selector) (string-empty-p selector)) "^dorg-test-" selector)
    t))
 
+(defun dorg-run-tests-batch-default-or-selector (&optional selector)
+  "Run the representative default, or arbitrary non-empty SELECTOR in batch.
+This is the Makefile `test' entry point.  An explicit selector is intentionally
+unrestricted for focused diagnosis; an absent selector resolves to the named,
+deterministic representative gate."
+  (if (or (null selector) (string-empty-p selector))
+      (dorg-run-tests-batch-gate "representative")
+    (dorg-run-tests-batch selector)))
+
 (defun dorg-run-tests-batch-gate (gate-name)
-  "Run the GATE-NAME tier in batch and exit: \"fast\", \"medium\", or \"full\".
-Resolves the tier's ERT selector via `dorg-test-gate-selector'.  The FAST
-gate (Dolt-free suites) skips the shared sql-server entirely, so it pays no
-server startup and never contends on Dolt; MEDIUM and FULL start it as
-usual.  See `dorg-test-gates' and the Makefile `test-fast'/`test-medium'
-targets."
+  "Run GATE-NAME in batch and exit.
+GATE-NAME is \"fast\", \"medium\", \"representative\", or \"full\".  FAST skips
+the shared sql-server entirely; every other gate starts it.  See
+`dorg-test-gates' and the Makefile targets."
   (let ((gate (intern gate-name)))
     (dorg-run-tests--batch (dorg-test-gate-selector gate)
                            (not (eq gate 'fast)))))

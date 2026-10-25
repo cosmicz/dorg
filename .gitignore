@@ -11,6 +11,8 @@ tmp/
 # Emacs auto-save (#file#) and lock (.#file) files
 \#*#
 .#*
+# DOrg's local saved-file gates and fixed reclaim tombstones
+.*.dorg-write.lock*
 
 # Dolt local database
 .dolt/
@@ -18,6 +20,10 @@ tmp/
 # Byte-compiled Elisp
 *.elc
 *-autoloads.el
+
+# Explicit marker for a checkout that supplies an active installed runtime.
+# Per-worktree and intentionally never propagated through Git.
+.installed-root
 
 # Flycheck
 /flycheck_*
@@ -38,9 +44,9 @@ tools/conflict-fixture/remote.org
 
 # Tools: Issue tracking and agents
 .beads/
-.em[b]ead/
+.embead/
 .dorg/
-.me[l]d/
+.meld/
 
 # tracker state
 .claude/settings.local.json

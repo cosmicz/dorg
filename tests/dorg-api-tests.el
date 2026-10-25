@@ -27,6 +27,37 @@
 (require 'cl-lib)
 (require 'dorg-api nil t)                ; RED: module not implemented yet
 
+;; API-only tests that double the query and apply engine still take the real
+;; writer gate.  Each call gets a nonexistent name under the test temp root;
+;; its parent can host a lock without a load-time resource or exit hook.
+(defun dorg-test-api--unit-file ()
+  "Return a fresh nonexistent source in a writable temp directory."
+  (concat (make-temp-name
+           (expand-file-name (format "dorg-test-api-unit-%s-" (emacs-pid))
+                             temporary-file-directory))
+          ".org"))
+
+(defmacro dorg-test-api--with-unit-files (&rest body)
+  "Run BODY and check that its synthetic source locks are reclaimed."
+  (declare (indent 0))
+  `(let (unit-files body-completed)
+     (cl-flet ((dorg-test-api--unit-file ()
+                 (let ((file (dorg-test-api--unit-file)))
+                   (push file unit-files)
+                   file)))
+       (unwind-protect
+           (prog1 (progn ,@body)
+             (setq body-completed t))
+         (let (leftovers)
+           (dolist (file unit-files)
+             (let ((lock (dorg-file-lock-path file)))
+               (dolist (path (list lock (concat lock ".reclaim")))
+                 (when (file-attributes path 'string)
+                   (push path leftovers)
+                   (ignore-errors (delete-file path))))))
+           (when body-completed
+             (should-not leftovers)))))))
+
 ;;; ─── Helpers ────────────────────────────────────────────────────────────
 
 (defun dorg-test-api--patches (form &optional source)
@@ -142,6 +173,261 @@
              (car (dorg-sql dolt-dir
                              "SELECT COUNT(*) AS cnt FROM dolt_log"))))
 
+;;; ─── Shared public capability contract ───────────────────────────────────
+
+;; This is deliberately data, not a second dispatcher.  It records which
+;; existing public-door controls may be credited for a backend/source cell.
+;; Keep pending feature routing out of this source: a pending row describes the
+;; public capability and its typed detail, never the work item that will land it.
+(defconst dorg-test-api--capability-matrix
+  '((:key keyword-heading-existing-buffer
+     :form (on (id 1001) (insert (keyword "K") (after-last) "c"))
+     :source-kind buffer :identity-policy dorg :status supported
+     :oracle-kind transitive-independent
+     :expected ((keyword "K" "a") (keyword "OTHER" "middle")
+                (keyword "K" "b") (keyword "K" "c") (text "Tail."))
+     :selector "^dorg-test-mutate-public-keyword-insert-.*"
+     :mutant (:executor plain-splice
+              :selector "^dorg-test-api-capability-plain-splice-noop-mutant-is-observable$"
+              :test dorg-test-api-capability-plain-splice-noop-mutant-is-observable)
+     :tests (dorg-test-mutate-public-keyword-insert-backend-parity
+             dorg-test-mutate-public-keyword-insert-plain-heading-placement))
+    (:key keyword-heading-missing-buffer
+     :form (on (id 1002) (insert (keyword "K") (after-last) "c"))
+     :source-kind buffer :identity-policy dorg :status supported
+     :oracle-kind transitive-independent
+     :expected ((keyword "OTHER" "middle") (text "Tail.") (keyword "K" "c"))
+     :selector "^dorg-test-mutate-public-keyword-insert-.*"
+     :tests (dorg-test-mutate-public-keyword-insert-backend-parity
+             dorg-test-mutate-public-keyword-insert-plain-heading-placement))
+    (:key keyword-heading-existing-dolt
+     ;; The real fixture allocates these IDs by title.  200/201 distinguish
+     ;; the existing/missing logical hosts; they are not fixture literals.
+     :form (on (id 200) (insert (keyword "K") (after-last) "c"))
+     :source-kind dolt :identity-policy dorg :status supported
+     :oracle-kind independent
+     :expected ((keyword "K" "a") (keyword "OTHER" "middle")
+                (keyword "K" "b") (keyword "K" "c") (text "Tail."))
+     :selector "^dorg-test-mutate-public-keyword-insert-backend-parity$"
+     :mutant (:executor dolt-write
+              :selector "^dorg-test-api-capability-dolt-write-noop-mutant-is-observable$"
+              :test dorg-test-api-capability-dolt-write-noop-mutant-is-observable)
+     :tests (dorg-test-mutate-public-keyword-insert-backend-parity))
+    (:key keyword-heading-missing-dolt
+     :form (on (id 201) (insert (keyword "K") (after-last) "c"))
+     :source-kind dolt :identity-policy dorg :status supported
+     :oracle-kind independent
+     :expected ((keyword "OTHER" "middle") (text "Tail.") (keyword "K" "c"))
+     :selector "^dorg-test-mutate-public-keyword-insert-backend-parity$"
+     :tests (dorg-test-mutate-public-keyword-insert-backend-parity))
+    (:key keyword-document-dolt
+     :form (on document (insert (keyword "K") (after-last) "root-c"))
+     :source-kind dolt :identity-policy dorg :status supported
+     :oracle-kind independent
+     :expected ((keyword "K" "root-a") (keyword "OTHER" "root-middle")
+                (keyword "K" "root-b") (keyword "K" "root-c")
+                (text "Root tail."))
+     :selector "^dorg-test-mutate-public-keyword-insert-backend-parity$"
+     :tests (dorg-test-mutate-public-keyword-insert-backend-parity))
+    (:key keyword-document-buffer
+     :form (on document (insert (keyword "K") (after-last) "root-c"))
+     :source-kind buffer :identity-policy dorg :status refused
+     :refusal (unsupported . no-source-preserving-editor)
+     :selector "^dorg-test-mutate-public-keyword-insert-plain-heading-placement$"
+     :tests (dorg-test-mutate-public-keyword-insert-plain-heading-placement))
+    (:key property-extern-file
+     :form (on (where (property "BEAD_ID" "a-1"))
+               (set (property "STATUS") "DONE"))
+     :source-kind file :identity-policy (:property "BEAD_ID") :status supported
+     :oracle-kind independent
+     :expected dorg-test-idp--prop-fixture-after
+     :selector "^dorg-test-idp-dry-run-apply-same-intent$"
+     :tests (dorg-test-idp-dry-run-apply-same-intent))
+    (:key text-insert-buffer
+     :form (on (id 1001) (insert (text) (after-last) "Appended note."))
+     :source-kind buffer :identity-policy dorg :status pending
+     :oracle-kind substring :pending-detail independent-oracle-required
+     :selector "^dorg-test-2rx9n-api-exec-insert-text-plain-org-preserves$"
+     :tests (dorg-test-2rx9n-api-exec-insert-text-plain-org-preserves))
+    (:key text-replace-dolt
+     :form (on (id 3001) (replace (text (occurrence 1)) "Rewritten via API."))
+     :source-kind dolt :identity-policy dorg :status pending
+     :oracle-kind substring :pending-detail independent-oracle-required
+     :selector "^dorg-test-2rx9n-api-exec-replace-text-dolt-preserves$"
+     :tests (dorg-test-2rx9n-api-exec-replace-text-dolt-preserves))
+    (:key identity-none-file
+     :form (on (key "a-1") (set (property "STATUS") "X"))
+     :source-kind file :identity-policy none :status refused
+     :refusal (unsupported . identity-none)
+     :selector "^dorg-test-idp-parity-none-uniform-refusal$"
+     :tests (dorg-test-idp-parity-none-uniform-refusal))
+    (:key heading-title-buffer
+     :form (on (key "line-a") (set (heading title) "A much longer λ title"))
+     :source-kind buffer :identity-policy dorg :status supported
+     :oracle-kind independent
+     :expected "*  TODO   [#B]  COMMENT A much longer λ title\t  :alpha:beta:  \n"
+     :selector "^dorg-test-1qdtb-title$" :tests (dorg-test-1qdtb-title))
+    (:key heading-title-file
+     :form (on (key "line-a") (set (heading title) "A much longer λ title"))
+     :source-kind file :identity-policy dorg :status supported
+     :oracle-kind independent
+     :expected "*  TODO   [#B]  COMMENT A much longer λ title\t  :alpha:beta:  \n"
+     :selector "^dorg-test-1qdtb-title$" :tests (dorg-test-1qdtb-title))
+    (:key heading-line-unrepresentable-buffer
+     :form (on (key "line-a") (set (heading priority) "AA"))
+     :source-kind buffer :identity-policy dorg :status refused
+     :refusal (invalid-target . heading-line-unrepresentable)
+     :selector "^dorg-test-1qdtb-unrepresentable-fields-refuse-before-apply$"
+     :tests (dorg-test-1qdtb-unrepresentable-fields-refuse-before-apply))
+    ;; These tests are retained in the inventory but have no literal oracle;
+    ;; they are not backend-creditable until one is added.
+    (:key query-property-plain
+     :form (query (where (property "FOO" "bar")))
+     :source-kind buffer :identity-policy dorg :status pending
+     :oracle-kind backend-vs-model :pending-detail independent-oracle-required
+     :selector "^dorg-test-ql-properties-parity-plain-vs-model$"
+     :tests (dorg-test-ql-properties-parity-plain-vs-model))
+    (:key query-property-dolt
+     :form (query (where (property "FOO" "bar")))
+     :source-kind dolt :identity-policy dorg :status pending
+     :oracle-kind backend-vs-backend :pending-detail independent-oracle-required
+     :selector "^dorg-test-ql-properties-parity-plain-vs-dolt$"
+     :tests (dorg-test-ql-properties-parity-plain-vs-dolt))
+    (:key planning-extern-file
+     :form (on (where (property "BEAD_ID" "a-1"))
+               (set (planning scheduled) "<2026-10-15 Thu>"))
+     :source-kind file :identity-policy (:property "BEAD_ID") :status supported
+     :oracle-kind independent :expected dorg-test-idp--planning-fixture-after
+     :selector "^dorg-test-idp-update-planning-supported$"
+     :tests (dorg-test-idp-update-planning-supported))
+    (:key capture-heading-file
+     :form (insert (heading (title "Captured")) (under (id 1)))
+     :source-kind file :identity-policy dorg :status pending
+     :pending-detail no-source-preserving-editor :selector nil :tests nil))
+  "Single test-side public capability contract for plain Org and Dolt.")
+
+(defun dorg-test-api--capability-test-names (selector)
+  "Return ERT names selected by SELECTOR, without running those tests."
+  (mapcar #'ert-test-name (ert-select-tests selector t)))
+
+(defun dorg-test-api--capability-expected-p (expected)
+  "Return non-nil when EXPECTED is a literal or a bound literal constant."
+  (if (and (symbolp expected) (boundp expected))
+      (symbol-value expected)
+    expected))
+
+(ert-deftest dorg-test-api-capability-matrix-is-well-formed ()
+  "The public capability matrix has usable, non-creditable pending cells.
+This deliberately server-free test verifies metadata only; it never invokes a
+named control or creates a Dolt fixture."
+  (let (keys mutant-executors)
+    (dolist (cell dorg-test-api--capability-matrix)
+      (let ((key (plist-get cell :key))
+            (status (plist-get cell :status))
+            (tests (plist-get cell :tests))
+            (selector (plist-get cell :selector)))
+        (dolist (field '(:key :form :source-kind :identity-policy :status))
+          (should (plist-get cell field)))
+        (should (memq (plist-get cell :source-kind) '(buffer file dolt)))
+        (should (memq status '(supported refused pending)))
+        (should-not (memq key keys))
+        (push key keys)
+        (dolist (test tests)
+          (should (ert-test-boundp test))
+          (should selector)
+          (should (memq test (dorg-test-api--capability-test-names selector))))
+        (when-let ((mutant (plist-get cell :mutant)))
+          (let ((executor (plist-get mutant :executor))
+                (test (plist-get mutant :test))
+                (mutant-selector (plist-get mutant :selector)))
+            (should (memq executor '(plain-splice dolt-write)))
+            (should (ert-test-boundp test))
+            (should mutant-selector)
+            (should (memq test
+                          (dorg-test-api--capability-test-names mutant-selector)))
+            (push executor mutant-executors)))
+        (pcase status
+          ('supported
+           (should tests)
+           (should (plist-member cell :expected))
+           (should (dorg-test-api--capability-expected-p
+                    (plist-get cell :expected)))
+           (should (memq (plist-get cell :oracle-kind)
+                         '(independent transitive-independent))))
+          ('refused
+           (should tests)
+           (let ((refusal (plist-get cell :refusal)))
+             (should (consp refusal))
+             (should (and (car refusal) (symbolp (car refusal))))
+             (should (and (cdr refusal) (symbolp (cdr refusal))))))
+          ('pending
+           (should (plist-get cell :pending-detail))
+           (should-not (memq (plist-get cell :oracle-kind)
+                             '(independent transitive-independent)))))))
+    (should (equal '(dolt-write plain-splice)
+                   (cl-sort mutant-executors #'string< :key #'symbol-name)))))
+
+(ert-deftest dorg-test-api-capability-plain-splice-noop-mutant-is-observable ()
+  "A no-op at the real plain splice boundary makes the public postimage RED."
+  (let ((form '(on (id 1001) (insert (text) (after-last) "Mutant text."))))
+    ;; Establish that the exact public intent has a real green leg first.
+    (dorg-test-mutate--with-content real-buf dorg-test-mutate--keyword-insert-sample
+      (dorg-test-mutate--assert-dorg-policy real-buf)
+      (should (plist-get (dorg-api-execute form :mode 'apply :source real-buf) :ok))
+      (should (string-match-p "Mutant text\\." (buffer-string))))
+    (dorg-test-mutate--with-content buf dorg-test-mutate--keyword-insert-sample
+      (dorg-test-mutate--assert-dorg-policy buf)
+      (let ((before (buffer-string))
+            (splice-calls 0))
+        (cl-letf (((symbol-function 'dorg-mutate--source-preserving-splice-patch)
+                   (lambda (&rest _) (cl-incf splice-calls) nil)))
+          (should (plist-get (dorg-api-execute form :mode 'apply :source buf) :ok))
+          (should (= 1 splice-calls))
+          ;; The same positive oracle is RED under a removed executor; the
+          ;; complete source stays unchanged, including wrong member/spans.
+          (should-error
+           (should (string-match-p "Mutant text\\." (buffer-string)))
+           :type 'ert-test-failed)
+          (should (equal before (buffer-string))))))))
+
+(ert-deftest dorg-test-api-capability-dolt-write-noop-mutant-is-observable ()
+  "A no-op at the Dolt write gate makes public durable-HEAD evidence RED."
+  (let ((fixture "* Old\n"))
+    ;; A real non-root heading update proves this intent is independently green.
+    (dorg-test-mutate--with-dolt
+      (let* ((root (dorg-test-mutate--seed dolt-dir fixture))
+             (target (dorg-test-mutate--id-by-title dolt-dir "Old"))
+             (source (list :dolt-dir dolt-dir :root-id root))
+             (head-before (dorg-head-commit dolt-dir)))
+        (should target)
+        (should (plist-get
+                 (dorg-api-execute `(on (id ,target) (set (heading title) "New"))
+                                   :mode 'apply :source source)
+                 :ok))
+        (should-not (equal head-before (dorg-head-commit dolt-dir)))))
+    (dorg-test-mutate--with-dolt
+      (let* ((root (dorg-test-mutate--seed dolt-dir fixture))
+             (target (dorg-test-mutate--id-by-title dolt-dir "Old"))
+             (source (list :dolt-dir dolt-dir :root-id root))
+             (head-before (dorg-head-commit dolt-dir))
+             (write-calls 0))
+        (should target)
+        (cl-letf (((symbol-function 'dorg-mutate--dolt-gated-apply)
+                   (lambda (_source _options _base _plan-fn &rest _)
+                     (cl-incf write-calls)
+                     (list :ok t :dry-run nil :source-kind 'dolt :root-id root
+                           :commit head-before :created nil :changed nil :deleted nil))))
+          (should (plist-get
+                   (dorg-api-execute `(on (id ,target) (set (heading title) "New"))
+                                     :mode 'apply :source source)
+                   :ok))
+          (should (= 1 write-calls))
+          ;; The durable readback oracle is RED only after its real green leg.
+          (should-error
+           (should-not (equal head-before (dorg-head-commit dolt-dir)))
+           :type 'ert-test-failed)
+          (should (equal head-before (dorg-head-commit dolt-dir))))))))
+
 ;;; ─── Intrinsic COMMENTED heading field (tracked-regression) ────────────────
 
 (ert-deftest dorg-test-c8ynt-commented-normalization-preserves-nil ()
@@ -158,22 +444,23 @@
 
 (ert-deftest dorg-test-c8ynt-commented-dry-run-is-wire-honest ()
   "Dry-run echoes exact COMMENTED intent and typed patches without a write."
-  (let (seen-patches)
-    (cl-letf (((symbol-function 'dorg-mutate--plan-patches)
-               (lambda (_source patches _ext-inputs &rest _)
-                 (setq seen-patches patches)
-                 '(:ok t :dry-run t :source-kind plain-org :root-id 1
-                   :base-revision "tok" :supported t :unsupported nil))))
-      (dolist (value '(t nil))
-        (let* ((intent `(on (id 100) (set (heading commented) ,value)))
-               (response (dorg-api-execute intent :mode 'dry-run
-                                           :source '(:file "/x.org")))
-               (patches (plist-get response :patches))
-               (fields (plist-get (car patches) :fields)))
-          (should (equal (list intent) (plist-get response :intent)))
-          (should (equal patches seen-patches))
-          (should (plist-member fields :commented))
-          (should (eq value (plist-get fields :commented))))))))
+  (dorg-test-api--with-unit-files
+   (let (seen-patches)
+     (cl-letf (((symbol-function 'dorg-mutate--plan-patches)
+		(lambda (_source patches _ext-inputs &rest _)
+                  (setq seen-patches patches)
+                  '(:ok t :dry-run t :source-kind plain-org :root-id 1
+			:base-revision "tok" :supported t :unsupported nil))))
+	      (dolist (value '(t nil))
+		(let* ((intent `(on (id 100) (set (heading commented) ,value)))
+		       (response (dorg-api-execute intent :mode 'dry-run
+						   :source (list :file (dorg-test-api--unit-file))))
+		       (patches (plist-get response :patches))
+		       (fields (plist-get (car patches) :fields)))
+		  (should (equal (list intent) (plist-get response :intent)))
+		  (should (equal patches seen-patches))
+		  (should (plist-member fields :commented))
+		  (should (eq value (plist-get fields :commented)))))))))
 
 ;;; ─── Atomic COMMENTED heading construction (tracked-regression) ───────────
 
@@ -218,31 +505,29 @@
          ((on (id 100) (delete (property "STATUS")))
           (:op delete :target
            (:property :host (:heading :id 100) :name "STATUS")))
-         ((on document (replace (keywords "SEQ_TODO") "TODO" "DONE"))
-          (:op replace :target (:keywords :host :root :name "SEQ_TODO")
+         ((on document (replace (keyword "SEQ_TODO" (all)) "TODO" "DONE"))
+          (:op replace :target (:keyword :host :root :name "SEQ_TODO" :select (:all))
            :values ("TODO" "DONE")))
-         ((on document (delete (keywords "SEQ_TODO")))
-          (:op delete :target (:keywords :host :root :name "SEQ_TODO")))
+         ((on document (delete (keyword "SEQ_TODO" (all))))
+          (:op delete :target (:keyword :host :root :name "SEQ_TODO" :select (:all))))
          ((on document
               (replace (keyword "REVIEWERS" (occurrence 2)) "a,b"))
           (:op replace
-           :target (:keyword :host :root :name "REVIEWERS" :occurrence 2)
-           :value "a,b" :missing :error))
+           :target (:keyword :host :root :name "REVIEWERS" :select (:occurrence 2))
+           :value "a,b"))
          ((on document (delete (keyword "REVIEWERS" (occurrence 1))))
           (:op delete
-           :target (:keyword :host :root :name "REVIEWERS" :occurrence 1)
-           :missing :error))
+           :target (:keyword :host :root :name "REVIEWERS" :select (:occurrence 1))))
          ((on document
               (insert (keyword "REVIEWERS") (after-last) "nav-new"))
-          (:op insert :target (:keywords :host :root :name "REVIEWERS")
+          (:op insert :target (:keyword :host :root :name "REVIEWERS")
            :value "nav-new" :position :after-last))
          ((on (id 100)
-              (insert (drawer-line "LOGBOOK" (occurrence 1))
+              (insert (drawer-line "LOGBOOK")
                       (before-first) "- State \"DONE\""))
           (:op insert
-           :target (:drawer-lines :host (:heading :id 100)
-                                  :name "LOGBOOK" :occurrence 1)
-           :position :before-first :missing :create :value "- State \"DONE\""))
+           :target (:drawer-line :host (:heading :id 100) :name "LOGBOOK")
+           :position :before-first :value "- State \"DONE\""))
          ((on (id 100) (set (heading todo) "DONE"))
           (:op update :target (:heading :id 100) :fields (:todo "DONE")))
          ((on (id 100) (set (planning scheduled) "<2026-07-01>"))
@@ -257,14 +542,14 @@
          ((on (id 100) (delete (subtree)))
           (:op delete :target (:subtree :id 100)))
          ((on (id 100) (insert (text) (after-last) "new"))
-          (:op insert :target (:texts :host (:heading :id 100))
+          (:op insert :target (:text :host (:heading :id 100))
            :position :after-last :value "new"))
          ((on (id 100) (replace (text (occurrence 1)) "new"))
           (:op replace
-           :target (:text :host (:heading :id 100) :occurrence 1)
-           :missing :error :value "new"))
-         ((on (id 100) (replace (items) (text "new")))
-          (:op replace :target (:items :host (:heading :id 100))
+           :target (:text :host (:heading :id 100) :select (:occurrence 1))
+           :value "new"))
+         ((on (id 100) (replace (item (all)) (text "new")))
+          (:op replace :target (:item :host (:heading :id 100) :select (:all))
            :items ((:kind text :text "new" :post-blank 0))))
          ((insert (heading (title "Inbox") (todo "TODO"))
                   (under document))
@@ -374,7 +659,7 @@
   "The public document host and grouped structural position have one spelling."
   (dolist
       (form
-       '((on root (delete (keywords "K")))
+       '((on root (delete (keyword "K" (all))))
          (insert (heading (title "x")) (under root))
          (on (id 100)
              (move (subtree) (under (id 7)) (after (id 9))))
@@ -389,20 +674,21 @@
 
 (ert-deftest dorg-test-g0vnp-dry-run-shows-public-vs-ir-boundary ()
   "Dry-run keeps the canonical intent while exposing unchanged internal :root."
-  (cl-letf (((symbol-function 'dorg-mutate--plan-patches)
-             (lambda (&rest _)
-               '(:ok t :dry-run t :source-kind plain-org :root-id 1
-                 :base-revision "tok" :supported t :unsupported nil))))
-    (let* ((form '(on document
-                       (replace (keywords "SEQ_TODO") "TODO" "DONE")))
-           (response (dorg-api-execute form :mode 'dry-run
-                                       :source '(:file "/x.org"))))
-      (should (equal (list form) (plist-get response :intent)))
-      (should
-       (equal '((:op replace
-                 :target (:keywords :host :root :name "SEQ_TODO")
-                 :values ("TODO" "DONE")))
-              (plist-get response :patches))))))
+  (dorg-test-api--with-unit-files
+   (cl-letf (((symbol-function 'dorg-mutate--plan-patches)
+              (lambda (&rest _)
+		'(:ok t :dry-run t :source-kind plain-org :root-id 1
+                      :base-revision "tok" :supported t :unsupported nil))))
+	    (let* ((form '(on document
+			      (replace (keyword "SEQ_TODO" (all)) "TODO" "DONE")))
+		   (response (dorg-api-execute form :mode 'dry-run
+					       :source (list :file (dorg-test-api--unit-file)))))
+	      (should (equal (list form) (plist-get response :intent)))
+	      (should
+	       (equal '((:op replace
+			     :target (:keyword :host :root :name "SEQ_TODO" :select (:all))
+			     :values ("TODO" "DONE")))
+		      (plist-get response :patches)))))))
 
 ;;; ─── AC2: typed patch IR v2 — op×target coverage ─────────────────────────
 ;; Each public action lowers to the exact canonical typed patch (docs/mutate.org
@@ -423,38 +709,38 @@
     (should (equal '(:property :host (:heading :id 100) :name "STATUS")
                    (plist-get p :target)))))
 
-(ert-deftest dorg-test-api-ir-replace-keywords-sequence ()
-  (let ((p (dorg-test-api--1 '(on document (replace (keywords "SEQ_TODO") "TODO" "NEXT" "DONE")))))
+(ert-deftest dorg-test-api-ir-replace-keyword-all-sequence ()
+  (let ((p (dorg-test-api--1 '(on document (replace (keyword "SEQ_TODO" (all)) "TODO" "NEXT" "DONE")))))
     (should (eq 'replace (plist-get p :op)))
-    (should (equal '(:keywords :host :root :name "SEQ_TODO") (plist-get p :target)))
+    (should (equal '(:keyword :host :root :name "SEQ_TODO" :select (:all))
+                   (plist-get p :target)))
     (should (equal '("TODO" "NEXT" "DONE") (plist-get p :values)))))
 
-(ert-deftest dorg-test-api-ir-delete-keywords-sequence ()
-  (let ((p (dorg-test-api--1 '(on document (delete (keywords "SEQ_TODO"))))))
+(ert-deftest dorg-test-api-ir-delete-keyword-all-sequence ()
+  (let ((p (dorg-test-api--1 '(on document (delete (keyword "SEQ_TODO" (all)))))))
     (should (eq 'delete (plist-get p :op)))
-    (should (equal '(:keywords :host :root :name "SEQ_TODO") (plist-get p :target)))))
+    (should (equal '(:keyword :host :root :name "SEQ_TODO" :select (:all))
+                   (plist-get p :target)))))
 
 (ert-deftest dorg-test-api-ir-replace-keyword-occurrence-preserves-base ()
-  "Public one-based (occurrence 2) stays :occurrence 2 in the typed IR."
+  "Public one-based (occurrence 2) stays a selector in the typed IR."
   (let ((p (dorg-test-api--1
             '(on document (replace (keyword "REVIEWERS" (occurrence 2)) "a,b")))))
     (should (eq 'replace (plist-get p :op)))
-    (should (equal '(:keyword :host :root :name "REVIEWERS" :occurrence 2)
+    (should (equal '(:keyword :host :root :name "REVIEWERS" :select (:occurrence 2))
                    (plist-get p :target)))
-    (should (equal "a,b" (plist-get p :value)))
-    (should (eq :error (plist-get p :missing)))))
+    (should (equal "a,b" (plist-get p :value)))))
 
 (ert-deftest dorg-test-api-ir-delete-keyword-occurrence ()
   (let ((p (dorg-test-api--1 '(on document (delete (keyword "REVIEWERS" (occurrence 1)))))))
     (should (eq 'delete (plist-get p :op)))
-    (should (equal '(:keyword :host :root :name "REVIEWERS" :occurrence 1)
-                   (plist-get p :target)))
-    (should (eq :error (plist-get p :missing)))))
+    (should (equal '(:keyword :host :root :name "REVIEWERS" :select (:occurrence 1))
+                   (plist-get p :target)))))
 
 (ert-deftest dorg-test-api-ir-insert-keyword-after-last ()
   (let ((p (dorg-test-api--1 '(on document (insert (keyword "REVIEWERS") (after-last) "nav-new")))))
     (should (eq 'insert (plist-get p :op)))
-    (should (equal '(:keywords :host :root :name "REVIEWERS") (plist-get p :target)))
+    (should (equal '(:keyword :host :root :name "REVIEWERS") (plist-get p :target)))
     (should (equal "nav-new" (plist-get p :value)))
     (should (eq :after-last (plist-get p :position)))))
 
@@ -516,28 +802,29 @@
 
 (ert-deftest dorg-test-kixox-dry-run-exposes-typed-numeric-anchors ()
   "Dry-run sends and exposes typed numeric insert and move anchors verbatim."
-  (let (seen)
-    (cl-letf (((symbol-function 'dorg-mutate--plan-patches)
-               (lambda (_source patches _ext-inputs &rest _)
-                 (setq seen patches)
-                 '(:ok t :dry-run t :source-kind plain-org :root-id 1
-                   :base-revision "tok" :supported t :unsupported nil))))
-      (let* ((intent
-              '(batch
-                (insert (heading (title "Created"))
-                        (under (id 7) (before (id 9))))
-                (on (id 42)
-                    (move (subtree) (under (id 7) (after (id 9)))))))
-             (response (dorg-api-execute intent :mode 'dry-run
-                                         :source '(:file "/x.org")))
-             (patches (plist-get response :patches)))
-        (should (equal patches seen))
-        (should (equal '(:tree :under (:heading :id 7)
-                               :before (:heading :id 9))
-                       (plist-get (car patches) :target)))
-        (should (equal '(:under (:heading :id 7)
-                               :after (:heading :id 9))
-                       (plist-get (cadr patches) :to)))))))
+  (dorg-test-api--with-unit-files
+   (let (seen)
+     (cl-letf (((symbol-function 'dorg-mutate--plan-patches)
+		(lambda (_source patches _ext-inputs &rest _)
+                  (setq seen patches)
+                  '(:ok t :dry-run t :source-kind plain-org :root-id 1
+			:base-revision "tok" :supported t :unsupported nil))))
+	      (let* ((intent
+		      '(batch
+			(insert (heading (title "Created"))
+				(under (id 7) (before (id 9))))
+			(on (id 42)
+			    (move (subtree) (under (id 7) (after (id 9)))))))
+		     (response (dorg-api-execute intent :mode 'dry-run
+						 :source (list :file (dorg-test-api--unit-file))))
+		     (patches (plist-get response :patches)))
+		(should (equal patches seen))
+		(should (equal '(:tree :under (:heading :id 7)
+				       :before (:heading :id 9))
+			       (plist-get (car patches) :target)))
+		(should (equal '(:under (:heading :id 7)
+					:after (:heading :id 9))
+			       (plist-get (cadr patches) :to))))))))
 
 (ert-deftest dorg-test-api-ir-delete-heading ()
   (let ((p (dorg-test-api--1 '(on (id 100) (delete (heading))))))
@@ -696,21 +983,20 @@ does not partially write earlier batch members."
       (delete-file file))))
 
 (ert-deftest dorg-test-api-extern-key-heading-apply-plain-org ()
-  "Plain-org heading updates through an external key remain unsupported.
-The public API still projects the external target, but faithful plain-org has no
-source-preserving heading/tree editor in this bead and leaves bytes unchanged."
+  "Plain-org title updates through an external key use the public editor."
   (let* ((initial "* TODO Alpha\n:PROPERTIES:\n:BEAD_ID: task-a\n:END:\n* TODO Beta\n:PROPERTIES:\n:BEAD_ID: task-b\n:END:\n")
          (file (make-temp-file "dorg-api-extern-heading-" nil ".org" initial))
          (source (dorg-test-api--extern-source file)))
     (unwind-protect
-        (let ((outcome (dorg-test-api--mutation-reason+detail
-                        (lambda ()
-                          (dorg-api-execute
-                           '(on (key "task-a")
-                                (set (heading title) "Renamed Alpha"))
-                           :mode 'apply :source source :save t)))))
-          (should (equal '(unsupported . no-source-preserving-editor) outcome))
-          (should (equal initial (dorg-test-api--slurp file))))
+        (should (plist-get
+                 (dorg-api-execute
+                  '(on (key "task-a")
+                       (set (heading title) "Renamed Alpha"))
+                  :mode 'apply :source source :save t)
+                 :ok))
+        (should (equal
+                 "* TODO Renamed Alpha\n:PROPERTIES:\n:BEAD_ID: task-a\n:END:\n* TODO Beta\n:PROPERTIES:\n:BEAD_ID: task-b\n:END:\n"
+                 (dorg-test-api--slurp file)))
       (delete-file file))))
 
 (ert-deftest dorg-test-api-extern-key-heading-apply-dolt ()
@@ -955,9 +1241,9 @@ is no direct interactive heading insert/move command in `dorg-mode' today."
       (dorg-sql-batch
        dd
        (list
-        "INSERT INTO headings (id, root_id, parent_id, sort_key, level, todo_keyword, priority, commented, title, post_blank, items_hash) VALUES (9000, 9000, NULL, X'01', 0, NULL, NULL, FALSE, NULL, 0, NULL)"
+        "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, todo_keyword, priority, commented, title, post_blank, items_hash) VALUES (9000, 9000, NULL, X'01', 0, NULL, NULL, FALSE, NULL, 0, NULL)"
         "INSERT INTO dorg_files (root_id, relative_path) VALUES (9000, 'foreign.org')"
-        "INSERT INTO headings (id, root_id, parent_id, sort_key, level, todo_keyword, priority, commented, title, post_blank, items_hash) VALUES (9001, 9000, 9000, X'01', 1, NULL, NULL, FALSE, 'Foreign', 0, NULL)"
+        "INSERT INTO headings (id, root_id, parent_id, sort_key, level_offset, todo_keyword, priority, commented, title, post_blank, items_hash) VALUES (9001, 9000, 9000, X'01', 1, NULL, NULL, FALSE, 'Foreign', 0, NULL)"
         "INSERT INTO heading_items (id, heading_id, sort_key, kind, post_blank) VALUES (9100, 9001, X'01', 'drawer', 0)"
         "INSERT INTO drawer_items (item_id, name) VALUES (9100, 'PROPERTIES')"
         "INSERT INTO property_entries (drawer_item_id, ordinal, prop_key, prop_value, raw_line) VALUES (9100, 1, 'BEAD_ID', 'foreign', ':BEAD_ID: foreign')"))
@@ -1058,14 +1344,13 @@ executor resolution against the owned source snapshot, before any write."
     (should (symbolp (plist-get p :op)))))
 
 ;;; ─── Text collection/occurrence selectors (tracked-regression) ──────────────
-;; Text creation addresses the plural collection plus an explicit position;
-;; replacement addresses one singular occurrence and carries strict missing
-;; policy.  Both compound addresses are born in this spelling.
+;; Text creation and occurrence replacement use the same singular target;
+;; selection lives in :select and missing laws belong to its IR row.
 
 (ert-deftest dorg-test-2rx9n-api-ir-insert-text-exact ()
   "Text insertion preserves the explicit target-relative position in IR."
   (should
-   (equal '(:op insert :target (:texts :host (:heading :id 100))
+   (equal '(:op insert :target (:text :host (:heading :id 100))
                  :position :after-last :value "a note")
           (dorg-test-api--1
            '(on (id 100) (insert (text) (after-last) "a note"))))))
@@ -1073,7 +1358,7 @@ executor resolution against the owned source snapshot, before any write."
 (ert-deftest dorg-test-9diah-api-ir-insert-text-before-first ()
   "Text insertion also accepts the target-relative before-first slot."
   (should
-   (equal '(:op insert :target (:texts :host (:heading :id 100))
+   (equal '(:op insert :target (:text :host (:heading :id 100))
                  :position :before-first :value "a note")
           (dorg-test-api--1
            '(on (id 100) (insert (text) (before-first) "a note"))))))
@@ -1082,10 +1367,29 @@ executor resolution against the owned source snapshot, before any write."
   "Text replacement preserves its one-based occurrence and strict policy."
   (should
    (equal '(:op replace
-                 :target (:text :host (:heading :id 100) :occurrence 1)
-                 :missing :error :value "new prose")
+                 :target (:text :host (:heading :id 100) :select (:occurrence 1))
+                 :value "new prose")
           (dorg-test-api--1
            '(on (id 100) (replace (text (occurrence 1)) "new prose"))))))
+
+(ert-deftest dorg-test-q60zv-api-ir-replace-body-literal-exact ()
+  "A body literal precondition remains explicit in the typed intent."
+  (should
+   (equal '(:op replace
+                 :target (:body :host (:heading :id 100) :literal "old words")
+                 :value "new prose")
+          (dorg-test-api--1
+           '(on (id 100) (replace (body (literal "old words")) "new prose"))))))
+
+(ert-deftest dorg-test-q60zv-api-body-literal-refusals ()
+  "Body replacement accepts one nonempty literal and no positional alias."
+  (dolist (form '((on (id 100) (replace (body (literal "")) "new"))
+                  (on (id 100) (replace (body (literal 4)) "new"))
+                  (on (id 100) (replace (body (literal "old")) 4))
+                  (on (id 100) (replace (body (occurrence 1)) "new"))
+                  (on (id 100) (replace (body) "new"))))
+    (dorg-test-api--should-reason 'invalid-target
+      (dorg-api-normalize form))))
 
 (ert-deftest dorg-test-2rx9n-api-text-selector-refusals ()
   "The text capability has closed selector and value shape."
@@ -1096,11 +1400,17 @@ executor resolution against the owned source snapshot, before any write."
                   (on (id 100) (replace (text (occurrence -1)) "x"))
                   (on (id 100) (replace (text (occurrence 1.5)) "x"))
                   (on (id 100) (replace (text (occurrence "1")) "x"))
-                  (on (id 100) (replace (text (occurrence 2)) "x"))
                   (on (id 100) (replace (text) "x"))
                   (on (id 100) (replace (text (occurrence 1) extra) "x"))))
     (dorg-test-api--should-reason 'invalid-target
       (dorg-api-normalize form))))
+
+(ert-deftest dorg-test-2rx9n-api-text-later-occurrence-normalizes ()
+  "A positive ordinal lowers without guessing whether the source has it."
+  (should (equal '(:text :host (:heading :id 100) :select (:occurrence 2))
+                 (plist-get (dorg-test-api--1
+                             '(on (id 100) (replace (text (occurrence 2)) "x")))
+                            :target))))
 
 (ert-deftest dorg-test-2rx9n-api-text-rejects-root ()
   "Root is not a public prose-text host."
@@ -1126,17 +1436,16 @@ executor resolution against the owned source snapshot, before any write."
 ;;; ─── Drawer-line front insertion (tracked-regression) ───────────────────
 
 (ert-deftest dorg-test-bnsmz-api-ir-insert-drawer-line-exact ()
-  "The frozen collection target preserves a valid lowercase NAME exactly."
+  "The singular drawer-line target preserves a valid lowercase NAME exactly."
   (should
    (equal
     '(:op insert
-      :target (:drawer-lines :host (:heading :id 100) :name "logbook"
-                             :occurrence 1)
-      :position :before-first :missing :create
+      :target (:drawer-line :host (:heading :id 100) :name "logbook")
+      :position :before-first
       :value "- State \"DONE\" [2026-08-14 Fri]")
     (dorg-test-api--1
      '(on (id 100)
-          (insert (drawer-line "logbook" (occurrence 1)) (before-first)
+          (insert (drawer-line "logbook") (before-first)
                   "- State \"DONE\" [2026-08-14 Fri]"))))))
 
 (ert-deftest dorg-test-9diah-api-ir-insert-drawer-line-after-last ()
@@ -1144,13 +1453,12 @@ executor resolution against the owned source snapshot, before any write."
   (should
    (equal
     '(:op insert
-      :target (:drawer-lines :host (:heading :id 100) :name "audit"
-                             :occurrence 1)
-      :position :after-last :missing :create
+      :target (:drawer-line :host (:heading :id 100) :name "audit")
+      :position :after-last
       :value "- appended")
     (dorg-test-api--1
      '(on (id 100)
-          (insert (drawer-line "audit" (occurrence 1)) (after-last)
+          (insert (drawer-line "audit") (after-last)
                   "- appended"))))))
 
 (ert-deftest dorg-test-bnsmz-api-drawer-line-validation ()
@@ -1160,25 +1468,23 @@ executor resolution against the owned source snapshot, before any write."
     (dorg-test-api--should-reason 'invalid-target
       (dorg-api-normalize
        `(on (id 100)
-            (insert (drawer-line ,name (occurrence 1)) (before-first) "safe")))))
+            (insert (drawer-line ,name) (before-first) "safe")))))
   (dolist (line (list 42 "two\nlines" "two\rlines"
                       (concat "nul" (string 0) "byte")
                       ":END:" "  :end:\t" ":OTHER:"))
     (dorg-test-api--should-reason 'invalid-target
       (dorg-api-normalize
        `(on (id 100)
-            (insert (drawer-line "LOGBOOK" (occurrence 1)) (before-first)
+            (insert (drawer-line "LOGBOOK") (before-first)
                     ,line)))))
   (dorg-test-api--should-reason 'invalid-target
     (dorg-api-normalize
      '(on document
-          (insert (drawer-line "LOGBOOK" (occurrence 1)) (before-first)
+          (insert (drawer-line "LOGBOOK") (before-first)
                   "safe")))))
 
 (ert-deftest dorg-test-bnsmz-api-drawer-line-selector-refusals ()
-  "Only occurrence one followed by before-first/after-last is accepted.
-Every refusal is classified as `invalid-target', including the capability
-boundary at occurrence two and a syntactically valid selector reversal."
+  "Drawer insertion is bare and accepts only the declared position grammar."
   (let ((forms
          '((on (id 100)
                (insert (drawer-line "LOGBOOK" (occurrence 0)) (before-first) "x"))
@@ -1189,7 +1495,7 @@ boundary at occurrence two and a syntactically valid selector reversal."
            (on (id 100)
                (insert (drawer-line "LOGBOOK" (occurrence 2)) (before-first) "x"))
            (on (id 100)
-               (insert (drawer-line "LOGBOOK" (occurrence 1)) (middle) "x"))
+               (insert (drawer-line "LOGBOOK") (middle) "x"))
            (on (id 100)
                (insert drawer-line "LOGBOOK" (before-first) (occurrence 1) "x")))))
     (should
@@ -1201,9 +1507,33 @@ boundary at occurrence two and a syntactically valid selector reversal."
 
 ;;; ─── Validation / error taxonomy (docs/mutate.org "Edge cases") ──────────
 
-(ert-deftest dorg-test-api-reject-dorg-id-property ()
-  (dorg-test-api--should-reason 'invalid-target
-    (dorg-api-normalize '(on (id 100) (set (property "DORG_ID") "x")))))
+(ert-deftest dorg-test-32mp9-api-refuses-owned-property-prefixes ()
+  "Every case-insensitive DORG_ property is refused before lowering.
+
+The lowercase identity rows are regressions: before this guard used the
+literal uppercase DORG_ID spelling, allowing the Org-equivalent `dorg_id' to
+replace or delete the real identity line during execution.  Each form must
+retain the key in its typed diagnostic so this proves the public property
+door, rather than a later engine refusal."
+  (dolist (key '("DORG_ID" "dorg_id" "Dorg_Id" "DORG_HASH"
+                 "DORG_CLOCK_START" "dorg_hash" "DORG_" "DORG_NEW"))
+    (dolist (form
+             (list `(on (id 100) (set (property ,key) "x"))
+                   `(on (id 100) (delete (property ,key)))
+                   `(insert (heading (title "Created")
+                                     (property ,key "x"))
+                            (under document))))
+      (let ((err (should-error (dorg-api-normalize form) :type 'dorg-api-error)))
+        (should (eq 'invalid-target (dorg-api-error-reason err)))
+        (should (equal key (plist-get (dorg-api-error-data err) :key))))))
+  ;; Prefix ownership is not a substring rule: unowned ordinary names lower.
+  (dolist (key '("STATUS" "XDORG_ID"))
+    (should (equal key
+                   (dorg-api--tget
+                    (plist-get
+                     (dorg-test-api--1 `(on (id 100) (set (property ,key) "x")))
+                     :target)
+                    :name)))))
 
 (ert-deftest dorg-test-api-reject-insert-heading-invalid-property ()
   "Insert property clauses validate at the public normalization boundary."
@@ -1222,7 +1552,7 @@ boundary at occurrence two and a syntactically valid selector reversal."
 
 (ert-deftest dorg-test-api-reject-dorg-prefixed-keyword ()
   (dorg-test-api--should-reason 'invalid-target
-    (dorg-api-normalize '(on document (replace (keywords "DORG_HASH") "x")))))
+    (dorg-api-normalize '(on document (replace (keyword "DORG_HASH" (all)) "x")))))
 
 (ert-deftest dorg-test-api-reject-lowercase-dorg-keyword ()
   "A LOWERCASE dorg_* keyword is rejected identically to DORG_* (tracked regression).
@@ -1232,7 +1562,7 @@ test (`dorg-test-api-reject-dorg-prefixed-keyword') cannot catch a missed
 repoint of the API check to the case-insensitive `dorg-protected-keyword-p';
 this one turns RED if the API validator reverts to a case-sensitive check."
   (dorg-test-api--should-reason 'invalid-target
-    (dorg-api-normalize '(on document (replace (keywords "dorg_hash") "x")))))
+    (dorg-api-normalize '(on document (replace (keyword "dorg_hash" (all)) "x")))))
 
 (ert-deftest dorg-test-api-reject-root-on-heading-field ()
   (dorg-test-api--should-reason 'invalid-target
@@ -1248,7 +1578,7 @@ this one turns RED if the API validator reverts to a case-sensitive check."
 
 (ert-deftest dorg-test-api-reject-empty-replace-keywords ()
   (dorg-test-api--should-reason 'invalid-target
-    (dorg-api-normalize '(on document (replace (keywords "R"))))))
+    (dorg-api-normalize '(on document (replace (keyword "R" (all)))))))
 
 (ert-deftest dorg-test-api-reject-move-both-before-and-after ()
   (dorg-test-api--should-reason 'invalid-target
@@ -1268,18 +1598,32 @@ this one turns RED if the API validator reverts to a case-sensitive check."
 
 ;;; ─── AC1/AC6: query-scoped expansion (shared normalization path) ─────────
 
+(ert-deftest dorg-test-api-where-refuses-display-projection ()
+  "Aliases cannot become mutation target identities."
+  (dorg-test-api--with-unit-files
+   (cl-letf (((symbol-function 'dorg-ql-select)
+              (lambda (&rest _)
+		(ert-fail "projected query reached target selection"))))
+	    (dolist (query '((pipe (where (id 101)) (select (as (field title) id)))
+			     (one (pipe (where (id 101)) (select (field id))))))
+	      (dorg-test-api--should-reason 'invalid-target
+					    (dorg-api-normalize
+					     `(on (where ,query) (set (property "STATUS") "DONE"))
+					     (list :file (dorg-test-api--unit-file))))))))
+
 (ert-deftest dorg-test-api-where-expands-to-per-id-patches ()
   "(on (where Q) ACTION) expands via dorg-ql-select to one patch per id."
-  (cl-letf (((symbol-function 'dorg-ql-select)
-             (lambda (&rest _) '((:heading-id 101) (:heading-id 102)))))
-    (let ((ps (dorg-test-api--patches
-               '(on (where (property "STATUS" "OPEN")) (set (property "STATUS") "DONE"))
-               '(:file "/x.org"))))
-      (should (= 2 (length ps)))
-      (should (equal '(:property :host (:heading :id 101) :name "STATUS")
-                     (plist-get (nth 0 ps) :target)))
-      (should (equal '(:property :host (:heading :id 102) :name "STATUS")
-                     (plist-get (nth 1 ps) :target))))))
+  (dorg-test-api--with-unit-files
+   (cl-letf (((symbol-function 'dorg-ql-select)
+              (lambda (&rest _) '((:heading-id 101) (:heading-id 102)))))
+	    (let ((ps (dorg-test-api--patches
+		       '(on (where (property "STATUS" "OPEN")) (set (property "STATUS") "DONE"))
+		       (list :file (dorg-test-api--unit-file)))))
+	      (should (= 2 (length ps)))
+	      (should (equal '(:property :host (:heading :id 101) :name "STATUS")
+			     (plist-get (nth 0 ps) :target)))
+	      (should (equal '(:property :host (:heading :id 102) :name "STATUS")
+			     (plist-get (nth 1 ps) :target)))))))
 
 (ert-deftest dorg-test-api-explicit-descriptor-never-expands-from-current-buffer ()
   "An explicit source descriptor must not fall back to implicit current-buffer.
@@ -1323,9 +1667,9 @@ evaluator so the assertion actually runs."
                                "* A\n:PROPERTIES:\n:DORG_ID: 1\n:END:\n"))
          (src (list :file file :identity 'dorg))
          (headings
-          (list (make-dorg-heading :id 1 :level 1 :title "A" :priority "A")
-                (make-dorg-heading :id 2 :level 1 :title "B" :priority "A")
-                (make-dorg-heading :id 5 :level 1 :title "C" :priority "B"))))
+          (list (make-dorg-heading :id 1 :level 1 :level-offset 1 :title "A" :priority "A")
+                (make-dorg-heading :id 2 :level 1 :level-offset 1 :title "B" :priority "A")
+                (make-dorg-heading :id 5 :level 1 :level-offset 1 :title "C" :priority "B"))))
     (unwind-protect
         (cl-letf (((symbol-function 'dorg-ql-select)
                    (lambda (q &rest _)
@@ -1345,16 +1689,17 @@ evaluator so the assertion actually runs."
 (ert-deftest dorg-test-api-key-idbearing-projects-heading-id ()
   "AC-4 (tracked-case): direct (key V) on an id-bearing source rewrites
 (key V) to (id V) through the shared seam and projects to the heading id."
-  (let ((seen nil))
-    (cl-letf (((symbol-function 'dorg-ql-select)
-               (lambda (q &rest _) (setq seen q) '((:heading-id 42)))))
-      (let ((ps (dorg-api-normalize
-                 '(on (key "42") (set (property "S") "X"))
-                 '(:file "/x.org"))))
-        (should (equal '(id "42") seen))
-        (should (= 1 (length ps)))
-        (should (equal '(:heading :id 42)
-                       (dorg-api--tget (plist-get (car ps) :target) :host)))))))
+  (dorg-test-api--with-unit-files
+   (let ((seen nil))
+     (cl-letf (((symbol-function 'dorg-ql-select)
+		(lambda (q &rest _) (setq seen q) '((:heading-id 42)))))
+	      (let ((ps (dorg-api-normalize
+			 '(on (key "42") (set (property "S") "X"))
+			 (list :file (dorg-test-api--unit-file)))))
+		(should (equal '(id "42") seen))
+		(should (= 1 (length ps)))
+		(should (equal '(:heading :id 42)
+			       (dorg-api--tget (plist-get (car ps) :target) :host))))))))
 
 (ert-deftest dorg-test-api-key-no-binding-is-invalid-target ()
   "AC-4 (tracked-case): direct mutate (key V) on a source that resolves to NO
@@ -1410,64 +1755,67 @@ before tri-state resolution this leaked `dorg-ql-error: id must be integer'."
   "mutate --dry-run returns the canonical response: :ok, :command mutate,
 :mode dry-run, :intent (the forms), :patches (typed IR), :targets, and a
 base token.  The retired lowered `:ops' echo is absent."
-  (cl-letf (((symbol-function 'dorg-mutate--plan-patches)
-             (lambda (&rest _)
-               '(:ok t :dry-run t :source-kind plain-org :root-id 1
-                 :base-revision "tok" :supported t :unsupported nil))))
-    (let ((r (dorg-api-execute '(on (id 100) (set (property "STATUS") "DONE"))
-                               :mode 'dry-run :source '(:file "/x.org"))))
-      (should (eq t (plist-get r :ok)))
-      (should (eq 'mutate (plist-get r :command)))
-      (should (eq 'dry-run (plist-get r :mode)))
-      (should (equal '((on (id 100) (set (property "STATUS") "DONE")))
-                     (plist-get r :intent)))
-      (should (plist-get r :patches))
-      (should-not (plist-member r :ops))
-      (should (member 100 (plist-get r :targets)))
-      (should (equal "tok" (plist-get r :base-revision))))))
+  (dorg-test-api--with-unit-files
+   (cl-letf (((symbol-function 'dorg-mutate--plan-patches)
+              (lambda (&rest _)
+		'(:ok t :dry-run t :source-kind plain-org :root-id 1
+                      :base-revision "tok" :supported t :unsupported nil))))
+	    (let ((r (dorg-api-execute '(on (id 100) (set (property "STATUS") "DONE"))
+				       :mode 'dry-run :source (list :file (dorg-test-api--unit-file)))))
+	      (should (eq t (plist-get r :ok)))
+	      (should (eq 'mutate (plist-get r :command)))
+	      (should (eq 'dry-run (plist-get r :mode)))
+	      (should (equal '((on (id 100) (set (property "STATUS") "DONE")))
+			     (plist-get r :intent)))
+	      (should (plist-get r :patches))
+	      (should-not (plist-member r :ops))
+	      (should (member 100 (plist-get r :targets)))
+	      (should (equal "tok" (plist-get r :base-revision)))))))
 
 (ert-deftest dorg-test-api-dry-run-occurrence-base-is-wire-stable ()
   "A dry-run response exposes the same one-based occurrence as its request."
-  (cl-letf (((symbol-function 'dorg-mutate--plan-patches)
-             (lambda (&rest _)
-               '(:ok t :dry-run t :source-kind plain-org :root-id 1
-                 :base-revision "tok" :supported t :unsupported nil))))
-    (let* ((r (dorg-api-execute
-               '(on (id 100)
-                    (replace (keyword "REVIEWERS" (occurrence 1)) "alice"))
-               :mode 'dry-run :source '(:file "/x.org")))
-           (patch (car (plist-get r :patches))))
-      (should
-       (equal '(:keyword :host (:heading :id 100)
-                         :name "REVIEWERS" :occurrence 1)
-              (plist-get patch :target)))
-      (should (equal (plist-get r :patches)
-                     (dorg-api-normalize
-                      '(on (id 100)
-                           (replace (keyword "REVIEWERS" (occurrence 1))
-                                    "alice"))))))))
+  (dorg-test-api--with-unit-files
+   (cl-letf (((symbol-function 'dorg-mutate--plan-patches)
+              (lambda (&rest _)
+		'(:ok t :dry-run t :source-kind plain-org :root-id 1
+                      :base-revision "tok" :supported t :unsupported nil))))
+	    (let* ((r (dorg-api-execute
+		       '(on (id 100)
+			    (replace (keyword "REVIEWERS" (occurrence 1)) "alice"))
+		       :mode 'dry-run :source (list :file (dorg-test-api--unit-file))))
+		   (patch (car (plist-get r :patches))))
+	      (should
+	       (equal '(:keyword :host (:heading :id 100)
+				 :name "REVIEWERS" :select (:occurrence 1))
+		      (plist-get patch :target)))
+	      (should (equal (plist-get r :patches)
+			     (dorg-api-normalize
+			      '(on (id 100)
+				   (replace (keyword "REVIEWERS" (occurrence 1))
+					    "alice")))))))))
 
 (ert-deftest dorg-test-2rx9n-api-dry-run-text-selectors-are-wire-stable ()
   "A dry-run response echoes text collection and occurrence selectors intact."
-  (cl-letf (((symbol-function 'dorg-mutate--plan-patches)
-             (lambda (&rest _)
-               '(:ok t :dry-run t :source-kind plain-org :root-id 1
-                 :base-revision "tok" :supported t :unsupported nil))))
-    (let* ((intent '(batch
-                     (on (id 100) (insert (text) (after-last) "new"))
-                     (on (id 100)
-                         (replace (text (occurrence 1)) "rewritten"))))
-           (response (dorg-api-execute intent :mode 'dry-run
-                                       :source '(:file "/x.org")))
-           (patches (plist-get response :patches)))
-      (should
-       (equal '((:op insert :target (:texts :host (:heading :id 100))
-                     :position :after-last :value "new")
-                (:op replace
-                     :target (:text :host (:heading :id 100) :occurrence 1)
-                     :missing :error :value "rewritten"))
-              patches))
-      (should (equal patches (dorg-api-normalize intent))))))
+  (dorg-test-api--with-unit-files
+   (cl-letf (((symbol-function 'dorg-mutate--plan-patches)
+              (lambda (&rest _)
+		'(:ok t :dry-run t :source-kind plain-org :root-id 1
+                      :base-revision "tok" :supported t :unsupported nil))))
+	    (let* ((intent '(batch
+			     (on (id 100) (insert (text) (after-last) "new"))
+			     (on (id 100)
+				 (replace (text (occurrence 1)) "rewritten"))))
+		   (response (dorg-api-execute intent :mode 'dry-run
+					       :source (list :file (dorg-test-api--unit-file))))
+		   (patches (plist-get response :patches)))
+	      (should
+	       (equal '((:op insert :target (:text :host (:heading :id 100))
+			     :position :after-last :value "new")
+			(:op replace
+			     :target (:text :host (:heading :id 100) :select (:occurrence 1))
+			     :value "rewritten"))
+		      patches))
+	      (should (equal patches (dorg-api-normalize intent)))))))
 
 ;;; ─── Native typed engine boundary ───────────────────────────────────────
 ;; These tests spy on the private boundary and assert that the public API sends
@@ -1476,58 +1824,62 @@ base token.  The retired lowered `:ops' echo is absent."
 (ert-deftest dorg-test-api-execute-dry-run-speaks-typed-ir-to-engine ()
   "mutate --dry-run calls the IR-native boundary `dorg-mutate--plan-patches'
 with typed PATCHES (op/target-bearing plists)."
-  (let (seen-patches)
-    (cl-letf (((symbol-function 'dorg-mutate--plan-patches)
-               (lambda (_source patches _ext-inputs &rest _)
-                 (setq seen-patches patches)
-                 '(:ok t :dry-run t :source-kind plain-org :root-id 1
-                   :base-revision "tok" :supported t :unsupported nil))))
-      (dorg-api-execute '(on (id 100) (set (property "STATUS") "DONE"))
-                        :mode 'dry-run :source '(:file "/x.org"))
-      (should seen-patches)
-      (should (plist-member (car seen-patches) :op))
-      (should (plist-member (car seen-patches) :target)))))
+  (dorg-test-api--with-unit-files
+   (let (seen-patches)
+     (cl-letf (((symbol-function 'dorg-mutate--plan-patches)
+		(lambda (_source patches _ext-inputs &rest _)
+                  (setq seen-patches patches)
+                  '(:ok t :dry-run t :source-kind plain-org :root-id 1
+			:base-revision "tok" :supported t :unsupported nil))))
+	      (dorg-api-execute '(on (id 100) (set (property "STATUS") "DONE"))
+				:mode 'dry-run :source (list :file (dorg-test-api--unit-file)))
+	      (should seen-patches)
+	      (should (plist-member (car seen-patches) :op))
+	      (should (plist-member (car seen-patches) :target))))))
 
 (ert-deftest dorg-test-api-execute-apply-speaks-typed-ir-to-engine ()
   "mutate --apply calls the IR-native boundary `dorg-mutate--apply-patches'
 with typed PATCHES."
-  (let (seen-patches)
-    (cl-letf (((symbol-function 'dorg-mutate--apply-patches)
-               (lambda (_source patches _ext-inputs &rest _)
-                 (setq seen-patches patches)
-                 '(:ok t :dry-run nil :source-kind plain-org :root-id 1
-                   :revision "tok2" :created nil :changed (100) :deleted nil))))
-      (dorg-api-execute '(on (id 100) (set (property "STATUS") "DONE"))
-                        :mode 'apply :source '(:file "/x.org"))
-      (should seen-patches)
-      (should (plist-member (car seen-patches) :op))
-      (should (plist-member (car seen-patches) :target)))))
+  (dorg-test-api--with-unit-files
+   (let (seen-patches)
+     (cl-letf (((symbol-function 'dorg-mutate--apply-patches)
+		(lambda (_source patches _ext-inputs &rest _)
+                  (setq seen-patches patches)
+                  '(:ok t :dry-run nil :source-kind plain-org :root-id 1
+			:revision "tok2" :created nil :changed (100) :deleted nil))))
+	      (dorg-api-execute '(on (id 100) (set (property "STATUS") "DONE"))
+				:mode 'apply :source (list :file (dorg-test-api--unit-file)))
+	      (should seen-patches)
+	      (should (plist-member (car seen-patches) :op))
+	      (should (plist-member (car seen-patches) :target))))))
 
 ;;; ─── API execute option/response forwarding ─────────────────────────────
 
 (ert-deftest dorg-test-api-execute-apply-forwards-save-option ()
   "An apply call preserves the public :save option for the mutation engine."
-  (let (seen-options)
-    (cl-letf (((symbol-function 'dorg-mutate--apply-patches)
-               (lambda (_source _patches _ext-inputs &rest options)
-                 (setq seen-options options)
-                 '(:ok t :dry-run nil :source-kind plain-org :root-id 1
-                   :revision "tok2" :created nil :changed (100) :deleted nil))))
-      (dorg-api-execute '(on (id 100) (set (property "STATUS") "DONE"))
-                        :mode 'apply :source '(:file "/x.org") :save t)
-      (should (eq t (plist-get seen-options :save))))))
+  (dorg-test-api--with-unit-files
+   (let (seen-options)
+     (cl-letf (((symbol-function 'dorg-mutate--apply-patches)
+		(lambda (_source _patches _ext-inputs &rest options)
+                  (setq seen-options options)
+                  '(:ok t :dry-run nil :source-kind plain-org :root-id 1
+			:revision "tok2" :created nil :changed (100) :deleted nil))))
+	      (dorg-api-execute '(on (id 100) (set (property "STATUS") "DONE"))
+				:mode 'apply :source (list :file (dorg-test-api--unit-file)) :save t)
+	      (should (eq t (plist-get seen-options :save)))))))
 
 (ert-deftest dorg-test-api-execute-apply-omits-save-when-unsupplied ()
   "Omitting :save does not synthesize a mutation-engine :save option."
-  (let (seen-options)
-    (cl-letf (((symbol-function 'dorg-mutate--apply-patches)
-               (lambda (_source _patches _ext-inputs &rest options)
-                 (setq seen-options options)
-                 '(:ok t :dry-run nil :source-kind plain-org :root-id 1
-                   :revision "tok2" :created nil :changed (100) :deleted nil))))
-      (dorg-api-execute '(on (id 100) (set (property "STATUS") "DONE"))
-                        :mode 'apply :source '(:file "/x.org"))
-      (should-not (plist-member seen-options :save)))))
+  (dorg-test-api--with-unit-files
+   (let (seen-options)
+     (cl-letf (((symbol-function 'dorg-mutate--apply-patches)
+		(lambda (_source _patches _ext-inputs &rest options)
+                  (setq seen-options options)
+                  '(:ok t :dry-run nil :source-kind plain-org :root-id 1
+			:revision "tok2" :created nil :changed (100) :deleted nil))))
+	      (dorg-api-execute '(on (id 100) (set (property "STATUS") "DONE"))
+				:mode 'apply :source (list :file (dorg-test-api--unit-file)))
+	      (should-not (plist-member seen-options :save))))))
 
 (ert-deftest dorg-test-api-execute-apply-forwards-message-option ()
   "An apply call preserves the public :message option for the mutation engine."
@@ -1570,138 +1922,181 @@ with typed PATCHES."
 
 (ert-deftest dorg-test-api-execute-omits-invalidation-when-engine-omits-it ()
   "The API response does not synthesize :invalidation for engines without it."
-  (cl-letf (((symbol-function 'dorg-mutate--apply-patches)
-             (lambda (&rest _)
-               '(:ok t :dry-run nil :source-kind plain-org :root-id 1
-                 :revision "tok2" :created nil :changed (100) :deleted nil))))
-    (let ((r (dorg-api-execute '(on (id 100) (set (property "STATUS") "DONE"))
-                               :mode 'apply :source '(:file "/x.org"))))
-      (should-not (plist-member r :invalidation))
-      (should (equal "tok2" (plist-get r :new-token))))))
+  (dorg-test-api--with-unit-files
+   (cl-letf (((symbol-function 'dorg-mutate--apply-patches)
+              (lambda (&rest _)
+		'(:ok t :dry-run nil :source-kind plain-org :root-id 1
+                      :revision "tok2" :created nil :changed (100) :deleted nil))))
+	    (let ((r (dorg-api-execute '(on (id 100) (set (property "STATUS") "DONE"))
+				       :mode 'apply :source (list :file (dorg-test-api--unit-file)))))
+	      (should-not (plist-member r :invalidation))
+	      (should (equal "tok2" (plist-get r :new-token)))))))
 
 (ert-deftest dorg-test-api-execute-dry-run-does-not-apply-with-save-message ()
   "Supplying apply-only options to dry-run still invokes only the plan path."
-  (let (planned)
-    (cl-letf (((symbol-function 'dorg-mutate--plan-patches)
-               (lambda (&rest _)
-                 (setq planned t)
-                 '(:ok t :dry-run t :source-kind plain-org :root-id 1
-                   :base-revision "tok" :supported t :unsupported nil
-                   :patches ((:op put
-                              :target (:property :host (:heading :id 100)
-                                                 :name "STATUS")
-                              :value "DONE")))))
-              ((symbol-function 'dorg-mutate--apply-patches)
-               (lambda (&rest _) (error "must not reach apply engine"))))
-      (let ((r (dorg-api-execute '(on (id 100) (set (property "STATUS") "DONE"))
-                                 :mode 'dry-run :source '(:file "/x.org")
-                                 :save t :message "ignored for dry-run")))
-        (should planned)
-        (should (eq 'dry-run (plist-get r :mode)))))))
+  (dorg-test-api--with-unit-files
+   (let (planned)
+     (cl-letf (((symbol-function 'dorg-mutate--plan-patches)
+		(lambda (&rest _)
+                  (setq planned t)
+                  '(:ok t :dry-run t :source-kind plain-org :root-id 1
+			:base-revision "tok" :supported t :unsupported nil
+			:patches ((:op put
+				       :target (:property :host (:heading :id 100)
+							  :name "STATUS")
+				       :value "DONE")))))
+               ((symbol-function 'dorg-mutate--apply-patches)
+		(lambda (&rest _) (error "must not reach apply engine"))))
+	      (let ((r (dorg-api-execute '(on (id 100) (set (property "STATUS") "DONE"))
+					 :mode 'dry-run :source (list :file (dorg-test-api--unit-file))
+					 :save t :message "ignored for dry-run")))
+		(should planned)
+		(should (eq 'dry-run (plist-get r :mode))))))))
 
 ;;; ─── AC4: mode exclusivity (exactly one of dry-run / apply) ──────────────
 
 (ert-deftest dorg-test-api-mode-neither-is-mode-error ()
-  (dorg-test-api--should-reason 'mode-error
-    (dorg-api-execute '(on (id 1) (set (property "A") "1")) :source '(:file "/x.org"))))
+  "A request without an execution mode is rejected before the writer gate."
+  (dorg-test-api--with-unit-files
+    (dorg-test-api--should-reason 'mode-error
+      (dorg-api-execute '(on (id 1) (set (property "A") "1"))
+                        :source (list :file (dorg-test-api--unit-file))))))
 
 (ert-deftest dorg-test-api-mode-both-is-mode-error ()
-  (dorg-test-api--should-reason 'mode-error
-    (dorg-api-execute '(on (id 1) (set (property "A") "1"))
-                      :mode 'both :source '(:file "/x.org"))))
+  "A request for both execution modes is rejected before the writer gate."
+  (dorg-test-api--with-unit-files
+    (dorg-test-api--should-reason 'mode-error
+      (dorg-api-execute '(on (id 1) (set (property "A") "1"))
+                        :mode 'both
+                        :source (list :file (dorg-test-api--unit-file))))))
 
 ;;; ─── AC6: query-scoped apply safety gates ────────────────────────────────
 
 (ert-deftest dorg-test-api-apply-query-without-expected-targets-errors ()
   "A query-scoped apply with no :expected-targets is expected-targets-required."
-  (cl-letf (((symbol-function 'dorg-ql-select)
-             (lambda (&rest _) '((:heading-id 101))))
-            ((symbol-function 'dorg-mutate--apply-patches)
-             (lambda (&rest _) (error "must not reach the engine"))))
-    (dorg-test-api--should-reason 'expected-targets-required
-      (dorg-api-execute '(on (where (property "S" "O")) (set (property "S") "X"))
-                        :mode 'apply :source '(:file "/x.org")))))
+  (dorg-test-api--with-unit-files
+   (cl-letf (((symbol-function 'dorg-ql-select)
+              (lambda (&rest _) '((:heading-id 101))))
+             ((symbol-function 'dorg-mutate--apply-patches)
+              (lambda (&rest _) (error "must not reach the engine"))))
+	    (dorg-test-api--should-reason 'expected-targets-required
+					  (dorg-api-execute '(on (where (property "S" "O")) (set (property "S") "X"))
+							    :mode 'apply :source (list :file (dorg-test-api--unit-file)))))))
 
 (ert-deftest dorg-test-api-apply-query-with-save-message-still-requires-expected-targets ()
   "Forwarded apply options do not weaken query-scoped safety gates."
-  (cl-letf (((symbol-function 'dorg-ql-select)
-             (lambda (&rest _) '((:heading-id 101))))
-            ((symbol-function 'dorg-mutate--apply-patches)
-             (lambda (&rest _) (error "must not reach the engine"))))
-    (dorg-test-api--should-reason 'expected-targets-required
-      (dorg-api-execute '(on (where (property "S" "O")) (set (property "S") "X"))
-                        :mode 'apply :source '(:file "/x.org")
-                        :save t :message "must not bypass guard"))))
+  (dorg-test-api--with-unit-files
+   (cl-letf (((symbol-function 'dorg-ql-select)
+              (lambda (&rest _) '((:heading-id 101))))
+             ((symbol-function 'dorg-mutate--apply-patches)
+              (lambda (&rest _) (error "must not reach the engine"))))
+	    (dorg-test-api--should-reason 'expected-targets-required
+					  (dorg-api-execute '(on (where (property "S" "O")) (set (property "S") "X"))
+							    :mode 'apply :source (list :file (dorg-test-api--unit-file))
+							    :save t :message "must not bypass guard")))))
 
 (ert-deftest dorg-test-api-apply-query-target-set-changed ()
   "Apply re-expands the query; a set differing from :expected-targets (by
 membership, order ignored) is target-set-changed."
-  (cl-letf (((symbol-function 'dorg-ql-select)
-             (lambda (&rest _) '((:heading-id 101) (:heading-id 103))))
-            ((symbol-function 'dorg-mutate--apply-patches)
-             (lambda (&rest _) (error "must not reach the engine"))))
-    (dorg-test-api--should-reason 'target-set-changed
-      (dorg-api-execute '(on (where (property "S" "O")) (set (property "S") "X"))
-                        :mode 'apply :expected-targets '(101 102)
-                        :source '(:file "/x.org")))))
+  (dorg-test-api--with-unit-files
+   (cl-letf (((symbol-function 'dorg-ql-select)
+              (lambda (&rest _) '((:heading-id 101) (:heading-id 103))))
+             ((symbol-function 'dorg-mutate--apply-patches)
+              (lambda (&rest _) (error "must not reach the engine"))))
+	    (dorg-test-api--should-reason 'target-set-changed
+					  (dorg-api-execute '(on (where (property "S" "O")) (set (property "S") "X"))
+							    :mode 'apply :expected-targets '(101 102)
+							    :source (list :file (dorg-test-api--unit-file)))))))
+
+(ert-deftest dorg-test-api-query-target-expansion-runs-under-saved-gate ()
+  "A saved query's target set is resolved only after the file gate is held."
+  (dorg-test-api--with-unit-files
+   (let ((inside nil)
+         (expanded nil))
+     (cl-letf (((symbol-function 'dorg-file-lock-call)
+		(lambda (_lock _timeout fn)
+                  (setq inside t)
+                  (unwind-protect
+                      (list :status :acquired :value (funcall fn "unit-record"))
+                    (setq inside nil))))
+               ((symbol-function 'dorg-ql-select)
+		(lambda (&rest _)
+                  (should inside)
+                  (setq expanded t)
+                  '((:heading-id 101))))
+               ((symbol-function 'dorg-mutate--apply-patches)
+		(lambda (&rest _)
+                  '(:ok t :dry-run nil :source-kind plain-org :root-id 1
+			:revision "t2" :created nil :changed (101) :deleted nil))))
+	      (should (plist-get
+		       (dorg-api-execute
+			'(on (where (property "S" "O")) (set (property "S") "X"))
+			:mode 'apply :expected-targets '(101)
+			:source (list :file (dorg-test-api--unit-file)))
+		       :ok))
+	      (should expanded)))))
 
 (ert-deftest dorg-test-api-apply-query-expected-set-membership-order-ignored ()
   "A confirmed set matching by membership (different order) is NOT changed:
 the guard passes and reaches the engine (folds tracked-case canonicalization)."
-  (let ((reached nil))
-    (cl-letf (((symbol-function 'dorg-ql-select)
-               (lambda (&rest _) '((:heading-id 101) (:heading-id 102))))
-              ((symbol-function 'dorg-mutate--apply-patches)
-               (lambda (&rest _)
-                 (setq reached t)
-                 '(:ok t :dry-run nil :source-kind plain-org :root-id 1
-                   :revision "t2" :created nil :changed (101 102) :deleted nil))))
-      (dorg-api-execute '(on (where (property "S" "O")) (set (property "S") "X"))
-                        :mode 'apply :expected-targets '(102 101) ; reversed
-                        :source '(:file "/x.org"))
-      (should reached))))
+  (dorg-test-api--with-unit-files
+   (let ((reached nil))
+     (cl-letf (((symbol-function 'dorg-ql-select)
+		(lambda (&rest _) '((:heading-id 101) (:heading-id 102))))
+               ((symbol-function 'dorg-mutate--apply-patches)
+		(lambda (&rest _)
+                  (setq reached t)
+                  '(:ok t :dry-run nil :source-kind plain-org :root-id 1
+			:revision "t2" :created nil :changed (101 102) :deleted nil))))
+	      (dorg-api-execute '(on (where (property "S" "O")) (set (property "S") "X"))
+				:mode 'apply :expected-targets '(102 101) ; reversed
+				:source (list :file (dorg-test-api--unit-file)))
+	      (should reached)))))
 
 (ert-deftest dorg-test-api-apply-one-selector-exempt-from-expected-targets ()
   "AC-6 (tracked-case): a bounded (where (one …)) apply asserts cardinality <= 1
 and is EXEMPT from the :expected-targets ceremony — it reaches the engine
 with no :expected-targets supplied."
-  (let ((reached nil))
-    (cl-letf (((symbol-function 'dorg-ql-select)
-               (lambda (&rest _) '((:heading-id 101))))
-              ((symbol-function 'dorg-mutate--apply-patches)
-               (lambda (&rest _)
-                 (setq reached t)
-                 '(:ok t :revision "t" :created nil :changed (101) :deleted nil))))
-      (dorg-api-execute '(on (where (one (property "S" "O"))) (set (property "S") "X"))
-                        :mode 'apply :source '(:file "/x.org"))
-      (should reached))))
+  (dorg-test-api--with-unit-files
+   (let ((reached nil))
+     (cl-letf (((symbol-function 'dorg-ql-select)
+		(lambda (&rest _) '((:heading-id 101))))
+               ((symbol-function 'dorg-mutate--apply-patches)
+		(lambda (&rest _)
+                  (setq reached t)
+                  '(:ok t :revision "t" :created nil :changed (101) :deleted nil))))
+	      (dorg-api-execute '(on (where (one (property "S" "O"))) (set (property "S") "X"))
+				:mode 'apply :source (list :file (dorg-test-api--unit-file)))
+	      (should reached)))))
 
 (ert-deftest dorg-test-api-apply-one-selector-exempt-nonvacuous ()
   "Non-vacuity for AC-6: with the bounded-selector predicate forced off, the
 same (one …) apply demands :expected-targets — proving the exemption is what
 lets it through."
-  (cl-letf (((symbol-function 'dorg-ql-select)
-             (lambda (&rest _) '((:heading-id 101))))
-            ((symbol-function 'dorg-api--selector-bounded-p) (lambda (&rest _) nil))
-            ((symbol-function 'dorg-mutate--apply-patches)
-             (lambda (&rest _) (error "must not reach the engine"))))
-    (dorg-test-api--should-reason 'expected-targets-required
-      (dorg-api-execute '(on (where (one (property "S" "O"))) (set (property "S") "X"))
-                        :mode 'apply :source '(:file "/x.org")))))
+  (dorg-test-api--with-unit-files
+   (cl-letf (((symbol-function 'dorg-ql-select)
+              (lambda (&rest _) '((:heading-id 101))))
+             ((symbol-function 'dorg-api--selector-bounded-p) (lambda (&rest _) nil))
+             ((symbol-function 'dorg-mutate--apply-patches)
+              (lambda (&rest _) (error "must not reach the engine"))))
+	    (dorg-test-api--should-reason 'expected-targets-required
+					  (dorg-api-execute '(on (where (one (property "S" "O"))) (set (property "S") "X"))
+							    :mode 'apply :source (list :file (dorg-test-api--unit-file)))))))
 
 (ert-deftest dorg-test-api-apply-key-selector-exempt-from-expected-targets ()
   "AC-6 (tracked-case): a bounded direct (key V) apply asserts cardinality <= 1
 and reaches the engine with no :expected-targets supplied."
-  (let ((reached nil))
-    (cl-letf (((symbol-function 'dorg-ql-select)
-               (lambda (&rest _) '((:heading-id 42))))
-              ((symbol-function 'dorg-mutate--apply-patches)
-               (lambda (&rest _)
-                 (setq reached t)
-                 '(:ok t :revision "t" :created nil :changed (42) :deleted nil))))
-      (dorg-api-execute '(on (key "42") (set (property "S") "X"))
-                        :mode 'apply :source '(:file "/x.org"))
-      (should reached))))
+  (dorg-test-api--with-unit-files
+   (let ((reached nil))
+     (cl-letf (((symbol-function 'dorg-ql-select)
+		(lambda (&rest _) '((:heading-id 42))))
+               ((symbol-function 'dorg-mutate--apply-patches)
+		(lambda (&rest _)
+                  (setq reached t)
+                  '(:ok t :revision "t" :created nil :changed (42) :deleted nil))))
+	      (dorg-api-execute '(on (key "42") (set (property "S") "X"))
+				:mode 'apply :source (list :file (dorg-test-api--unit-file)))
+	      (should reached)))))
 
 (ert-deftest dorg-test-api-identity-violation-reason-registered ()
   "AC-8 (tracked-case): identity-violation is in the closed error-reason set and
@@ -1714,16 +2109,17 @@ round-trips through the accessor."
 (ert-deftest dorg-test-api-apply-broad-write-refused-over-threshold ()
   "An apply over more than `dorg-api-broad-write-threshold' confirmed targets
 without :allow-broad is broad-write-refused."
-  (let* ((n (1+ dorg-api-broad-write-threshold))
-         (ids (number-sequence 1 n))
-         (hits (mapcar (lambda (i) (list :heading-id i)) ids)))
-    (cl-letf (((symbol-function 'dorg-ql-select) (lambda (&rest _) hits))
-              ((symbol-function 'dorg-mutate--apply-patches)
-               (lambda (&rest _) (error "must not reach the engine"))))
-      (dorg-test-api--should-reason 'broad-write-refused
-        (dorg-api-execute '(on (where (property "S" "O")) (set (property "S") "X"))
-                          :mode 'apply :expected-targets ids
-                          :source '(:file "/x.org"))))))
+  (dorg-test-api--with-unit-files
+   (let* ((n (1+ dorg-api-broad-write-threshold))
+          (ids (number-sequence 1 n))
+          (hits (mapcar (lambda (i) (list :heading-id i)) ids)))
+     (cl-letf (((symbol-function 'dorg-ql-select) (lambda (&rest _) hits))
+               ((symbol-function 'dorg-mutate--apply-patches)
+		(lambda (&rest _) (error "must not reach the engine"))))
+	      (dorg-test-api--should-reason 'broad-write-refused
+					    (dorg-api-execute '(on (where (property "S" "O")) (set (property "S") "X"))
+							      :mode 'apply :expected-targets ids
+							      :source (list :file (dorg-test-api--unit-file))))))))
 
 ;;; ─── tracked-case: deterministic expected-target set comparison ────────────
 ;; The query-scoped apply guard (dorg-api.el) compares the re-expanded target
@@ -1734,11 +2130,11 @@ without :allow-broad is broad-write-refused."
 ;; These tests pin that determinism: duplicate/reordered/unchanged confirmations
 ;; pass to the engine, while missing/extra/changed sets are `target-set-changed'.
 
-(defun dorg-test-api--guard-scenario (resolved expected)
-  "Run a query-scoped apply whose query resolves to RESOLVED heading ids,
-with EXPECTED supplied as :expected-targets.  Return `reached' when the guard
-passes and the engine runs, else the signalled `dorg-api-error' :reason symbol.
-The engine is stubbed to a reach-sentinel so only the guard is exercised."
+(defun dorg-test-api--guard-scenario (resolved expected file)
+  "Run a query-scoped apply resolving to RESOLVED heading ids.
+Use EXPECTED as :expected-targets and FILE as source.  Return `reached'
+when the guard passes and the engine runs, else the signalled
+`dorg-api-error' :reason symbol.  The engine is stubbed to a sentinel."
   (let ((reached nil))
     (cl-letf (((symbol-function 'dorg-ql-select)
                (lambda (&rest _)
@@ -1753,46 +2149,61 @@ The engine is stubbed to a reach-sentinel so only the guard is exercised."
                        (dorg-api-execute
                         '(on (where (property "S" "O")) (set (property "S") "X"))
                         :mode 'apply :expected-targets expected
-                        :source '(:file "/x.org"))))))
+                        :source (list :file file))))))
         (if reached 'reached reason)))))
 
 (ert-deftest dorg-test-api-apply-expected-duplicate-input-deduped ()
   "Duplicate ids in :expected-targets are stably de-duplicated before the
 comparison; a set equal by membership still passes to the engine (AC2)."
-  (should (eq 'reached (dorg-test-api--guard-scenario '(101 102) '(101 101 102)))))
+  (dorg-test-api--with-unit-files
+    (should (eq 'reached
+                (dorg-test-api--guard-scenario
+                 '(101 102) '(101 101 102) (dorg-test-api--unit-file))))))
 
 (ert-deftest dorg-test-api-apply-expected-set-not-multiset ()
   "The comparison is set membership, not multiset: repeated expected ids that
 reduce to the resolved set pass (AC1/AC2)."
-  (should (eq 'reached (dorg-test-api--guard-scenario '(101 102) '(101 102 102)))))
+  (dorg-test-api--with-unit-files
+    (should (eq 'reached
+                (dorg-test-api--guard-scenario
+                 '(101 102) '(101 102 102) (dorg-test-api--unit-file))))))
 
 (ert-deftest dorg-test-api-apply-expected-dedupe-does-not-mask-mismatch ()
   "De-duplicating duplicate expected input must not hide a real membership
 difference: (101 101 103) vs resolved (101 102) is still target-set-changed."
-  (should (eq 'target-set-changed
-              (dorg-test-api--guard-scenario '(101 102) '(101 101 103)))))
+  (dorg-test-api--with-unit-files
+    (should (eq 'target-set-changed
+                (dorg-test-api--guard-scenario
+                 '(101 102) '(101 101 103) (dorg-test-api--unit-file))))))
 
 (ert-deftest dorg-test-api-apply-missing-target-is-changed ()
   "A resolved set MISSING an expected id (resolved is a proper subset of
 expected) is target-set-changed (AC3)."
-  (should (eq 'target-set-changed
-              (dorg-test-api--guard-scenario '(101) '(101 102)))))
+  (dorg-test-api--with-unit-files
+    (should (eq 'target-set-changed
+                (dorg-test-api--guard-scenario
+                 '(101) '(101 102) (dorg-test-api--unit-file))))))
 
 (ert-deftest dorg-test-api-apply-extra-target-is-changed ()
   "A resolved set with an EXTRA id beyond expected (resolved is a proper
 superset of expected) is target-set-changed (AC3)."
-  (should (eq 'target-set-changed
-              (dorg-test-api--guard-scenario '(101 102 103) '(101 102)))))
+  (dorg-test-api--with-unit-files
+    (should (eq 'target-set-changed
+                (dorg-test-api--guard-scenario
+                 '(101 102 103) '(101 102) (dorg-test-api--unit-file))))))
 
 (ert-deftest dorg-test-api-apply-expected-exact-unchanged-passes ()
   "An exact same-order membership match passes to the engine (unchanged set);
 complements the reversed-order pass to pin order-independence in both
 directions (AC1)."
-  (should (eq 'reached (dorg-test-api--guard-scenario '(101 102) '(101 102)))))
+  (dorg-test-api--with-unit-files
+    (should (eq 'reached
+                (dorg-test-api--guard-scenario
+                 '(101 102) '(101 102) (dorg-test-api--unit-file))))))
 
 ;;; ─── L2: public ordered item-sequence verb (tracked-regression) ───────────────
 ;;
-;; The public `(replace (items) ITEM…)` verb normalizes to one typed patch whose
+;; The public `(replace (item (all)) ITEM…)` verb normalizes to one typed patch whose
 ;; item sequence preserves interleaved text/keyword/planning/drawer order.
 ;;
 ;; Item forms:  (text "S") | (keyword "K" "V")
@@ -1800,7 +2211,7 @@ directions (AC1)."
 ;;            | (drawer "NAME" (K V)…) | (drawer "NAME" :lines ("L"…))
 
 (defun dorg-test-api--replace-items-patch (form)
-  "Normalize FORM to exactly one typed replace-items patch and return it."
+  "Normalize FORM to exactly one typed item replacement patch and return it."
   (let ((patches (dorg-api-normalize form nil)))
     (should (= 1 (length patches)))
     (car patches)))
@@ -1809,17 +2220,18 @@ directions (AC1)."
   "Return PATCH's canonical typed item values."
   (plist-get patch :items))
 
-;; L2-a — the public verb normalizes to one `replace :items` patch whose items
+;; L2-a — the public verb normalizes to one `replace :item` patch whose items
 ;; are canonical drawer/text/keyword values.
 (ert-deftest dorg-test-api-replace-items-normalizes-to-one-patch ()
   (let* ((form '(on (id 42)
-                    (replace (items)
+                    (replace (item (all))
                              (drawer "PROPERTIES" ("BEAD_ID" "a-1"))
                              (text "Body.")
                              (keyword "FOO" "solo"))))
          (patch (dorg-test-api--replace-items-patch form)))
     (should (eq 'replace (plist-get patch :op)))
-    (should (equal '(:items :host (:heading :id 42)) (plist-get patch :target)))
+    (should (equal '(:item :host (:heading :id 42) :select (:all))
+                   (plist-get patch :target)))
     (should (equal
              '((:kind drawer :name "PROPERTIES" :properties (("BEAD_ID" . "a-1"))
                 :post-blank 0)
@@ -1831,7 +2243,7 @@ directions (AC1)."
 ;; document order (the sequence is ordered, not set-like).
 (ert-deftest dorg-test-api-replace-items-ordered-planning-text ()
   (let* ((form '(on (id 7)
-                    (replace (items)
+                    (replace (item (all))
                              (planning :scheduled "<2026-07-13 Mon>")
                              (text "After planning."))))
          (patch (dorg-test-api--replace-items-patch form)))
@@ -1843,34 +2255,48 @@ directions (AC1)."
 ;; L2-c — an empty sequence and a protected keyword item are invalid targets.
 ;; Public items clearing is unsupported: replacing requires at least one item.
 (ert-deftest dorg-test-cyvpd-empty-replace-items-is-invalid-target ()
-  "A recognized items address with its required value missing is invalid-target."
+  "A recognized item target with its required value missing is invalid-target."
   (let ((err (should-error
-              (dorg-api-normalize '(on (id 1) (replace (items))) nil)
+              (dorg-api-normalize '(on (id 1) (replace (item (all)))) nil)
               :type 'dorg-api-error)))
     (should (eq 'invalid-target (dorg-api-error-reason err)))
-    (should (equal '(:reason invalid-target :action (replace (items)))
+    (should (equal '(:reason invalid-target :action (replace (item (all))))
                    (dorg-api-error-data err)))))
 
 (ert-deftest dorg-test-cyvpd-empty-replace-items-refuses-before-engine ()
-  "Empty items refuse before either public execution mode reaches the engine."
-  (let (called)
-    (cl-letf (((symbol-function 'dorg-mutate--plan-patches)
-               (lambda (&rest _)
-                 (setq called t)
-                 (error "must not plan")))
-              ((symbol-function 'dorg-mutate--apply-patches)
-               (lambda (&rest _)
-                 (setq called t)
-                 (error "must not apply"))))
-      (dolist (mode '(dry-run apply))
-        (dorg-test-api--should-reason 'invalid-target
-          (dorg-api-execute '(on (id 1) (replace (items)))
-                            :mode mode :source '(:file "/x.org"))))
-      (should-not called))))
+  "Empty item selection refuses before either public execution mode reaches the engine."
+  (dorg-test-api--with-unit-files
+   (let (called)
+     (cl-letf (((symbol-function 'dorg-mutate--plan-patches)
+		(lambda (&rest _)
+                  (setq called t)
+                  (error "must not plan")))
+               ((symbol-function 'dorg-mutate--apply-patches)
+		(lambda (&rest _)
+                  (setq called t)
+                  (error "must not apply"))))
+	      (dolist (mode '(dry-run apply))
+		(dorg-test-api--should-reason 'invalid-target
+					      (dorg-api-execute '(on (id 1) (replace (item (all))))
+								:mode mode :source (list :file (dorg-test-api--unit-file)))))
+	      (should-not called)))))
 
 (ert-deftest dorg-test-api-replace-items-rejects-protected-keyword ()
   (dorg-test-api--should-reason 'invalid-target
-    (dorg-api-normalize '(on (id 1) (replace (items) (keyword "DORG_ID" "5"))) nil)))
+    (dorg-api-normalize '(on (id 1) (replace (item (all)) (keyword "DORG_ID" "5"))) nil)))
+
+(ert-deftest dorg-test-api-owned-metadata-refuses-every-generic-property-form ()
+  "No public generic form reaches the unavailable clock-owner boundary."
+  (dolist (form
+           '((on (id 1) (set (property "DORG_CLOCK_START") "2026-10-14T08:00:00Z"))
+             (on (id 1) (delete (property "dorg_clock_start")))
+             (on (id 1) (set (property "DORG_CLOCK_START+") "accumulate"))
+             (insert (heading (title "Clock")
+                              (property "DORG_CLOCK_START" "2026-10-14T08:00:00Z"))
+                     (under (id 1)))))
+    (let ((err (should-error (dorg-api-normalize form nil) :type 'dorg-api-error)))
+      (should (eq 'invalid-target (dorg-api-error-reason err)))
+      (should-not (plist-member (dorg-api-error-data err) :detail)))))
 
 ;;; ─── B5 Option A: no-buffer Dolt binding is queryable for target expansion ──
 ;; A resolved (:dolt-dir … :root-id …) binding carries no buffer/file, and
@@ -2135,6 +2561,83 @@ partial/extra write).  Fails if the public-base validation block is removed."
       (delete-file file))))
 
 ;;; ─── First-class immutable mutation intent (tracked-regression) ─────────────
+
+(ert-deftest dorg-test-fhhwd-intent-copy-refuses-cyclic-cons-spines ()
+  "Unsupported circular forms/options refuse without formatting cyclic data."
+  (let* ((max-lisp-eval-depth 1000)
+         (form (list 'batch))
+         (options (list :message "cyclic")))
+    (setcdr form form)
+    (setcdr (cdr options) options)
+    (should-error (dorg-api-make-mutation-intent form) :type 'circular-list)
+    (should-error (dorg-api-make-mutation-intent '(batch) :base options)
+                  :type 'circular-list)))
+
+(ert-deftest dorg-test-fhhwd-wide-intent-constructor-and-accessor-own-form ()
+  "A wide valid public batch is copied at the runner's unchanged depth bound."
+  (let* ((max-lisp-eval-depth 1000)
+         (form (cons 'batch
+                     (cl-loop for id from 1 to 512
+                              collect (list 'on (list 'id id)
+                                            (list 'set
+                                                  (list 'property
+                                                        (copy-sequence "K"))
+                                                  (copy-sequence "V"))))))
+         (intent (dorg-api-make-mutation-intent form))
+         (inspection (dorg-api-mutation-intent-form intent)))
+    (should (equal form inspection))
+    (should (= 512 (length (cdr inspection))))
+    ;; Mutating both the original spine and its last element must be isolated.
+    (aset (nth 2 (nth 2 (car (last form)))) 0 ?X)
+    (setcar (cdr form) '(on (id 999) (set (property "K") "X")))
+    (should (equal '(on (id 1) (set (property "K") "V"))
+                   (cadr (dorg-api-mutation-intent-form intent))))
+    (should (equal "V"
+                   (nth 2 (nth 2
+                               (car (last
+                                     (dorg-api-mutation-intent-form intent)))))))
+    ;; Accessor copies have the same spine and element ownership law.
+    (aset (nth 2 (nth 2 (car (last inspection)))) 0 ?Y)
+    (setcdr inspection nil)
+    (let ((again (dorg-api-mutation-intent-form intent)))
+      (should (= 512 (length (cdr again))))
+      (should (equal "V" (nth 2 (nth 2 (car (last again)))))))))
+
+(ert-deftest dorg-test-fhhwd-intent-copy-preserves-dotted-vector-ownership ()
+  "Public option copies detach dotted tails and vectors but retain handles."
+  (with-temp-buffer
+    (let* ((handle (current-buffer))
+           (head (copy-sequence "head"))
+           (tail (copy-sequence "tail"))
+           (vector (vector (cons head tail) handle
+                           (vector (copy-sequence "nested"))))
+           (intent (dorg-api-make-mutation-intent
+                    '(on (id 1) (set (property "K") "V"))
+                    :source handle :base vector))
+           (options (dorg-api-mutation-intent-options intent))
+           (copy (plist-get options :base)))
+      (should (equal vector copy))
+      (should-not (eq vector copy))
+      (should-not (eq (aref vector 0) (aref copy 0)))
+      (should (eq handle (plist-get options :source)))
+      (should (eq handle (aref copy 1)))
+      (aset head 0 ?X)
+      (aset tail 0 ?X)
+      (aset (aref (aref vector 2) 0) 0 ?X)
+      (aset vector 1 nil)
+      (should (equal '("head" . "tail") (aref copy 0)))
+      (should (equal "nested" (aref (aref copy 2) 0)))
+      (aset (cdr (aref copy 0)) 0 ?Y)
+      (setcar (aref copy 0) "replaced")
+      (aset (aref copy 2) 0 "replaced")
+      (let* ((derived (dorg-api-mutation-intent-with intent :message "new"))
+             (again (plist-get (dorg-api-mutation-intent-options derived)
+                              :base)))
+        (should (equal '("head" . "tail") (aref again 0)))
+        (should (equal "nested" (aref (aref again 2) 0)))
+        (should (eq handle (aref again 1)))
+        (should-not (plist-member (dorg-api-mutation-intent-options intent)
+                                  :message))))))
 
 (ert-deftest dorg-test-nwlkl-intent-deep-owns-input-and-inspection ()
   "Mutation intent owns mutable input and returns detached inspection values."
@@ -2450,6 +2953,466 @@ not silently accepted as \"no inputs\"."
       (should (equal raw value))
       (should (equal (list form) (plist-get value :intent)))
       (should (equal "nwlkl-dolt" (plist-get value :op-id))))))
+
+;;; 39omw — initial public planning failure, not the downstream re-plan seam
+
+(defvar dorg-test-39omw--events nil)
+(defvar dorg-test-39omw--missing-condition nil)
+(defvar dorg-test-39omw--recovery-rows '(((c . "39omw-original-commit"))))
+(defconst dorg-test-39omw--descriptor
+  '(:dolt-dir "/nonexistent/public-replay/" :root-id 100))
+(defconst dorg-test-39omw--delete '(on (id 101) (delete (heading))))
+
+(defun dorg-test-39omw--missing-plan
+    (source patches _options unsupported &optional _owner-plan)
+  "Apply PATCHES to an in-memory post-delete state, raising the real error."
+  (should-not unsupported)
+  (let ((ps (dorg-mutate--ps-create
+             :root-id 100 :headings (make-hash-table :test 'eql))))
+    (condition-case err
+        (dolist (patch patches)
+          (dorg-mutate--ps-apply-patch ps patch source))
+      (dorg-mutate-error
+       (setq dorg-test-39omw--missing-condition err)
+       (push 'missing-target dorg-test-39omw--events)
+       (signal (car err) (cdr err))))))
+
+(defun dorg-test-39omw--execute (form &optional opaque mode)
+  "Execute FORM through the real raw or OPAQUE public boundary in MODE."
+  (if opaque
+      (dorg-api-execute
+       (dorg-api-make-mutation-intent
+        form :source dorg-test-39omw--descriptor :op-id "39omw-op")
+       :mode (or mode 'apply))
+    (dorg-api-execute form :mode (or mode 'apply)
+                      :source dorg-test-39omw--descriptor :op-id "39omw-op")))
+
+(defun dorg-test-39omw--receipt-rows (receipt lease query &rest args)
+  "Supply SQL ROWS only; retain real receipt query/extraction/recovery laws."
+  (should (eq lease '39omw-lease))
+  (let ((sql (apply #'format query args))
+        (op-id (dorg-sql-quote "39omw-op")))
+    (cond
+     ((equal sql (format (concat "SELECT gen_id, intent_digest FROM dorg_mutation_log"
+                                 " WHERE op_id = %s") op-id))
+      (should (eq (car dorg-test-39omw--events) 'schema))
+      (push 'lookup dorg-test-39omw--events)
+      (when receipt
+        (list (list (cons 'gen_id (car receipt))
+                    (cons 'intent_digest (cdr receipt))))))
+     ((equal sql (format (concat "SELECT to_commit AS c FROM dolt_diff_dorg_mutation_log"
+                                 " WHERE diff_type = 'added' AND to_gen_id = %s")
+                         (dorg-sql-quote (car receipt))))
+      ;; Exact equality rejects op-id/date ordering or unquoted generation IDs.
+      (should (string-match-p "diff_type = 'added' AND to_gen_id =" sql))
+      (push 'recover dorg-test-39omw--events)
+      dorg-test-39omw--recovery-rows)
+     (t (ert-fail (format "unexpected receipt SQL: %s" sql))))))
+
+(defmacro dorg-test-39omw--with-receipt (evidence &rest body)
+  "Keep real public/planner/settled/result behavior; double receipt transport.
+EVIDENCE is (GEN-ID . DIGEST) or nil.  No fixture or server is started."
+  (declare (indent 1) (debug t))
+  `(progn
+     (require 'dorg-dolt)
+     (let ((dorg-test-39omw--events nil)
+           (dorg-test-39omw--missing-condition nil)
+           (receipt ,evidence)
+           (planner (symbol-function 'dorg-mutate--make-plan))
+           (settled (symbol-function 'dorg-mutate--dolt-op-id-settled)))
+       (cl-letf
+           (((symbol-function 'dorg-mutate--dolt-plan-data)
+             #'dorg-test-39omw--missing-plan)
+            ((symbol-function 'dorg-mutate--make-plan)
+             (lambda (source patches options &optional owner-plan)
+               (push 'plan-enter dorg-test-39omw--events)
+               (prog1 (funcall planner source patches options owner-plan)
+                 (push 'plan-exit dorg-test-39omw--events))))
+            ((symbol-function 'dorg-mutate--dolt-op-id-settled)
+             (lambda (source options op-id digest base)
+               (should (dorg-mutate-source-p source))
+               (should (eq 'dolt (dorg-mutate-source-kind source)))
+               (should (= 100 (dorg-mutate-source-root-id source)))
+               (should (equal op-id (plist-get options :op-id)))
+               (should (equal digest (plist-get options :intent-digest)))
+               (should (equal base (plist-get options :base-commit)))
+               (push 'settled dorg-test-39omw--events)
+               (funcall settled source options op-id digest base)))
+            ((symbol-function 'dorg-mutate-call-with-store-gate)
+             (lambda (dir fn &optional op-id _deadline)
+               (should (equal dir "/nonexistent/public-replay/"))
+               (should (equal op-id "39omw-op"))
+               (push 'gate dorg-test-39omw--events)
+               (funcall fn '39omw-lease '39omw-key)))
+            ((symbol-function 'dorg-sql--require-mutation-log-schema)
+             (lambda (lease)
+               (should (eq lease '39omw-lease))
+               (push 'schema dorg-test-39omw--events)))
+            ((symbol-function 'dorg-mutate--execute-patches)
+             (lambda (&rest _) (ert-fail "replay reached execute-patches")))
+            ((symbol-function 'dorg-mutate--dolt-gated-apply)
+             (lambda (&rest _) (ert-fail "replay reached downstream gate")))
+            ((symbol-function 'dorg-sql--lease-exec)
+             (lambda (lease query &rest args)
+               (apply #'dorg-test-39omw--receipt-rows receipt lease query args)))
+            ((symbol-function 'dorg-sql--lease-batch)
+             (lambda (&rest _) (ert-fail "unexpected commit batch"))))
+         ,@body))))
+
+(defun dorg-test-39omw--delete-evidence ()
+  "Return a receipt binding the original normalized delete, not a fake digest."
+  (cons "39omw-generation"
+        (dorg-mutate--intent-digest
+         (dorg-api-normalize dorg-test-39omw--delete)
+         (dorg-mutate--resolve-source dorg-test-39omw--descriptor))))
+
+(ert-deftest dorg-test-39omw-public-consumed-target-replay-recovers-settled ()
+  "Raw and opaque public replay recover at the INITIAL plan failure only."
+  (dolist (opaque '(nil t))
+    (dorg-test-39omw--with-receipt (dorg-test-39omw--delete-evidence)
+      (let ((result (dorg-test-39omw--execute dorg-test-39omw--delete opaque)))
+        (should (plist-get result :ok))
+        (should (plist-get result :idempotent))
+        (should (equal "39omw-op" (plist-get result :op-id)))
+        (should (equal "39omw-original-commit" (plist-get result :new-token)))
+        (should (equal (list dorg-test-39omw--delete) (plist-get result :intent)))
+        (should (equal '(plan-enter missing-target settled gate schema lookup
+                                   recover)
+                       (reverse dorg-test-39omw--events)))))))
+
+(ert-deftest dorg-test-39omw-public-consumed-target-mismatched-intent-refuses ()
+  "Digest mismatch wins over missing target, on both raw and opaque routes."
+  (dolist (opaque '(nil t))
+    (dorg-test-39omw--with-receipt (dorg-test-39omw--delete-evidence)
+      (let* ((different '(on (id 101) (delete (subtree))))
+             (digest (dorg-mutate--intent-digest
+                      (dorg-api-normalize different)
+                      (dorg-mutate--resolve-source dorg-test-39omw--descriptor)))
+             (err (should-error (dorg-test-39omw--execute different opaque)
+                                :type 'dorg-mutate-error)))
+        (should-not (equal digest (cdr receipt)))
+        (should (eq 'idempotency-key-mismatch (dorg-mutate-error-reason err)))
+        (should (equal "39omw-op" (plist-get (dorg-mutate-error-data err) :op-id)))
+        (should (equal '(plan-enter missing-target settled gate schema lookup)
+                       (reverse dorg-test-39omw--events)))))))
+
+(ert-deftest dorg-test-39omw-public-consumed-target-without-evidence-retains-error ()
+  "A lookup miss re-signals the identical real initial-plan condition/data."
+  (dolist (opaque '(nil t))
+    (dorg-test-39omw--with-receipt nil
+      (let ((err (should-error
+                  (dorg-test-39omw--execute dorg-test-39omw--delete opaque)
+                  :type 'dorg-mutate-error)))
+        (should (equal err dorg-test-39omw--missing-condition))
+        (should (equal '(plan-enter missing-target settled gate schema lookup)
+                       (reverse dorg-test-39omw--events)))))))
+
+(ert-deftest dorg-test-39omw-no-op-id-dry-run-and-missing-digest-retain-error ()
+  "Recovery is APPLY-only and needs both op-id and nonempty string digest."
+  (dorg-test-39omw--with-receipt (dorg-test-39omw--delete-evidence)
+    (dolist (options '(nil (:op-id "39omw-op")
+                          (:op-id "39omw-op" :intent-digest "")
+                          (:op-id "39omw-op" :intent-digest 1)
+                          (:op-id "39omw-op" :intent-digest "digest" :dry-run t)))
+      (setq dorg-test-39omw--events nil)
+      (let ((err (should-error
+                  (apply #'dorg-mutate--apply-patches
+                         dorg-test-39omw--descriptor
+                         (dorg-api-normalize dorg-test-39omw--delete) nil options)
+                  :type 'dorg-mutate-error)))
+        (should (equal err dorg-test-39omw--missing-condition))
+        (should (equal '(missing-target plan-enter) dorg-test-39omw--events))))
+    (setq dorg-test-39omw--events nil)
+    (should-error (dorg-test-39omw--execute dorg-test-39omw--delete nil 'dry-run)
+                  :type 'dorg-mutate-error)
+    (should (equal '(missing-target plan-enter) dorg-test-39omw--events))))
+
+(ert-deftest dorg-test-39omw-invalid-input-never-consults-receipt ()
+  "Raw/source/identity/typed validation failures do not inherit recovery."
+  (dorg-test-39omw--with-receipt (dorg-test-39omw--delete-evidence)
+    (should-error (dorg-test-39omw--execute '(on (id nope) (delete (heading))))
+                  :type 'dorg-api-error)
+    (should-error (dorg-api-execute dorg-test-39omw--delete :mode 'apply
+                                   :source '(:dolt-dir 7 :root-id 100)
+                                   :op-id "39omw-op")
+                  :type 'dorg-mutate-error)
+    (should-error (dorg-test-39omw--execute
+                   '(on (id 101) (set (property "DORG_ID") "other")))
+                  :type 'dorg-api-error)
+    (should-error (dorg-api-execute dorg-test-39omw--delete :mode 'apply
+                                   :source '(:dolt-dir "/nonexistent/public-replay/"
+                                             :root-id 100 :identity none)
+                                   :op-id "39omw-op")
+                  :type 'dorg-mutate-error)
+    (should-error (dorg-mutate--apply-patches
+                   dorg-test-39omw--descriptor
+                   '((:op delete :target (:heading :id "not-integer"))) nil
+                   :op-id "39omw-op" :intent-digest "digest")
+                  :type 'dorg-mutate-error)
+    (should-not dorg-test-39omw--events)))
+
+(ert-deftest dorg-test-39omw-history-direct-apply-without-op-id-retains-error ()
+  "Exercise the actual history direct caller with unchanged no-op-id law."
+  (require 'dorg-history)
+  (dorg-test-39omw--with-receipt (dorg-test-39omw--delete-evidence)
+    (cl-letf (((symbol-function 'dorg-commit-ancestor-p) (lambda (&rest _) t))
+              ((symbol-function 'dorg-model-load-tree)
+               (lambda (&rest _) (make-hash-table :test 'eql)))
+              ((symbol-function 'dorg-head-commit) (lambda (&rest _) "head"))
+              ((symbol-function 'dorg-restore--patches)
+               (lambda (&rest _) (dorg-api-normalize dorg-test-39omw--delete))))
+      (let ((err (should-error
+                  (dorg-restore-to-commit "/nonexistent/public-replay/" 100 nil
+                                          "ancestor" "history control")
+                  :type 'dorg-mutate-error)))
+        (should (equal err dorg-test-39omw--missing-condition))
+        (should (equal '(missing-target plan-enter) dorg-test-39omw--events))))))
+
+(ert-deftest dorg-test-39omw-plain-org-and-ineligible-errors-are-not-reconciled ()
+  "No Dolt recovery for plain Org or for an unsupported planning condition."
+  (dorg-test-api--with-unit-files
+   (dorg-test-39omw--with-receipt (dorg-test-39omw--delete-evidence)
+				  ;; The Dolt missing-state double is not a plain-Org classifier.  Inject a
+				  ;; typed planning failure here without changing plain-Org patch support.
+				  (cl-letf (((symbol-function 'dorg-mutate--make-plan)
+					     (lambda (&rest _)
+					       (dorg-mutate--raise 'invariant "plain planning refusal"))))
+					   (let ((err (should-error
+						       (dorg-mutate--apply-patches
+							(list :file (dorg-test-api--unit-file))
+							(dorg-api-normalize dorg-test-39omw--delete) nil
+							:op-id "39omw-op" :intent-digest "digest")
+						       :type 'dorg-mutate-error)))
+					     (should (equal "plain planning refusal" (cadr err)))
+					     (should-not dorg-test-39omw--events)))
+				  (setq dorg-test-39omw--events nil)
+				  (cl-letf (((symbol-function 'dorg-mutate--dolt-plan-data)
+					     (lambda (&rest _)
+					       (dorg-mutate--raise 'unsupported "ineligible fixture condition"))))
+					   (let ((err (should-error (dorg-test-39omw--execute dorg-test-39omw--delete)
+								    :type 'dorg-mutate-error)))
+					     (should (eq 'unsupported (dorg-mutate-error-reason err)))
+					     (should (equal '(plan-enter) dorg-test-39omw--events)))))))
+
+(ert-deftest dorg-test-39omw-execution-failure-is-not-a-planning-retry ()
+  "An eligible-looking EXECUTION error must propagate without receipt lookup."
+  (dorg-test-39omw--with-receipt (dorg-test-39omw--delete-evidence)
+    (cl-letf (((symbol-function 'dorg-mutate--dolt-plan-data) (lambda (&rest _) nil))
+              ((symbol-function 'dorg-mutate--execute-patches)
+               (lambda (&rest _)
+                 (push 'execute dorg-test-39omw--events)
+                 (dorg-mutate--raise 'invariant "execution refusal"))))
+      (let ((err (should-error (dorg-test-39omw--execute dorg-test-39omw--delete)
+                               :type 'dorg-mutate-error)))
+        (should (eq 'invariant (dorg-mutate-error-reason err)))
+        (should (equal '(execute plan-exit plan-enter) dorg-test-39omw--events))))))
+
+(ert-deftest dorg-test-39omw-successful-op-id-plans-before-receipt-lookup ()
+  "Retain the legitimate post-plan gate-first preflight on a successful plan."
+  (require 'dorg-dolt)
+  (let ((executor (symbol-function 'dorg-mutate--execute-patches))
+        (gated (symbol-function 'dorg-mutate--dolt-gated-apply)))
+    (dorg-test-39omw--with-receipt nil
+      (cl-letf (((symbol-function 'dorg-mutate--dolt-plan-data)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'dorg-mutate--execute-patches) executor)
+                ((symbol-function 'dorg-mutate--dolt-gated-apply) gated)
+                ((symbol-function 'dorg-mutate--dolt-build-attempt)
+                 (lambda (&rest _)
+                   (list :plan-base "head" :sql nil :empty '(:ok t)))))
+        (should (plist-get (dorg-test-39omw--execute dorg-test-39omw--delete) :ok))
+        (should (equal '(plan-enter plan-exit gate schema lookup)
+                       (reverse dorg-test-39omw--events)))))))
+
+(ert-deftest dorg-test-39omw-bounded-cross-root-initial-error-laws ()
+  "Existing cross-root typed planning has the same hit/mismatch/miss laws."
+  (let* ((source (dorg-mutate--resolve-source dorg-test-39omw--descriptor))
+         (destination (dorg-mutate--resolve-source
+                       '(:dolt-dir "/nonexistent/public-replay/" :root-id 500)))
+         (patch (list :op 'move :target '(:subtree :id 101)
+                      :to '(:under (:heading :id 501))
+                      :to-source destination :preserve-ids t))
+         (digest (dorg-mutate--intent-digest (list patch) source)))
+    (dolist (law '(hit mismatch miss))
+      (dorg-test-39omw--with-receipt
+          (and (not (eq law 'miss))
+               (cons "39omw-generation" (if (eq law 'hit) digest "other-digest")))
+        (cl-letf (((symbol-function 'dorg-mutate--dolt-plan-data)
+                   (lambda (src patches options unsupported &optional _owner-plan)
+                     (should-not unsupported)
+                     (let ((cross (dorg-mutate--dolt-cross-root-batch-patch src patches)))
+                       (should cross)
+                       (dorg-mutate--dolt-cross-root-plan-data src cross options))))
+                  ((symbol-function 'dorg-mutate--dolt-cross-root-plan-data)
+                   (lambda (src cross options)
+                     (push 'cross-root-plan dorg-test-39omw--events)
+                     (dorg-test-39omw--missing-plan src (list cross) options nil))))
+          (if (eq law 'hit)
+              (let ((result (dorg-mutate--apply-patches
+                             source (list patch) nil
+                             :op-id "39omw-op" :intent-digest digest)))
+                (should (plist-get result :idempotent))
+                (should (equal "39omw-original-commit" (plist-get result :commit))))
+            (let ((err (should-error
+                        (dorg-mutate--apply-patches
+                         source (list patch) nil :op-id "39omw-op" :intent-digest digest)
+                        :type 'dorg-mutate-error)))
+              (if (eq law 'mismatch)
+                  (should (eq 'idempotency-key-mismatch (dorg-mutate-error-reason err)))
+                (should (equal err dorg-test-39omw--missing-condition)))))
+          (should (= 1 (cl-count 'cross-root-plan dorg-test-39omw--events)))
+          (should (= 1 (cl-count 'settled dorg-test-39omw--events)))
+          (should (= 1 (cl-count 'lookup dorg-test-39omw--events))))))))
+
+(ert-deftest dorg-test-39omw-key-query-normalization-refusals-stay-before-lookup ()
+  "Failed key/query resolution and expected-target gates are not replay recovery."
+  (dorg-test-39omw--with-receipt (dorg-test-39omw--delete-evidence)
+    (cl-letf (((symbol-function 'dorg-api--ql-select)
+               (lambda (&rest _)
+                 (dorg-api--raise 'invalid-target "selector missing" :detail 'missing))))
+      (dolist (target '((key "consumed") (where (property "K" "V"))))
+        (let ((err (should-error
+                    (dorg-test-39omw--execute `(on ,target (delete (heading))))
+                    :type 'dorg-api-error)))
+          (should (eq 'invalid-target (dorg-api-error-reason err))))))
+    (cl-letf (((symbol-function 'dorg-api--ql-select) (lambda (&rest _) nil)))
+      (let ((err (should-error
+                  (dorg-test-39omw--execute
+                   '(on (where (property "K" "V")) (delete (heading))))
+                  :type 'dorg-api-error)))
+        (should (eq 'expected-targets-required (dorg-api-error-reason err)))))
+    (should-not dorg-test-39omw--events)))
+
+(ert-deftest dorg-test-39omw-shared-eligibility-and-generation-recovery-law ()
+  "Both sites share eligibility; real generation recovery is quoted and unambiguous."
+  (should (equal '(invalid-target invariant)
+                 dorg-mutate--settled-planning-error-reasons))
+  (require 'dorg-dolt)
+  (let ((gated (symbol-function 'dorg-mutate--dolt-gated-apply)))
+    (dorg-test-39omw--with-receipt (dorg-test-39omw--delete-evidence)
+      (let ((dorg-mutate--settled-planning-error-reasons nil))
+        (should-error (dorg-test-39omw--execute dorg-test-39omw--delete)
+                      :type 'dorg-mutate-error)
+        (should-not (memq 'settled dorg-test-39omw--events))
+        (setq dorg-test-39omw--events nil)
+        (should-error
+         (funcall gated
+                  (dorg-mutate--resolve-source dorg-test-39omw--descriptor)
+                  (list :op-id "39omw-op" :intent-digest (cdr receipt)) nil
+                  (lambda () (dorg-mutate--raise 'invariant "re-plan failure")))
+         :type 'dorg-mutate-error)
+        (should-not dorg-test-39omw--events))))
+  ;; Drive the PUBLIC hit through the real recovery helper.  Both ambiguous
+  ;; directions must fail closed; a single immutable-generation transition wins.
+  (dolist (rows '(nil (((c . "39omw-original-commit")))
+                     (((c . "old")) ((c . "new")))))
+    (let ((dorg-test-39omw--recovery-rows rows))
+      (dorg-test-39omw--with-receipt (dorg-test-39omw--delete-evidence)
+        (setcar receipt "39omw-gen'quoted")
+        (if (= 1 (length rows))
+            (should (equal "39omw-original-commit"
+                           (plist-get (dorg-test-39omw--execute dorg-test-39omw--delete)
+                                      :new-token)))
+          (should-error (dorg-test-39omw--execute dorg-test-39omw--delete)
+                        :type 'dorg-sql-lease-broken))
+        (should (= 1 (cl-count 'recover dorg-test-39omw--events)))))))
+
+;;; Compact operation receipts; derived postimage response retirement.
+
+(ert-deftest dorg-test-fhhwd-live-intent-options-and-unrelated-raw-options-unchanged ()
+  "Retirement must not change compact operation options or unrelated raw behavior."
+  (let* ((options '(:op-id "compact-op" :save nil :message "compact"))
+         (intent (apply #'dorg-api-make-mutation-intent '(batch) options)))
+    (should (equal options (dorg-api-mutation-intent-options intent)))
+    ;; The historical raw projection is domain-ordered, not caller-ordered.
+    (should (equal '(:save nil :message "compact" :op-id "compact-op")
+                   (dorg-api--raw-intent-options
+                    (append '(:unrelated-unknown t :mode apply) options
+                            '(:op-id "ignored-second-value")))))))
+
+(ert-deftest dorg-test-fhhwd-intent-constructor-refuses-retired-model-option ()
+  "Presence, including nil, refuses through the existing closed option domain."
+  (dolist (value '(nil t))
+    (let ((err (should-error
+                (dorg-api-make-mutation-intent
+                 '(batch) :return-candidate-models value)
+                :type 'dorg-api-error)))
+      (should (eq 'malformed (dorg-api-error-reason err)))
+      (should (eq :return-candidate-models
+                  (plist-get (dorg-api-error-data err) :option))))))
+
+(ert-deftest dorg-test-fhhwd-intent-replacement-refuses-retired-model-option ()
+  "Functional replacement cannot reintroduce the retired option or mutate intent."
+  (let* ((intent (dorg-api-make-mutation-intent '(batch) :op-id "compact-op"))
+         (before (dorg-api-mutation-intent-options intent)))
+    (dolist (value '(nil t))
+      (let ((err (should-error
+                  (dorg-api-mutation-intent-with
+                   intent :return-candidate-models value)
+                  :type 'dorg-api-error)))
+        (should (eq 'malformed (dorg-api-error-reason err)))
+        (should (eq :return-candidate-models
+                    (plist-get (dorg-api-error-data err) :option)))))
+    (should (equal before (dorg-api-mutation-intent-options intent)))))
+
+(ert-deftest dorg-test-fhhwd-raw-execute-refuses-retired-option-before-planning ()
+  "Raw execute must not silently filter the formerly supported option away."
+  (cl-letf (((symbol-function 'dorg-api-normalize)
+             (lambda (&rest _) (ert-fail "retired option reached normalization")))
+            ((symbol-function 'dorg-mutate--resolve-source)
+             (lambda (&rest _) (ert-fail "retired option resolved a source")))
+            ((symbol-function 'dorg-mutate--apply-patches)
+             (lambda (&rest _) (ert-fail "retired option entered the engine"))))
+    (dolist (mode '(dry-run apply))
+      (dolist (value '(nil t))
+        (let ((err (should-error
+                    (dorg-api-execute '(batch) :mode mode
+                                      :return-candidate-models value)
+                    :type 'dorg-api-error)))
+          (should (eq 'malformed (dorg-api-error-reason err)))
+          (should (eq :return-candidate-models
+                      (plist-get (dorg-api-error-data err) :option))))))))
+
+(ert-deftest dorg-test-fhhwd-compact-insert-has-no-payload-argument ()
+  "A new receipt is exactly four fields; legacy nullable storage is omitted."
+  (require 'dorg-dolt)
+  (should (equal '(4 . 4) (func-arity #'dorg-sql--mutation-log-insert-sql)))
+  (should
+   (equal (format (concat "INSERT INTO dorg_mutation_log"
+                          " (op_id, gen_id, intent_digest, ts)"
+                          " VALUES (%s, %s, %s, %d)")
+                  (dorg-sql-quote "op'quoted")
+                  (dorg-sql-quote "gen'quoted")
+                  (dorg-sql-quote "intent") 123)
+          (dorg-sql--mutation-log-insert-sql
+           "op'quoted" "gen'quoted" "intent" 123))))
+
+(ert-deftest dorg-test-fhhwd-settled-result-recovers-without-payload-read ()
+  "Real generation recovery returns the compact result without reading old payload."
+  (require 'dorg-dolt)
+  (let ((reads nil))
+    (cl-letf (((symbol-function 'dorg-sql--lease-exec)
+               (lambda (lease query &rest args)
+                 (should (eq 'compact-lease lease))
+                 (let ((sql (apply #'format query args)))
+                   (push sql reads)
+                   (should
+                    (equal (format
+                            (concat "SELECT to_commit AS c"
+                                    " FROM dolt_diff_dorg_mutation_log"
+                                    " WHERE diff_type = 'added' AND to_gen_id = %s")
+                            (dorg-sql-quote "gen'quoted"))
+                           sql))
+                   '(((c . "original-commit")))))))
+      (let ((result (dorg-mutate--dolt-idempotent-result
+                     'compact-lease "gen'quoted" "compact-op" "base" 100)))
+        (should (plist-get result :ok))
+        (should (plist-get result :idempotent))
+        (should (equal "original-commit" (plist-get result :commit)))
+        (should (equal "compact-op" (plist-get result :op-id)))
+        (should-not (plist-member result :postimages))
+        (should-not (plist-member result :candidate-models))
+        (should (= 1 (length reads)))))))
 
 (provide 'dorg-api-tests)
 ;;; dorg-api-tests.el ends here

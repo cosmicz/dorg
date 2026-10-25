@@ -1,6 +1,6 @@
 #+title: DOrg Public API Caller Census
 
-This census records the DOrg =0.1.0= public surface that external consumers may
+This census records the current public surface that external consumers may
 depend on.  It replaces the older 2026-07-09 pre-internalization snapshot as
 the current documentation view.  Historical caller findings remain useful
 background only where noted;
@@ -16,13 +16,16 @@ known cross-repository coupling by accident.
 
 | Family | Public entry points | Notes |
 |--------+---------------------+-------|
-| Mutation command API | ~dorg-api-read~, ~dorg-api-normalize~, ~dorg-api-make-mutation-intent~, ~dorg-api-execute~ | One public write door; callers pass DSL forms or first-class intents and receive typed command envelopes. |
-| Query API | ~dorg-ql-select~, ~dorg-command-run-query~, ~dorg-session-open~, ~dorg-session-query~, ~dorg-session-refresh~, ~dorg-session-close~ | Atomic and composable v2 query forms share the same facade and backend adapters. |
+| Mutation command API | ~dorg-api-read~, ~dorg-api-normalize~, ~dorg-api-make-mutation-intent~, ~dorg-api-make-owner-intent~, ~dorg-api-execute~ | One public write door; callers pass DSL forms or first-class intents and receive typed command envelopes. |
+| Query API | ~dorg-ql-select~, ~dorg-ql-select-snapshot~, ~dorg-ql-snapshot-public~, ~dorg-command-run-query~, ~dorg-session-open~, ~dorg-session-query~, ~dorg-session-refresh~, ~dorg-session-close~ | Atomic and composable query forms share the same facade and backend adapters; snapshot callers retain source/data revision and context identity. |
 | Materialized views | ~dorg-materialize~, ~dorg-refresh-materialized-view~, ~dorg-materialized-view-scope~, ~dorg-render~, ~dorg-render-island~ | Dolt-backed buffers and ~/dorg:~ views are read-only projections. |
-| Registry and backend descriptors | ~dorg-bind-dolt~, ~dorg-unregister~, ~dorg-current-registration~, ~dorg-registered-backend~, ~dorg-registered-dolt-dir~, ~dorg-backend-plain-org~, ~dorg-backend-dolt~ | Binding and descriptor inspection are public; direct mutation still goes through the typed door. |
+| Registry and backend descriptors | ~dorg-bind-dolt~, ~dorg-bind-existing-dolt~, ~dorg-unregister~, ~dorg-current-registration~, ~make-dorg-registration~, ~dorg-registered-backend~, ~dorg-registered-dolt-dir~, ~dorg-backend-plain-org~, ~dorg-backend-dolt~, ~dorg-repo-root-id~ | Public constructors and read-only root lookup support ephemeral query bindings; direct mutation still goes through the typed door. |
 | Dolt storage/admin | ~dorg-sql~, ~dorg-sql-batch~, ~dorg-sql-quote~, ~dorg-head-commit~, ~dorg-commit~, ~dorg-dolt-start~, ~dorg-dolt-stop~, ~dorg-dolt-stop-all~, ~dorg-dolt-list~, ~dorg-dolt-compact~ | SQL helpers remain risky and schema-coupled.  They are kept for existing extension/downstream needs, not as a general application write API. |
 | Import and transactions | ~dorg-import-document~, ~dorg-transaction-commit~ | Explicit administrative import/recovery and exact-base transactions; not a replacement for typed mutation. |
-| Extension plane | ~dorg-register-extension~, ~dorg-unregister-extension~, ~dorg-get-extension~, ~dorg-registered-extensions~, ~dorg-ext-rebuild-index~, documented extension context/accessor functions | Extension authors register schema/migrations and derived-index projectors; caller-payload mutation inputs are retired. |
+| Extension plane | ~dorg-register-extension~, ~dorg-load-extension~, ~dorg-unregister-extension~, ~dorg-get-extension~, ~dorg-registered-extensions~, ~dorg-ext-rebuild-index~, documented extension context/accessor functions | Extension authors register schema/migrations and derived-index projectors; standalone loading uses the =dorg-extension-NAME= convention and caller-payload mutation inputs are retired. |
+| Managed clocks | ~dorg-clock-make-intent~, ~dorg-clock-read~, ~dorg-clock-task-ref~, ~dorg-clock-task-ref-decode~, ~dorg-clock-render-interval~ | Explicit Dolt authority, stable task identity and immutable lifecycle requests; no generic property writes. |
+| Optional Org clock adapter | ~dorg-clock-emacs-enable~, ~dorg-clock-emacs-reconcile~, ~dorg-clock-emacs-retry-pending~ | Opt-in interception before local CLOCK edits, read-only reconciliation, exact-intent retry. |
+| Store identity | ~dorg-api-identify-store~ | Explicit identification or fork, clean working set required; reads never mint an ID. |
 | Domain/model readers | ~dorg-model-load-tree~, ~dorg-model-load-headings~, documented ~dorg-heading-*~ and ~dorg-item-*~ accessors | Public where current docs expose them, but consumers should prefer query/render facades for new cross-repo integration. |
 
 * Risky Symbol Rows
@@ -41,10 +44,16 @@ known cross-repository coupling by accident.
 | ~dorg-head-commit~ | Dolt HEAD probe | ~keep-public~ | Freshness, exact-base checks, and diagnostics need a stable commit-token probe. |
 | ~dorg-register-extension~ | Extension registration | ~keep-public~ | The supported extension schema/projector registration point. |
 | ~dorg-ext-rebuild-index~ | Exact-revision derived-index audit/repair | ~keep-public~ | The controlled administrative path for auditing or repairing one declared extension scope through its existing projector. |
+| ~dorg-ext-rebuild-plan-policy-upgrade~ | Explicit derived-policy upgrade plan | ~keep-public~ | Read-only, frozen-revision plan of a deliberate OLD-to-NEW derivation-policy migration through content-addressed producers. |
+| ~dorg-ext-rebuild-apply-policy-upgrade~ | Explicit derived-policy upgrade apply | ~keep-public~ | Applies only a re-derived identical plan in one validated transaction and returns the self-contained receipt. |
+| ~dorg-ext-rebuild-invert-policy-upgrade~ | Exact inverse of a policy upgrade | ~keep-public~ | Restores the exact pre-upgrade derived rows from a forward receipt; no force or generic restore. |
 | ~dorg-ext-read-context-root-id~ | Extension read context accessor | ~keep-public~ | Generated accessor on the documented extension read context used by read-plane callbacks. |
 | ~dorg-registered-backend~ | Registry backend lookup | ~keep-public~ | Public descriptor lookup for callers that need backend routing without private registry state. |
 | ~dorg-registered-dolt-dir~ | Registry Dolt-dir lookup | ~keep-public~ | Kept for existing public docs and simple Dolt-bound buffer inspection. |
 | ~dorg-bind-dolt~ | File/backend binding | ~keep-public~ | Primary public binding operation for connecting an Org file/buffer to a Dolt store. |
+| ~dorg-bind-existing-dolt~ | Existing-store safe-reader binding | ~keep-public~ | Programmatic bind that refuses missing, incompatible, or unbound stores without initialization, migration, root creation, or Org UI edits. |
+| ~make-dorg-registration~ | Ephemeral query binding constructor | ~keep-public~ | Names an explicitly resolved Dolt root and its source file without visiting the file or changing the registry; construction does not validate the binding. |
+| ~dorg-repo-root-id~ | Read-only file/root lookup | ~keep-public~ | Resolves an existing binding for a query source and refuses ambiguity or malformed roots; callers must reject an unbound nil result. |
 
 * Demoted Or Retired Surface
 
